@@ -9,3 +9,11 @@ out/
 target/
 __pycache__/
 *.py[cod]
+
+# >>> setup-ci generated ignores >>>
+*.log
+.cache/
+.coverage
+coverage/
+target/
+# <<< setup-ci generated ignores <<<

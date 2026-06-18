@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
@@ -218,14 +219,19 @@ describe('setup-ci CLI', () => {
       path.join(scriptDir, 'setup-ci.mjs'),
     );
 
-    const { stdout } = await execFileAsync(
-      process.execPath,
-      [path.join(scriptDir, 'setup-ci.mjs'), '--list'],
-      {
-        cwd: workDir,
+    let stdout = '';
+    const module = await import(pathToFileURL(path.join(scriptDir, 'setup-ci.mjs')).href);
+    const status = await module.runCli({
+      argv: ['--list'],
+      cwd: workDir,
+      stdout: {
+        write: (chunk) => {
+          stdout += chunk;
+        },
       },
-    );
+    });
 
+    assert.equal(status, 0);
     assert.match(stdout, /js-ts: HTML\/JavaScript\/TypeScript/);
   });
 

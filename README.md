@@ -1,96 +1,96 @@
-# Codex-Gated Repository Template
+# Webex Generic Account Bot
 
-This template starts a repository with the Codex review gate workflow already on
-the default branch. It also includes a modular CI generator for adding
-project-specific formatter, linter, test, and benchmark entrypoints after a
-repository is created from the template.
+Long-running Webex generic-account bot that dispatches space-specific messages
+to Codex and replies in the original Webex thread.
 
-## Included
+This repo is the bot layer. It depends on
+[`webex-headless-messenger`](https://crates.io/crates/webex-headless-messenger)
+for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state.
 
-- `.github/workflows/codex-review-gate.yml`
-- `.gitignore`
-- `scripts/setup-ci.mjs`
-- this README
+## Current Slice
 
-The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. It pins
-`JoeyTeng/codex-review-gate-action` to the v1.2.1 commit SHA so privileged
-`pull_request_target` runs do not depend on a movable tag.
+- Receives `SidecarEvent` JSON from the Webex JS SDK sidecar over loopback HTTP.
+- Authenticates local forwarding with `WEBEX_SIDECAR_TOKEN`.
+- Uses `JsonlStateStore` leases to avoid concurrent duplicate Codex runs for the
+  same Webex message.
+- Matches behavior by Webex `roomId`.
+- Supports `mention`, `prefix`, `always`, and `never` room triggers.
+- Supports sender allowlists by Webex person ID and email.
+- Renders a per-room prompt template and runs `codex exec`.
+- Replies to the Webex message thread with the Codex result.
+- Bounds concurrent request processing with `server.max_concurrent_requests`.
+- Scrubs Webex token variables from the Codex subprocess environment.
 
-## Generate Project CI
+The first implementation is synchronous per sidecar request: the HTTP request
+returns after Codex finishes and the Webex reply is accepted. For this slice,
+set the JS sidecar forwarding timeout higher than the configured Codex timeout.
+Durable background job recovery is the next reliability layer.
 
-Run the setup script from a new repository created from this template:
+## Configuration
+
+Start from [`config/example.toml`](config/example.toml). Keep secrets in
+environment variables or token files.
+
+Minimum environment:
 
 ```bash
-node scripts/setup-ci.mjs
+export WEBEX_SIDECAR_TOKEN='<local-forwarding-token>'
+export WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token
 ```
 
-With no arguments, the script opens an interactive selector. For repeatable setup,
-pass modules explicitly:
+Check config without calling Webex:
 
 ```bash
-node scripts/setup-ci.mjs --tool js-ts --tool python --tool docker --tool markdown
-node scripts/setup-ci.mjs --all --benchmark --dry-run
+cargo run -- --config config/example.toml --check-config
 ```
 
-The script writes `.github/workflows/ci.yml` plus the selected tool configs. It is
-idempotent when generated files have not changed. If a target file already exists
-with different content, the script refuses to overwrite it unless `--force` is
-provided. Use `--dry-run` to inspect planned writes first.
-
-Supported modules:
-
-- `js-ts`: pnpm, ESLint, Prettier, Vite, and Vitest.
-- `python`: uv, Ruff, Pyright, and pytest.
-- `swift`: swift-format, SwiftLint, and `swift test`.
-- `go`: `gofmt`, `go vet`, and `go test`.
-- `rust`: `cargo fmt`, `cargo clippy`, and `cargo test`.
-- `github-actions`: actionlint.
-- `bash`: shfmt, shellcheck, and `bash -n`.
-- `markdown`: Prettier and markdownlint-cli2.
-- `docker`: hadolint and `docker buildx build --check`.
-
-`--benchmark` creates `scripts/benchmark.sh` only. It does not create or enable a
-benchmark workflow, and benchmark commands are not part of the default PR gate.
-The script includes benchmark entries for JavaScript/TypeScript, Python, Go, and
-Rust when those modules are selected.
-
-## After Creating a Repository
-
-1. Add the project source, tests, and license.
-2. Run `node scripts/setup-ci.mjs` and commit the generated CI/tooling files.
-3. Install or lock generated dependencies where applicable, such as `pnpm install`
-   for JavaScript/TypeScript or Markdown modules.
-4. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
-   branch before requiring the status check.
-5. Enable the required status check with the bootstrap helper from
-   `JoeyTeng/codex-review-gate`:
+Run the bot:
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+cargo run -- --config config/example.toml
 ```
 
-The helper defaults to dry-run. It refuses to require `codex/review-gate` until
-the workflow exists on the repository default branch.
-
-## Optional Repository Variables
-
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
-- `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
-  runner is allocated.
-- `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
-- `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
-- `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`: clean completion buffer.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`: set to `false` to disable
-  same-head recovery after resolved Codex findings.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`: `head` or `fresh`.
-
-## Template Maintenance
-
-Run the generator tests with Node's built-in test runner:
+Point the `webex-headless-messenger` JS sidecar at the bot:
 
 ```bash
-node --test test/setup-ci.node-test.mjs
+WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token \
+WEBEX_SIDECAR_TOKEN="$WEBEX_SIDECAR_TOKEN" \
+WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
+WEBEX_SIDECAR_MESSAGE_EVENTS=created \
+WEBEX_SIDECAR_FORWARD_TIMEOUT_MS=700000 \
+node ../Webex-headless-messenger/examples/sidecar-js/index.mjs
+```
+
+## Safety Model
+
+The default Codex runner uses:
+
+- `codex exec`
+- `--sandbox read-only`
+- `--ask-for-approval never`
+- `--ephemeral`
+- a scrubbed subprocess environment that does not forward Webex token variables
+
+Temporary Linux user isolation is the right long-term boundary for untrusted
+chat-driven prompts, but it should live behind the runner abstraction. Creating
+and deleting OS users requires root or a privileged helper, so this MVP rejects
+`codex.isolation.mode = "ephemeral-linux-user"` until that helper is explicitly
+designed. Good follow-up shapes are `systemd-run --property=DynamicUser=yes`, a
+small root-owned worker launcher, or a pre-provisioned pool of locked-down worker
+users.
+
+## Development
+
+Generated Rust CI runs:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+Local tests:
+
+```bash
+cargo test --all-features
 ```

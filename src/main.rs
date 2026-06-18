@@ -1,0 +1,573 @@
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result, anyhow};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use clap::Parser;
+use serde::Serialize;
+use serde_json::json;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, Semaphore},
+};
+use tracing::{error, info, warn};
+use webex_generic_account_bot::{
+    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, render_prompt, should_trigger,
+    webex::build_webex_client,
+};
+use webex_headless_messenger::{
+    AttemptLease, AttemptStart, JsonlStateStore, SidecarEvent, WebexClient,
+    types::{CreateMessage, Message},
+};
+
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    #[arg(long, default_value = "config/example.toml")]
+    config: PathBuf,
+    #[arg(long)]
+    check_config: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "webex_generic_account_bot=info,tower_http=info".into()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    let config = Arc::new(BotConfig::load(&cli.config)?);
+    if cli.check_config {
+        println!("config_ok=true");
+        return Ok(());
+    }
+
+    let sidecar_token = sidecar_token(&config)?;
+    let webex = build_webex_client(&config.webex)?;
+    let self_person_id = resolve_self_person_id(&config, &webex).await?;
+    let state_store = JsonlStateStore::load(config.state_file.clone())?;
+    let app = Arc::new(BotApp {
+        config: config.clone(),
+        sidecar_token,
+        self_person_id,
+        webex,
+        state: Mutex::new(state_store),
+        runner: Arc::new(ExecCodexRunner),
+        request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
+    });
+
+    let event_path = config.server.event_path.clone();
+    let health_path = config.server.health_path.clone();
+    let router = Router::new()
+        .route(&event_path, post(handle_event))
+        .route(&health_path, get(handle_health))
+        .with_state(AppState { app: app.clone() });
+    let bind: SocketAddr = config
+        .server
+        .bind
+        .parse()
+        .with_context(|| format!("invalid server.bind {}", config.server.bind))?;
+    let listener = TcpListener::bind(bind).await?;
+    info!(
+        bind = %listener.local_addr()?,
+        event_path = %event_path,
+        health_path = %health_path,
+        "webex generic account bot listening"
+    );
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct AppState {
+    app: Arc<BotApp>,
+}
+
+struct BotApp {
+    config: Arc<BotConfig>,
+    sidecar_token: Option<String>,
+    self_person_id: Option<String>,
+    webex: WebexClient,
+    state: Mutex<JsonlStateStore>,
+    runner: Arc<dyn CodexRunner>,
+    request_slots: Arc<Semaphore>,
+}
+
+impl BotApp {
+    async fn process_event(&self, event: SidecarEvent) -> Result<BotAction, HttpError> {
+        if event.version != 1 {
+            return Ok(BotAction::ignored("unsupported_event_version", None, None));
+        }
+        if event.resource != "messages" || event.event != "created" {
+            return Ok(BotAction::ignored(
+                "unsupported_event",
+                Some(event.resource),
+                None,
+            ));
+        }
+
+        let mut message: Message = serde_json::from_value(event.data)
+            .map_err(|error| HttpError::bad_request(format!("invalid message payload: {error}")))?;
+        let Some(message_id) = message.id.clone() else {
+            return Ok(BotAction::ignored("missing_message_id", None, None));
+        };
+        let attempt = match self.begin_attempt(&message_id).await? {
+            AttemptStart::Started(attempt) => attempt,
+            AttemptStart::Processed => {
+                return Ok(BotAction::ignored(
+                    "duplicate_message",
+                    Some(message_id),
+                    message.room_id.clone(),
+                ));
+            }
+            AttemptStart::Leased(retry_after) => {
+                return Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("message {message_id} already has an active attempt lease"),
+                    retry_after,
+                ));
+            }
+        };
+
+        if message.room_id.is_none() || message.person_id.is_none() {
+            match self.webex.get_message(&message_id).await {
+                Ok(hydrated) => merge_message(&mut message, hydrated),
+                Err(error) => {
+                    self.defer_attempt(&attempt, self.config.server.attempt_lease())
+                        .await?;
+                    return Err(HttpError::retry_after(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to hydrate message {message_id}: {error}"),
+                        self.config.server.attempt_lease(),
+                    ));
+                }
+            }
+        }
+
+        let Some(room_id) = message.room_id.clone() else {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "missing_room_id",
+                Some(message_id),
+                None,
+            ));
+        };
+        let Some(policy) = self.config.policy_for_room(&room_id) else {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "no_room_policy",
+                Some(message_id),
+                Some(room_id),
+            ));
+        };
+        if self
+            .self_person_id
+            .as_deref()
+            .is_some_and(|self_id| message.person_id.as_deref() == Some(self_id))
+        {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "self_message",
+                Some(message_id),
+                Some(room_id),
+            ));
+        }
+
+        let trigger = should_trigger(policy, &message, self.self_person_id.as_deref());
+        if !matches!(trigger, webex_generic_account_bot::TriggerDecision::Matched) {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                trigger_reason(&trigger),
+                Some(message_id),
+                Some(room_id),
+            ));
+        }
+
+        let Some(context) = MessageContext::from_message(&message) else {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "incomplete_message_context",
+                Some(message_id),
+                Some(room_id),
+            ));
+        };
+        let codex_config = self.config.codex_for_policy(policy);
+        let prompt = render_prompt(&policy.prompt_template, &context);
+        let reply_text = match self.runner.run(codex_config, &prompt, &message_id).await {
+            Ok(output) => output.final_message,
+            Err(error) => {
+                warn!(message_id = %message_id, error = %error, "codex run failed");
+                format!(
+                    "Codex run failed:\n{}",
+                    truncate_for_reply(&error.to_string())
+                )
+            }
+        };
+        let parent_id = message
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| message_id.clone());
+        let reply = self
+            .webex
+            .create_message(&CreateMessage::reply_text(
+                &room_id,
+                parent_id,
+                truncate_for_reply(&reply_text),
+            ))
+            .await
+            .map_err(|error| {
+                HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("failed to send Webex reply for message {message_id}: {error}"),
+                    self.config.server.attempt_lease(),
+                )
+            })?;
+        self.mark_processed(&attempt).await?;
+        Ok(BotAction::replied(
+            message_id,
+            room_id,
+            reply.id,
+            reply_text.len(),
+        ))
+    }
+
+    async fn begin_attempt(&self, message_id: &str) -> Result<AttemptStart, HttpError> {
+        let mut state = self.state.lock().await;
+        state
+            .begin_attempt(message_id, self.config.server.attempt_lease())
+            .map_err(HttpError::state_error)
+    }
+
+    async fn mark_processed(&self, attempt: &AttemptLease) -> Result<(), HttpError> {
+        let mut state = self.state.lock().await;
+        state
+            .mark_processed(attempt)
+            .map_err(HttpError::state_error)
+    }
+
+    async fn defer_attempt(
+        &self,
+        attempt: &AttemptLease,
+        lease: Duration,
+    ) -> Result<(), HttpError> {
+        let mut state = self.state.lock().await;
+        state
+            .defer_attempt(attempt, lease)
+            .map_err(HttpError::state_error)
+    }
+}
+
+async fn handle_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(event): Json<SidecarEvent>,
+) -> Response {
+    if let Err(error) = authorize(&state.app, &headers) {
+        return error.into_response();
+    }
+    let _permit = match state.app.request_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return HttpError::retry_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server busy",
+                Duration::from_secs(5),
+            )
+            .into_response();
+        }
+    };
+    match state.app.process_event(event).await {
+        Ok(action) => {
+            let status = if action.action == "replied" {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (status, Json(json!({ "ok": true, "action": action }))).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn handle_health(State(state): State<AppState>) -> Response {
+    let state_path = {
+        let store = state.app.state.lock().await;
+        store.path().display().to_string()
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "rooms": state.app.config.rooms.len(),
+            "selfPersonIdKnown": state.app.self_person_id.is_some(),
+            "stateFile": state_path,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BotAction {
+    action: &'static str,
+    reason: Option<String>,
+    message_id: Option<String>,
+    room_id: Option<String>,
+    reply_id: Option<String>,
+    reply_chars: Option<usize>,
+}
+
+impl BotAction {
+    fn ignored(
+        reason: impl Into<String>,
+        message_id: Option<String>,
+        room_id: Option<String>,
+    ) -> Self {
+        Self {
+            action: "ignored",
+            reason: Some(reason.into()),
+            message_id,
+            room_id,
+            reply_id: None,
+            reply_chars: None,
+        }
+    }
+
+    fn replied(
+        message_id: String,
+        room_id: String,
+        reply_id: Option<String>,
+        reply_chars: usize,
+    ) -> Self {
+        Self {
+            action: "replied",
+            reason: None,
+            message_id: Some(message_id),
+            room_id: Some(room_id),
+            reply_id,
+            reply_chars: Some(reply_chars),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HttpError {
+    status: StatusCode,
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+impl HttpError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn retry_after(status: StatusCode, message: impl Into<String>, retry_after: Duration) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    fn state_error(error: webex_headless_messenger::Error) -> Self {
+        Self::retry_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("state store error: {error}"),
+            Duration::from_secs(30),
+        )
+    }
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        let body = Json(json!({
+            "ok": false,
+            "error": self.message,
+        }));
+        let mut response = (self.status, body).into_response();
+        if let Some(retry_after) = self.retry_after {
+            if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().max(1).to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
+    }
+}
+
+fn trigger_reason(trigger: &webex_generic_account_bot::TriggerDecision) -> &'static str {
+    match trigger {
+        webex_generic_account_bot::TriggerDecision::Matched => "matched",
+        webex_generic_account_bot::TriggerDecision::RoomDisabled => "room_disabled",
+        webex_generic_account_bot::TriggerDecision::SenderNotAllowed => "sender_not_allowed",
+        webex_generic_account_bot::TriggerDecision::MissingSelfPersonId => "missing_self_person_id",
+        webex_generic_account_bot::TriggerDecision::NotMentioned => "not_mentioned",
+        webex_generic_account_bot::TriggerDecision::PrefixNotMatched => "prefix_not_matched",
+    }
+}
+
+fn authorize(app: &BotApp, headers: &HeaderMap) -> Result<(), HttpError> {
+    let Some(token) = &app.sidecar_token else {
+        return Ok(());
+    };
+    let expected = format!("Bearer {token}");
+    let authorized = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected);
+    if authorized {
+        Ok(())
+    } else {
+        Err(HttpError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "unauthorized".to_owned(),
+            retry_after: None,
+        })
+    }
+}
+
+fn sidecar_token(config: &BotConfig) -> Result<Option<String>> {
+    let token = env::var(&config.server.sidecar_token_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if token.is_none() && !config.server.allow_unauthenticated {
+        return Err(anyhow!(
+            "set {} or server.allow_unauthenticated = true",
+            config.server.sidecar_token_env
+        ));
+    }
+    if token.is_none() {
+        warn!("sidecar forwarding is unauthenticated");
+    }
+    Ok(token)
+}
+
+async fn resolve_self_person_id(config: &BotConfig, webex: &WebexClient) -> Result<Option<String>> {
+    if let Some(person_id) = &config.self_person_id {
+        return Ok(Some(person_id.clone()));
+    }
+    let me = webex
+        .me()
+        .await
+        .context("failed to resolve Webex people/me")?;
+    Ok(me.id)
+}
+
+fn merge_message(target: &mut Message, hydrated: Message) {
+    if target.id.is_none() {
+        target.id = hydrated.id;
+    }
+    if target.parent_id.is_none() {
+        target.parent_id = hydrated.parent_id;
+    }
+    if target.room_id.is_none() {
+        target.room_id = hydrated.room_id;
+    }
+    if target.room_type.is_none() {
+        target.room_type = hydrated.room_type;
+    }
+    if target.person_id.is_none() {
+        target.person_id = hydrated.person_id;
+    }
+    if target.person_email.is_none() {
+        target.person_email = hydrated.person_email;
+    }
+    if target.text.is_none() {
+        target.text = hydrated.text;
+    }
+    if target.markdown.is_none() {
+        target.markdown = hydrated.markdown;
+    }
+    if target.mentioned_people.is_empty() {
+        target.mentioned_people = hydrated.mentioned_people;
+    }
+    if target.mentioned_groups.is_empty() {
+        target.mentioned_groups = hydrated.mentioned_groups;
+    }
+}
+
+fn truncate_for_reply(value: &str) -> String {
+    webex_generic_account_bot::policy::trim_to_chars(value, 6_000)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(%error, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                error!(%error, "failed to install SIGTERM handler");
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_action_serializes_reason() {
+        let action = BotAction::ignored(
+            "not_mentioned",
+            Some("message-1".to_owned()),
+            Some("room-1".to_owned()),
+        );
+        let value = serde_json::to_value(action).unwrap();
+
+        assert_eq!(value["action"], "ignored");
+        assert_eq!(value["reason"], "not_mentioned");
+    }
+
+    #[test]
+    fn merge_message_fills_missing_fields() {
+        let mut target = Message {
+            id: Some("message-1".to_owned()),
+            ..Message::default()
+        };
+        let hydrated = Message {
+            room_id: Some("room-1".to_owned()),
+            person_id: Some("person-1".to_owned()),
+            mentioned_people: vec!["bot-person".to_owned()],
+            ..Message::default()
+        };
+
+        merge_message(&mut target, hydrated);
+
+        assert_eq!(target.room_id.as_deref(), Some("room-1"));
+        assert_eq!(target.person_id.as_deref(), Some("person-1"));
+        assert_eq!(target.mentioned_people, vec!["bot-person"]);
+    }
+}
