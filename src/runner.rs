@@ -176,17 +176,29 @@ async fn read_limited<R>(reader: &mut R, max_bytes: usize) -> Result<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut bytes = Vec::new();
-    let limit = max_bytes.saturating_add(1) as u64;
-    reader.take(limit).read_to_end(&mut bytes).await?;
-    Ok(limited_string(bytes, max_bytes))
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(kept.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let to_keep = read.min(remaining);
+        kept.extend_from_slice(&buffer[..to_keep]);
+        if to_keep < read {
+            truncated = true;
+        }
+    }
+    Ok(limited_string(kept, truncated))
 }
 
-fn limited_string(mut bytes: Vec<u8>, max_bytes: usize) -> String {
-    let truncated = bytes.len() > max_bytes;
-    if truncated {
-        bytes.truncate(max_bytes);
-    }
+fn limited_string(bytes: Vec<u8>, truncated: bool) -> String {
     let mut value = String::from_utf8_lossy(&bytes).to_string();
     if truncated {
         value.push_str("\n[truncated]");
@@ -295,7 +307,17 @@ mod tests {
 
     #[test]
     fn limited_string_caps_bytes_before_decoding() {
-        assert_eq!(limited_string(b"abcdef".to_vec(), 3), "abc\n[truncated]");
+        assert_eq!(limited_string(b"abc".to_vec(), true), "abc\n[truncated]");
+    }
+
+    #[tokio::test]
+    async fn read_limited_drains_after_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let reader_task = tokio::spawn(async move { read_limited(&mut reader, 3).await.unwrap() });
+        writer.write_all(b"abcdef").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(reader_task.await.unwrap(), "abc\n[truncated]");
     }
 
     #[test]

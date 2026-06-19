@@ -56,6 +56,7 @@ impl BotConfig {
             room.validate()?;
         }
         self.codex.validate()?;
+        self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
         Ok(())
     }
@@ -78,6 +79,17 @@ impl BotConfig {
                         codex.cwd.display()
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_attempt_lease(&self) -> Result<()> {
+        for (name, codex) in self.codex_configs() {
+            if codex.timeout_secs >= self.server.attempt_lease_secs {
+                return Err(anyhow!(
+                    "server.attempt_lease_secs must be greater than codex.timeout_secs for {name}"
+                ));
             }
         }
         Ok(())
@@ -205,6 +217,17 @@ impl CodexConfig {
         if self.output_limit_chars == 0 {
             return Err(anyhow!(
                 "codex.output_limit_chars must be greater than zero"
+            ));
+        }
+        if self.timeout_secs == 0 {
+            return Err(anyhow!("codex.timeout_secs must be greater than zero"));
+        }
+        if self.sandbox != "read-only" {
+            return Err(anyhow!("codex.sandbox must be \"read-only\" in this MVP"));
+        }
+        if self.approval_policy != "never" {
+            return Err(anyhow!(
+                "codex.approval_policy must be \"never\" in this MVP"
             ));
         }
         if self
@@ -345,9 +368,14 @@ fn validate_http_path(name: &str, path: &str) -> Result<()> {
 }
 
 fn path_is_inside(path: &Path, root: &Path) -> bool {
-    let path = absolute_lexical(path);
-    let root = absolute_lexical(root);
+    let path = real_or_absolute_lexical(path);
+    let root = real_or_absolute_lexical(root);
     path == root || path.starts_with(root)
+}
+
+fn real_or_absolute_lexical(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| absolute_lexical(path))
 }
 
 fn absolute_lexical(path: &Path) -> PathBuf {
@@ -475,6 +503,53 @@ room_id = "room-1"
     }
 
     #[test]
+    fn rejects_codex_timeout_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 10
+
+[codex]
+timeout_secs = 10
+
+[[rooms]]
+room_id = "room-1"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("attempt_lease_secs")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_codex_runtime_modes() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+sandbox = "danger-full-access"
+
+[[rooms]]
+room_id = "room-1"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+    }
+
+    #[test]
     fn rejects_access_token_file_inside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -497,5 +572,30 @@ room_id = "room-1"
                 .to_string()
                 .contains("must not be inside codex cwd")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_boundary_resolves_symlinked_codex_cwd() {
+        use std::os::unix::fs::symlink;
+        use std::time::SystemTime;
+
+        let root = env::temp_dir().join(format!(
+            "webex-bot-config-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_cwd = root.join("real-cwd");
+        let link_cwd = root.join("link-cwd");
+        let token = real_cwd.join("token");
+        fs::create_dir_all(&real_cwd).unwrap();
+        fs::write(&token, "token").unwrap();
+        symlink(&real_cwd, &link_cwd).unwrap();
+
+        assert!(path_is_inside(&token, &link_cwd));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
