@@ -3,7 +3,6 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
@@ -219,20 +218,19 @@ describe('setup-ci CLI', () => {
       path.join(scriptDir, 'setup-ci.mjs'),
     );
 
-    let stdout = '';
-    const module = await import(pathToFileURL(path.join(scriptDir, 'setup-ci.mjs')).href);
-    const status = await module.runCli({
-      argv: ['--list'],
-      cwd: workDir,
-      stdout: {
-        write: (chunk) => {
-          stdout += chunk;
+    await execFileAsync(
+      process.execPath,
+      [path.join(scriptDir, 'setup-ci.mjs'), '--tool', 'github-actions', '--force'],
+      {
+        cwd: workDir,
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
         },
       },
-    });
+    );
 
-    assert.equal(status, 0);
-    assert.match(stdout, /js-ts: HTML\/JavaScript\/TypeScript/);
+    await fs.stat(path.join(workDir, '.github', 'workflows', 'ci.yml'));
   });
 
   it('can be imported when argv[1] is not a file path', async () => {

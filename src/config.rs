@@ -266,10 +266,10 @@ impl CodexConfig {
         if self
             .model_reasoning_effort
             .as_deref()
-            .is_some_and(|effort| effort.trim().is_empty() || effort.trim() != effort)
+            .is_some_and(|effort| !valid_reasoning_effort(effort))
         {
             return Err(anyhow!(
-                "codex.model_reasoning_effort must be non-empty without surrounding whitespace"
+                "codex.model_reasoning_effort must be one of minimal, low, medium, high, or xhigh"
             ));
         }
         self.isolation.validate()
@@ -468,6 +468,10 @@ fn validate_http_path(name: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn valid_reasoning_effort(value: &str) -> bool {
+    matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh")
+}
+
 fn path_is_inside(path: &Path, root: &Path) -> bool {
     let lexical_path = absolute_lexical(path);
     let lexical_root = absolute_lexical(root);
@@ -615,6 +619,29 @@ allow_all_senders = true
         assert_eq!(
             config.codex.model_reasoning_effort.as_deref(),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_codex_reasoning_effort() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+model_reasoning_effort = "xhigh\""
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("model_reasoning_effort")
         );
     }
 

@@ -484,7 +484,7 @@ fn classify_webex_api_error(api: &ApiError, default_retry: Duration) -> WebexFai
     if api.status == 429 {
         return WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry));
     }
-    if (400..500).contains(&api.status) && !matches!(api.status, 408 | 409) {
+    if matches!(api.status, 400 | 404 | 410 | 422) {
         return WebexFailureAction::Stop;
     }
     WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
@@ -826,6 +826,16 @@ mod tests {
         assert_eq!(
             classify_webex_failure(&error, Duration::from_secs(30)),
             WebexFailureAction::Retry(Duration::from_secs(42))
+        );
+    }
+
+    #[test]
+    fn webex_401_errors_retry_for_token_reload() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(401, None))));
+
+        assert_eq!(
+            classify_webex_failure(&error, Duration::from_secs(30)),
+            WebexFailureAction::Retry(Duration::from_secs(30))
         );
     }
 
