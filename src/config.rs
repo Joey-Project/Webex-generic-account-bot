@@ -125,6 +125,7 @@ pub struct CodexConfig {
     pub cwd: PathBuf,
     pub profile: Option<String>,
     pub model: Option<String>,
+    pub model_reasoning_effort: Option<String>,
     pub sandbox: String,
     pub approval_policy: String,
     pub timeout_secs: u64,
@@ -141,6 +142,7 @@ impl Default for CodexConfig {
             cwd: PathBuf::from("."),
             profile: None,
             model: None,
+            model_reasoning_effort: None,
             sandbox: "read-only".to_owned(),
             approval_policy: "never".to_owned(),
             timeout_secs: 600,
@@ -164,6 +166,15 @@ impl CodexConfig {
         if self.output_limit_chars == 0 {
             return Err(anyhow!(
                 "codex.output_limit_chars must be greater than zero"
+            ));
+        }
+        if self
+            .model_reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| effort.trim().is_empty() || effort.trim() != effort)
+        {
+            return Err(anyhow!(
+                "codex.model_reasoning_effort must be non-empty without surrounding whitespace"
             ));
         }
         self.isolation.validate()
@@ -335,6 +346,28 @@ trigger = "prefix"
                 .unwrap_err()
                 .to_string()
                 .contains("prefixes")
+        );
+    }
+
+    #[test]
+    fn parses_codex_reasoning_effort() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+
+[[rooms]]
+room_id = "room-1"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.codex.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            config.codex.model_reasoning_effort.as_deref(),
+            Some("xhigh")
         );
     }
 }

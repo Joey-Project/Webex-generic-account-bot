@@ -146,6 +146,10 @@ fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
         args.push("--model".into());
         args.push(model.into());
     }
+    if let Some(reasoning_effort) = &config.model_reasoning_effort {
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort=\"{reasoning_effort}\"").into());
+    }
     args.push("-".into());
     args
 }
@@ -280,6 +284,26 @@ mod tests {
             !args
                 .windows(2)
                 .any(|pair| pair == ["exec", "--ask-for-approval"])
+        );
+    }
+
+    #[test]
+    fn model_reasoning_effort_is_passed_as_codex_config_override() {
+        let config = CodexConfig {
+            model: Some("gpt-5.5".to_owned()),
+            model_reasoning_effort: Some("xhigh".to_owned()),
+            ..CodexConfig::default()
+        };
+        let args = codex_exec_args(&config, std::path::Path::new("/tmp/out"));
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-5.5"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["-c", "model_reasoning_effort=\"xhigh\""] })
         );
     }
 

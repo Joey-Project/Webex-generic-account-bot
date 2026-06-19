@@ -28,6 +28,8 @@ access_token_file_env = "WEBEX_ACCESS_TOKEN_FILE"
 [codex]
 bin = "codex"
 cwd = "."
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
 sandbox = "read-only"
 approval_policy = "never"
 timeout_secs = 600

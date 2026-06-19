@@ -31,6 +31,10 @@ Durable background job recovery is the next reliability layer.
 Start from [`config/example.toml`](config/example.toml). Keep secrets in
 environment variables or token files.
 
+Codex model settings can be configured globally under `[codex]` or overridden
+per room under `[rooms.codex]`, including `model` and
+`model_reasoning_effort`.
+
 Minimum environment:
 
 ```bash
