@@ -65,9 +65,8 @@ node ../Webex-headless-messenger/examples/sidecar-js/index.mjs
 
 The default Codex runner uses:
 
-- `codex exec`
+- `codex --ask-for-approval never exec`
 - `--sandbox read-only`
-- `--ask-for-approval never`
 - `--ephemeral`
 - a scrubbed subprocess environment that does not forward Webex token variables
 
@@ -94,3 +93,36 @@ Local tests:
 ```bash
 cargo test --all-features
 ```
+
+## Live E2E
+
+The live E2E harness starts the Rust bot, starts the JavaScript Webex sidecar,
+sends a message with a separate Webex bot token, and waits for the generic
+account to reply in the original thread.
+
+Required local `.env` keys:
+
+```bash
+E2E_BOT_ACCESS_TOKEN='<sender-bot-token>'
+E2E_BOT_EMAIL='<sender-bot-email>'
+```
+
+Default target:
+
+- generic account: `miku.gen@cisco.com`
+- room: `miku bot test`
+- trigger prefix: `/codex-e2e`
+- generic-account access token file:
+  `../Webex-headless-messenger/.codex-tmp/webex-test/access-token`
+
+Run:
+
+```bash
+node scripts/e2e-webex-bot.mjs
+```
+
+The script writes its generated bot config under `.codex-tmp/miku-bot-test/`,
+uses `.env` only for the sender bot token/email, and stops the bot and sidecar
+when the test completes. Set `E2E_KEEP_PROCESSES=1` to leave both processes
+running for manual inspection. If `cargo` or `codex` is not on `PATH`, set
+`E2E_CARGO_BIN` or `E2E_CODEX_BIN` to the executable path before running it.

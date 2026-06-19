@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     env,
-    path::PathBuf,
+    ffi::OsString,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -57,31 +58,7 @@ async fn run_codex_exec(
     config.validate()?;
     let output_path = output_path(message_id).await?;
     let mut command = Command::new(&config.bin);
-    command
-        .arg("exec")
-        .arg("--color")
-        .arg("never")
-        .arg("--ask-for-approval")
-        .arg(&config.approval_policy)
-        .arg("--sandbox")
-        .arg(&config.sandbox)
-        .arg("--cd")
-        .arg(&config.cwd)
-        .arg("--output-last-message")
-        .arg(&output_path);
-    if config.skip_git_repo_check {
-        command.arg("--skip-git-repo-check");
-    }
-    if config.ephemeral {
-        command.arg("--ephemeral");
-    }
-    if let Some(profile) = &config.profile {
-        command.arg("--profile").arg(profile);
-    }
-    if let Some(model) = &config.model {
-        command.arg("--model").arg(model);
-    }
-    command.arg("-");
+    command.args(codex_exec_args(config, &output_path));
     apply_scrubbed_env(&mut command);
     command
         .stdin(Stdio::piped())
@@ -139,6 +116,38 @@ async fn run_codex_exec(
         stdout,
         stderr,
     })
+}
+
+fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
+    let mut args = vec![
+        "--ask-for-approval".into(),
+        config.approval_policy.clone().into(),
+        "exec".into(),
+        "--color".into(),
+        "never".into(),
+        "--sandbox".into(),
+        config.sandbox.clone().into(),
+        "--cd".into(),
+        config.cwd.as_os_str().into(),
+        "--output-last-message".into(),
+        output_path.as_os_str().into(),
+    ];
+    if config.skip_git_repo_check {
+        args.push("--skip-git-repo-check".into());
+    }
+    if config.ephemeral {
+        args.push("--ephemeral".into());
+    }
+    if let Some(profile) = &config.profile {
+        args.push("--profile".into());
+        args.push(profile.into());
+    }
+    if let Some(model) = &config.model {
+        args.push("--model".into());
+        args.push(model.into());
+    }
+    args.push("-".into());
+    args
 }
 
 fn read_pipe<R>(pipe: Option<R>) -> tokio::task::JoinHandle<Result<String>>
@@ -254,6 +263,24 @@ mod tests {
         assert_eq!(config.sandbox, "read-only");
         assert_eq!(config.approval_policy, "never");
         assert!(config.ephemeral);
+    }
+
+    #[test]
+    fn approval_policy_is_passed_before_exec_subcommand() {
+        let args = codex_exec_args(&CodexConfig::default(), std::path::Path::new("/tmp/out"));
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args[0], "--ask-for-approval");
+        assert_eq!(args[1], "never");
+        assert_eq!(args[2], "exec");
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["exec", "--ask-for-approval"])
+        );
     }
 
     #[test]
