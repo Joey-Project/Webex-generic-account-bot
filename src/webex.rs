@@ -23,17 +23,10 @@ pub struct ReloadingAccessTokenProvider {
 
 impl ReloadingAccessTokenProvider {
     pub fn from_config(config: &WebexAuthConfig) -> Result<Self> {
-        if let Some(path) = &config.access_token_file {
+        if let Some(path) = config.runtime_access_token_file() {
             return Ok(Self {
-                source: TokenSource::File(path.clone()),
+                source: TokenSource::File(path),
             });
-        }
-        if let Ok(path) = env::var(&config.access_token_file_env) {
-            if !path.trim().is_empty() {
-                return Ok(Self {
-                    source: TokenSource::File(PathBuf::from(path)),
-                });
-            }
         }
         if let Ok(token) = env::var(&config.access_token_env) {
             if !token.trim().is_empty() {

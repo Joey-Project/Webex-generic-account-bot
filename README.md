@@ -72,7 +72,9 @@ The default Codex runner uses:
 - `codex --ask-for-approval never exec`
 - `--sandbox read-only`
 - `--ephemeral`
+- `--ignore-user-config` and `--ignore-rules`
 - a scrubbed subprocess environment that does not forward Webex token variables
+  or `CODEX_HOME`
 
 Keep Webex token files and config files that contain secrets outside every
 configured Codex `cwd`. The bot rejects explicit token files, and token files

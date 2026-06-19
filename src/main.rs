@@ -3,8 +3,9 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
+    body::{Body, to_bytes},
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,13 +18,15 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, render_prompt, should_trigger,
-    webex::build_webex_client,
+    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, TriggerMode, render_prompt,
+    should_trigger, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     AttemptLease, AttemptStart, JsonlStateStore, SidecarEvent, WebexClient,
     types::{CreateMessage, Message},
 };
+
+const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -140,7 +143,7 @@ impl BotApp {
             }
         };
 
-        if message_needs_hydration(&message) {
+        if message.room_id.is_none() {
             match self.webex.get_message(&message_id).await {
                 Ok(hydrated) => merge_message(&mut message, hydrated),
                 Err(error) => {
@@ -171,6 +174,20 @@ impl BotApp {
                 Some(room_id),
             ));
         };
+        if message_needs_hydration(policy, &message) {
+            match self.webex.get_message(&message_id).await {
+                Ok(hydrated) => merge_message(&mut message, hydrated),
+                Err(error) => {
+                    self.defer_attempt(&attempt, self.config.server.attempt_lease())
+                        .await?;
+                    return Err(HttpError::retry_after(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to hydrate message {message_id}: {error}"),
+                        self.config.server.attempt_lease(),
+                    ));
+                }
+            }
+        }
         if self
             .self_person_id
             .as_deref()
@@ -269,12 +286,8 @@ impl BotApp {
     }
 }
 
-async fn handle_event(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(event): Json<SidecarEvent>,
-) -> Response {
-    if let Err(error) = authorize(&state.app, &headers) {
+async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if let Err(error) = authorize(&state.app, request.headers()) {
         return error.into_response();
     }
     let _permit = match state.app.request_slots.clone().try_acquire_owned() {
@@ -286,6 +299,20 @@ async fn handle_event(
                 Duration::from_secs(5),
             )
             .into_response();
+        }
+    };
+    let body = match to_bytes(request.into_body(), MAX_EVENT_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            return HttpError::bad_request(format!("failed to read sidecar event body: {error}"))
+                .into_response();
+        }
+    };
+    let event = match serde_json::from_slice::<SidecarEvent>(&body) {
+        Ok(event) => event,
+        Err(error) => {
+            return HttpError::bad_request(format!("invalid sidecar event payload: {error}"))
+                .into_response();
         }
     };
     match state.app.process_event(event).await {
@@ -502,12 +529,15 @@ fn merge_message(target: &mut Message, hydrated: Message) {
     }
 }
 
-fn message_needs_hydration(message: &Message) -> bool {
+fn message_needs_hydration(
+    policy: &webex_generic_account_bot::RoomPolicy,
+    message: &Message,
+) -> bool {
     message.room_id.is_none()
         || message.person_id.is_none()
         || message.person_email.is_none()
         || (message.text.is_none() && message.markdown.is_none())
-        || message.mentioned_people.is_empty()
+        || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
 }
 
 fn truncate_for_reply(value: &str) -> String {
@@ -599,6 +629,10 @@ mod tests {
 
     #[test]
     fn metadata_only_message_needs_hydration() {
+        let policy = webex_generic_account_bot::RoomPolicy {
+            allow_all_senders: true,
+            ..webex_generic_account_bot::RoomPolicy::default()
+        };
         let message = Message {
             id: Some("message-1".to_owned()),
             room_id: Some("room-1".to_owned()),
@@ -606,11 +640,15 @@ mod tests {
             ..Message::default()
         };
 
-        assert!(message_needs_hydration(&message));
+        assert!(message_needs_hydration(&policy, &message));
     }
 
     #[test]
-    fn complete_message_does_not_need_hydration() {
+    fn complete_mention_message_does_not_need_hydration() {
+        let policy = webex_generic_account_bot::RoomPolicy {
+            allow_all_senders: true,
+            ..webex_generic_account_bot::RoomPolicy::default()
+        };
         let message = Message {
             id: Some("message-1".to_owned()),
             room_id: Some("room-1".to_owned()),
@@ -621,7 +659,27 @@ mod tests {
             ..Message::default()
         };
 
-        assert!(!message_needs_hydration(&message));
+        assert!(!message_needs_hydration(&policy, &message));
+    }
+
+    #[test]
+    fn prefix_message_does_not_need_mentions_to_skip_hydration() {
+        let policy = webex_generic_account_bot::RoomPolicy {
+            trigger: TriggerMode::Prefix,
+            prefixes: vec!["/codex".to_owned()],
+            allow_all_senders: true,
+            ..webex_generic_account_bot::RoomPolicy::default()
+        };
+        let message = Message {
+            id: Some("message-1".to_owned()),
+            room_id: Some("room-1".to_owned()),
+            person_id: Some("person-1".to_owned()),
+            person_email: Some("joey@example.com".to_owned()),
+            text: Some("/codex run".to_owned()),
+            ..Message::default()
+        };
+
+        assert!(!message_needs_hydration(&policy, &message));
     }
 
     #[test]

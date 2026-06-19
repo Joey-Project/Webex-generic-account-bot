@@ -126,6 +126,8 @@ fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
         "exec".into(),
         "--color".into(),
         "never".into(),
+        "--ignore-user-config".into(),
+        "--ignore-rules".into(),
         "--sandbox".into(),
         config.sandbox.clone().into(),
         "--cd".into(),
@@ -244,7 +246,6 @@ pub fn scrubbed_env() -> BTreeMap<String, String> {
     const PASSTHROUGH: &[&str] = &[
         "PATH",
         "HOME",
-        "CODEX_HOME",
         "USER",
         "LOGNAME",
         "SHELL",
@@ -292,12 +293,20 @@ mod tests {
         unsafe {
             env::set_var("WEBEX_ACCESS_TOKEN", "secret");
             env::set_var("WEBEX_SIDECAR_TOKEN", "secret");
+            env::set_var("CODEX_HOME", "/tmp/codex-home-with-extra-config");
         }
 
         let env = scrubbed_env();
 
         assert!(!env.contains_key("WEBEX_ACCESS_TOKEN"));
         assert!(!env.contains_key("WEBEX_SIDECAR_TOKEN"));
+        assert!(!env.contains_key("CODEX_HOME"));
+
+        unsafe {
+            env::remove_var("WEBEX_ACCESS_TOKEN");
+            env::remove_var("WEBEX_SIDECAR_TOKEN");
+            env::remove_var("CODEX_HOME");
+        }
     }
 
     #[test]
@@ -350,6 +359,18 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["exec", "--ask-for-approval"])
         );
+    }
+
+    #[test]
+    fn codex_exec_ignores_user_config_and_rules() {
+        let args = codex_exec_args(&CodexConfig::default(), std::path::Path::new("/tmp/out"));
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "--ignore-rules"));
     }
 
     #[test]

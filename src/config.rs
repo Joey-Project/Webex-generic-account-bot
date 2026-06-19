@@ -70,7 +70,7 @@ impl BotConfig {
     }
 
     fn validate_secret_boundaries(&self) -> Result<()> {
-        for token_file in self.runtime_access_token_files() {
+        if let Some(token_file) = self.webex.runtime_access_token_file() {
             for (name, codex) in self.codex_configs() {
                 if path_is_inside(&token_file, &codex.cwd) {
                     return Err(anyhow!(
@@ -95,19 +95,6 @@ impl BotConfig {
         Ok(())
     }
 
-    fn runtime_access_token_files(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Some(path) = &self.webex.access_token_file {
-            paths.push(path.clone());
-        }
-        if let Ok(path) = env::var(&self.webex.access_token_file_env) {
-            if !path.trim().is_empty() {
-                paths.push(PathBuf::from(path));
-            }
-        }
-        paths
-    }
-
     fn codex_configs(&self) -> Vec<(String, &CodexConfig)> {
         let mut configs = vec![("global codex".to_owned(), &self.codex)];
         for room in &self.rooms {
@@ -116,6 +103,20 @@ impl BotConfig {
             }
         }
         configs
+    }
+}
+
+impl WebexAuthConfig {
+    pub fn runtime_access_token_file(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.access_token_file {
+            return Some(path.clone());
+        }
+        if let Ok(path) = env::var(&self.access_token_file_env) {
+            if !path.trim().is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+        None
     }
 }
 
@@ -379,14 +380,24 @@ fn validate_http_path(name: &str, path: &str) -> Result<()> {
 }
 
 fn path_is_inside(path: &Path, root: &Path) -> bool {
-    let path = real_or_absolute_lexical(path);
-    let root = real_or_absolute_lexical(root);
-    path == root || path.starts_with(root)
+    let lexical_path = absolute_lexical(path);
+    let lexical_root = absolute_lexical(root);
+    if path_starts_with(&lexical_path, &lexical_root) {
+        return true;
+    }
+
+    let real_path = path.canonicalize().ok();
+    let real_root = root.canonicalize().ok();
+    match (real_path, real_root) {
+        (Some(path), Some(root)) => path_starts_with(&path, &root),
+        (Some(path), None) => path_starts_with(&path, &lexical_root),
+        (None, Some(root)) => path_starts_with(&lexical_path, &root),
+        (None, None) => false,
+    }
 }
 
-fn real_or_absolute_lexical(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| absolute_lexical(path))
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 fn absolute_lexical(path: &Path) -> PathBuf {
@@ -616,6 +627,63 @@ allow_all_senders = true
         assert!(path_is_inside(&token, &link_cwd));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_boundary_rejects_symlink_path_inside_codex_cwd() {
+        use std::os::unix::fs::symlink;
+        use std::time::SystemTime;
+
+        let root = env::temp_dir().join(format!(
+            "webex-bot-config-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let codex_cwd = root.join("codex-cwd");
+        let token_dir = root.join("token-dir");
+        let real_token = token_dir.join("token");
+        let link_token = codex_cwd.join("token-link");
+        fs::create_dir_all(&codex_cwd).unwrap();
+        fs::create_dir_all(&token_dir).unwrap();
+        fs::write(&real_token, "token").unwrap();
+        symlink(&real_token, &link_token).unwrap();
+
+        assert!(path_is_inside(&link_token, &codex_cwd));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_token_file_takes_priority_over_env_token_file() {
+        unsafe {
+            env::set_var(
+                "WEBEX_BOT_TEST_TOKEN_FILE_PRIORITY",
+                ".codex-tmp/stale-token",
+            );
+        }
+        let config: BotConfig = toml::from_str(
+            r#"
+[webex]
+access_token_file = "/var/lib/webex/access-token"
+access_token_file_env = "WEBEX_BOT_TEST_TOKEN_FILE_PRIORITY"
+
+[codex]
+cwd = ".codex-tmp"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_ok());
+        unsafe {
+            env::remove_var("WEBEX_BOT_TEST_TOKEN_FILE_PRIORITY");
+        }
     }
 
     #[test]
