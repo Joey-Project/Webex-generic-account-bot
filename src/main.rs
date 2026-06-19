@@ -218,7 +218,7 @@ impl BotApp {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
-        let reply_markdown = truncate_for_reply(&reply_text);
+        let reply_markdown = truncate_for_reply(&sanitize_reply_markdown(&reply_text));
         let reply = self
             .webex
             .create_message(&reply_markdown_message(
@@ -514,6 +514,10 @@ fn truncate_for_reply(value: &str) -> String {
     webex_generic_account_bot::policy::trim_to_chars(value, 6_000)
 }
 
+fn sanitize_reply_markdown(markdown: &str) -> String {
+    markdown.replace("<@", "&lt;@")
+}
+
 fn reply_markdown_message(
     room_id: impl Into<String>,
     parent_id: impl Into<String>,
@@ -632,6 +636,14 @@ mod tests {
                 "parentId": "parent-1",
                 "markdown": "**ok**"
             })
+        );
+    }
+
+    #[test]
+    fn reply_markdown_escapes_webex_mentions() {
+        assert_eq!(
+            sanitize_reply_markdown("hello <@all> and <@person:123>"),
+            "hello &lt;@all> and &lt;@person:123>"
         );
     }
 }

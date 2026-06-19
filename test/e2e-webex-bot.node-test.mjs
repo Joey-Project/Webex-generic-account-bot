@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   buildE2eOptions,
   expectedReply,
+  parseAccessTokenFile,
   parseDotenv,
   renderBotConfig,
 } from '../scripts/e2e-webex-bot.mjs';
@@ -20,6 +21,19 @@ E2E_PROMPT=/codex-e2e hello # trailing comment
     assert.equal(parsed.E2E_BOT_ACCESS_TOKEN, 'token-value');
     assert.equal(parsed.E2E_BOT_EMAIL, 'clean.bot@example.com');
     assert.equal(parsed.E2E_PROMPT, '/codex-e2e hello');
+  });
+});
+
+describe('e2e access token parsing', () => {
+  it('parses raw token files', () => {
+    assert.equal(parseAccessTokenFile(' raw-token\n'), 'raw-token');
+  });
+
+  it('parses token set JSON files', () => {
+    assert.equal(
+      parseAccessTokenFile(JSON.stringify({ accessToken: ' json-token\n' })),
+      'json-token',
+    );
   });
 });
 

@@ -63,6 +63,7 @@ name = "Prefix command room"
 room_id = "ANOTHER_WEBEX_ROOM_ID"
 trigger = "prefix"
 prefixes = ["@codex", "/codex"]
+allowed_person_emails = ["joey@example.com"]
 prompt_template = """
 Handle this Webex command as Codex.
 

@@ -79,6 +79,11 @@ configured Codex `cwd`. The bot rejects explicit token files, and token files
 provided through `WEBEX_ACCESS_TOKEN_FILE`, when they sit under a configured
 Codex working directory.
 
+Each room must configure `allowed_person_ids`, `allowed_person_emails`, or the
+explicit `allow_all_senders = true` escape hatch. Use `allow_all_senders` only
+for trusted Spaces; current-user isolation is not a strong secret boundary
+against allowed prompt authors.
+
 Temporary Linux user isolation is the right long-term boundary for untrusted
 chat-driven prompts, but it should live behind the runner abstraction. Creating
 and deleting OS users requires root or a privileged helper, so this MVP rejects

@@ -283,6 +283,7 @@ pub struct RoomPolicy {
     pub name: Option<String>,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
+    pub allow_all_senders: bool,
     pub allowed_person_ids: Vec<String>,
     pub allowed_person_emails: Vec<String>,
     pub prompt_template: String,
@@ -296,6 +297,7 @@ impl Default for RoomPolicy {
             name: None,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
+            allow_all_senders: false,
             allowed_person_ids: Vec::new(),
             allowed_person_emails: Vec::new(),
             prompt_template: DEFAULT_PROMPT_TEMPLATE.to_owned(),
@@ -308,6 +310,15 @@ impl RoomPolicy {
     fn validate(&self) -> Result<()> {
         if self.room_id.trim().is_empty() {
             return Err(anyhow!("rooms.room_id must not be empty"));
+        }
+        if !self.allow_all_senders
+            && self.allowed_person_ids.is_empty()
+            && self.allowed_person_emails.is_empty()
+        {
+            return Err(anyhow!(
+                "rooms[{}] must configure allowed_person_ids, allowed_person_emails, or allow_all_senders = true",
+                self.room_id
+            ));
         }
         if matches!(self.trigger, TriggerMode::Prefix) {
             if self.prefixes.is_empty() {
@@ -413,6 +424,7 @@ mod tests {
             r#"
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -431,6 +443,7 @@ mode = "ephemeral-linux-user"
 
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -446,6 +459,7 @@ room_id = "room-1"
 [[rooms]]
 room_id = "room-1"
 trigger = "prefix"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -467,6 +481,7 @@ trigger = "prefix"
 room_id = "room-1"
 trigger = "prefix"
 prefixes = [""]
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -490,6 +505,7 @@ model_reasoning_effort = "xhigh"
 
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -514,6 +530,7 @@ timeout_secs = 10
 
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -536,6 +553,7 @@ sandbox = "danger-full-access"
 
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -561,6 +579,7 @@ cwd = ".codex-tmp"
 
 [[rooms]]
 room_id = "room-1"
+allow_all_senders = true
 "#,
         )
         .unwrap();
@@ -597,5 +616,24 @@ room_id = "room-1"
         assert!(path_is_inside(&token, &link_cwd));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rooms_require_sender_allowlist_by_default() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("allowed_person")
+        );
     }
 }

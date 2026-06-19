@@ -69,7 +69,7 @@ pub fn should_trigger(
             if policy
                 .prefixes
                 .iter()
-                .any(|prefix| body.trim_start().starts_with(prefix))
+                .any(|prefix| prefix_matches(&body, prefix))
             {
                 TriggerDecision::Matched
             } else {
@@ -105,8 +105,11 @@ pub fn trim_to_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
-    if policy.allowed_person_ids.is_empty() && policy.allowed_person_emails.is_empty() {
+    if policy.allow_all_senders {
         return true;
+    }
+    if policy.allowed_person_ids.is_empty() && policy.allowed_person_emails.is_empty() {
+        return false;
     }
 
     let person_id_allowed = message
@@ -121,6 +124,14 @@ fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
     });
 
     person_id_allowed || person_email_allowed
+}
+
+fn prefix_matches(body: &str, prefix: &str) -> bool {
+    let body = body.trim_start();
+    let Some(rest) = body.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
 fn message_body(message: &Message) -> String {
@@ -153,7 +164,10 @@ mod tests {
 
     #[test]
     fn mention_trigger_matches_self_person_id() {
-        let policy = RoomPolicy::default();
+        let policy = RoomPolicy {
+            allow_all_senders: true,
+            ..RoomPolicy::default()
+        };
 
         assert_eq!(
             should_trigger(&policy, &message(), Some("bot-person")),
@@ -163,7 +177,10 @@ mod tests {
 
     #[test]
     fn mention_trigger_requires_self_person_id() {
-        let policy = RoomPolicy::default();
+        let policy = RoomPolicy {
+            allow_all_senders: true,
+            ..RoomPolicy::default()
+        };
 
         assert_eq!(
             should_trigger(&policy, &message(), None),
@@ -176,6 +193,7 @@ mod tests {
         let policy = RoomPolicy {
             trigger: TriggerMode::Prefix,
             prefixes: vec!["@codex".to_owned()],
+            allow_all_senders: true,
             ..RoomPolicy::default()
         };
         let mut message = message();
@@ -202,6 +220,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_sender_allowlist_denies_by_default() {
+        let policy = RoomPolicy::default();
+
+        assert_eq!(
+            should_trigger(&policy, &message(), Some("bot-person")),
+            TriggerDecision::SenderNotAllowed
+        );
+    }
+
+    #[test]
     fn sender_allowlist_matches_any_configured_identifier() {
         let policy = RoomPolicy {
             allowed_person_ids: vec!["person-1".to_owned()],
@@ -223,6 +251,30 @@ mod tests {
         assert_eq!(
             prompt,
             "room=room-1 sender=Joey@example.com body=@bot run this"
+        );
+    }
+
+    #[test]
+    fn prefix_trigger_requires_boundary_after_prefix() {
+        let policy = RoomPolicy {
+            trigger: TriggerMode::Prefix,
+            prefixes: vec!["/codex".to_owned()],
+            allow_all_senders: true,
+            ..RoomPolicy::default()
+        };
+        let mut message = message();
+        message.text = Some("/codexify this".to_owned());
+        message.mentioned_people.clear();
+
+        assert_eq!(
+            should_trigger(&policy, &message, None),
+            TriggerDecision::PrefixNotMatched
+        );
+
+        message.text = Some("/codex this".to_owned());
+        assert_eq!(
+            should_trigger(&policy, &message, None),
+            TriggerDecision::Matched
         );
     }
 }

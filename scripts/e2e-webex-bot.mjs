@@ -44,6 +44,22 @@ export function parseDotenv(contents) {
   return result;
 }
 
+export function parseAccessTokenFile(contents) {
+  const trimmed = contents.trim();
+  if (!trimmed) {
+    throw new Error('access token file is empty');
+  }
+  if (!trimmed.startsWith('{')) {
+    return trimmed;
+  }
+  const tokenSet = JSON.parse(trimmed);
+  const token = tokenSet.accessToken;
+  if (typeof token !== 'string' || !token.trim()) {
+    throw new Error('access token file JSON has an empty accessToken');
+  }
+  return token.trim();
+}
+
 export function renderBotConfig(options) {
   return `state_file = ${tomlString(options.stateFile)}
 self_person_id = ${tomlString(options.selfPersonId)}
@@ -199,10 +215,10 @@ async function main() {
       `e2e_message_sent=true room="${options.roomTitle}" message_id=${sentMessage.id} sender=${options.senderEmail}`,
     );
 
-    const mikuToken = await fs.readFile(options.accessTokenFile, 'utf8');
+    const mikuToken = parseAccessTokenFile(await fs.readFile(options.accessTokenFile, 'utf8'));
     reply = await withProcessWatch(
       waitForReply({
-        accessToken: mikuToken.trim(),
+        accessToken: mikuToken,
         marker: options.marker,
         parentId: sentMessage.id,
         pollIntervalMs: options.pollIntervalMs,
