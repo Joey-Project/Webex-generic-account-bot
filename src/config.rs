@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env, fs,
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -45,6 +46,7 @@ impl BotConfig {
     pub fn validate(&self) -> Result<()> {
         validate_http_path("server.event_path", &self.server.event_path)?;
         validate_http_path("server.health_path", &self.server.health_path)?;
+        self.server.validate()?;
         if self.server.event_path == self.server.health_path {
             return Err(anyhow!(
                 "server.event_path must differ from server.health_path"
@@ -172,6 +174,13 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn attempt_lease(&self) -> Duration {
         Duration::from_secs(self.attempt_lease_secs.max(1))
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.bind
+            .parse::<SocketAddr>()
+            .map_err(|error| anyhow!("server.bind must be a socket address: {error}"))?;
+        Ok(())
     }
 }
 
@@ -806,6 +815,29 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate rooms.room_id")
+        );
+    }
+
+    #[test]
+    fn invalid_server_bind_is_rejected() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+bind = "localhost:8787"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("server.bind")
         );
     }
 

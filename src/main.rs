@@ -15,6 +15,7 @@ use serde_json::json;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, Semaphore},
+    time::timeout,
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
@@ -22,11 +23,13 @@ use webex_generic_account_bot::{
     should_trigger, webex::build_webex_client,
 };
 use webex_headless_messenger::{
-    AttemptLease, AttemptStart, JsonlStateStore, SidecarEvent, WebexClient,
+    ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, SidecarEvent,
+    WebexClient,
     types::{CreateMessage, Message},
 };
 
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
+const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -144,16 +147,12 @@ impl BotApp {
         };
 
         if message.room_id.is_none() {
-            match self.webex.get_message(&message_id).await {
+            match self.get_message(&message_id).await {
                 Ok(hydrated) => merge_message(&mut message, hydrated),
                 Err(error) => {
-                    self.defer_attempt(&attempt, self.config.server.attempt_lease())
-                        .await?;
-                    return Err(HttpError::retry_after(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("failed to hydrate message {message_id}: {error}"),
-                        self.config.server.attempt_lease(),
-                    ));
+                    return self
+                        .handle_get_message_failure(&attempt, &message_id, &message, error)
+                        .await;
                 }
             }
         }
@@ -175,16 +174,12 @@ impl BotApp {
             ));
         };
         if message_needs_hydration(policy, &message) {
-            match self.webex.get_message(&message_id).await {
+            match self.get_message(&message_id).await {
                 Ok(hydrated) => merge_message(&mut message, hydrated),
                 Err(error) => {
-                    self.defer_attempt(&attempt, self.config.server.attempt_lease())
-                        .await?;
-                    return Err(HttpError::retry_after(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("failed to hydrate message {message_id}: {error}"),
-                        self.config.server.attempt_lease(),
-                    ));
+                    return self
+                        .handle_get_message_failure(&attempt, &message_id, &message, error)
+                        .await;
                 }
             }
         }
@@ -236,28 +231,93 @@ impl BotApp {
             .clone()
             .unwrap_or_else(|| message_id.clone());
         let reply_markdown = truncate_for_reply(&sanitize_reply_markdown(&reply_text));
-        let reply = self
-            .webex
-            .create_message(&reply_markdown_message(
-                &room_id,
-                parent_id,
-                &reply_markdown,
-            ))
-            .await
-            .map_err(|error| {
-                HttpError::retry_after(
+        let reply_request = reply_markdown_message(&room_id, parent_id, &reply_markdown);
+        let reply = match self.create_message(&reply_request).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                return self
+                    .handle_create_message_failure(&attempt, &message_id, &room_id, error)
+                    .await;
+            }
+        };
+        let action = BotAction::replied(message_id, room_id, reply.id, reply_markdown.len());
+        if let Err(error) = self.mark_processed(&attempt).await {
+            error!(
+                error = %error.message,
+                "failed to mark message processed after Webex accepted reply"
+            );
+        }
+        Ok(action)
+    }
+
+    async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
+        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.get_message(message_id)).await {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
+        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.create_message(request)).await {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn handle_get_message_failure(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        message: &Message,
+        error: WebexCallError,
+    ) -> Result<BotAction, HttpError> {
+        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+            WebexFailureAction::Stop => {
+                self.mark_processed(attempt).await?;
+                Ok(BotAction::ignored(
+                    "message_unavailable",
+                    Some(message_id.to_owned()),
+                    message.room_id.clone(),
+                ))
+            }
+            WebexFailureAction::Retry(retry_after) => {
+                self.defer_attempt(attempt, retry_after).await?;
+                Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("failed to hydrate message {message_id}: {error}"),
+                    retry_after,
+                ))
+            }
+        }
+    }
+
+    async fn handle_create_message_failure(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        room_id: &str,
+        error: WebexCallError,
+    ) -> Result<BotAction, HttpError> {
+        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+            WebexFailureAction::Stop => {
+                self.mark_processed(attempt).await?;
+                Ok(BotAction::ignored(
+                    "reply_rejected",
+                    Some(message_id.to_owned()),
+                    Some(room_id.to_owned()),
+                ))
+            }
+            WebexFailureAction::Retry(retry_after) => {
+                self.defer_attempt(attempt, retry_after).await?;
+                Err(HttpError::retry_after(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("failed to send Webex reply for message {message_id}: {error}"),
-                    self.config.server.attempt_lease(),
-                )
-            })?;
-        self.mark_processed(&attempt).await?;
-        Ok(BotAction::replied(
-            message_id,
-            room_id,
-            reply.id,
-            reply_markdown.len(),
-        ))
+                    retry_after,
+                ))
+            }
+        }
     }
 
     async fn begin_attempt(&self, message_id: &str) -> Result<AttemptStart, HttpError> {
@@ -387,6 +447,47 @@ impl BotAction {
             reply_chars: Some(reply_chars),
         }
     }
+}
+
+#[derive(Debug)]
+enum WebexCallError {
+    Client(WebexError),
+    TimedOut,
+}
+
+impl std::fmt::Display for WebexCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) => write!(formatter, "{error}"),
+            Self::TimedOut => write!(formatter, "request timed out after 30 seconds"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebexFailureAction {
+    Stop,
+    Retry(Duration),
+}
+
+fn classify_webex_failure(error: &WebexCallError, default_retry: Duration) -> WebexFailureAction {
+    match error {
+        WebexCallError::TimedOut => WebexFailureAction::Retry(default_retry),
+        WebexCallError::Client(WebexError::Api(api)) => {
+            classify_webex_api_error(api, default_retry)
+        }
+        WebexCallError::Client(_) => WebexFailureAction::Retry(default_retry),
+    }
+}
+
+fn classify_webex_api_error(api: &ApiError, default_retry: Duration) -> WebexFailureAction {
+    if api.status == 429 {
+        return WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry));
+    }
+    if (400..500).contains(&api.status) && !matches!(api.status, 408 | 409) {
+        return WebexFailureAction::Stop;
+    }
+    WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
 }
 
 #[derive(Debug)]
@@ -703,5 +804,48 @@ mod tests {
             sanitize_reply_markdown("hello <@all> and <@person:123>"),
             "hello &lt;@all> and &lt;@person:123>"
         );
+    }
+
+    #[test]
+    fn webex_404_errors_stop_retries() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(404, None))));
+
+        assert_eq!(
+            classify_webex_failure(&error, Duration::from_secs(30)),
+            WebexFailureAction::Stop
+        );
+    }
+
+    #[test]
+    fn webex_429_errors_use_retry_after() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(
+            429,
+            Some(Duration::from_secs(42)),
+        ))));
+
+        assert_eq!(
+            classify_webex_failure(&error, Duration::from_secs(30)),
+            WebexFailureAction::Retry(Duration::from_secs(42))
+        );
+    }
+
+    #[test]
+    fn webex_timeout_errors_retry_with_default_lease() {
+        assert_eq!(
+            classify_webex_failure(&WebexCallError::TimedOut, Duration::from_secs(30)),
+            WebexFailureAction::Retry(Duration::from_secs(30))
+        );
+    }
+
+    fn api_error(status: u16, retry_after: Option<Duration>) -> ApiError {
+        ApiError {
+            status,
+            reason: "status".to_owned(),
+            message: None,
+            tracking_id: None,
+            retry_after,
+            details: Vec::new(),
+            body: None,
+        }
     }
 }
