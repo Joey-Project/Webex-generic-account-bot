@@ -1,6 +1,6 @@
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    env, fs,
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -56,6 +56,7 @@ impl BotConfig {
             room.validate()?;
         }
         self.codex.validate()?;
+        self.validate_secret_boundaries()?;
         Ok(())
     }
 
@@ -65,6 +66,44 @@ impl BotConfig {
 
     pub fn codex_for_policy<'a>(&'a self, policy: &'a RoomPolicy) -> &'a CodexConfig {
         policy.codex.as_ref().unwrap_or(&self.codex)
+    }
+
+    fn validate_secret_boundaries(&self) -> Result<()> {
+        for token_file in self.runtime_access_token_files() {
+            for (name, codex) in self.codex_configs() {
+                if path_is_inside(&token_file, &codex.cwd) {
+                    return Err(anyhow!(
+                        "webex access token file {} must not be inside codex cwd {} ({name})",
+                        token_file.display(),
+                        codex.cwd.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime_access_token_files(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(path) = &self.webex.access_token_file {
+            paths.push(path.clone());
+        }
+        if let Ok(path) = env::var(&self.webex.access_token_file_env) {
+            if !path.trim().is_empty() {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        paths
+    }
+
+    fn codex_configs(&self) -> Vec<(String, &CodexConfig)> {
+        let mut configs = vec![("global codex".to_owned(), &self.codex)];
+        for room in &self.rooms {
+            if let Some(codex) = &room.codex {
+                configs.push((format!("room {}", room.room_id), codex));
+            }
+        }
+        configs
     }
 }
 
@@ -247,11 +286,23 @@ impl RoomPolicy {
         if self.room_id.trim().is_empty() {
             return Err(anyhow!("rooms.room_id must not be empty"));
         }
-        if matches!(self.trigger, TriggerMode::Prefix) && self.prefixes.is_empty() {
-            return Err(anyhow!(
-                "rooms[{}].prefixes is required when trigger = \"prefix\"",
-                self.room_id
-            ));
+        if matches!(self.trigger, TriggerMode::Prefix) {
+            if self.prefixes.is_empty() {
+                return Err(anyhow!(
+                    "rooms[{}].prefixes is required when trigger = \"prefix\"",
+                    self.room_id
+                ));
+            }
+            if self
+                .prefixes
+                .iter()
+                .any(|prefix| prefix.trim().is_empty() || prefix.trim() != prefix)
+            {
+                return Err(anyhow!(
+                    "rooms[{}].prefixes must be non-empty without surrounding whitespace",
+                    self.room_id
+                ));
+            }
         }
         if self.prompt_template.trim().is_empty() {
             return Err(anyhow!(
@@ -291,6 +342,37 @@ fn validate_http_path(name: &str, path: &str) -> Result<()> {
         return Err(anyhow!("{name} must be an absolute HTTP path"));
     }
     Ok(())
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let path = absolute_lexical(path);
+    let root = absolute_lexical(root);
+    path == root || path.starts_with(root)
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    normalize_lexical(&joined)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -350,6 +432,27 @@ trigger = "prefix"
     }
 
     #[test]
+    fn prefix_trigger_rejects_blank_prefixes() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+trigger = "prefix"
+prefixes = [""]
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty")
+        );
+    }
+
+    #[test]
     fn parses_codex_reasoning_effort() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -368,6 +471,31 @@ room_id = "room-1"
         assert_eq!(
             config.codex.model_reasoning_effort.as_deref(),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn rejects_access_token_file_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[webex]
+access_token_file = ".codex-tmp/token"
+
+[codex]
+cwd = ".codex-tmp"
+
+[[rooms]]
+room_id = "room-1"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not be inside codex cwd")
         );
     }
 }

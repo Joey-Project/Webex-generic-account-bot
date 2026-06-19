@@ -84,8 +84,9 @@ async fn run_codex_exec(
     stdin.shutdown().await.ok();
     drop(stdin);
 
-    let stdout_task = read_pipe(child.stdout.take());
-    let stderr_task = read_pipe(child.stderr.take());
+    let capture_limit = capture_limit_bytes(config.output_limit_chars);
+    let stdout_task = read_pipe(child.stdout.take(), capture_limit);
+    let stderr_task = read_pipe(child.stderr.take(), capture_limit);
     let status = match timeout(config.timeout(), child.wait()).await {
         Ok(status) => status.context("failed while waiting for codex process")?,
         Err(_) => {
@@ -107,7 +108,7 @@ async fn run_codex_exec(
         ));
     }
 
-    let final_message = fs::read_to_string(&output_path)
+    let final_message = read_limited_file(&output_path, capture_limit)
         .await
         .unwrap_or_else(|_| stdout.clone());
     let _ = fs::remove_file(&output_path).await;
@@ -154,7 +155,7 @@ fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
     args
 }
 
-fn read_pipe<R>(pipe: Option<R>) -> tokio::task::JoinHandle<Result<String>>
+fn read_pipe<R>(pipe: Option<R>, max_bytes: usize) -> tokio::task::JoinHandle<Result<String>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -162,10 +163,42 @@ where
         let Some(mut pipe) = pipe else {
             return Ok(String::new());
         };
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).await?;
-        Ok(String::from_utf8_lossy(&bytes).to_string())
+        read_limited(&mut pipe, max_bytes).await
     })
+}
+
+async fn read_limited_file(path: &Path, max_bytes: usize) -> Result<String> {
+    let mut file = fs::File::open(path).await?;
+    read_limited(&mut file, max_bytes).await
+}
+
+async fn read_limited<R>(reader: &mut R, max_bytes: usize) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let limit = max_bytes.saturating_add(1) as u64;
+    reader.take(limit).read_to_end(&mut bytes).await?;
+    Ok(limited_string(bytes, max_bytes))
+}
+
+fn limited_string(mut bytes: Vec<u8>, max_bytes: usize) -> String {
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    let mut value = String::from_utf8_lossy(&bytes).to_string();
+    if truncated {
+        value.push_str("\n[truncated]");
+    }
+    value
+}
+
+fn capture_limit_bytes(output_limit_chars: usize) -> usize {
+    output_limit_chars
+        .max(1)
+        .saturating_mul(4)
+        .saturating_add(1024)
 }
 
 async fn output_path(message_id: &str) -> Result<PathBuf> {
@@ -258,6 +291,16 @@ mod tests {
     #[test]
     fn trims_long_output() {
         assert_eq!(trim_to_chars("abcdef", 3), "abc\n[truncated]");
+    }
+
+    #[test]
+    fn limited_string_caps_bytes_before_decoding() {
+        assert_eq!(limited_string(b"abcdef".to_vec(), 3), "abc\n[truncated]");
+    }
+
+    #[test]
+    fn capture_limit_allows_utf8_expansion_headroom() {
+        assert_eq!(capture_limit_bytes(3), 1036);
     }
 
     #[test]

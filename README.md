@@ -74,6 +74,11 @@ The default Codex runner uses:
 - `--ephemeral`
 - a scrubbed subprocess environment that does not forward Webex token variables
 
+Keep Webex token files and config files that contain secrets outside every
+configured Codex `cwd`. The bot rejects explicit token files, and token files
+provided through `WEBEX_ACCESS_TOKEN_FILE`, when they sit under a configured
+Codex working directory.
+
 Temporary Linux user isolation is the right long-term boundary for untrusted
 chat-driven prompts, but it should live behind the runner abstraction. Creating
 and deleting OS users requires root or a privileged helper, so this MVP rejects

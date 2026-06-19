@@ -140,7 +140,7 @@ impl BotApp {
             }
         };
 
-        if message.room_id.is_none() || message.person_id.is_none() {
+        if message_needs_hydration(&message) {
             match self.webex.get_message(&message_id).await {
                 Ok(hydrated) => merge_message(&mut message, hydrated),
                 Err(error) => {
@@ -502,6 +502,14 @@ fn merge_message(target: &mut Message, hydrated: Message) {
     }
 }
 
+fn message_needs_hydration(message: &Message) -> bool {
+    message.room_id.is_none()
+        || message.person_id.is_none()
+        || message.person_email.is_none()
+        || (message.text.is_none() && message.markdown.is_none())
+        || message.mentioned_people.is_empty()
+}
+
 fn truncate_for_reply(value: &str) -> String {
     webex_generic_account_bot::policy::trim_to_chars(value, 6_000)
 }
@@ -583,6 +591,33 @@ mod tests {
         assert_eq!(target.room_id.as_deref(), Some("room-1"));
         assert_eq!(target.person_id.as_deref(), Some("person-1"));
         assert_eq!(target.mentioned_people, vec!["bot-person"]);
+    }
+
+    #[test]
+    fn metadata_only_message_needs_hydration() {
+        let message = Message {
+            id: Some("message-1".to_owned()),
+            room_id: Some("room-1".to_owned()),
+            person_id: Some("person-1".to_owned()),
+            ..Message::default()
+        };
+
+        assert!(message_needs_hydration(&message));
+    }
+
+    #[test]
+    fn complete_message_does_not_need_hydration() {
+        let message = Message {
+            id: Some("message-1".to_owned()),
+            room_id: Some("room-1".to_owned()),
+            person_id: Some("person-1".to_owned()),
+            person_email: Some("joey@example.com".to_owned()),
+            markdown: Some("@bot run".to_owned()),
+            mentioned_people: vec!["bot-person".to_owned()],
+            ..Message::default()
+        };
+
+        assert!(!message_needs_hydration(&message));
     }
 
     #[test]

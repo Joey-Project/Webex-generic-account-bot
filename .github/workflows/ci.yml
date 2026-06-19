@@ -16,6 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  node:
+    name: Node
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Run Node tests
+        run: node --test test/*.node-test.mjs
+
   rust:
     name: Rust
     runs-on: ubuntu-latest
