@@ -169,6 +169,56 @@ export function expectedReply(replies, { marker, selfPersonId, selfPersonEmail }
   return { ...reply, markerFound: true };
 }
 
+export function childBaseEnv(env = process.env) {
+  const allowedKeys = [
+    'PATH',
+    'HOME',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+    'LANG',
+    'LC_ALL',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+    'NODE_EXTRA_CA_CERTS',
+    'RUSTUP_HOME',
+    'CARGO_HOME',
+  ];
+  return Object.fromEntries(
+    allowedKeys
+      .filter((key) => typeof env[key] === 'string' && env[key].length > 0)
+      .map((key) => [key, env[key]]),
+  );
+}
+
+export function botProcessEnv(options, env = process.env) {
+  return {
+    ...childBaseEnv(env),
+    RUST_LOG: env.RUST_LOG || 'webex_generic_account_bot=info',
+    WEBEX_SIDECAR_TOKEN: options.sidecarToken,
+  };
+}
+
+export function sidecarProcessEnv(options, env = process.env) {
+  return {
+    ...childBaseEnv(env),
+    WEBEX_ACCESS_TOKEN_FILE: options.accessTokenFile,
+    WEBEX_SIDECAR_FORWARD_RETRIES: '1',
+    WEBEX_SIDECAR_FORWARD_TIMEOUT_MS: String(options.replyTimeoutMs + 30000),
+    WEBEX_SIDECAR_HEALTH_BIND: options.sidecarHealthBind,
+    WEBEX_SIDECAR_MAX_IN_FLIGHT: '1',
+    WEBEX_SIDECAR_MESSAGE_EVENTS: 'created',
+    WEBEX_SIDECAR_RETRY_BASE_MS: '1000',
+    WEBEX_SIDECAR_RETRY_MAX_MS: '5000',
+    WEBEX_SIDECAR_TARGET_URL: `http://${options.botBind}/webex/events`,
+    WEBEX_SIDECAR_TOKEN: options.sidecarToken,
+    WEBEX_SIDECAR_TOKEN_RELOAD_INTERVAL_MS: '0',
+  };
+}
+
 async function main() {
   const env = await loadEnvironment();
   const options = buildE2eOptions(env);
@@ -336,31 +386,14 @@ async function writeConfig(options) {
 function startBot(options) {
   return startProcess('bot', options.cargoBin, ['run', '--quiet', '--', '--config', options.configPath], {
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      RUST_LOG: process.env.RUST_LOG || 'webex_generic_account_bot=info',
-      WEBEX_SIDECAR_TOKEN: options.sidecarToken,
-    },
+    env: botProcessEnv(options),
   });
 }
 
 function startSidecar(options) {
   return startProcess('sidecar', process.execPath, [options.sidecarScript], {
     cwd: path.dirname(options.sidecarScript),
-    env: {
-      ...process.env,
-      WEBEX_ACCESS_TOKEN_FILE: options.accessTokenFile,
-      WEBEX_SIDECAR_FORWARD_RETRIES: '1',
-      WEBEX_SIDECAR_FORWARD_TIMEOUT_MS: String(options.replyTimeoutMs + 30000),
-      WEBEX_SIDECAR_HEALTH_BIND: options.sidecarHealthBind,
-      WEBEX_SIDECAR_MAX_IN_FLIGHT: '1',
-      WEBEX_SIDECAR_MESSAGE_EVENTS: 'created',
-      WEBEX_SIDECAR_RETRY_BASE_MS: '1000',
-      WEBEX_SIDECAR_RETRY_MAX_MS: '5000',
-      WEBEX_SIDECAR_TARGET_URL: `http://${options.botBind}/webex/events`,
-      WEBEX_SIDECAR_TOKEN: options.sidecarToken,
-      WEBEX_SIDECAR_TOKEN_RELOAD_INTERVAL_MS: '0',
-    },
+    env: sidecarProcessEnv(options),
   });
 }
 

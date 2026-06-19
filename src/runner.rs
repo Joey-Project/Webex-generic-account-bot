@@ -1,9 +1,12 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    fs::Permissions,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{self, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -59,6 +62,7 @@ async fn run_codex_exec(
     let output_path = output_path(message_id).await?;
     let mut command = Command::new(&config.bin);
     command.args(codex_exec_args(config, &output_path));
+    configure_child_process(&mut command);
     apply_scrubbed_env(&mut command);
     command
         .stdin(Stdio::piped())
@@ -90,7 +94,9 @@ async fn run_codex_exec(
     let status = match timeout(config.timeout(), child.wait()).await {
         Ok(status) => status.context("failed while waiting for codex process")?,
         Err(_) => {
-            let _ = child.kill().await;
+            terminate_child(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             let _ = fs::remove_file(&output_path).await;
             return Err(anyhow!(
                 "codex exec timed out after {} seconds",
@@ -157,6 +163,54 @@ fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
     args
 }
 
+fn configure_child_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+async fn terminate_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        terminate_child_group(child).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_child_group(child: &mut tokio::process::Child) {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+
+    if let Some(pid) = child.id() {
+        let process_group = -(pid as i32);
+        unsafe {
+            kill(process_group, SIGTERM);
+        }
+        if timeout(std::time::Duration::from_millis(250), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        unsafe {
+            kill(process_group, SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
 fn read_pipe<R>(pipe: Option<R>, max_bytes: usize) -> tokio::task::JoinHandle<Result<String>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -218,14 +272,46 @@ fn capture_limit_bytes(output_limit_chars: usize) -> usize {
 async fn output_path(message_id: &str) -> Result<PathBuf> {
     let dir = env::temp_dir().join("webex-generic-account-bot");
     fs::create_dir_all(&dir).await?;
+    set_private_dir_permissions(&dir).await?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    Ok(dir.join(format!(
-        "codex-output-{}-{timestamp}.txt",
+        .as_nanos();
+    let path = dir.join(format!(
+        "codex-output-{}-{}-{timestamp}.txt",
+        process::id(),
         sanitize_path_fragment(message_id)
-    )))
+    ));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await?;
+    drop(file);
+    set_private_file_permissions(&path).await?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+async fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_private_file_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn sanitize_path_fragment(value: &str) -> String {
@@ -279,9 +365,21 @@ async fn brief_pause_for_kill() {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{env, fs as std_fs, path::PathBuf, time::SystemTime};
 
     use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "webex-generic-account-bot-runner-{name}-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn path_fragment_is_sanitized() {
@@ -332,6 +430,24 @@ mod tests {
     #[test]
     fn capture_limit_allows_utf8_expansion_headroom() {
         assert_eq!(capture_limit_bytes(3), 1036);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_path_uses_private_permissions() {
+        let path = output_path("message-1").await.unwrap();
+        let dir = path.parent().unwrap();
+
+        assert_eq!(
+            std_fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std_fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = std_fs::remove_file(path);
     }
 
     #[test]
@@ -401,5 +517,47 @@ mod tests {
         };
 
         config.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_codex_process_group() {
+        let root = temp_path("process-group");
+        std_fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("fake-codex.sh");
+        let pid_file = root.join("sleep.pid");
+        std_fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nsleep 20 &\necho $! > {}\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std_fs::set_permissions(&fake_codex, std_fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config = CodexConfig {
+            bin: fake_codex.display().to_string(),
+            cwd: root.clone(),
+            timeout_secs: 1,
+            ..CodexConfig::default()
+        };
+        let result = run_codex_exec(&config, "prompt", "message-1").await;
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let pid = std_fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!process_exists(pid));
+
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe { kill(pid, 0) == 0 }
     }
 }

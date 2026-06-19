@@ -221,7 +221,7 @@ impl BotApp {
         };
         let codex_config = self.config.codex_for_policy(policy);
         let prompt = render_prompt(&policy.prompt_template, &context);
-        let reply_text = match self.runner.run(codex_config, &prompt, &message_id).await {
+        let reply_text = match self.runner.run(&codex_config, &prompt, &message_id).await {
             Ok(output) => output.final_message,
             Err(error) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");

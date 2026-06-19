@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -52,10 +53,15 @@ impl BotConfig {
         if self.rooms.is_empty() {
             return Err(anyhow!("at least one [[rooms]] policy is required"));
         }
+        self.validate_room_ids()?;
         for room in &self.rooms {
             room.validate()?;
         }
-        self.codex.validate()?;
+        for (name, codex) in self.codex_configs() {
+            codex
+                .validate()
+                .map_err(|error| anyhow!("invalid {name}: {error}"))?;
+        }
         self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
         Ok(())
@@ -65,8 +71,22 @@ impl BotConfig {
         self.rooms.iter().find(|policy| policy.room_id == room_id)
     }
 
-    pub fn codex_for_policy<'a>(&'a self, policy: &'a RoomPolicy) -> &'a CodexConfig {
-        policy.codex.as_ref().unwrap_or(&self.codex)
+    pub fn codex_for_policy(&self, policy: &RoomPolicy) -> CodexConfig {
+        policy
+            .codex
+            .as_ref()
+            .map(|patch| patch.apply_to(&self.codex))
+            .unwrap_or_else(|| self.codex.clone())
+    }
+
+    fn validate_room_ids(&self) -> Result<()> {
+        let mut seen = HashSet::new();
+        for room in &self.rooms {
+            if !seen.insert(room.room_id.as_str()) {
+                return Err(anyhow!("duplicate rooms.room_id {}", room.room_id));
+            }
+        }
+        Ok(())
     }
 
     fn validate_secret_boundaries(&self) -> Result<()> {
@@ -95,11 +115,14 @@ impl BotConfig {
         Ok(())
     }
 
-    fn codex_configs(&self) -> Vec<(String, &CodexConfig)> {
-        let mut configs = vec![("global codex".to_owned(), &self.codex)];
+    fn codex_configs(&self) -> Vec<(String, CodexConfig)> {
+        let mut configs = vec![("global codex".to_owned(), self.codex.clone())];
         for room in &self.rooms {
-            if let Some(codex) = &room.codex {
-                configs.push((format!("room {}", room.room_id), codex));
+            if room.codex.is_some() {
+                configs.push((
+                    format!("room {}", room.room_id),
+                    self.codex_for_policy(room),
+                ));
             }
         }
         configs
@@ -244,6 +267,66 @@ impl CodexConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodexConfigPatch {
+    pub bin: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub model_reasoning_effort: Option<String>,
+    pub sandbox: Option<String>,
+    pub approval_policy: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub output_limit_chars: Option<usize>,
+    pub skip_git_repo_check: Option<bool>,
+    pub ephemeral: Option<bool>,
+    pub isolation: Option<IsolationConfig>,
+}
+
+impl CodexConfigPatch {
+    fn apply_to(&self, base: &CodexConfig) -> CodexConfig {
+        let mut config = base.clone();
+        if let Some(value) = &self.bin {
+            config.bin = value.clone();
+        }
+        if let Some(value) = &self.cwd {
+            config.cwd = value.clone();
+        }
+        if let Some(value) = &self.profile {
+            config.profile = Some(value.clone());
+        }
+        if let Some(value) = &self.model {
+            config.model = Some(value.clone());
+        }
+        if let Some(value) = &self.model_reasoning_effort {
+            config.model_reasoning_effort = Some(value.clone());
+        }
+        if let Some(value) = &self.sandbox {
+            config.sandbox = value.clone();
+        }
+        if let Some(value) = &self.approval_policy {
+            config.approval_policy = value.clone();
+        }
+        if let Some(value) = self.timeout_secs {
+            config.timeout_secs = value;
+        }
+        if let Some(value) = self.output_limit_chars {
+            config.output_limit_chars = value;
+        }
+        if let Some(value) = self.skip_git_repo_check {
+            config.skip_git_repo_check = value;
+        }
+        if let Some(value) = self.ephemeral {
+            config.ephemeral = value;
+        }
+        if let Some(value) = &self.isolation {
+            config.isolation = value.clone();
+        }
+        config
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IsolationConfig {
@@ -288,7 +371,7 @@ pub struct RoomPolicy {
     pub allowed_person_ids: Vec<String>,
     pub allowed_person_emails: Vec<String>,
     pub prompt_template: String,
-    pub codex: Option<CodexConfig>,
+    pub codex: Option<CodexConfigPatch>,
 }
 
 impl Default for RoomPolicy {
@@ -344,9 +427,6 @@ impl RoomPolicy {
                 "rooms[{}].prompt_template must not be empty",
                 self.room_id
             ));
-        }
-        if let Some(codex) = &self.codex {
-            codex.validate()?;
         }
         Ok(())
     }
@@ -703,5 +783,58 @@ room_id = "room-1"
                 .to_string()
                 .contains("allowed_person")
         );
+    }
+
+    #[test]
+    fn duplicate_room_ids_are_rejected() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate rooms.room_id")
+        );
+    }
+
+    #[test]
+    fn room_codex_override_inherits_global_config() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/srv/webex-bot/workspace"
+model = "gpt-5.5"
+timeout_secs = 123
+skip_git_repo_check = true
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.codex]
+model = "gpt-5.5-mini"
+"#,
+        )
+        .unwrap();
+
+        let policy = config.policy_for_room("room-1").unwrap();
+        let codex = config.codex_for_policy(policy);
+
+        assert_eq!(codex.cwd, PathBuf::from("/srv/webex-bot/workspace"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.5-mini"));
+        assert_eq!(codex.timeout_secs, 123);
+        assert!(codex.skip_git_repo_check);
     }
 }

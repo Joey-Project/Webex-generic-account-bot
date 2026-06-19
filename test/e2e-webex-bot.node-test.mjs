@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  botProcessEnv,
   buildE2eOptions,
   expectedReply,
   parseAccessTokenFile,
   parseDotenv,
   renderBotConfig,
+  sidecarProcessEnv,
 } from '../scripts/e2e-webex-bot.mjs';
 
 describe('e2e dotenv parsing', () => {
@@ -77,6 +79,33 @@ describe('e2e config rendering', () => {
 
     assert.equal(options.cargoBin, '/custom/cargo');
     assert.equal(options.codexBin, '/custom/codex');
+  });
+
+  it('does not forward sender bot secrets to child processes', () => {
+    const options = buildE2eOptions({
+      E2E_BOT_ACCESS_TOKEN: 'secret-token',
+      E2E_BOT_EMAIL: 'clean.bot@example.com',
+      E2E_MARKER: 'marker-1',
+      PATH: '/usr/bin',
+    });
+    const parentEnv = {
+      PATH: '/usr/bin',
+      E2E_BOT_ACCESS_TOKEN: 'secret-token',
+      WEBEX_ACCESS_TOKEN: 'generic-token',
+      RUST_LOG: 'debug',
+    };
+
+    const botEnv = botProcessEnv(options, parentEnv);
+    const sidecarEnv = sidecarProcessEnv(options, parentEnv);
+
+    assert.equal(botEnv.RUST_LOG, 'debug');
+    assert.equal(botEnv.WEBEX_SIDECAR_TOKEN, options.sidecarToken);
+    assert.equal(sidecarEnv.WEBEX_ACCESS_TOKEN_FILE, options.accessTokenFile);
+    assert.equal(sidecarEnv.WEBEX_SIDECAR_TOKEN, options.sidecarToken);
+    for (const env of [botEnv, sidecarEnv]) {
+      assert.equal(env.E2E_BOT_ACCESS_TOKEN, undefined);
+      assert.equal(env.WEBEX_ACCESS_TOKEN, undefined);
+    }
   });
 });
 
