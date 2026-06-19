@@ -218,12 +218,13 @@ impl BotApp {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
+        let reply_markdown = truncate_for_reply(&reply_text);
         let reply = self
             .webex
-            .create_message(&CreateMessage::reply_text(
+            .create_message(&reply_markdown_message(
                 &room_id,
                 parent_id,
-                truncate_for_reply(&reply_text),
+                &reply_markdown,
             ))
             .await
             .map_err(|error| {
@@ -238,7 +239,7 @@ impl BotApp {
             message_id,
             room_id,
             reply.id,
-            reply_text.len(),
+            reply_markdown.len(),
         ))
     }
 
@@ -505,6 +506,19 @@ fn truncate_for_reply(value: &str) -> String {
     webex_generic_account_bot::policy::trim_to_chars(value, 6_000)
 }
 
+fn reply_markdown_message(
+    room_id: impl Into<String>,
+    parent_id: impl Into<String>,
+    markdown: impl Into<String>,
+) -> CreateMessage {
+    CreateMessage {
+        room_id: Some(room_id.into()),
+        parent_id: Some(parent_id.into()),
+        markdown: Some(markdown.into()),
+        ..CreateMessage::default()
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -569,5 +583,20 @@ mod tests {
         assert_eq!(target.room_id.as_deref(), Some("room-1"));
         assert_eq!(target.person_id.as_deref(), Some("person-1"));
         assert_eq!(target.mentioned_people, vec!["bot-person"]);
+    }
+
+    #[test]
+    fn reply_message_uses_markdown_body() {
+        let value =
+            serde_json::to_value(reply_markdown_message("room-1", "parent-1", "**ok**")).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "roomId": "room-1",
+                "parentId": "parent-1",
+                "markdown": "**ok**"
+            })
+        );
     }
 }

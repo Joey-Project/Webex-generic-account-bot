@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .env.*
+jenkins.env
 .codex-tmp/
 node_modules/
 dist/
