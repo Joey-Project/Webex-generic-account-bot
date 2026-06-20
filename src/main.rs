@@ -220,10 +220,7 @@ impl BotApp {
             Ok(output) => output.final_message,
             Err(error) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");
-                format!(
-                    "Codex run failed:\n{}",
-                    truncate_for_reply(&error.to_string())
-                )
+                "Codex run failed. Check the bot service logs for details.".to_owned()
             }
         };
         let parent_id = message
@@ -484,7 +481,7 @@ fn classify_webex_api_error(api: &ApiError, default_retry: Duration) -> WebexFai
     if api.status == 429 {
         return WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry));
     }
-    if matches!(api.status, 400 | 404 | 410 | 422) {
+    if matches!(api.status, 400 | 403 | 404 | 410 | 422) {
         return WebexFailureAction::Stop;
     }
     WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
@@ -836,6 +833,16 @@ mod tests {
         assert_eq!(
             classify_webex_failure(&error, Duration::from_secs(30)),
             WebexFailureAction::Retry(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn webex_403_errors_stop_retries() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(403, None))));
+
+        assert_eq!(
+            classify_webex_failure(&error, Duration::from_secs(30)),
+            WebexFailureAction::Stop
         );
     }
 

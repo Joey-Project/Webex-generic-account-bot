@@ -53,6 +53,8 @@ describe('e2e config rendering', () => {
     assert.match(config, /trigger = "prefix"/);
     assert.match(config, /prefixes = \["\/codex-e2e"\]/);
     assert.doesNotMatch(config, /secret-token/);
+    assert.doesNotMatch(config, /cwd = ".*Webex-generic-account-bot"/);
+    assert.doesNotMatch(config, /\.env/);
   });
 
   it('falls back to executable names when PATH lookup is unavailable', () => {

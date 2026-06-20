@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BotConfig {
@@ -108,9 +110,12 @@ impl BotConfig {
 
     fn validate_attempt_lease(&self) -> Result<()> {
         for (name, codex) in self.codex_configs() {
-            if codex.timeout_secs >= self.server.attempt_lease_secs {
+            let minimum_lease = codex
+                .timeout_secs
+                .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(2));
+            if minimum_lease >= self.server.attempt_lease_secs {
                 return Err(anyhow!(
-                    "server.attempt_lease_secs must be greater than codex.timeout_secs for {name}"
+                    "server.attempt_lease_secs must be greater than codex.timeout_secs plus Webex request timeout margin for {name}"
                 ));
             }
         }
@@ -668,6 +673,32 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("attempt_lease_secs")
+        );
+    }
+
+    #[test]
+    fn rejects_codex_timeout_without_webex_attempt_margin() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 101
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
         );
     }
 

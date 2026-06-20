@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
@@ -24,6 +25,10 @@ const DEFAULT_SIDECAR_SCRIPT = path.resolve(
   '../Webex-headless-messenger/examples/sidecar-js/index.mjs',
 );
 const DEFAULT_CONFIG_PATH = path.resolve(REPO_ROOT, '.codex-tmp/miku-bot-test/e2e-config.toml');
+const DEFAULT_CODEX_CWD = path.resolve(
+  os.tmpdir(),
+  'webex-generic-account-bot-e2e/codex-cwd',
+);
 const DEFAULT_STATE_FILE = path.resolve(REPO_ROOT, '.codex-tmp/miku-bot-test/e2e-state.jsonl');
 const WEBEX_API_BASE = 'https://webexapis.com/v1';
 
@@ -78,7 +83,7 @@ access_token_file = ${tomlString(options.accessTokenFile)}
 
 [codex]
 bin = ${tomlString(options.codexBin)}
-cwd = ${tomlString(REPO_ROOT)}
+cwd = ${tomlString(options.codexCwd)}
 sandbox = ${tomlString(options.codexSandbox)}
 approval_policy = "never"
 timeout_secs = ${options.codexTimeoutSecs}
@@ -126,6 +131,7 @@ export function buildE2eOptions(env = process.env) {
     botToken,
     cargoBin: env.E2E_CARGO_BIN || resolveExecutable('cargo', env.PATH) || 'cargo',
     codexBin: env.E2E_CODEX_BIN || resolveExecutable('codex', env.PATH) || 'codex',
+    codexCwd: path.resolve(env.E2E_CODEX_CWD || DEFAULT_CODEX_CWD),
     codexSandbox: env.E2E_CODEX_SANDBOX || 'read-only',
     codexTimeoutSecs: parsePositiveInteger(env.E2E_CODEX_TIMEOUT_SECS, 300),
     configPath: path.resolve(env.E2E_CONFIG_PATH || DEFAULT_CONFIG_PATH),
@@ -379,6 +385,7 @@ function parseBind(bind) {
 
 async function writeConfig(options) {
   await fs.mkdir(path.dirname(options.configPath), { recursive: true });
+  await fs.mkdir(options.codexCwd, { recursive: true });
   await fs.writeFile(options.configPath, renderBotConfig(options), 'utf8');
   console.log(`e2e_config=${path.relative(REPO_ROOT, options.configPath)}`);
 }
