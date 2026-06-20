@@ -83,6 +83,12 @@ impl BotConfig {
         self.rooms.iter().find(|policy| policy.room_id == room_id)
     }
 
+    pub fn room_is_read_only_source(&self, room_id: &str) -> bool {
+        self.rooms
+            .iter()
+            .any(|policy| policy.read_only_source && policy.room_id == room_id)
+    }
+
     pub fn codex_for_policy(&self, policy: &RoomPolicy) -> CodexConfig {
         policy
             .codex
@@ -418,6 +424,10 @@ pub enum IsolationMode {
 pub struct RoomPolicy {
     pub room_id: String,
     pub name: Option<String>,
+    pub output_room_id: Option<String>,
+    pub forward_source_message: bool,
+    pub read_only_source: bool,
+    pub jenkins_context: Option<JenkinsContextConfig>,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
     pub allow_all_senders: bool,
@@ -432,6 +442,10 @@ impl Default for RoomPolicy {
         Self {
             room_id: String::new(),
             name: None,
+            output_room_id: None,
+            forward_source_message: false,
+            read_only_source: false,
+            jenkins_context: None,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
             allow_all_senders: false,
@@ -447,6 +461,38 @@ impl RoomPolicy {
     fn validate(&self) -> Result<()> {
         if self.room_id.trim().is_empty() {
             return Err(anyhow!("rooms.room_id must not be empty"));
+        }
+        if let Some(output_room_id) = &self.output_room_id {
+            if output_room_id.trim().is_empty() {
+                return Err(anyhow!(
+                    "rooms[{}].output_room_id must not be empty when set",
+                    self.room_id
+                ));
+            }
+            if output_room_id == &self.room_id {
+                return Err(anyhow!(
+                    "rooms[{}].output_room_id must differ from room_id",
+                    self.room_id
+                ));
+            }
+            if !self.forward_source_message {
+                return Err(anyhow!(
+                    "rooms[{}].forward_source_message = true is required when output_room_id is set",
+                    self.room_id
+                ));
+            }
+        }
+        if self.read_only_source && self.output_room_id.is_none() {
+            return Err(anyhow!(
+                "rooms[{}].read_only_source requires output_room_id",
+                self.room_id
+            ));
+        }
+        if self.forward_source_message && self.output_room_id.is_none() {
+            return Err(anyhow!(
+                "rooms[{}].forward_source_message requires output_room_id",
+                self.room_id
+            ));
         }
         if !self.allow_all_senders
             && self.allowed_person_ids.is_empty()
@@ -480,6 +526,68 @@ impl RoomPolicy {
                 "rooms[{}].prompt_template must not be empty",
                 self.room_id
             ));
+        }
+        if let Some(jenkins_context) = &self.jenkins_context {
+            jenkins_context
+                .validate()
+                .with_context(|| format!("invalid jenkins_context for room {}", self.room_id))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JenkinsContextConfig {
+    pub enabled: bool,
+    pub node_bin: String,
+    pub script: PathBuf,
+    pub env_file: PathBuf,
+    pub timeout_secs: u64,
+    pub max_urls: usize,
+    pub output_limit_chars: usize,
+}
+
+impl Default for JenkinsContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            node_bin: "node".to_owned(),
+            script: PathBuf::from("scripts/jenkins-readonly.mjs"),
+            env_file: PathBuf::from("/etc/webex-generic-account-bot/jenkins.env"),
+            timeout_secs: 30,
+            max_urls: 3,
+            output_limit_chars: 12_000,
+        }
+    }
+}
+
+impl JenkinsContextConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.max(1))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_bin.trim().is_empty() {
+            return Err(anyhow!("node_bin must not be empty"));
+        }
+        if self.script.as_os_str().is_empty() {
+            return Err(anyhow!("script must not be empty"));
+        }
+        if self.env_file.as_os_str().is_empty() {
+            return Err(anyhow!("env_file must not be empty"));
+        }
+        if self.timeout_secs == 0 {
+            return Err(anyhow!("timeout_secs must be greater than zero"));
+        }
+        if self.max_urls == 0 {
+            return Err(anyhow!("max_urls must be greater than zero"));
+        }
+        if self.output_limit_chars == 0 {
+            return Err(anyhow!("output_limit_chars must be greater than zero"));
         }
         Ok(())
     }
@@ -958,6 +1066,116 @@ allow_all_senders = true
                 .to_string()
                 .contains("duplicate rooms.room_id")
         );
+    }
+
+    #[test]
+    fn output_room_requires_forward_source_message() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-2"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("forward_source_message")
+        );
+    }
+
+    #[test]
+    fn read_only_source_requires_output_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("read_only_source")
+        );
+    }
+
+    #[test]
+    fn output_room_must_differ_from_source_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-1"
+forward_source_message = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must differ")
+        );
+    }
+
+    #[test]
+    fn parses_staging_output_room_policy() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-2"
+forward_source_message = true
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert!(config.room_is_read_only_source("room-1"));
+        assert!(!config.room_is_read_only_source("room-2"));
+        assert_eq!(config.rooms[0].output_room_id.as_deref(), Some("room-2"));
+    }
+
+    #[test]
+    fn parses_jenkins_context_config() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+timeout_secs = 15
+max_urls = 2
+output_limit_chars = 2048
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let jenkins_context = config.rooms[0].jenkins_context.as_ref().unwrap();
+        assert!(jenkins_context.enabled);
+        assert_eq!(jenkins_context.timeout_secs, 15);
+        assert_eq!(jenkins_context.max_urls, 2);
+        assert_eq!(jenkins_context.output_limit_chars, 2048);
     }
 
     #[test]
