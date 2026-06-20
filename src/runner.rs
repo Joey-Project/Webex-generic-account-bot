@@ -118,8 +118,9 @@ async fn run_codex_exec(
         .await
         .unwrap_or_else(|_| stdout.clone());
     let _ = fs::remove_file(&output_path).await;
+    let final_message = normalize_final_message(&final_message, config.output_limit_chars)?;
     Ok(CodexRunOutput {
-        final_message: trim_to_chars(final_message.trim(), config.output_limit_chars),
+        final_message,
         stdout,
         stderr,
     })
@@ -260,6 +261,14 @@ fn limited_string(bytes: Vec<u8>, truncated: bool) -> String {
         value.push_str("\n[truncated]");
     }
     value
+}
+
+fn normalize_final_message(value: &str, max_chars: usize) -> Result<String> {
+    let trimmed = trim_to_chars(value.trim(), max_chars);
+    if trimmed.trim().is_empty() {
+        return Err(anyhow!("codex exec produced an empty final message"));
+    }
+    Ok(trimmed)
 }
 
 fn capture_limit_bytes(output_limit_chars: usize) -> usize {
@@ -410,6 +419,16 @@ mod tests {
     #[test]
     fn trims_long_output() {
         assert_eq!(trim_to_chars("abcdef", 3), "abc\n[truncated]");
+    }
+
+    #[test]
+    fn empty_final_message_is_rejected() {
+        assert!(
+            normalize_final_message(" \n\t", 100)
+                .unwrap_err()
+                .to_string()
+                .contains("empty final message")
+        );
     }
 
     #[test]

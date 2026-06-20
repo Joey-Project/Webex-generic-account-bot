@@ -270,7 +270,7 @@ impl BotApp {
         message: &Message,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
-        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+        match classify_webex_create_failure(&error, self.config.server.attempt_lease()) {
             WebexFailureAction::Stop => {
                 self.mark_processed(attempt).await?;
                 Ok(BotAction::ignored(
@@ -485,6 +485,18 @@ fn classify_webex_api_error(api: &ApiError, default_retry: Duration) -> WebexFai
         return WebexFailureAction::Stop;
     }
     WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
+}
+
+fn classify_webex_create_failure(
+    error: &WebexCallError,
+    default_retry: Duration,
+) -> WebexFailureAction {
+    match error {
+        WebexCallError::Client(WebexError::Api(api)) if matches!(api.status, 401 | 429) => {
+            WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
+        }
+        _ => WebexFailureAction::Stop,
+    }
 }
 
 #[derive(Debug)]
@@ -851,6 +863,14 @@ mod tests {
         assert_eq!(
             classify_webex_failure(&WebexCallError::TimedOut, Duration::from_secs(30)),
             WebexFailureAction::Retry(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn webex_create_timeout_errors_stop_to_avoid_duplicate_posts() {
+        assert_eq!(
+            classify_webex_create_failure(&WebexCallError::TimedOut, Duration::from_secs(30)),
+            WebexFailureAction::Stop
         );
     }
 
