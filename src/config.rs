@@ -11,6 +11,9 @@ use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
+const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
+    STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -130,11 +133,43 @@ impl BotConfig {
                 ));
             }
         }
+        for room in &self.rooms {
+            let Some(jenkins_context) = room
+                .jenkins_context
+                .as_ref()
+                .filter(|jenkins_context| jenkins_context.enabled)
+            else {
+                continue;
+            };
+            let codex = self.codex_for_policy(room);
+            let name = format!("room {}", room.room_id);
+            if path_is_inside(&jenkins_context.script, &codex.cwd) {
+                return Err(anyhow!(
+                    "rooms[{}].jenkins_context.script {} must not be inside codex cwd {} ({name})",
+                    room.room_id,
+                    jenkins_context.script.display(),
+                    codex.cwd.display()
+                ));
+            }
+            if path_is_inside(&jenkins_context.env_file, &codex.cwd) {
+                return Err(anyhow!(
+                    "rooms[{}].jenkins_context.env_file {} must not be inside codex cwd {} ({name})",
+                    room.room_id,
+                    jenkins_context.env_file.display(),
+                    codex.cwd.display()
+                ));
+            }
+        }
         Ok(())
     }
 
     fn validate_attempt_lease(&self) -> Result<()> {
-        self.validate_attempt_lease_for("global codex", &self.codex, 0)?;
+        self.validate_attempt_lease_for(
+            "global codex",
+            &self.codex,
+            0,
+            WEBEX_REQUESTS_PER_ATTEMPT,
+        )?;
         for room in &self.rooms {
             let codex = self.codex_for_policy(room);
             let jenkins_prefetch_secs = room
@@ -143,11 +178,16 @@ impl BotConfig {
                 .filter(|context| context.enabled)
                 .map(JenkinsContextConfig::max_prefetch_secs)
                 .unwrap_or(0);
-            if room.codex.is_some() || jenkins_prefetch_secs > 0 {
+            let webex_requests = room.webex_requests_per_attempt();
+            if room.codex.is_some()
+                || jenkins_prefetch_secs > 0
+                || webex_requests > WEBEX_REQUESTS_PER_ATTEMPT
+            {
                 self.validate_attempt_lease_for(
                     &format!("room {}", room.room_id),
                     &codex,
                     jenkins_prefetch_secs,
+                    webex_requests,
                 )?;
             }
         }
@@ -159,11 +199,12 @@ impl BotConfig {
         name: &str,
         codex: &CodexConfig,
         jenkins_prefetch_secs: u64,
+        webex_requests: u64,
     ) -> Result<()> {
         let minimum_lease = codex
             .timeout_secs
             .saturating_add(jenkins_prefetch_secs)
-            .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT));
+            .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(webex_requests));
         if minimum_lease >= self.server.attempt_lease_secs {
             return Err(anyhow!(
                 "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time and Webex request timeout margin for {name}"
@@ -559,6 +600,14 @@ impl RoomPolicy {
         }
         Ok(())
     }
+
+    fn webex_requests_per_attempt(&self) -> u64 {
+        let mut requests = WEBEX_REQUESTS_PER_ATTEMPT;
+        if self.output_room_id.is_some() {
+            requests = requests.saturating_add(STAGING_WEBEX_REQUESTS_PER_ATTEMPT);
+        }
+        requests
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -942,6 +991,35 @@ max_urls = 3
     }
 
     #[test]
+    fn rejects_staging_webex_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 400
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "production-room"
+output_room_id = "staging-room"
+forward_source_message = true
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
     fn rejects_blank_self_person_id() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -1205,6 +1283,9 @@ allow_all_senders = true
     fn parses_staging_output_room_policy() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [[rooms]]
 room_id = "room-1"
 output_room_id = "room-2"
@@ -1265,6 +1346,52 @@ env_file = "/etc/webex-generic-account-bot/jenkins.env"
 
         let error = config.validate().unwrap_err();
         assert!(format!("{error:#}").contains("script must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_jenkins_script_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/srv/webex-bot/workspace"
+codex_home = "/srv/webex-bot/codex-home"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/srv/webex-bot/workspace/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("jenkins_context.script"));
+    }
+
+    #[test]
+    fn rejects_jenkins_env_file_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/srv/webex-bot/workspace"
+codex_home = "/srv/webex-bot/codex-home"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/srv/webex-bot/workspace/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("jenkins_context.env_file"));
     }
 
     #[test]

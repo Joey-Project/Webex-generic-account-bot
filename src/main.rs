@@ -16,8 +16,9 @@ use clap::Parser;
 use serde::Serialize;
 use serde_json::json;
 use tokio::{
+    io::AsyncReadExt,
     net::TcpListener,
-    process::Command,
+    process::{Child, Command},
     sync::{Mutex, Semaphore},
     time::timeout,
 };
@@ -284,6 +285,8 @@ async fn run_jenkins_context_helper(
 ) -> Result<String> {
     let mut command = Command::new(&config.node_bin);
     let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
+    configure_jenkins_helper_process(&mut command);
+    apply_jenkins_helper_env(&mut command);
     command
         .arg(&config.script)
         .arg("--env-file")
@@ -297,28 +300,157 @@ async fn run_jenkins_context_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = timeout(config.timeout(), command.output())
-        .await
-        .with_context(|| {
-            format!(
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn Jenkins diagnostics helper {}",
+            config.node_bin
+        )
+    })?;
+    let capture_limit = helper_capture_limit_bytes(config.output_limit_chars);
+    let stdout_task = read_limited_pipe(child.stdout.take(), capture_limit);
+    let stderr_task = read_limited_pipe(child.stderr.take(), capture_limit);
+    let status = match timeout(config.timeout(), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            terminate_jenkins_helper(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(error).context("failed to run Jenkins diagnostics helper");
+        }
+        Err(_) => {
+            terminate_jenkins_helper(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(anyhow!(
                 "Jenkins diagnostics helper timed out after {} seconds",
                 config.timeout_secs
-            )
-        })?
-        .context("failed to run Jenkins diagnostics helper")?;
+            ));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .context("failed to join Jenkins stdout reader")??;
+    let stderr = stderr_task
+        .await
+        .context("failed to join Jenkins stderr reader")??;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() {
+    if status.success() {
         return Ok(compact_jenkins_helper_output(&stdout));
     }
 
     Ok(format!(
         "helper_exit_status={}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
+        status,
         compact_jenkins_helper_output(&stdout),
         stderr
     ))
+}
+
+fn apply_jenkins_helper_env(command: &mut Command) {
+    command.env_clear();
+    for (key, value) in webex_generic_account_bot::runner::scrubbed_env() {
+        command.env(key, value);
+    }
+}
+
+fn configure_jenkins_helper_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+async fn terminate_jenkins_helper(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        terminate_jenkins_helper_group(child).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_jenkins_helper_group(child: &mut Child) {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+
+    if let Some(pid) = child.id() {
+        let process_group = -(pid as i32);
+        unsafe {
+            kill(process_group, SIGTERM);
+        }
+        if timeout(Duration::from_millis(250), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        unsafe {
+            kill(process_group, SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn read_limited_pipe<R>(
+    pipe: Option<R>,
+    max_bytes: usize,
+) -> tokio::task::JoinHandle<Result<String>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut pipe) = pipe else {
+            return Ok(String::new());
+        };
+        read_limited(&mut pipe, max_bytes).await
+    })
+}
+
+async fn read_limited<R>(reader: &mut R, max_bytes: usize) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(kept.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let to_keep = read.min(remaining);
+        kept.extend_from_slice(&buffer[..to_keep]);
+        if to_keep < read {
+            truncated = true;
+        }
+    }
+    let mut value = String::from_utf8_lossy(&kept).to_string();
+    if truncated {
+        value.push_str("\n[truncated]");
+    }
+    Ok(value)
+}
+
+fn helper_capture_limit_bytes(output_limit_chars: usize) -> usize {
+    output_limit_chars
+        .max(1)
+        .saturating_mul(4)
+        .saturating_add(1024)
 }
 
 fn compact_jenkins_helper_output(output: &str) -> String {
@@ -1912,6 +2044,81 @@ mod tests {
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn jenkins_helper_uses_scrubbed_environment() {
+        unsafe {
+            env::set_var("WEBEX_ACCESS_TOKEN", "secret-webex-token");
+            env::set_var("WEBEX_SIDECAR_TOKEN", "secret-sidecar-token");
+        }
+        let helper_dir = unique_state_path().with_extension("helper-env-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "printf 'webex=%s\\n' \"${WEBEX_ACCESS_TOKEN-unset}\"\n\
+             printf 'sidecar=%s\\n' \"${WEBEX_SIDECAR_TOKEN-unset}\"\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains("webex=unset"));
+        assert!(output.contains("sidecar=unset"));
+        assert!(!output.contains("secret-webex-token"));
+        assert!(!output.contains("secret-sidecar-token"));
+        unsafe {
+            env::remove_var("WEBEX_ACCESS_TOKEN");
+            env::remove_var("WEBEX_SIDECAR_TOKEN");
+        }
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_output_is_bounded_before_compaction() {
+        let helper_dir = unique_state_path().with_extension("helper-output-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "i=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 8,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains("[truncated]"));
+        assert!(output.len() < 1_200);
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
     #[test]
     fn webex_404_errors_stop_retries() {
         let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(404, None))));
@@ -2218,7 +2425,7 @@ mod tests {
             self_person_id: Some(SELF_PERSON_ID.to_owned()),
             server: webex_generic_account_bot::ServerConfig {
                 allow_unauthenticated: true,
-                attempt_lease_secs: 180,
+                attempt_lease_secs: 420,
                 ..webex_generic_account_bot::ServerConfig::default()
             },
             codex: webex_generic_account_bot::CodexConfig {
