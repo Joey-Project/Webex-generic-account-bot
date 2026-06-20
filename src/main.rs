@@ -1,6 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -23,9 +24,9 @@ use webex_generic_account_bot::{
     should_trigger, webex::build_webex_client,
 };
 use webex_headless_messenger::{
-    ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, SidecarEvent,
+    ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
     WebexClient,
-    types::{CreateMessage, ListMessages, Message},
+    types::{CreateMessage, ListMessages, Message, Person},
 };
 
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
@@ -58,8 +59,8 @@ async fn main() -> Result<()> {
     }
 
     let sidecar_token = sidecar_token(&config)?;
-    let webex = build_webex_client(&config.webex)?;
-    let self_person_id = resolve_self_person_id(&config, &webex).await?;
+    let webex: Arc<dyn WebexApi> = Arc::new(build_webex_client(&config.webex)?);
+    let self_person_id = resolve_self_person_id(&config, webex.as_ref()).await?;
     let state_store = JsonlStateStore::load(config.state_file.clone())?;
     let app = Arc::new(BotApp {
         config: config.clone(),
@@ -105,7 +106,7 @@ struct BotApp {
     config: Arc<BotConfig>,
     sidecar_token: Option<String>,
     self_person_id: Option<String>,
-    webex: WebexClient,
+    webex: Arc<dyn WebexApi>,
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
     request_slots: Arc<Semaphore>,
@@ -117,6 +118,95 @@ struct ReplyCreateContext<'a> {
     parent_id: &'a str,
     reply_marker: &'a str,
     reply_chars: usize,
+}
+
+#[async_trait]
+trait WebexApi: Send + Sync {
+    async fn me(&self) -> Result<Person, WebexCallError>;
+    async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError>;
+    async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError>;
+    async fn find_reply_by_marker(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        marker: &str,
+        self_person_id: Option<&str>,
+    ) -> Result<Option<Message>, WebexCallError>;
+}
+
+#[async_trait]
+impl WebexApi for WebexClient {
+    async fn me(&self) -> Result<Person, WebexCallError> {
+        match timeout(WEBEX_REQUEST_TIMEOUT, WebexClient::me(self)).await {
+            Ok(Ok(person)) => Ok(person),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
+        match timeout(
+            WEBEX_REQUEST_TIMEOUT,
+            WebexClient::get_message(self, message_id),
+        )
+        .await
+        {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
+        match timeout(
+            WEBEX_REQUEST_TIMEOUT,
+            WebexClient::create_message(self, request),
+        )
+        .await
+        {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn find_reply_by_marker(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        marker: &str,
+        self_person_id: Option<&str>,
+    ) -> Result<Option<Message>, WebexCallError> {
+        let request = ListMessages {
+            room_id: room_id.to_owned(),
+            parent_id: Some(parent_id.to_owned()),
+            max: Some(100),
+            ..ListMessages::default()
+        };
+        let mut page: Page<Message> =
+            match timeout(WEBEX_REQUEST_TIMEOUT, self.list_messages(&request)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
+        loop {
+            if let Some(reply) = page
+                .items
+                .into_iter()
+                .find(|reply| reply_matches_marker(reply, marker, self_person_id))
+            {
+                return Ok(Some(reply));
+            }
+            let Some(next) = page.next else {
+                return Ok(None);
+            };
+            page = match timeout(WEBEX_REQUEST_TIMEOUT, self.next_page(next)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
+        }
+    }
 }
 
 impl BotApp {
@@ -290,19 +380,11 @@ impl BotApp {
     }
 
     async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
-        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.get_message(message_id)).await {
-            Ok(Ok(message)) => Ok(message),
-            Ok(Err(error)) => Err(WebexCallError::Client(error)),
-            Err(_) => Err(WebexCallError::TimedOut),
-        }
+        self.webex.get_message(message_id).await
     }
 
     async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
-        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.create_message(request)).await {
-            Ok(Ok(message)) => Ok(message),
-            Ok(Err(error)) => Err(WebexCallError::Client(error)),
-            Err(_) => Err(WebexCallError::TimedOut),
-        }
+        self.webex.create_message(request).await
     }
 
     async fn find_existing_reply_by_marker(
@@ -311,35 +393,9 @@ impl BotApp {
         parent_id: &str,
         marker: &str,
     ) -> Result<Option<Message>, WebexCallError> {
-        let request = ListMessages {
-            room_id: room_id.to_owned(),
-            parent_id: Some(parent_id.to_owned()),
-            max: Some(100),
-            ..ListMessages::default()
-        };
-        let mut page: webex_headless_messenger::Page<Message> =
-            match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.list_messages(&request)).await {
-                Ok(Ok(page)) => page,
-                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
-                Err(_) => return Err(WebexCallError::TimedOut),
-            };
-        loop {
-            if let Some(reply) = page
-                .items
-                .into_iter()
-                .find(|reply| reply_matches_marker(reply, marker, self.self_person_id.as_deref()))
-            {
-                return Ok(Some(reply));
-            }
-            let Some(next) = page.next else {
-                return Ok(None);
-            };
-            page = match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.next_page(next)).await {
-                Ok(Ok(page)) => page,
-                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
-                Err(_) => return Err(WebexCallError::TimedOut),
-            };
-        }
+        self.webex
+            .find_reply_by_marker(room_id, parent_id, marker, self.self_person_id.as_deref())
+            .await
     }
 
     async fn handle_get_message_failure(
@@ -725,14 +781,19 @@ fn sidecar_token(config: &BotConfig) -> Result<Option<String>> {
     Ok(token)
 }
 
-async fn resolve_self_person_id(config: &BotConfig, webex: &WebexClient) -> Result<Option<String>> {
+async fn resolve_self_person_id(
+    config: &BotConfig,
+    webex: &dyn WebexApi,
+) -> Result<Option<String>> {
     if let Some(person_id) = &config.self_person_id {
         return Ok(Some(person_id.clone()));
     }
-    let me = timeout(WEBEX_REQUEST_TIMEOUT, webex.me())
-        .await
-        .map_err(|_| anyhow!("timed out resolving Webex people/me after 30 seconds"))?
-        .context("failed to resolve Webex people/me")?;
+    let me = webex.me().await.map_err(|error| match error {
+        WebexCallError::TimedOut => {
+            anyhow!("timed out resolving Webex people/me after 30 seconds")
+        }
+        WebexCallError::Client(error) => anyhow!("failed to resolve Webex people/me: {error}"),
+    })?;
     Ok(me.id)
 }
 
@@ -883,7 +944,140 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+    use webex_generic_account_bot::CodexRunOutput;
+
+    const ROOM_ID: &str = "room-1";
+    const SELF_PERSON_ID: &str = "bot-person";
+    const SENDER_PERSON_ID: &str = "sender-person";
+    const SENDER_EMAIL: &str = "sender@example.com";
+    type ReplySearchRequest = (String, String, String, Option<String>);
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn process_event_runs_codex_and_sends_markdown_reply() {
+        let harness = TestHarness::new();
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+        harness.runner.push_output("## Diagnosis\n\n- Looks good");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "please inspect",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.message_id.as_deref(), Some("message-1"));
+        assert_eq!(action.room_id.as_deref(), Some(ROOM_ID));
+        assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].room_id.as_deref(), Some(ROOM_ID));
+        assert_eq!(created[0].parent_id.as_deref(), Some("message-1"));
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("## Diagnosis"));
+        assert!(markdown.contains(&reply_marker("message-1")));
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn process_event_reuses_existing_marker_without_codex_run() {
+        let harness = TestHarness::new();
+        let marker = reply_marker("message-1");
+        harness
+            .webex
+            .push_reply_search(Ok(vec![reply_with_marker("reply-existing", &marker)]));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "already handled",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("reply-existing"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn retryable_reconciliation_failure_defers_without_codex_run() {
+        let harness = TestHarness::new();
+        harness
+            .webex
+            .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(503, Some(Duration::from_secs(42))),
+            )))));
+
+        let error = harness
+            .app
+            .process_event(message_event(inbound_message("message-1", "retry later")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(42)));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(!harness.processed("message-1").await);
+
+        let leased = harness
+            .app
+            .process_event(message_event(inbound_message("message-1", "retry later")))
+            .await
+            .unwrap_err();
+        assert_eq!(leased.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(leased.message.contains("active attempt lease"));
+    }
+
+    #[tokio::test]
+    async fn create_timeout_reconciles_existing_reply_and_marks_processed() {
+        let harness = TestHarness::new();
+        let marker = reply_marker("message-1");
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Err(WebexCallError::TimedOut));
+        harness
+            .webex
+            .push_reply_search(Ok(vec![reply_with_marker("reply-after-timeout", &marker)]));
+        harness.runner.push_output("The reply reached Webex.");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message("message-1", "timeout path")))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("reply-after-timeout"));
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert_eq!(harness.webex.created_requests().len(), 1);
+        assert_eq!(harness.webex.reply_searches().len(), 2);
+        assert!(harness.processed("message-1").await);
+    }
 
     #[test]
     fn bot_action_serializes_reason() {
@@ -1127,6 +1321,248 @@ mod tests {
             retry_after,
             details: Vec::new(),
             body: None,
+        }
+    }
+
+    struct TestHarness {
+        app: BotApp,
+        webex: Arc<FakeWebex>,
+        runner: Arc<FakeRunner>,
+        state_path: PathBuf,
+    }
+
+    impl TestHarness {
+        fn new() -> Self {
+            let state_path = unique_state_path();
+            let config = test_config(state_path.clone());
+            let state = JsonlStateStore::load(config.state_file.clone()).unwrap();
+            let webex = Arc::new(FakeWebex::default());
+            let runner = Arc::new(FakeRunner::default());
+            let app = BotApp {
+                config,
+                sidecar_token: None,
+                self_person_id: Some(SELF_PERSON_ID.to_owned()),
+                webex: webex.clone(),
+                state: Mutex::new(state),
+                runner: runner.clone(),
+                request_slots: Arc::new(Semaphore::new(4)),
+            };
+            Self {
+                app,
+                webex,
+                runner,
+                state_path,
+            }
+        }
+
+        async fn processed(&self, message_id: &str) -> bool {
+            self.app
+                .state
+                .lock()
+                .await
+                .contains_processed_message(message_id)
+        }
+    }
+
+    impl Drop for TestHarness {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.state_path);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeWebex {
+        reply_search_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
+        create_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
+        created_requests: StdMutex<Vec<CreateMessage>>,
+        reply_search_requests: StdMutex<Vec<ReplySearchRequest>>,
+    }
+
+    impl FakeWebex {
+        fn push_reply_search(&self, result: Result<Vec<Message>, WebexCallError>) {
+            self.reply_search_results.lock().unwrap().push_back(result);
+        }
+
+        fn push_create_result(&self, result: Result<Message, WebexCallError>) {
+            self.create_results.lock().unwrap().push_back(result);
+        }
+
+        fn created_requests(&self) -> Vec<CreateMessage> {
+            self.created_requests.lock().unwrap().clone()
+        }
+
+        fn reply_searches(&self) -> Vec<ReplySearchRequest> {
+            self.reply_search_requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WebexApi for FakeWebex {
+        async fn me(&self) -> Result<Person, WebexCallError> {
+            Ok(Person {
+                id: Some(SELF_PERSON_ID.to_owned()),
+                ..Person::default()
+            })
+        }
+
+        async fn get_message(&self, _message_id: &str) -> Result<Message, WebexCallError> {
+            panic!("unexpected message hydration in test")
+        }
+
+        async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
+            self.created_requests.lock().unwrap().push(request.clone());
+            self.create_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(reply_message("reply-default")))
+        }
+
+        async fn find_reply_by_marker(
+            &self,
+            room_id: &str,
+            parent_id: &str,
+            marker: &str,
+            self_person_id: Option<&str>,
+        ) -> Result<Option<Message>, WebexCallError> {
+            self.reply_search_requests.lock().unwrap().push((
+                room_id.to_owned(),
+                parent_id.to_owned(),
+                marker.to_owned(),
+                self_person_id.map(ToOwned::to_owned),
+            ));
+            self.reply_search_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .map(|replies| {
+                    replies
+                        .into_iter()
+                        .find(|reply| reply_matches_marker(reply, marker, self_person_id))
+                })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRunner {
+        outputs: StdMutex<VecDeque<std::result::Result<CodexRunOutput, String>>>,
+        calls: StdMutex<Vec<(String, String)>>,
+    }
+
+    impl FakeRunner {
+        fn push_output(&self, final_message: impl Into<String>) {
+            self.outputs.lock().unwrap().push_back(Ok(CodexRunOutput {
+                final_message: final_message.into(),
+                stdout: String::new(),
+                stderr: String::new(),
+            }));
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CodexRunner for FakeRunner {
+        async fn run(
+            &self,
+            _config: &webex_generic_account_bot::config::CodexConfig,
+            prompt: &str,
+            message_id: &str,
+        ) -> Result<CodexRunOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((message_id.to_owned(), prompt.to_owned()));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(CodexRunOutput {
+                        final_message: "Codex reply".to_owned(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                })
+                .map_err(|message| anyhow!(message))
+        }
+    }
+
+    fn test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let config = BotConfig {
+            state_file: state_path,
+            self_person_id: Some(SELF_PERSON_ID.to_owned()),
+            server: webex_generic_account_bot::ServerConfig {
+                allow_unauthenticated: true,
+                attempt_lease_secs: 180,
+                ..webex_generic_account_bot::ServerConfig::default()
+            },
+            codex: webex_generic_account_bot::CodexConfig {
+                cwd: PathBuf::from("/tmp/webex-generic-account-bot-work"),
+                codex_home: PathBuf::from("/tmp/webex-generic-account-bot-codex-home"),
+                timeout_secs: 30,
+                ..webex_generic_account_bot::CodexConfig::default()
+            },
+            rooms: vec![webex_generic_account_bot::RoomPolicy {
+                room_id: ROOM_ID.to_owned(),
+                trigger: TriggerMode::Always,
+                allow_all_senders: true,
+                prompt_template: "Message {message_id}: {body}".to_owned(),
+                ..webex_generic_account_bot::RoomPolicy::default()
+            }],
+            ..BotConfig::default()
+        };
+        config.validate().unwrap();
+        Arc::new(config)
+    }
+
+    fn unique_state_path() -> PathBuf {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "webex-generic-account-bot-test-{}-{counter}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn message_event(message: Message) -> SidecarEvent {
+        SidecarEvent::message_created(serde_json::to_value(message).unwrap())
+    }
+
+    fn inbound_message(message_id: &str, body: &str) -> Message {
+        Message {
+            id: Some(message_id.to_owned()),
+            room_id: Some(ROOM_ID.to_owned()),
+            person_id: Some(SENDER_PERSON_ID.to_owned()),
+            person_email: Some(SENDER_EMAIL.to_owned()),
+            text: Some(body.to_owned()),
+            markdown: Some(body.to_owned()),
+            ..Message::default()
+        }
+    }
+
+    fn reply_message(reply_id: &str) -> Message {
+        Message {
+            id: Some(reply_id.to_owned()),
+            room_id: Some(ROOM_ID.to_owned()),
+            person_id: Some(SELF_PERSON_ID.to_owned()),
+            ..Message::default()
+        }
+    }
+
+    fn reply_with_marker(reply_id: &str, marker: &str) -> Message {
+        Message {
+            id: Some(reply_id.to_owned()),
+            room_id: Some(ROOM_ID.to_owned()),
+            person_id: Some(SELF_PERSON_ID.to_owned()),
+            markdown: Some(format!("done\n\n_Ref: `{marker}`_")),
+            ..Message::default()
         }
     }
 }
