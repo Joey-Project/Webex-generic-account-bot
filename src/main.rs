@@ -270,7 +270,7 @@ impl BotApp {
         message: &Message,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
-        match classify_webex_create_failure(&error, self.config.server.attempt_lease()) {
+        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
             WebexFailureAction::Stop => {
                 self.mark_processed(attempt).await?;
                 Ok(BotAction::ignored(
@@ -297,7 +297,7 @@ impl BotApp {
         room_id: &str,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
-        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+        match classify_webex_create_failure(&error, self.config.server.attempt_lease()) {
             WebexFailureAction::Stop => {
                 self.mark_processed(attempt).await?;
                 Ok(BotAction::ignored(
