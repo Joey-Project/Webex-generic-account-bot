@@ -236,7 +236,9 @@ impl BotApp {
             }
             Ok(None) => {}
             Err(error) => {
-                warn!(message_id = %message_id, error = %error, "failed to reconcile existing Webex reply before Codex run");
+                return self
+                    .handle_reconciliation_failure(&attempt, &message_id, error)
+                    .await;
             }
         }
 
@@ -361,6 +363,35 @@ impl BotApp {
                 Err(HttpError::retry_after(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("failed to hydrate message {message_id}: {error}"),
+                    retry_after,
+                ))
+            }
+        }
+    }
+
+    async fn handle_reconciliation_failure(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        error: WebexCallError,
+    ) -> Result<BotAction, HttpError> {
+        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+            WebexFailureAction::Stop => {
+                warn!(message_id = %message_id, error = %error, "failed to reconcile existing Webex reply before Codex run");
+                self.mark_processed(attempt).await?;
+                Ok(BotAction::ignored(
+                    "reply_reconciliation_failed",
+                    Some(message_id.to_owned()),
+                    None,
+                ))
+            }
+            WebexFailureAction::Retry(retry_after) => {
+                self.defer_attempt(attempt, retry_after).await?;
+                Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "failed to reconcile existing Webex reply for message {message_id}: {error}"
+                    ),
                     retry_after,
                 ))
             }

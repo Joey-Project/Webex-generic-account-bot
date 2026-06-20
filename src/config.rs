@@ -114,9 +114,11 @@ impl BotConfig {
             }
         }
         for (name, codex) in self.codex_configs() {
-            if path_is_inside(&codex.codex_home, &codex.cwd) {
+            if path_is_inside(&codex.codex_home, &codex.cwd)
+                || path_is_inside(&codex.cwd, &codex.codex_home)
+            {
                 return Err(anyhow!(
-                    "codex.codex_home {} must not be inside codex cwd {} ({name})",
+                    "codex.codex_home {} must not overlap codex cwd {} ({name})",
                     codex.codex_home.display(),
                     codex.cwd.display()
                 ));
@@ -1012,6 +1014,30 @@ allow_all_senders = true
 [codex]
 cwd = "."
 codex_home = ".codex"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("codex.codex_home")
+        );
+    }
+
+    #[test]
+    fn rejects_codex_cwd_inside_codex_home() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/var/lib/webex-generic-account-bot/codex-home/workspace"
+codex_home = "/var/lib/webex-generic-account-bot/codex-home"
 
 [[rooms]]
 room_id = "room-1"
