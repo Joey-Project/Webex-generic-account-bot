@@ -752,11 +752,12 @@ fn reply_marker(message_id: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("<!-- webex-generic-account-bot:reply-for={encoded_id} -->")
+    format!("wgb-ref:{encoded_id}")
 }
 
 fn prepare_reply_markdown(markdown: &str, marker: &str) -> String {
-    let marker_chars = marker.chars().count().saturating_add(2);
+    let marker_footer = format!("_Ref: `{marker}`_");
+    let marker_chars = marker_footer.chars().count().saturating_add(2);
     let truncation_suffix = "\n[truncated]".chars().count();
     let visible_limit = REPLY_LIMIT_CHARS
         .saturating_sub(marker_chars)
@@ -766,7 +767,7 @@ fn prepare_reply_markdown(markdown: &str, marker: &str) -> String {
         &sanitize_reply_markdown(markdown),
         visible_limit,
     );
-    format!("{visible}\n\n{marker}")
+    format!("{visible}\n\n{marker_footer}")
 }
 
 fn reply_matches_marker(reply: &Message, marker: &str, self_person_id: Option<&str>) -> bool {
@@ -958,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_reply_includes_hidden_marker_within_limit() {
+    fn prepared_reply_includes_reference_marker_within_limit() {
         let marker = reply_marker("message-1");
         let reply = prepare_reply_markdown(&"x".repeat(7_000), &marker);
 
@@ -970,7 +971,7 @@ mod tests {
     fn reply_marker_hex_encodes_message_id() {
         let marker = reply_marker("message-->1");
 
-        assert!(marker.contains("6d6573736167652d2d3e31"));
+        assert_eq!(marker, "wgb-ref:6d6573736167652d2d3e31");
         assert!(!marker.contains("message-->1"));
     }
 

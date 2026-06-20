@@ -8,6 +8,7 @@ import {
   parseAccessTokenFile,
   parseDotenv,
   renderBotConfig,
+  replyReferenceMarker,
   sidecarProcessEnv,
 } from '../scripts/e2e-webex-bot.mjs';
 
@@ -115,6 +116,10 @@ describe('e2e config rendering', () => {
 });
 
 describe('e2e reply matching', () => {
+  it('builds the same bot reference marker as the Rust bot', () => {
+    assert.equal(replyReferenceMarker('message-1'), 'wgb-ref:6d6573736167652d31');
+  });
+
   it('rejects generic-account replies that do not contain the marker', () => {
     assert.throws(
       () =>
@@ -143,15 +148,17 @@ describe('e2e reply matching', () => {
   });
 
   it('rejects generic-account replies from an unexpected email when present', () => {
+    const parentId = 'parent-1';
     assert.throws(
       () =>
         expectedReply(
           [
             {
               id: 'reply-1',
+              parentId,
               personId: 'miku-person',
               personEmail: 'wrong@example.com',
-              markdown: 'expected-marker',
+              markdown: `expected-marker ${replyReferenceMarker(parentId)}`,
             },
           ],
           {

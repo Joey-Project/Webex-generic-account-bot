@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
+const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -56,6 +57,13 @@ impl BotConfig {
         }
         if self.rooms.is_empty() {
             return Err(anyhow!("at least one [[rooms]] policy is required"));
+        }
+        if self
+            .self_person_id
+            .as_deref()
+            .is_some_and(|person_id| person_id.trim().is_empty())
+        {
+            return Err(anyhow!("self_person_id must not be empty when set"));
         }
         self.validate_room_ids()?;
         for room in &self.rooms {
@@ -119,9 +127,9 @@ impl BotConfig {
 
     fn validate_attempt_lease(&self) -> Result<()> {
         for (name, codex) in self.codex_configs() {
-            let minimum_lease = codex
-                .timeout_secs
-                .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(2));
+            let minimum_lease = codex.timeout_secs.saturating_add(
+                WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT),
+            );
             if minimum_lease >= self.server.attempt_lease_secs {
                 return Err(anyhow!(
                     "server.attempt_lease_secs must be greater than codex.timeout_secs plus Webex request timeout margin for {name}"
@@ -369,12 +377,14 @@ impl CodexConfigPatch {
 #[serde(default, deny_unknown_fields)]
 pub struct IsolationConfig {
     pub mode: IsolationMode,
+    pub trusted_prompt_authors: bool,
 }
 
 impl Default for IsolationConfig {
     fn default() -> Self {
         Self {
             mode: IsolationMode::CurrentUser,
+            trusted_prompt_authors: true,
         }
     }
 }
@@ -382,7 +392,10 @@ impl Default for IsolationConfig {
 impl IsolationConfig {
     fn validate(&self) -> Result<()> {
         match self.mode {
-            IsolationMode::CurrentUser => Ok(()),
+            IsolationMode::CurrentUser if self.trusted_prompt_authors => Ok(()),
+            IsolationMode::CurrentUser => Err(anyhow!(
+                "codex.isolation.trusted_prompt_authors must be true for current-user mode"
+            )),
             IsolationMode::EphemeralLinuxUser => Err(anyhow!(
                 "codex.isolation.mode = \"ephemeral-linux-user\" is planned but not implemented in this MVP"
             )),
@@ -590,6 +603,25 @@ allow_all_senders = true
     }
 
     #[test]
+    fn current_user_mode_requires_trusted_prompt_authors() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex.isolation]
+mode = "current-user"
+trusted_prompt_authors = false
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("trusted_prompt_authors"));
+    }
+
+    #[test]
     fn prefix_trigger_requires_prefixes() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -727,6 +759,28 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn rejects_blank_self_person_id() {
+        let config: BotConfig = toml::from_str(
+            r#"
+self_person_id = " "
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("self_person_id")
         );
     }
 

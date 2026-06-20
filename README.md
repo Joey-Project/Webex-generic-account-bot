@@ -18,7 +18,7 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 - Supports sender allowlists by Webex person ID and email.
 - Renders a per-room prompt template and runs `codex exec`.
 - Replies to the Webex message thread with the Codex result.
-- Reconciles ambiguous Webex reply creation failures with a hidden reply marker
+- Reconciles ambiguous Webex reply creation failures with a stable reply marker
   before retrying.
 - Bounds concurrent request processing with `server.max_concurrent_requests`.
 - Scrubs Webex token variables from the Codex subprocess environment.
@@ -95,8 +95,11 @@ for trusted Spaces; current-user isolation is not a strong secret boundary
 against allowed prompt authors.
 
 Temporary Linux user isolation is the right long-term boundary for untrusted
-chat-driven prompts, but it should live behind the runner abstraction. Creating
-and deleting OS users requires root or a privileged helper, so this MVP rejects
+chat-driven prompts. `codex.isolation.mode = "current-user"` is only a
+trusted-prompt-author mode and requires
+`codex.isolation.trusted_prompt_authors = true`; it is not a secret-read
+boundary against allowed prompt authors. Creating and deleting OS users requires
+root or a privileged helper, so this MVP rejects
 `codex.isolation.mode = "ephemeral-linux-user"` until that helper is explicitly
 designed. Good follow-up shapes are `systemd-run --property=DynamicUser=yes`, a
 small root-owned worker launcher, or a pre-provisioned pool of locked-down worker

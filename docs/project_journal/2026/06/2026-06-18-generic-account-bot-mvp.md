@@ -24,7 +24,7 @@ superseded_by:
 - Live E2E passed after updating the Codex runner to pass approval policy as a top-level Codex CLI option before the `exec` subcommand.
 - The E2E harness now fails if the generic-account reply does not contain the run marker, preventing false positives from Codex error replies.
 - The E2E harness also checks the reply identity when Webex returns `personEmail`, verifies fixed localhost ports are free, and fails if the bot or sidecar exits before the Webex reply is observed.
-- Review hardening added retry-safe Webex reply failure handling with marker reconciliation, loopback-only unauthenticated sidecar mode, authenticated health metadata, runner timeout coverage for blocked stdin writes, and `codex.codex_home` support for bot-owned Codex auth/config.
+- Review hardening added retry-safe Webex reply failure handling with stable marker reconciliation, loopback-only unauthenticated sidecar mode, authenticated health metadata, runner timeout coverage for blocked stdin writes, and `codex.codex_home` support for bot-owned Codex auth/config.
 
 ## Next Steps
 - Decide whether the next slice should prioritize durable job recovery or privileged ephemeral Linux user runner support.

@@ -94,6 +94,7 @@ ephemeral = true
 
 [codex.isolation]
 mode = "current-user"
+trusted_prompt_authors = true
 
 [[rooms]]
 name = ${tomlString(options.roomTitle)}
@@ -164,6 +165,12 @@ export function expectedReply(replies, { marker, selfPersonId, selfPersonEmail }
   if (!body.includes(marker)) {
     throw new Error(`generic account reply did not contain marker reply_id=${reply.id ?? '<unknown>'}`);
   }
+  const referenceMarker = replyReferenceMarker(reply.parentId ?? reply.parent_id ?? '');
+  if (!body.includes(referenceMarker)) {
+    throw new Error(
+      `generic account reply did not contain bot reference marker reply_id=${reply.id ?? '<unknown>'}`,
+    );
+  }
   const replyEmail = reply.personEmail ?? reply.person_email;
   if (
     selfPersonEmail &&
@@ -175,6 +182,10 @@ export function expectedReply(replies, { marker, selfPersonId, selfPersonEmail }
     );
   }
   return { ...reply, markerFound: true };
+}
+
+export function replyReferenceMarker(messageId) {
+  return `wgb-ref:${Buffer.from(String(messageId), 'utf8').toString('hex')}`;
 }
 
 export function childBaseEnv(env = process.env) {

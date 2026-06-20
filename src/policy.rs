@@ -136,9 +136,9 @@ fn prefix_matches(body: &str, prefix: &str) -> bool {
 
 fn message_body(message: &Message) -> String {
     message
-        .markdown
+        .text
         .as_deref()
-        .or(message.text.as_deref())
+        .or(message.markdown.as_deref())
         .unwrap_or("")
         .to_owned()
 }
@@ -198,6 +198,25 @@ mod tests {
         };
         let mut message = message();
         message.text = Some("@codex summarize".to_owned());
+        message.mentioned_people.clear();
+
+        assert_eq!(
+            should_trigger(&policy, &message, None),
+            TriggerDecision::Matched
+        );
+    }
+
+    #[test]
+    fn prefix_trigger_prefers_visible_text_over_markdown_formatting() {
+        let policy = RoomPolicy {
+            trigger: TriggerMode::Prefix,
+            prefixes: vec!["@codex".to_owned()],
+            allow_all_senders: true,
+            ..RoomPolicy::default()
+        };
+        let mut message = message();
+        message.text = Some("@codex summarize".to_owned());
+        message.markdown = Some("<@person:bot-person> summarize".to_owned());
         message.mentioned_people.clear();
 
         assert_eq!(

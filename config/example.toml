@@ -40,6 +40,7 @@ ephemeral = true
 
 [codex.isolation]
 mode = "current-user"
+trusted_prompt_authors = true
 
 [[rooms]]
 name = "Mention-driven Codex room"
