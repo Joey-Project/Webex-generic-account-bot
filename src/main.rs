@@ -35,6 +35,8 @@ use webex_headless_messenger::{
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
+const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
+const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -150,6 +152,7 @@ trait WebexApi: Send + Sync {
         parent_id: Option<&str>,
         marker: &str,
         self_person_id: Option<&str>,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError>;
 }
 
@@ -195,6 +198,7 @@ impl WebexApi for WebexClient {
         parent_id: Option<&str>,
         marker: &str,
         self_person_id: Option<&str>,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError> {
         let request = ListMessages {
             room_id: room_id.to_owned(),
@@ -211,13 +215,18 @@ impl WebexApi for WebexClient {
                 Ok(Err(error)) => return Err(WebexCallError::Client(error)),
                 Err(_) => return Err(WebexCallError::TimedOut),
             };
+        let mut pages_read = 0usize;
         loop {
+            pages_read = pages_read.saturating_add(1);
             if let Some(reply) = page
                 .items
                 .into_iter()
                 .find(|reply| reply_matches_marker(reply, marker, self_person_id))
             {
                 return Ok(Some(reply));
+            }
+            if max_pages.is_some_and(|limit| pages_read >= limit) {
+                return Ok(None);
             }
             let Some(next) = page.next else {
                 return Ok(None);
@@ -241,7 +250,6 @@ fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) 
 
 async fn jenkins_context_prompt(
     policy: &webex_generic_account_bot::RoomPolicy,
-    codex_config: &webex_generic_account_bot::CodexConfig,
     context: &MessageContext,
 ) -> Result<Option<String>> {
     let Some(config) = &policy.jenkins_context else {
@@ -257,7 +265,7 @@ async fn jenkins_context_prompt(
 
     let mut sections = Vec::new();
     for url in urls {
-        let output = run_jenkins_context_helper(config, &codex_config.cwd, &url).await?;
+        let output = run_jenkins_context_helper(config, &url).await?;
         sections.push(format!(
             "URL: {url}\n```text\n{}\n```",
             trim_to_chars(output.trim(), config.output_limit_chars)
@@ -272,10 +280,10 @@ async fn jenkins_context_prompt(
 
 async fn run_jenkins_context_helper(
     config: &webex_generic_account_bot::JenkinsContextConfig,
-    cwd: &Path,
     url: &str,
 ) -> Result<String> {
     let mut command = Command::new(&config.node_bin);
+    let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
     command
         .arg(&config.script)
         .arg("--env-file")
@@ -283,7 +291,8 @@ async fn run_jenkins_context_helper(
         .arg("diagnose")
         .arg("--url")
         .arg(url)
-        .current_dir(cwd)
+        .current_dir(script_dir)
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -473,6 +482,7 @@ impl BotApp {
                 &reply_thread.room_id,
                 Some(&reply_thread.parent_id),
                 &reply_marker,
+                None,
             )
             .await
         {
@@ -504,7 +514,7 @@ impl BotApp {
         };
         let codex_config = self.config.codex_for_policy(policy);
         let mut prompt = render_prompt(&policy.prompt_template, &context);
-        match jenkins_context_prompt(policy, &codex_config, &context).await {
+        match jenkins_context_prompt(policy, &context).await {
             Ok(Some(context_prompt)) => {
                 prompt = append_prefetched_context(&prompt, &context_prompt);
             }
@@ -581,9 +591,16 @@ impl BotApp {
         room_id: &str,
         parent_id: Option<&str>,
         marker: &str,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError> {
         self.webex
-            .find_message_by_marker(room_id, parent_id, marker, self.self_person_id.as_deref())
+            .find_message_by_marker(
+                room_id,
+                parent_id,
+                marker,
+                self.self_person_id.as_deref(),
+                max_pages,
+            )
             .await
     }
 
@@ -605,7 +622,12 @@ impl BotApp {
 
         let source_marker = source_marker(message_id);
         match self
-            .find_existing_message_by_marker(output_room_id, None, &source_marker)
+            .find_existing_message_by_marker(
+                output_room_id,
+                None,
+                &source_marker,
+                Some(SOURCE_MARKER_SEARCH_MAX_PAGES),
+            )
             .await
         {
             Ok(Some(forward)) => {
@@ -768,6 +790,7 @@ impl BotApp {
                         context.output_room_id,
                         None,
                         context.source_marker,
+                        Some(SOURCE_MARKER_SEARCH_MAX_PAGES),
                     )
                     .await
                 {
@@ -818,6 +841,7 @@ impl BotApp {
                         context.room_id,
                         Some(context.parent_id),
                         context.reply_marker,
+                        None,
                     )
                     .await
                 {
@@ -1230,16 +1254,21 @@ fn prepare_forward_markdown(
         .as_deref()
         .or(message.person_id.as_deref())
         .unwrap_or("unknown");
-    let body = trim_to_chars(
-        &sanitize_reply_markdown(
-            message
-                .markdown
-                .as_deref()
-                .or(message.text.as_deref())
-                .or(message.html.as_deref())
-                .unwrap_or(""),
-        ),
-        4_000,
+    let prefix = format!(
+        "**Forwarded Webex message for staging triage**\n\nSource room: `{source_room_id}`\nSource message: `{message_id}`\nSender: `{sender}`\n\n"
+    );
+    let suffix = format!("\n\n{}", hidden_marker_comment(marker));
+    let body_limit = FORWARD_MARKDOWN_LIMIT_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix.len())
+        .max(1);
+    let body = sanitize_reply_markdown(
+        message
+            .markdown
+            .as_deref()
+            .or(message.text.as_deref())
+            .or(message.html.as_deref())
+            .unwrap_or(""),
     );
     let quoted_body = if body.trim().is_empty() {
         "> [empty message]".to_owned()
@@ -1255,11 +1284,31 @@ fn prepare_forward_markdown(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let quoted_body = trim_to_utf8_bytes(&quoted_body, body_limit);
+    format!("{prefix}{quoted_body}{suffix}")
+}
 
-    format!(
-        "**Forwarded Webex message for staging triage**\n\nSource room: `{source_room_id}`\nSource message: `{message_id}`\nSender: `{sender}`\n\n{quoted_body}\n\n{}",
-        hidden_marker_comment(marker)
-    )
+fn trim_to_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    const SUFFIX: &str = "\n[truncated]";
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if max_bytes <= SUFFIX.len() {
+        return SUFFIX[..max_bytes].to_owned();
+    }
+    let visible_limit = max_bytes - SUFFIX.len();
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > visible_limit {
+            break;
+        }
+        end = next;
+    }
+    format!("{}{}", &value[..end], SUFFIX)
 }
 
 fn prepare_reply_markdown(markdown: &str, marker: &str) -> String {
@@ -1382,7 +1431,13 @@ mod tests {
     const SELF_PERSON_ID: &str = "bot-person";
     const SENDER_PERSON_ID: &str = "sender-person";
     const SENDER_EMAIL: &str = "sender@example.com";
-    type MarkerSearchRequest = (String, Option<String>, String, Option<String>);
+    type MarkerSearchRequest = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<usize>,
+    );
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test]
@@ -1536,7 +1591,8 @@ mod tests {
                 OUTPUT_ROOM_ID.to_owned(),
                 None,
                 source_marker.clone(),
-                Some(SELF_PERSON_ID.to_owned())
+                Some(SELF_PERSON_ID.to_owned()),
+                Some(SOURCE_MARKER_SEARCH_MAX_PAGES)
             )
         );
         assert_eq!(
@@ -1545,7 +1601,8 @@ mod tests {
                 OUTPUT_ROOM_ID.to_owned(),
                 Some("forward-1".to_owned()),
                 reply_marker.clone(),
-                Some(SELF_PERSON_ID.to_owned())
+                Some(SELF_PERSON_ID.to_owned()),
+                None
             )
         );
 
@@ -1745,6 +1802,23 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_source_markdown_keeps_marker_within_byte_limit() {
+        let marker = source_marker("message-1");
+        let message = Message {
+            markdown: Some("測".repeat(5_000)),
+            person_email: Some("sender@example.com".to_owned()),
+            ..Message::default()
+        };
+
+        let markdown = prepare_forward_markdown(&message, ROOM_ID, "message-1", &marker);
+
+        assert!(markdown.contains(&marker));
+        assert!(markdown.contains("[truncated]"));
+        assert!(markdown.len() <= FORWARD_MARKDOWN_LIMIT_BYTES);
+        assert!(markdown.is_char_boundary(markdown.len()));
+    }
+
+    #[test]
     fn reply_marker_hex_encodes_message_id() {
         let marker = reply_marker("message-->1");
 
@@ -1809,6 +1883,33 @@ mod tests {
             compact_jenkins_helper_output(output),
             "jenkins_readonly=true\ninfra_signals:\n- dns failure"
         );
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_runs_from_script_directory() {
+        let helper_dir = unique_state_path().with_extension("helper-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(&script, "printf 'pwd=%s\\n' \"$PWD\"\n").unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script: script.clone(),
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains(&format!("pwd={}", helper_dir.display())));
+        fs::remove_dir_all(helper_dir).unwrap();
     }
 
     #[test]
@@ -2014,12 +2115,14 @@ mod tests {
             parent_id: Option<&str>,
             marker: &str,
             self_person_id: Option<&str>,
+            max_pages: Option<usize>,
         ) -> Result<Option<Message>, WebexCallError> {
             self.marker_search_requests.lock().unwrap().push((
                 room_id.to_owned(),
                 parent_id.map(ToOwned::to_owned),
                 marker.to_owned(),
                 self_person_id.map(ToOwned::to_owned),
+                max_pages,
             ));
             self.marker_search_results
                 .lock()

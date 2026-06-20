@@ -45,9 +45,14 @@ message and replies under that mirror. Runtime write guards reject any attempt
 to create a Webex message in a configured read-only source room.
 
 For Jenkins triage rooms, `[rooms.jenkins_context]` can prefetch read-only
-diagnostics with `scripts/jenkins-readonly.mjs` and append the result to the
-Codex prompt. Codex then summarises the prefetched evidence without needing
-network access to Jenkins from inside its sandbox.
+diagnostics with a trusted helper script and append the result to the Codex
+prompt. Configure `script` as an absolute path outside any Codex workspace, for
+example `/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs`. The bot
+runs the helper from the helper script's directory, kills timed-out helpers, and
+requires `server.attempt_lease_secs` to cover the Codex timeout, Jenkins
+prefetch timeout budget, and Webex request margin. Codex then summarises the
+prefetched evidence without needing network access to Jenkins from inside its
+sandbox.
 
 Minimum environment:
 

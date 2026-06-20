@@ -134,15 +134,40 @@ impl BotConfig {
     }
 
     fn validate_attempt_lease(&self) -> Result<()> {
-        for (name, codex) in self.codex_configs() {
-            let minimum_lease = codex.timeout_secs.saturating_add(
-                WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT),
-            );
-            if minimum_lease >= self.server.attempt_lease_secs {
-                return Err(anyhow!(
-                    "server.attempt_lease_secs must be greater than codex.timeout_secs plus Webex request timeout margin for {name}"
-                ));
+        self.validate_attempt_lease_for("global codex", &self.codex, 0)?;
+        for room in &self.rooms {
+            let codex = self.codex_for_policy(room);
+            let jenkins_prefetch_secs = room
+                .jenkins_context
+                .as_ref()
+                .filter(|context| context.enabled)
+                .map(JenkinsContextConfig::max_prefetch_secs)
+                .unwrap_or(0);
+            if room.codex.is_some() || jenkins_prefetch_secs > 0 {
+                self.validate_attempt_lease_for(
+                    &format!("room {}", room.room_id),
+                    &codex,
+                    jenkins_prefetch_secs,
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_attempt_lease_for(
+        &self,
+        name: &str,
+        codex: &CodexConfig,
+        jenkins_prefetch_secs: u64,
+    ) -> Result<()> {
+        let minimum_lease = codex
+            .timeout_secs
+            .saturating_add(jenkins_prefetch_secs)
+            .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT));
+        if minimum_lease >= self.server.attempt_lease_secs {
+            return Err(anyhow!(
+                "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time and Webex request timeout margin for {name}"
+            ));
         }
         Ok(())
     }
@@ -553,7 +578,7 @@ impl Default for JenkinsContextConfig {
         Self {
             enabled: true,
             node_bin: "node".to_owned(),
-            script: PathBuf::from("scripts/jenkins-readonly.mjs"),
+            script: PathBuf::new(),
             env_file: PathBuf::from("/etc/webex-generic-account-bot/jenkins.env"),
             timeout_secs: 30,
             max_urls: 3,
@@ -567,6 +592,12 @@ impl JenkinsContextConfig {
         Duration::from_secs(self.timeout_secs.max(1))
     }
 
+    pub fn max_prefetch_secs(&self) -> u64 {
+        self.timeout_secs
+            .max(1)
+            .saturating_mul(self.max_urls as u64)
+    }
+
     fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -577,8 +608,14 @@ impl JenkinsContextConfig {
         if self.script.as_os_str().is_empty() {
             return Err(anyhow!("script must not be empty"));
         }
+        if !self.script.is_absolute() {
+            return Err(anyhow!("script must be an absolute path"));
+        }
         if self.env_file.as_os_str().is_empty() {
             return Err(anyhow!("env_file must not be empty"));
+        }
+        if !self.env_file.is_absolute() {
+            return Err(anyhow!("env_file must be an absolute path"));
         }
         if self.timeout_secs == 0 {
             return Err(anyhow!("timeout_secs must be greater than zero"));
@@ -873,6 +910,38 @@ allow_all_senders = true
     }
 
     #[test]
+    fn rejects_jenkins_prefetch_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 190
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+timeout_secs = 30
+max_urls = 3
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Jenkins prefetch time")
+        );
+    }
+
+    #[test]
     fn rejects_blank_self_person_id() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -1161,7 +1230,7 @@ room_id = "room-1"
 allow_all_senders = true
 
 [rooms.jenkins_context]
-script = "scripts/jenkins-readonly.mjs"
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 15
 max_urls = 2
@@ -1173,9 +1242,29 @@ output_limit_chars = 2048
         config.validate().unwrap();
         let jenkins_context = config.rooms[0].jenkins_context.as_ref().unwrap();
         assert!(jenkins_context.enabled);
+        assert!(jenkins_context.script.is_absolute());
         assert_eq!(jenkins_context.timeout_secs, 15);
         assert_eq!(jenkins_context.max_urls, 2);
         assert_eq!(jenkins_context.output_limit_chars, 2048);
+    }
+
+    #[test]
+    fn rejects_relative_jenkins_context_script() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("script must be an absolute path"));
     }
 
     #[test]

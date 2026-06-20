@@ -98,6 +98,7 @@ Source message:
 # layer and append them to the Codex prompt. This avoids requiring Codex sandbox
 # network access to Jenkins.
 [rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 30
 max_urls = 3
