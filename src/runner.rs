@@ -77,7 +77,7 @@ async fn run_codex_exec(
         )
     })?;
 
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("failed to open codex stdin"))?;
@@ -87,13 +87,12 @@ async fn run_codex_exec(
     let stderr_task = read_pipe(child.stderr.take(), capture_limit);
     let status = match timeout(
         config.timeout(),
-        write_prompt_and_wait(&mut child, &mut stdin, prompt),
+        write_prompt_and_wait(&mut child, stdin, prompt),
     )
     .await
     {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            drop(stdin);
             terminate_child(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
@@ -101,7 +100,6 @@ async fn run_codex_exec(
             return Err(error);
         }
         Err(_) => {
-            drop(stdin);
             terminate_child(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
@@ -112,8 +110,12 @@ async fn run_codex_exec(
             ));
         }
     };
-    let stdout = stdout_task.await??;
-    let stderr = stderr_task.await??;
+    let stdout = stdout_task
+        .await
+        .context("failed to join codex stdout reader")??;
+    let stderr = stderr_task
+        .await
+        .context("failed to join codex stderr reader")??;
     if !status.success() {
         let _ = fs::remove_file(&output_path).await;
         return Err(anyhow!(
@@ -136,7 +138,7 @@ async fn run_codex_exec(
 
 async fn write_prompt_and_wait(
     child: &mut Child,
-    stdin: &mut ChildStdin,
+    mut stdin: ChildStdin,
     prompt: &str,
 ) -> Result<ExitStatus> {
     stdin
@@ -144,6 +146,7 @@ async fn write_prompt_and_wait(
         .await
         .context("failed to write prompt to codex stdin")?;
     stdin.shutdown().await.ok();
+    drop(stdin);
     child
         .wait()
         .await
@@ -655,6 +658,45 @@ mod tests {
         let result = run_codex_exec(&config, &prompt, "message-stdin-timeout").await;
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
+
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_is_drained_while_child_runs() {
+        let root = temp_path("stdout-drain");
+        std_fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("fake-codex.sh");
+        std_fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+yes stdout | head -c 200000
+printf 'final from fake codex\n' > "$out"
+"#,
+        )
+        .unwrap();
+        std_fs::set_permissions(&fake_codex, std_fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config = CodexConfig {
+            bin: fake_codex.display().to_string(),
+            cwd: root.clone(),
+            timeout_secs: 5,
+            ..CodexConfig::default()
+        };
+        let result = run_codex_exec(&config, "prompt", "message-stdout-drain")
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_message, "final from fake codex");
 
         let _ = std_fs::remove_dir_all(root);
     }

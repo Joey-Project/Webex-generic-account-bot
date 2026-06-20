@@ -18,7 +18,7 @@ max_concurrent_requests = 4
 # Keep this longer than the expected Codex runtime and shorter than the sidecar
 # retry horizon. The JS sidecar's WEBEX_SIDECAR_FORWARD_TIMEOUT_MS should be
 # greater than codex.timeout_secs.
-attempt_lease_secs = 900
+attempt_lease_secs = 1200
 
 [webex]
 access_token_env = "WEBEX_ACCESS_TOKEN"
@@ -72,3 +72,34 @@ Handle this Webex command as Codex.
 Message:
 {body}
 """
+
+[[rooms]]
+name = "Production source mirrored to staging"
+room_id = "PRODUCTION_WEBEX_ROOM_ID"
+output_room_id = "STAGING_WEBEX_ROOM_ID"
+forward_source_message = true
+read_only_source = true
+trigger = "always"
+allowed_person_emails = ["trusted-sender@example.com"]
+prompt_template = """
+You are processing a read-only production Space message in staging mode.
+The bot must not reply in the production Space. It will first mirror the source
+message into the staging Space, then reply under that mirrored message.
+
+Room: {room_id}
+Message ID: {message_id}
+Sender: {person_email}
+
+Source message:
+{body}
+"""
+
+# Optional: for Jenkins triage rooms, prefetch read-only diagnostics in the bot
+# layer and append them to the Codex prompt. This avoids requiring Codex sandbox
+# network access to Jenkins.
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+timeout_secs = 30
+max_urls = 3
+output_limit_chars = 5000

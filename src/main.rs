@@ -1,4 +1,12 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    path::Path,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -14,14 +22,16 @@ use clap::Parser;
 use serde::Serialize;
 use serde_json::json;
 use tokio::{
+    io::AsyncReadExt,
     net::TcpListener,
+    process::{Child, Command},
     sync::{Mutex, Semaphore},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
     BotConfig, CodexRunner, ExecCodexRunner, MessageContext, TriggerMode, render_prompt,
-    should_trigger, webex::build_webex_client,
+    should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -32,6 +42,8 @@ use webex_headless_messenger::{
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
+const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
+const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -120,17 +132,34 @@ struct ReplyCreateContext<'a> {
     reply_chars: usize,
 }
 
+struct ForwardCreateContext<'a> {
+    message_id: &'a str,
+    output_room_id: &'a str,
+    source_marker: &'a str,
+}
+
+struct ReplyThread {
+    room_id: String,
+    parent_id: String,
+}
+
+enum ReplyThreadSetup {
+    Ready(ReplyThread),
+    Finished(BotAction),
+}
+
 #[async_trait]
 trait WebexApi: Send + Sync {
     async fn me(&self) -> Result<Person, WebexCallError>;
     async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError>;
     async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError>;
-    async fn find_reply_by_marker(
+    async fn find_message_by_marker(
         &self,
         room_id: &str,
-        parent_id: &str,
+        parent_id: Option<&str>,
         marker: &str,
         self_person_id: Option<&str>,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError>;
 }
 
@@ -170,32 +199,41 @@ impl WebexApi for WebexClient {
         }
     }
 
-    async fn find_reply_by_marker(
+    async fn find_message_by_marker(
         &self,
         room_id: &str,
-        parent_id: &str,
+        parent_id: Option<&str>,
         marker: &str,
         self_person_id: Option<&str>,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError> {
         let request = ListMessages {
             room_id: room_id.to_owned(),
-            parent_id: Some(parent_id.to_owned()),
+            parent_id: parent_id.map(ToOwned::to_owned),
             max: Some(100),
             ..ListMessages::default()
         };
         let mut page: Page<Message> =
             match timeout(WEBEX_REQUEST_TIMEOUT, self.list_messages(&request)).await {
                 Ok(Ok(page)) => page,
+                Ok(Err(error)) if parent_message_listing_is_empty(parent_id, &error) => {
+                    return Ok(None);
+                }
                 Ok(Err(error)) => return Err(WebexCallError::Client(error)),
                 Err(_) => return Err(WebexCallError::TimedOut),
             };
+        let mut pages_read = 0usize;
         loop {
+            pages_read = pages_read.saturating_add(1);
             if let Some(reply) = page
                 .items
                 .into_iter()
                 .find(|reply| reply_matches_marker(reply, marker, self_person_id))
             {
                 return Ok(Some(reply));
+            }
+            if max_pages.is_some_and(|limit| pages_read >= limit) {
+                return Ok(None);
             }
             let Some(next) = page.next else {
                 return Ok(None);
@@ -207,6 +245,290 @@ impl WebexApi for WebexClient {
             };
         }
     }
+}
+
+fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) -> bool {
+    parent_id.is_some()
+        && matches!(
+            error,
+            WebexError::Api(api) if api.status == StatusCode::NOT_FOUND.as_u16()
+        )
+}
+
+async fn jenkins_context_prompt(
+    policy: &webex_generic_account_bot::RoomPolicy,
+    context: &MessageContext,
+) -> Result<Option<String>> {
+    let Some(config) = &policy.jenkins_context else {
+        return Ok(None);
+    };
+    if !config.enabled {
+        return Ok(None);
+    }
+    let urls = extract_jenkins_urls(&context.body, config.max_urls);
+    if urls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut sections = Vec::new();
+    for url in urls {
+        let output = run_jenkins_context_helper(config, &url).await?;
+        sections.push(format!(
+            "URL: {url}\n```text\n{}\n```",
+            trim_to_chars(output.trim(), config.output_limit_chars)
+        ));
+    }
+
+    Ok(Some(format!(
+        "Prefetched Jenkins diagnostics (read-only helper output; use this instead of running Jenkins commands from Codex):\n\n{}",
+        sections.join("\n\n")
+    )))
+}
+
+async fn run_jenkins_context_helper(
+    config: &webex_generic_account_bot::JenkinsContextConfig,
+    url: &str,
+) -> Result<String> {
+    let mut command = Command::new(&config.node_bin);
+    let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
+    configure_jenkins_helper_process(&mut command);
+    apply_jenkins_helper_env(&mut command);
+    command
+        .arg(&config.script)
+        .arg("--env-file")
+        .arg(&config.env_file)
+        .arg("diagnose")
+        .arg("--url")
+        .arg(url)
+        .current_dir(script_dir)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn Jenkins diagnostics helper {}",
+            config.node_bin
+        )
+    })?;
+    #[cfg(unix)]
+    let process_group = child.id().map(|pid| -(pid as i32));
+    let capture_limit = helper_capture_limit_bytes(config.output_limit_chars);
+    let stdout_task = read_limited_pipe(child.stdout.take(), capture_limit);
+    let stderr_task = read_limited_pipe(child.stderr.take(), capture_limit);
+    let deadline = Instant::now() + config.timeout();
+    let status = match timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            terminate_jenkins_helper(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(error).context("failed to run Jenkins diagnostics helper");
+        }
+        Err(_) => {
+            terminate_jenkins_helper(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(anyhow!(
+                "Jenkins diagnostics helper timed out after {} seconds",
+                config.timeout_secs
+            ));
+        }
+    };
+    #[cfg(unix)]
+    terminate_jenkins_helper_process_group(process_group, SIGTERM);
+    let (stdout, stderr) =
+        match timeout_at(deadline, join_helper_output(stdout_task, stderr_task)).await {
+            Ok(output) => output?,
+            Err(_) => {
+                #[cfg(unix)]
+                terminate_jenkins_helper_process_group(process_group, SIGKILL);
+                return Err(anyhow!(
+                    "Jenkins diagnostics helper timed out after {} seconds",
+                    config.timeout_secs
+                ));
+            }
+        };
+
+    if status.success() {
+        return Ok(compact_jenkins_helper_output(&stdout));
+    }
+
+    Ok(format!(
+        "helper_exit_status={}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        compact_jenkins_helper_output(&stdout),
+        stderr
+    ))
+}
+
+async fn join_helper_output(
+    stdout_task: tokio::task::JoinHandle<Result<String>>,
+    stderr_task: tokio::task::JoinHandle<Result<String>>,
+) -> Result<(String, String)> {
+    let stdout = stdout_task
+        .await
+        .context("failed to join Jenkins stdout reader")??;
+    let stderr = stderr_task
+        .await
+        .context("failed to join Jenkins stderr reader")??;
+    Ok((stdout, stderr))
+}
+
+fn apply_jenkins_helper_env(command: &mut Command) {
+    command.env_clear();
+    for (key, value) in webex_generic_account_bot::runner::scrubbed_env() {
+        command.env(key, value);
+    }
+}
+
+fn configure_jenkins_helper_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+async fn terminate_jenkins_helper(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        terminate_jenkins_helper_group(child).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_jenkins_helper_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        let process_group = -(pid as i32);
+        terminate_jenkins_helper_process_group(Some(process_group), SIGTERM);
+        if timeout(Duration::from_millis(250), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        terminate_jenkins_helper_process_group(Some(process_group), SIGKILL);
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+fn terminate_jenkins_helper_process_group(process_group: Option<i32>, signal: i32) {
+    if let Some(process_group) = process_group {
+        unsafe {
+            kill(process_group, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn read_limited_pipe<R>(
+    pipe: Option<R>,
+    max_bytes: usize,
+) -> tokio::task::JoinHandle<Result<String>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut pipe) = pipe else {
+            return Ok(String::new());
+        };
+        read_limited(&mut pipe, max_bytes).await
+    })
+}
+
+async fn read_limited<R>(reader: &mut R, max_bytes: usize) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(kept.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let to_keep = read.min(remaining);
+        kept.extend_from_slice(&buffer[..to_keep]);
+        if to_keep < read {
+            truncated = true;
+        }
+    }
+    let mut value = String::from_utf8_lossy(&kept).to_string();
+    if truncated {
+        value.push_str("\n[truncated]");
+    }
+    Ok(value)
+}
+
+fn helper_capture_limit_bytes(output_limit_chars: usize) -> usize {
+    output_limit_chars
+        .max(1)
+        .saturating_mul(4)
+        .saturating_add(1024)
+}
+
+fn compact_jenkins_helper_output(output: &str) -> String {
+    let mut lines = Vec::new();
+    for line in output.lines() {
+        if line.trim() == "console_tail:" {
+            break;
+        }
+        lines.push(line);
+    }
+    let compacted = lines.join("\n").trim().to_owned();
+    if compacted.is_empty() {
+        output.trim().to_owned()
+    } else {
+        compacted
+    }
+}
+
+fn extract_jenkins_urls(body: &str, max_urls: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+    for token in body.split(|ch: char| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'')) {
+        let trimmed = token.trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']'));
+        let Some(rest) = trimmed.strip_prefix("https://engci-private-sjc.cisco.com/") else {
+            continue;
+        };
+        let url = format!(
+            "https://engci-private-sjc.cisco.com/{}",
+            rest.trim_end_matches([')', ']', '.', ',', ';', ':'])
+        );
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+        if urls.len() >= max_urls {
+            break;
+        }
+    }
+    urls
+}
+
+fn append_prefetched_context(prompt: &str, context: &str) -> String {
+    format!("{prompt}\n\n{context}")
 }
 
 impl BotApp {
@@ -310,8 +632,27 @@ impl BotApp {
             .clone()
             .unwrap_or_else(|| message_id.clone());
         let reply_marker = reply_marker(&message_id);
+        let reply_thread = match self
+            .prepare_reply_thread(
+                policy,
+                &message,
+                &message_id,
+                &room_id,
+                &parent_id,
+                &attempt,
+            )
+            .await?
+        {
+            ReplyThreadSetup::Ready(reply_thread) => reply_thread,
+            ReplyThreadSetup::Finished(action) => return Ok(action),
+        };
         match self
-            .find_existing_reply_by_marker(&room_id, &parent_id, &reply_marker)
+            .find_existing_message_by_marker(
+                &reply_thread.room_id,
+                Some(&reply_thread.parent_id),
+                &reply_marker,
+                None,
+            )
             .await
         {
             Ok(Some(reply)) => {
@@ -319,7 +660,7 @@ impl BotApp {
                 self.mark_processed(&attempt).await?;
                 return Ok(BotAction::replied(
                     message_id,
-                    room_id,
+                    reply_thread.room_id,
                     reply.id,
                     reply_chars,
                 ));
@@ -341,7 +682,20 @@ impl BotApp {
             ));
         };
         let codex_config = self.config.codex_for_policy(policy);
-        let prompt = render_prompt(&policy.prompt_template, &context);
+        let mut prompt = render_prompt(&policy.prompt_template, &context);
+        match jenkins_context_prompt(policy, &context).await {
+            Ok(Some(context_prompt)) => {
+                prompt = append_prefetched_context(&prompt, &context_prompt);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(message_id = %message_id, error = %error, "failed to prefetch Jenkins diagnostics");
+                prompt = append_prefetched_context(
+                    &prompt,
+                    &format!("Jenkins diagnostics helper failed before Codex run: {error}"),
+                );
+            }
+        }
         let reply_text = match self.runner.run(&codex_config, &prompt, &message_id).await {
             Ok(output) => output.final_message,
             Err(error) => {
@@ -350,7 +704,11 @@ impl BotApp {
             }
         };
         let reply_markdown = prepare_reply_markdown(&reply_text, &reply_marker);
-        let reply_request = reply_markdown_message(&room_id, parent_id, &reply_markdown);
+        let reply_request = reply_markdown_message(
+            &reply_thread.room_id,
+            &reply_thread.parent_id,
+            &reply_markdown,
+        );
         let reply = match self.create_message(&reply_request).await {
             Ok(reply) => reply,
             Err(error) => {
@@ -359,7 +717,7 @@ impl BotApp {
                         &attempt,
                         ReplyCreateContext {
                             message_id: &message_id,
-                            room_id: &room_id,
+                            room_id: &reply_thread.room_id,
                             parent_id: reply_request.parent_id.as_deref().unwrap_or(&message_id),
                             reply_marker: &reply_marker,
                             reply_chars: reply_markdown.len(),
@@ -369,7 +727,12 @@ impl BotApp {
                     .await;
             }
         };
-        let action = BotAction::replied(message_id, room_id, reply.id, reply_markdown.len());
+        let action = BotAction::replied(
+            message_id,
+            reply_thread.room_id,
+            reply.id,
+            reply_markdown.len(),
+        );
         if let Err(error) = self.mark_processed(&attempt).await {
             error!(
                 error = %error.message,
@@ -384,18 +747,111 @@ impl BotApp {
     }
 
     async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
+        if let Some(room_id) = request.room_id.as_deref() {
+            if self.config.room_is_read_only_source(room_id) {
+                return Err(WebexCallError::WriteBlocked(room_id.to_owned()));
+            }
+        }
         self.webex.create_message(request).await
     }
 
-    async fn find_existing_reply_by_marker(
+    async fn find_existing_message_by_marker(
         &self,
         room_id: &str,
-        parent_id: &str,
+        parent_id: Option<&str>,
         marker: &str,
+        max_pages: Option<usize>,
     ) -> Result<Option<Message>, WebexCallError> {
         self.webex
-            .find_reply_by_marker(room_id, parent_id, marker, self.self_person_id.as_deref())
+            .find_message_by_marker(
+                room_id,
+                parent_id,
+                marker,
+                self.self_person_id.as_deref(),
+                max_pages,
+            )
             .await
+    }
+
+    async fn prepare_reply_thread(
+        &self,
+        policy: &webex_generic_account_bot::RoomPolicy,
+        message: &Message,
+        message_id: &str,
+        source_room_id: &str,
+        source_parent_id: &str,
+        attempt: &AttemptLease,
+    ) -> Result<ReplyThreadSetup, HttpError> {
+        let Some(output_room_id) = policy.output_room_id.as_deref() else {
+            return Ok(ReplyThreadSetup::Ready(ReplyThread {
+                room_id: source_room_id.to_owned(),
+                parent_id: source_parent_id.to_owned(),
+            }));
+        };
+
+        let source_marker = source_marker(message_id);
+        match self
+            .find_existing_message_by_marker(
+                output_room_id,
+                None,
+                &source_marker,
+                source_marker_search_max_pages(message, self.config.server.attempt_lease()),
+            )
+            .await
+        {
+            Ok(Some(forward)) => {
+                if let Some(parent_id) = forward.id {
+                    return Ok(ReplyThreadSetup::Ready(ReplyThread {
+                        room_id: output_room_id.to_owned(),
+                        parent_id,
+                    }));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return self
+                    .handle_forward_reconciliation_failure(
+                        attempt,
+                        message_id,
+                        output_room_id,
+                        error,
+                    )
+                    .await;
+            }
+        }
+
+        let forward_markdown =
+            prepare_forward_markdown(message, source_room_id, message_id, &source_marker);
+        let forward_request = top_level_markdown_message(output_room_id, &forward_markdown);
+        match self.create_message(&forward_request).await {
+            Ok(forward) => match forward.id {
+                Some(parent_id) => Ok(ReplyThreadSetup::Ready(ReplyThread {
+                    room_id: output_room_id.to_owned(),
+                    parent_id,
+                })),
+                None => {
+                    self.defer_attempt(attempt, self.config.server.attempt_lease())
+                        .await?;
+                    Err(HttpError::retry_after(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("forwarded Webex source message {message_id} had no message id"),
+                        self.config.server.attempt_lease(),
+                    ))
+                }
+            },
+            Err(error) => {
+                self.handle_forward_create_failure(
+                    attempt,
+                    ForwardCreateContext {
+                        message_id,
+                        output_room_id,
+                        source_marker: &source_marker,
+                    },
+                    error,
+                )
+                .await
+            }
+        }
     }
 
     async fn handle_get_message_failure(
@@ -454,6 +910,85 @@ impl BotApp {
         }
     }
 
+    async fn handle_forward_reconciliation_failure(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        output_room_id: &str,
+        error: WebexCallError,
+    ) -> Result<ReplyThreadSetup, HttpError> {
+        match classify_webex_failure(&error, self.config.server.attempt_lease()) {
+            WebexFailureAction::Stop => {
+                warn!(message_id = %message_id, output_room_id = %output_room_id, error = %error, "failed to reconcile forwarded source message before Codex run");
+                self.mark_processed(attempt).await?;
+                Ok(ReplyThreadSetup::Finished(BotAction::ignored(
+                    "source_forward_reconciliation_failed",
+                    Some(message_id.to_owned()),
+                    Some(output_room_id.to_owned()),
+                )))
+            }
+            WebexFailureAction::Retry(retry_after) => {
+                self.defer_attempt(attempt, retry_after).await?;
+                Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("failed to reconcile forwarded source message {message_id}: {error}"),
+                    retry_after,
+                ))
+            }
+        }
+    }
+
+    async fn handle_forward_create_failure(
+        &self,
+        attempt: &AttemptLease,
+        context: ForwardCreateContext<'_>,
+        error: WebexCallError,
+    ) -> Result<ReplyThreadSetup, HttpError> {
+        match classify_webex_create_failure(&error, self.config.server.attempt_lease()) {
+            WebexFailureAction::Stop => {
+                self.mark_processed(attempt).await?;
+                Ok(ReplyThreadSetup::Finished(BotAction::ignored(
+                    "source_forward_rejected",
+                    Some(context.message_id.to_owned()),
+                    Some(context.output_room_id.to_owned()),
+                )))
+            }
+            WebexFailureAction::Retry(retry_after) => {
+                match self
+                    .find_existing_message_by_marker(
+                        context.output_room_id,
+                        None,
+                        context.source_marker,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some(forward)) => {
+                        if let Some(parent_id) = forward.id {
+                            return Ok(ReplyThreadSetup::Ready(ReplyThread {
+                                room_id: context.output_room_id.to_owned(),
+                                parent_id,
+                            }));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(message_id = %context.message_id, output_room_id = %context.output_room_id, error = %error, "failed to reconcile forwarded source message after create failure");
+                    }
+                }
+                self.defer_attempt(attempt, retry_after).await?;
+                Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "failed to forward Webex source message {}: {error}",
+                        context.message_id
+                    ),
+                    retry_after,
+                ))
+            }
+        }
+    }
+
     async fn handle_create_message_failure(
         &self,
         attempt: &AttemptLease,
@@ -471,10 +1006,11 @@ impl BotApp {
             }
             WebexFailureAction::Retry(retry_after) => {
                 match self
-                    .find_existing_reply_by_marker(
+                    .find_existing_message_by_marker(
                         context.room_id,
-                        context.parent_id,
+                        Some(context.parent_id),
                         context.reply_marker,
+                        None,
                     )
                     .await
                 {
@@ -641,6 +1177,7 @@ impl BotAction {
 enum WebexCallError {
     Client(WebexError),
     TimedOut,
+    WriteBlocked(String),
 }
 
 impl std::fmt::Display for WebexCallError {
@@ -648,6 +1185,12 @@ impl std::fmt::Display for WebexCallError {
         match self {
             Self::Client(error) => write!(formatter, "{error}"),
             Self::TimedOut => write!(formatter, "request timed out after 30 seconds"),
+            Self::WriteBlocked(room_id) => {
+                write!(
+                    formatter,
+                    "write blocked for read-only source room {room_id}"
+                )
+            }
         }
     }
 }
@@ -665,6 +1208,7 @@ fn classify_webex_failure(error: &WebexCallError, default_retry: Duration) -> We
             classify_webex_api_error(api, default_retry)
         }
         WebexCallError::Client(_) => WebexFailureAction::Retry(default_retry),
+        WebexCallError::WriteBlocked(_) => WebexFailureAction::Stop,
     }
 }
 
@@ -793,6 +1337,9 @@ async fn resolve_self_person_id(
             anyhow!("timed out resolving Webex people/me after 30 seconds")
         }
         WebexCallError::Client(error) => anyhow!("failed to resolve Webex people/me: {error}"),
+        WebexCallError::WriteBlocked(room_id) => {
+            anyhow!("failed to resolve Webex people/me: write blocked for {room_id}")
+        }
     })?;
     Ok(me.id)
 }
@@ -841,21 +1388,122 @@ fn message_needs_hydration(
         || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
 }
 
+fn source_marker_search_max_pages(message: &Message, recovery_age: Duration) -> Option<usize> {
+    if message_is_at_least_age(message, recovery_age) {
+        None
+    } else {
+        Some(SOURCE_MARKER_SEARCH_MAX_PAGES)
+    }
+}
+
+fn message_is_at_least_age(message: &Message, min_age: Duration) -> bool {
+    let Some(created) = message.created else {
+        return false;
+    };
+    let created_ms = created.timestamp_millis();
+    if created_ms < 0 {
+        return true;
+    }
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    now.as_millis().saturating_sub(created_ms as u128) >= min_age.as_millis()
+}
+
 fn sanitize_reply_markdown(markdown: &str) -> String {
     markdown.replace("<@", "&lt;@")
 }
 
 fn reply_marker(message_id: &str) -> String {
-    let encoded_id = message_id
+    format!("wgb-ref:{}", marker_hex(message_id))
+}
+
+fn source_marker(message_id: &str) -> String {
+    format!("wgb-source-ref:{}", marker_hex(message_id))
+}
+
+fn marker_hex(message_id: &str) -> String {
+    message_id
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("wgb-ref:{encoded_id}")
+        .collect::<String>()
+}
+
+fn hidden_marker_comment(marker: &str) -> String {
+    format!("<!-- {marker} -->")
+}
+
+fn prepare_forward_markdown(
+    message: &Message,
+    source_room_id: &str,
+    message_id: &str,
+    marker: &str,
+) -> String {
+    let sender = message
+        .person_email
+        .as_deref()
+        .or(message.person_id.as_deref())
+        .unwrap_or("unknown");
+    let prefix = format!(
+        "**Forwarded Webex message for staging triage**\n\nSource room: `{source_room_id}`\nSource message: `{message_id}`\nSender: `{sender}`\n\n"
+    );
+    let suffix = format!("\n\n{}", hidden_marker_comment(marker));
+    let body_limit = FORWARD_MARKDOWN_LIMIT_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix.len())
+        .max(1);
+    let body = sanitize_reply_markdown(
+        message
+            .markdown
+            .as_deref()
+            .or(message.text.as_deref())
+            .or(message.html.as_deref())
+            .unwrap_or(""),
+    );
+    let quoted_body = if body.trim().is_empty() {
+        "> [empty message]".to_owned()
+    } else {
+        body.lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    ">".to_owned()
+                } else {
+                    format!("> {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let quoted_body = trim_to_utf8_bytes(&quoted_body, body_limit);
+    format!("{prefix}{quoted_body}{suffix}")
+}
+
+fn trim_to_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    const SUFFIX: &str = "\n[truncated]";
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if max_bytes <= SUFFIX.len() {
+        return SUFFIX[..max_bytes].to_owned();
+    }
+    let visible_limit = max_bytes - SUFFIX.len();
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > visible_limit {
+            break;
+        }
+        end = next;
+    }
+    format!("{}{}", &value[..end], SUFFIX)
 }
 
 fn prepare_reply_markdown(markdown: &str, marker: &str) -> String {
-    let marker_footer = format!("_Ref: `{marker}`_");
+    let marker_footer = hidden_marker_comment(marker);
     let marker_chars = marker_footer.chars().count().saturating_add(2);
     let truncation_suffix = "\n[truncated]".chars().count();
     let visible_limit = REPLY_LIMIT_CHARS
@@ -913,6 +1561,17 @@ fn reply_markdown_message(
     }
 }
 
+fn top_level_markdown_message(
+    room_id: impl Into<String>,
+    markdown: impl Into<String>,
+) -> CreateMessage {
+    CreateMessage {
+        room_id: Some(room_id.into()),
+        markdown: Some(markdown.into()),
+        ..CreateMessage::default()
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -959,10 +1618,17 @@ mod tests {
     use webex_generic_account_bot::CodexRunOutput;
 
     const ROOM_ID: &str = "room-1";
+    const OUTPUT_ROOM_ID: &str = "staging-room-1";
     const SELF_PERSON_ID: &str = "bot-person";
     const SENDER_PERSON_ID: &str = "sender-person";
     const SENDER_EMAIL: &str = "sender@example.com";
-    type ReplySearchRequest = (String, String, String, Option<String>);
+    type MarkerSearchRequest = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<usize>,
+    );
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test]
@@ -1075,8 +1741,170 @@ mod tests {
         assert_eq!(action.reply_id.as_deref(), Some("reply-after-timeout"));
         assert_eq!(harness.runner.calls().len(), 1);
         assert_eq!(harness.webex.created_requests().len(), 1);
-        assert_eq!(harness.webex.reply_searches().len(), 2);
+        assert_eq!(harness.webex.marker_searches().len(), 2);
         assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn staging_policy_forwards_source_then_replies_under_output_message() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+        let source_marker = source_marker("message-1");
+        let reply_marker = reply_marker("message-1");
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("forward-1", OUTPUT_ROOM_ID)));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("reply-1", OUTPUT_ROOM_ID)));
+        harness
+            .runner
+            .push_output("**Jenkins infra false alarm:** DNS issue [log](https://example/log)");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed at https://example/job/1",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
+        let searches = harness.webex.marker_searches();
+        assert_eq!(searches.len(), 2);
+        assert_eq!(
+            searches[0],
+            (
+                OUTPUT_ROOM_ID.to_owned(),
+                None,
+                source_marker.clone(),
+                Some(SELF_PERSON_ID.to_owned()),
+                Some(SOURCE_MARKER_SEARCH_MAX_PAGES)
+            )
+        );
+        assert_eq!(
+            searches[1],
+            (
+                OUTPUT_ROOM_ID.to_owned(),
+                Some("forward-1".to_owned()),
+                reply_marker.clone(),
+                Some(SELF_PERSON_ID.to_owned()),
+                None
+            )
+        );
+
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(created[0].parent_id, None);
+        let forward_markdown = created[0].markdown.as_deref().unwrap();
+        assert!(forward_markdown.contains("Forwarded Webex message"));
+        assert!(forward_markdown.contains("Source room: `room-1`"));
+        assert!(forward_markdown.contains("Source message: `message-1`"));
+        assert!(forward_markdown.contains("Jenkins failed"));
+        assert!(forward_markdown.contains(&source_marker));
+        assert!(!forward_markdown.contains("_Ref:"));
+        assert!(forward_markdown.contains("<!-- wgb-source-ref:"));
+        assert_eq!(created[1].room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(created[1].parent_id.as_deref(), Some("forward-1"));
+        let reply_markdown = created[1].markdown.as_deref().unwrap();
+        assert!(reply_markdown.contains(&reply_marker));
+        assert!(!reply_markdown.contains("_Ref:"));
+        assert!(reply_markdown.contains("<!-- wgb-ref:"));
+        assert!(
+            created
+                .iter()
+                .all(|request| request.room_id.as_deref() != Some(ROOM_ID))
+        );
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn staging_policy_reuses_existing_forward_and_reply_without_codex_run() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+        harness.webex.push_reply_search(Ok(vec![message_with_marker(
+            "forward-existing",
+            OUTPUT_ROOM_ID,
+            &source_marker("message-1"),
+        )]));
+        harness.webex.push_reply_search(Ok(vec![message_with_marker(
+            "reply-existing",
+            OUTPUT_ROOM_ID,
+            &reply_marker("message-1"),
+        )]));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "already mirrored",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(action.reply_id.as_deref(), Some("reply-existing"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn old_staging_source_uses_unbounded_source_marker_search() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+        let source_marker = source_marker("message-1");
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("forward-1", OUTPUT_ROOM_ID)));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("reply-1", OUTPUT_ROOM_ID)));
+        harness.runner.push_output("done");
+        let mut message = inbound_message("message-1", "old Jenkins failure");
+        message.created = Some(serde_json::from_str("\"1970-01-01T00:00:00Z\"").unwrap());
+
+        harness
+            .app
+            .process_event(message_event(message))
+            .await
+            .unwrap();
+
+        let searches = harness.webex.marker_searches();
+        assert_eq!(
+            searches[0],
+            (
+                OUTPUT_ROOM_ID.to_owned(),
+                None,
+                source_marker,
+                Some(SELF_PERSON_ID.to_owned()),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_source_guard_blocks_writes_to_source_room() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+
+        let error = harness
+            .app
+            .create_message(&top_level_markdown_message(ROOM_ID, "must not write"))
+            .await
+            .unwrap_err();
+
+        match error {
+            WebexCallError::WriteBlocked(room_id) => assert_eq!(room_id, ROOM_ID),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(harness.webex.created_requests().is_empty());
     }
 
     #[test]
@@ -1200,6 +2028,23 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_source_markdown_keeps_marker_within_byte_limit() {
+        let marker = source_marker("message-1");
+        let message = Message {
+            markdown: Some("測".repeat(5_000)),
+            person_email: Some("sender@example.com".to_owned()),
+            ..Message::default()
+        };
+
+        let markdown = prepare_forward_markdown(&message, ROOM_ID, "message-1", &marker);
+
+        assert!(markdown.contains(&marker));
+        assert!(markdown.contains("[truncated]"));
+        assert!(markdown.len() <= FORWARD_MARKDOWN_LIMIT_BYTES);
+        assert!(markdown.is_char_boundary(markdown.len()));
+    }
+
+    #[test]
     fn reply_marker_hex_encodes_message_id() {
         let marker = reply_marker("message-->1");
 
@@ -1234,6 +2079,171 @@ mod tests {
     }
 
     #[test]
+    fn extract_jenkins_urls_deduplicates_and_trims_punctuation() {
+        let body = "job <https://engci-private-sjc.cisco.com/jenkins/job/a/1/>, \
+            duplicate https://engci-private-sjc.cisco.com/jenkins/job/a/1/. \
+            next https://engci-private-sjc.cisco.com/jenkins/job/b/2/)";
+
+        assert_eq!(
+            extract_jenkins_urls(body, 2),
+            vec![
+                "https://engci-private-sjc.cisco.com/jenkins/job/a/1/".to_owned(),
+                "https://engci-private-sjc.cisco.com/jenkins/job/b/2/".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn append_prefetched_context_keeps_original_prompt() {
+        let prompt = append_prefetched_context("base prompt", "diagnostics");
+
+        assert_eq!(prompt, "base prompt\n\ndiagnostics");
+    }
+
+    #[test]
+    fn compact_jenkins_helper_output_drops_console_tail() {
+        let output =
+            "jenkins_readonly=true\ninfra_signals:\n- dns failure\n\nconsole_tail:\nraw log";
+
+        assert_eq!(
+            compact_jenkins_helper_output(output),
+            "jenkins_readonly=true\ninfra_signals:\n- dns failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_runs_from_script_directory() {
+        let helper_dir = unique_state_path().with_extension("helper-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(&script, "printf 'pwd=%s\\n' \"$PWD\"\n").unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script: script.clone(),
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains(&format!("pwd={}", helper_dir.display())));
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_uses_scrubbed_environment() {
+        unsafe {
+            env::set_var("WEBEX_ACCESS_TOKEN", "secret-webex-token");
+            env::set_var("WEBEX_SIDECAR_TOKEN", "secret-sidecar-token");
+        }
+        let helper_dir = unique_state_path().with_extension("helper-env-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "printf 'webex=%s\\n' \"${WEBEX_ACCESS_TOKEN-unset}\"\n\
+             printf 'sidecar=%s\\n' \"${WEBEX_SIDECAR_TOKEN-unset}\"\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains("webex=unset"));
+        assert!(output.contains("sidecar=unset"));
+        assert!(!output.contains("secret-webex-token"));
+        assert!(!output.contains("secret-sidecar-token"));
+        unsafe {
+            env::remove_var("WEBEX_ACCESS_TOKEN");
+            env::remove_var("WEBEX_SIDECAR_TOKEN");
+        }
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_output_is_bounded_before_compaction() {
+        let helper_dir = unique_state_path().with_extension("helper-output-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "i=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 8,
+            enabled: true,
+        };
+
+        let output =
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
+                .await
+                .unwrap();
+
+        assert!(output.contains("[truncated]"));
+        assert!(output.len() < 1_200);
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_kills_process_group_before_joining_pipes() {
+        let helper_dir = unique_state_path().with_extension("helper-pipe-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(&script, "sleep 5 &\nprintf 'parent_done\\n'\n").unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 1,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output = timeout(
+            Duration::from_secs(2),
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(output.contains("parent_done"));
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[test]
     fn webex_404_errors_stop_retries() {
         let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(404, None))));
 
@@ -1241,6 +2251,14 @@ mod tests {
             classify_webex_failure(&error, Duration::from_secs(30)),
             WebexFailureAction::Stop
         );
+    }
+
+    #[test]
+    fn parent_message_listing_404_is_empty_only_for_parent_searches() {
+        let error = WebexError::Api(Box::new(api_error(404, None)));
+
+        assert!(parent_message_listing_is_empty(Some("parent-1"), &error));
+        assert!(!parent_message_listing_is_empty(None, &error));
     }
 
     #[test]
@@ -1334,7 +2352,11 @@ mod tests {
     impl TestHarness {
         fn new() -> Self {
             let state_path = unique_state_path();
-            let config = test_config(state_path.clone());
+            Self::with_config(test_config(state_path))
+        }
+
+        fn with_config(config: Arc<BotConfig>) -> Self {
+            let state_path = config.state_file.clone();
             let state = JsonlStateStore::load(config.state_file.clone()).unwrap();
             let webex = Arc::new(FakeWebex::default());
             let runner = Arc::new(FakeRunner::default());
@@ -1372,15 +2394,15 @@ mod tests {
 
     #[derive(Default)]
     struct FakeWebex {
-        reply_search_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
+        marker_search_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
         create_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
         created_requests: StdMutex<Vec<CreateMessage>>,
-        reply_search_requests: StdMutex<Vec<ReplySearchRequest>>,
+        marker_search_requests: StdMutex<Vec<MarkerSearchRequest>>,
     }
 
     impl FakeWebex {
         fn push_reply_search(&self, result: Result<Vec<Message>, WebexCallError>) {
-            self.reply_search_results.lock().unwrap().push_back(result);
+            self.marker_search_results.lock().unwrap().push_back(result);
         }
 
         fn push_create_result(&self, result: Result<Message, WebexCallError>) {
@@ -1391,8 +2413,8 @@ mod tests {
             self.created_requests.lock().unwrap().clone()
         }
 
-        fn reply_searches(&self) -> Vec<ReplySearchRequest> {
-            self.reply_search_requests.lock().unwrap().clone()
+        fn marker_searches(&self) -> Vec<MarkerSearchRequest> {
+            self.marker_search_requests.lock().unwrap().clone()
         }
     }
 
@@ -1418,20 +2440,22 @@ mod tests {
                 .unwrap_or_else(|| Ok(reply_message("reply-default")))
         }
 
-        async fn find_reply_by_marker(
+        async fn find_message_by_marker(
             &self,
             room_id: &str,
-            parent_id: &str,
+            parent_id: Option<&str>,
             marker: &str,
             self_person_id: Option<&str>,
+            max_pages: Option<usize>,
         ) -> Result<Option<Message>, WebexCallError> {
-            self.reply_search_requests.lock().unwrap().push((
+            self.marker_search_requests.lock().unwrap().push((
                 room_id.to_owned(),
-                parent_id.to_owned(),
+                parent_id.map(ToOwned::to_owned),
                 marker.to_owned(),
                 self_person_id.map(ToOwned::to_owned),
+                max_pages,
             ));
-            self.reply_search_results
+            self.marker_search_results
                 .lock()
                 .unwrap()
                 .pop_front()
@@ -1519,6 +2543,37 @@ mod tests {
         Arc::new(config)
     }
 
+    fn staging_test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let config = BotConfig {
+            state_file: state_path,
+            self_person_id: Some(SELF_PERSON_ID.to_owned()),
+            server: webex_generic_account_bot::ServerConfig {
+                allow_unauthenticated: true,
+                attempt_lease_secs: 420,
+                ..webex_generic_account_bot::ServerConfig::default()
+            },
+            codex: webex_generic_account_bot::CodexConfig {
+                cwd: PathBuf::from("/tmp/webex-generic-account-bot-work"),
+                codex_home: PathBuf::from("/tmp/webex-generic-account-bot-codex-home"),
+                timeout_secs: 30,
+                ..webex_generic_account_bot::CodexConfig::default()
+            },
+            rooms: vec![webex_generic_account_bot::RoomPolicy {
+                room_id: ROOM_ID.to_owned(),
+                output_room_id: Some(OUTPUT_ROOM_ID.to_owned()),
+                forward_source_message: true,
+                read_only_source: true,
+                trigger: TriggerMode::Always,
+                allow_all_senders: true,
+                prompt_template: "Message {message_id}: {body}".to_owned(),
+                ..webex_generic_account_bot::RoomPolicy::default()
+            }],
+            ..BotConfig::default()
+        };
+        config.validate().unwrap();
+        Arc::new(config)
+    }
+
     fn unique_state_path() -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -1548,18 +2603,26 @@ mod tests {
     }
 
     fn reply_message(reply_id: &str) -> Message {
+        message_with_room(reply_id, ROOM_ID)
+    }
+
+    fn message_with_room(message_id: &str, room_id: &str) -> Message {
         Message {
-            id: Some(reply_id.to_owned()),
-            room_id: Some(ROOM_ID.to_owned()),
+            id: Some(message_id.to_owned()),
+            room_id: Some(room_id.to_owned()),
             person_id: Some(SELF_PERSON_ID.to_owned()),
             ..Message::default()
         }
     }
 
     fn reply_with_marker(reply_id: &str, marker: &str) -> Message {
+        message_with_marker(reply_id, ROOM_ID, marker)
+    }
+
+    fn message_with_marker(message_id: &str, room_id: &str, marker: &str) -> Message {
         Message {
-            id: Some(reply_id.to_owned()),
-            room_id: Some(ROOM_ID.to_owned()),
+            id: Some(message_id.to_owned()),
+            room_id: Some(room_id.to_owned()),
             person_id: Some(SELF_PERSON_ID.to_owned()),
             markdown: Some(format!("done\n\n_Ref: `{marker}`_")),
             ..Message::default()

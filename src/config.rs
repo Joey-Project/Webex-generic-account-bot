@@ -11,6 +11,9 @@ use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
+const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
+    STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -83,6 +86,12 @@ impl BotConfig {
         self.rooms.iter().find(|policy| policy.room_id == room_id)
     }
 
+    pub fn room_is_read_only_source(&self, room_id: &str) -> bool {
+        self.rooms
+            .iter()
+            .any(|policy| policy.read_only_source && policy.room_id == room_id)
+    }
+
     pub fn codex_for_policy(&self, policy: &RoomPolicy) -> CodexConfig {
         policy
             .codex
@@ -124,19 +133,82 @@ impl BotConfig {
                 ));
             }
         }
+        for room in &self.rooms {
+            let Some(jenkins_context) = room
+                .jenkins_context
+                .as_ref()
+                .filter(|jenkins_context| jenkins_context.enabled)
+            else {
+                continue;
+            };
+            let codex = self.codex_for_policy(room);
+            let name = format!("room {}", room.room_id);
+            if path_is_inside(&jenkins_context.script, &codex.cwd) {
+                return Err(anyhow!(
+                    "rooms[{}].jenkins_context.script {} must not be inside codex cwd {} ({name})",
+                    room.room_id,
+                    jenkins_context.script.display(),
+                    codex.cwd.display()
+                ));
+            }
+            if path_is_inside(&jenkins_context.env_file, &codex.cwd) {
+                return Err(anyhow!(
+                    "rooms[{}].jenkins_context.env_file {} must not be inside codex cwd {} ({name})",
+                    room.room_id,
+                    jenkins_context.env_file.display(),
+                    codex.cwd.display()
+                ));
+            }
+        }
         Ok(())
     }
 
     fn validate_attempt_lease(&self) -> Result<()> {
-        for (name, codex) in self.codex_configs() {
-            let minimum_lease = codex.timeout_secs.saturating_add(
-                WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT),
-            );
-            if minimum_lease >= self.server.attempt_lease_secs {
-                return Err(anyhow!(
-                    "server.attempt_lease_secs must be greater than codex.timeout_secs plus Webex request timeout margin for {name}"
-                ));
+        self.validate_attempt_lease_for(
+            "global codex",
+            &self.codex,
+            0,
+            WEBEX_REQUESTS_PER_ATTEMPT,
+        )?;
+        for room in &self.rooms {
+            let codex = self.codex_for_policy(room);
+            let jenkins_prefetch_secs = room
+                .jenkins_context
+                .as_ref()
+                .filter(|context| context.enabled)
+                .map(JenkinsContextConfig::max_prefetch_secs)
+                .unwrap_or(0);
+            let webex_requests = room.webex_requests_per_attempt();
+            if room.codex.is_some()
+                || jenkins_prefetch_secs > 0
+                || webex_requests > WEBEX_REQUESTS_PER_ATTEMPT
+            {
+                self.validate_attempt_lease_for(
+                    &format!("room {}", room.room_id),
+                    &codex,
+                    jenkins_prefetch_secs,
+                    webex_requests,
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_attempt_lease_for(
+        &self,
+        name: &str,
+        codex: &CodexConfig,
+        jenkins_prefetch_secs: u64,
+        webex_requests: u64,
+    ) -> Result<()> {
+        let minimum_lease = codex
+            .timeout_secs
+            .saturating_add(jenkins_prefetch_secs)
+            .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(webex_requests));
+        if minimum_lease >= self.server.attempt_lease_secs {
+            return Err(anyhow!(
+                "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time and Webex request timeout margin for {name}"
+            ));
         }
         Ok(())
     }
@@ -418,6 +490,10 @@ pub enum IsolationMode {
 pub struct RoomPolicy {
     pub room_id: String,
     pub name: Option<String>,
+    pub output_room_id: Option<String>,
+    pub forward_source_message: bool,
+    pub read_only_source: bool,
+    pub jenkins_context: Option<JenkinsContextConfig>,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
     pub allow_all_senders: bool,
@@ -432,6 +508,10 @@ impl Default for RoomPolicy {
         Self {
             room_id: String::new(),
             name: None,
+            output_room_id: None,
+            forward_source_message: false,
+            read_only_source: false,
+            jenkins_context: None,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
             allow_all_senders: false,
@@ -447,6 +527,38 @@ impl RoomPolicy {
     fn validate(&self) -> Result<()> {
         if self.room_id.trim().is_empty() {
             return Err(anyhow!("rooms.room_id must not be empty"));
+        }
+        if let Some(output_room_id) = &self.output_room_id {
+            if output_room_id.trim().is_empty() {
+                return Err(anyhow!(
+                    "rooms[{}].output_room_id must not be empty when set",
+                    self.room_id
+                ));
+            }
+            if output_room_id == &self.room_id {
+                return Err(anyhow!(
+                    "rooms[{}].output_room_id must differ from room_id",
+                    self.room_id
+                ));
+            }
+            if !self.forward_source_message {
+                return Err(anyhow!(
+                    "rooms[{}].forward_source_message = true is required when output_room_id is set",
+                    self.room_id
+                ));
+            }
+        }
+        if self.read_only_source && self.output_room_id.is_none() {
+            return Err(anyhow!(
+                "rooms[{}].read_only_source requires output_room_id",
+                self.room_id
+            ));
+        }
+        if self.forward_source_message && self.output_room_id.is_none() {
+            return Err(anyhow!(
+                "rooms[{}].forward_source_message requires output_room_id",
+                self.room_id
+            ));
         }
         if !self.allow_all_senders
             && self.allowed_person_ids.is_empty()
@@ -480,6 +592,88 @@ impl RoomPolicy {
                 "rooms[{}].prompt_template must not be empty",
                 self.room_id
             ));
+        }
+        if let Some(jenkins_context) = &self.jenkins_context {
+            jenkins_context
+                .validate()
+                .with_context(|| format!("invalid jenkins_context for room {}", self.room_id))?;
+        }
+        Ok(())
+    }
+
+    fn webex_requests_per_attempt(&self) -> u64 {
+        let mut requests = WEBEX_REQUESTS_PER_ATTEMPT;
+        if self.output_room_id.is_some() {
+            requests = requests.saturating_add(STAGING_WEBEX_REQUESTS_PER_ATTEMPT);
+        }
+        requests
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JenkinsContextConfig {
+    pub enabled: bool,
+    pub node_bin: String,
+    pub script: PathBuf,
+    pub env_file: PathBuf,
+    pub timeout_secs: u64,
+    pub max_urls: usize,
+    pub output_limit_chars: usize,
+}
+
+impl Default for JenkinsContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            node_bin: "node".to_owned(),
+            script: PathBuf::new(),
+            env_file: PathBuf::from("/etc/webex-generic-account-bot/jenkins.env"),
+            timeout_secs: 30,
+            max_urls: 3,
+            output_limit_chars: 12_000,
+        }
+    }
+}
+
+impl JenkinsContextConfig {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.max(1))
+    }
+
+    pub fn max_prefetch_secs(&self) -> u64 {
+        self.timeout_secs
+            .max(1)
+            .saturating_mul(self.max_urls as u64)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_bin.trim().is_empty() {
+            return Err(anyhow!("node_bin must not be empty"));
+        }
+        if self.script.as_os_str().is_empty() {
+            return Err(anyhow!("script must not be empty"));
+        }
+        if !self.script.is_absolute() {
+            return Err(anyhow!("script must be an absolute path"));
+        }
+        if self.env_file.as_os_str().is_empty() {
+            return Err(anyhow!("env_file must not be empty"));
+        }
+        if !self.env_file.is_absolute() {
+            return Err(anyhow!("env_file must be an absolute path"));
+        }
+        if self.timeout_secs == 0 {
+            return Err(anyhow!("timeout_secs must be greater than zero"));
+        }
+        if self.max_urls == 0 {
+            return Err(anyhow!("max_urls must be greater than zero"));
+        }
+        if self.output_limit_chars == 0 {
+            return Err(anyhow!("output_limit_chars must be greater than zero"));
         }
         Ok(())
     }
@@ -765,6 +959,67 @@ allow_all_senders = true
     }
 
     #[test]
+    fn rejects_jenkins_prefetch_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 190
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+timeout_secs = 30
+max_urls = 3
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Jenkins prefetch time")
+        );
+    }
+
+    #[test]
+    fn rejects_staging_webex_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 400
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "production-room"
+output_room_id = "staging-room"
+forward_source_message = true
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
     fn rejects_blank_self_person_id() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -958,6 +1213,185 @@ allow_all_senders = true
                 .to_string()
                 .contains("duplicate rooms.room_id")
         );
+    }
+
+    #[test]
+    fn output_room_requires_forward_source_message() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-2"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("forward_source_message")
+        );
+    }
+
+    #[test]
+    fn read_only_source_requires_output_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("read_only_source")
+        );
+    }
+
+    #[test]
+    fn output_room_must_differ_from_source_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-1"
+forward_source_message = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must differ")
+        );
+    }
+
+    #[test]
+    fn parses_staging_output_room_policy() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 1200
+
+[[rooms]]
+room_id = "room-1"
+output_room_id = "room-2"
+forward_source_message = true
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert!(config.room_is_read_only_source("room-1"));
+        assert!(!config.room_is_read_only_source("room-2"));
+        assert_eq!(config.rooms[0].output_room_id.as_deref(), Some("room-2"));
+    }
+
+    #[test]
+    fn parses_jenkins_context_config() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+timeout_secs = 15
+max_urls = 2
+output_limit_chars = 2048
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let jenkins_context = config.rooms[0].jenkins_context.as_ref().unwrap();
+        assert!(jenkins_context.enabled);
+        assert!(jenkins_context.script.is_absolute());
+        assert_eq!(jenkins_context.timeout_secs, 15);
+        assert_eq!(jenkins_context.max_urls, 2);
+        assert_eq!(jenkins_context.output_limit_chars, 2048);
+    }
+
+    #[test]
+    fn rejects_relative_jenkins_context_script() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("script must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_jenkins_script_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/srv/webex-bot/workspace"
+codex_home = "/srv/webex-bot/codex-home"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/srv/webex-bot/workspace/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("jenkins_context.script"));
+    }
+
+    #[test]
+    fn rejects_jenkins_env_file_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "/srv/webex-bot/workspace"
+codex_home = "/srv/webex-bot/codex-home"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+env_file = "/srv/webex-bot/workspace/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("jenkins_context.env_file"));
     }
 
     #[test]

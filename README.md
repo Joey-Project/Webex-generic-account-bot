@@ -37,6 +37,23 @@ Codex model settings can be configured globally under `[codex]` or overridden
 per room under `[rooms.codex]`, including `model` and
 `model_reasoning_effort`.
 
+For staging production Space behaviour, a room policy can set
+`output_room_id`, `forward_source_message = true`, and
+`read_only_source = true`. The bot then treats `room_id` as a read-only source:
+it mirrors the original message into `output_room_id` as a top-level staging
+message and replies under that mirror. Runtime write guards reject any attempt
+to create a Webex message in a configured read-only source room.
+
+For Jenkins triage rooms, `[rooms.jenkins_context]` can prefetch read-only
+diagnostics with a trusted helper script and append the result to the Codex
+prompt. Configure `script` as an absolute path outside any Codex workspace, for
+example `/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs`. The bot
+runs the helper from the helper script's directory, kills timed-out helpers, and
+requires `server.attempt_lease_secs` to cover the Codex timeout, Jenkins
+prefetch timeout budget, and Webex request margin. Codex then summarises the
+prefetched evidence without needing network access to Jenkins from inside its
+sandbox.
+
 Minimum environment:
 
 ```bash
