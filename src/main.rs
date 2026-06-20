@@ -698,9 +698,9 @@ async fn resolve_self_person_id(config: &BotConfig, webex: &WebexClient) -> Resu
     if let Some(person_id) = &config.self_person_id {
         return Ok(Some(person_id.clone()));
     }
-    let me = webex
-        .me()
+    let me = timeout(WEBEX_REQUEST_TIMEOUT, webex.me())
         .await
+        .map_err(|_| anyhow!("timed out resolving Webex people/me after 30 seconds"))?
         .context("failed to resolve Webex people/me")?;
     Ok(me.id)
 }
