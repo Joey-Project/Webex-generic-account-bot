@@ -54,6 +54,7 @@ describe('e2e config rendering', () => {
     assert.match(config, /prefixes = \["\/codex-e2e"\]/);
     assert.doesNotMatch(config, /secret-token/);
     assert.doesNotMatch(config, /cwd = ".*Webex-generic-account-bot"/);
+    assert.match(config, /codex_home = "/);
     assert.doesNotMatch(config, /\.env/);
   });
 
@@ -75,12 +76,14 @@ describe('e2e config rendering', () => {
       E2E_BOT_EMAIL: 'clean.bot@example.com',
       E2E_CARGO_BIN: '/custom/cargo',
       E2E_CODEX_BIN: '/custom/codex',
+      E2E_CODEX_HOME: '/custom/codex-home',
       E2E_MARKER: 'marker-1',
       PATH: '',
     });
 
     assert.equal(options.cargoBin, '/custom/cargo');
     assert.equal(options.codexBin, '/custom/codex');
+    assert.equal(options.codexHome, '/custom/codex-home');
   });
 
   it('does not forward sender bot secrets to child processes', () => {

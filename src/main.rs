@@ -25,11 +25,12 @@ use webex_generic_account_bot::{
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, SidecarEvent,
     WebexClient,
-    types::{CreateMessage, Message},
+    types::{CreateMessage, ListMessages, Message},
 };
 
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_LIMIT_CHARS: usize = 6_000;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -108,6 +109,14 @@ struct BotApp {
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
     request_slots: Arc<Semaphore>,
+}
+
+struct ReplyCreateContext<'a> {
+    message_id: &'a str,
+    room_id: &'a str,
+    parent_id: &'a str,
+    reply_marker: &'a str,
+    reply_chars: usize,
 }
 
 impl BotApp {
@@ -206,6 +215,31 @@ impl BotApp {
             ));
         }
 
+        let parent_id = message
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| message_id.clone());
+        let reply_marker = reply_marker(&message_id);
+        match self
+            .find_existing_reply_by_marker(&room_id, &parent_id, &reply_marker)
+            .await
+        {
+            Ok(Some(reply)) => {
+                let reply_chars = existing_reply_chars(&reply);
+                self.mark_processed(&attempt).await?;
+                return Ok(BotAction::replied(
+                    message_id,
+                    room_id,
+                    reply.id,
+                    reply_chars,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(message_id = %message_id, error = %error, "failed to reconcile existing Webex reply before Codex run");
+            }
+        }
+
         let Some(context) = MessageContext::from_message(&message) else {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
@@ -223,17 +257,23 @@ impl BotApp {
                 "Codex run failed. Check the bot service logs for details.".to_owned()
             }
         };
-        let parent_id = message
-            .parent_id
-            .clone()
-            .unwrap_or_else(|| message_id.clone());
-        let reply_markdown = truncate_for_reply(&sanitize_reply_markdown(&reply_text));
+        let reply_markdown = prepare_reply_markdown(&reply_text, &reply_marker);
         let reply_request = reply_markdown_message(&room_id, parent_id, &reply_markdown);
         let reply = match self.create_message(&reply_request).await {
             Ok(reply) => reply,
             Err(error) => {
                 return self
-                    .handle_create_message_failure(&attempt, &message_id, &room_id, error)
+                    .handle_create_message_failure(
+                        &attempt,
+                        ReplyCreateContext {
+                            message_id: &message_id,
+                            room_id: &room_id,
+                            parent_id: reply_request.parent_id.as_deref().unwrap_or(&message_id),
+                            reply_marker: &reply_marker,
+                            reply_chars: reply_markdown.len(),
+                        },
+                        error,
+                    )
                     .await;
             }
         };
@@ -261,6 +301,36 @@ impl BotApp {
             Ok(Err(error)) => Err(WebexCallError::Client(error)),
             Err(_) => Err(WebexCallError::TimedOut),
         }
+    }
+
+    async fn list_reply_messages(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+    ) -> Result<Vec<Message>, WebexCallError> {
+        let request = ListMessages {
+            room_id: room_id.to_owned(),
+            parent_id: Some(parent_id.to_owned()),
+            max: Some(100),
+            ..ListMessages::default()
+        };
+        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.list_messages(&request)).await {
+            Ok(Ok(page)) => Ok(page.items),
+            Ok(Err(error)) => Err(WebexCallError::Client(error)),
+            Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn find_existing_reply_by_marker(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        marker: &str,
+    ) -> Result<Option<Message>, WebexCallError> {
+        let replies = self.list_reply_messages(room_id, parent_id).await?;
+        Ok(replies
+            .into_iter()
+            .find(|reply| reply_matches_marker(reply, marker, self.self_person_id.as_deref())))
     }
 
     async fn handle_get_message_failure(
@@ -293,8 +363,7 @@ impl BotApp {
     async fn handle_create_message_failure(
         &self,
         attempt: &AttemptLease,
-        message_id: &str,
-        room_id: &str,
+        context: ReplyCreateContext<'_>,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
         match classify_webex_create_failure(&error, self.config.server.attempt_lease()) {
@@ -302,15 +371,40 @@ impl BotApp {
                 self.mark_processed(attempt).await?;
                 Ok(BotAction::ignored(
                     "reply_rejected",
-                    Some(message_id.to_owned()),
-                    Some(room_id.to_owned()),
+                    Some(context.message_id.to_owned()),
+                    Some(context.room_id.to_owned()),
                 ))
             }
             WebexFailureAction::Retry(retry_after) => {
+                match self
+                    .find_existing_reply_by_marker(
+                        context.room_id,
+                        context.parent_id,
+                        context.reply_marker,
+                    )
+                    .await
+                {
+                    Ok(Some(reply)) => {
+                        self.mark_processed(attempt).await?;
+                        return Ok(BotAction::replied(
+                            context.message_id.to_owned(),
+                            context.room_id.to_owned(),
+                            reply.id,
+                            context.reply_chars,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(message_id = %context.message_id, error = %error, "failed to reconcile existing Webex reply after create failure");
+                    }
+                }
                 self.defer_attempt(attempt, retry_after).await?;
                 Err(HttpError::retry_after(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to send Webex reply for message {message_id}: {error}"),
+                    format!(
+                        "failed to send Webex reply for message {}: {error}",
+                        context.message_id
+                    ),
                     retry_after,
                 ))
             }
@@ -385,7 +479,10 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
     }
 }
 
-async fn handle_health(State(state): State<AppState>) -> Response {
+async fn handle_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = authorize(&state.app, &headers) {
+        return error.into_response();
+    }
     let state_path = {
         let store = state.app.state.lock().await;
         store.path().display().to_string()
@@ -645,12 +742,62 @@ fn message_needs_hydration(
         || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
 }
 
-fn truncate_for_reply(value: &str) -> String {
-    webex_generic_account_bot::policy::trim_to_chars(value, 6_000)
-}
-
 fn sanitize_reply_markdown(markdown: &str) -> String {
     markdown.replace("<@", "&lt;@")
+}
+
+fn reply_marker(message_id: &str) -> String {
+    let encoded_id = message_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("<!-- webex-generic-account-bot:reply-for={encoded_id} -->")
+}
+
+fn prepare_reply_markdown(markdown: &str, marker: &str) -> String {
+    let marker_chars = marker.chars().count().saturating_add(2);
+    let truncation_suffix = "\n[truncated]".chars().count();
+    let visible_limit = REPLY_LIMIT_CHARS
+        .saturating_sub(marker_chars)
+        .saturating_sub(truncation_suffix)
+        .max(1);
+    let visible = webex_generic_account_bot::policy::trim_to_chars(
+        &sanitize_reply_markdown(markdown),
+        visible_limit,
+    );
+    format!("{visible}\n\n{marker}")
+}
+
+fn reply_matches_marker(reply: &Message, marker: &str, self_person_id: Option<&str>) -> bool {
+    if let Some(self_person_id) = self_person_id {
+        if reply.person_id.as_deref() != Some(self_person_id) {
+            return false;
+        }
+    }
+    reply_body(reply).contains(marker)
+}
+
+fn existing_reply_chars(reply: &Message) -> usize {
+    reply
+        .markdown
+        .as_deref()
+        .or(reply.text.as_deref())
+        .unwrap_or_default()
+        .chars()
+        .count()
+}
+
+fn reply_body(reply: &Message) -> String {
+    [
+        reply.markdown.as_deref(),
+        reply.text.as_deref(),
+        reply.html.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn reply_markdown_message(
@@ -808,6 +955,49 @@ mod tests {
             sanitize_reply_markdown("hello <@all> and <@person:123>"),
             "hello &lt;@all> and &lt;@person:123>"
         );
+    }
+
+    #[test]
+    fn prepared_reply_includes_hidden_marker_within_limit() {
+        let marker = reply_marker("message-1");
+        let reply = prepare_reply_markdown(&"x".repeat(7_000), &marker);
+
+        assert!(reply.contains(&marker));
+        assert!(reply.chars().count() <= REPLY_LIMIT_CHARS);
+    }
+
+    #[test]
+    fn reply_marker_hex_encodes_message_id() {
+        let marker = reply_marker("message-->1");
+
+        assert!(marker.contains("6d6573736167652d2d3e31"));
+        assert!(!marker.contains("message-->1"));
+    }
+
+    #[test]
+    fn reply_marker_match_requires_self_identity_when_known() {
+        let marker = reply_marker("message-1");
+        let matching = Message {
+            markdown: Some(format!("done\n\n{marker}")),
+            person_id: Some("self-person".to_owned()),
+            ..Message::default()
+        };
+        let wrong_sender = Message {
+            markdown: Some(marker.clone()),
+            person_id: Some("other-person".to_owned()),
+            ..Message::default()
+        };
+
+        assert!(reply_matches_marker(
+            &matching,
+            &marker,
+            Some("self-person")
+        ));
+        assert!(!reply_matches_marker(
+            &wrong_sender,
+            &marker,
+            Some("self-person")
+        ));
     }
 
     #[test]

@@ -84,6 +84,7 @@ access_token_file = ${tomlString(options.accessTokenFile)}
 [codex]
 bin = ${tomlString(options.codexBin)}
 cwd = ${tomlString(options.codexCwd)}
+codex_home = ${tomlString(options.codexHome)}
 sandbox = ${tomlString(options.codexSandbox)}
 approval_policy = "never"
 timeout_secs = ${options.codexTimeoutSecs}
@@ -132,6 +133,7 @@ export function buildE2eOptions(env = process.env) {
     cargoBin: env.E2E_CARGO_BIN || resolveExecutable('cargo', env.PATH) || 'cargo',
     codexBin: env.E2E_CODEX_BIN || resolveExecutable('codex', env.PATH) || 'codex',
     codexCwd: path.resolve(env.E2E_CODEX_CWD || DEFAULT_CODEX_CWD),
+    codexHome: path.resolve(env.E2E_CODEX_HOME || env.CODEX_HOME || path.join(os.homedir(), '.codex')),
     codexSandbox: env.E2E_CODEX_SANDBOX || 'read-only',
     codexTimeoutSecs: parsePositiveInteger(env.E2E_CODEX_TIMEOUT_SECS, 300),
     configPath: path.resolve(env.E2E_CONFIG_PATH || DEFAULT_CONFIG_PATH),
@@ -243,6 +245,7 @@ async function main() {
       waitForHttpOk(`http://${options.botBind}/healthz`, {
         timeoutMs: 60000,
         label: 'bot health',
+        headers: { Authorization: `Bearer ${options.sidecarToken}` },
       }),
       [bot],
     );
@@ -491,12 +494,12 @@ async function withProcessWatch(work, processes) {
   ]);
 }
 
-async function waitForHttpOk(url, { timeoutMs, label }) {
+async function waitForHttpOk(url, { timeoutMs, label, headers = {} }) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { headers });
       if (response.ok) {
         console.log(`${label.replaceAll(' ', '_')}_ok=true`);
         return;

@@ -106,14 +106,12 @@ impl BotConfig {
             }
         }
         for (name, codex) in self.codex_configs() {
-            if let Some(codex_home) = &codex.codex_home {
-                if path_is_inside(codex_home, &codex.cwd) {
-                    return Err(anyhow!(
-                        "codex.codex_home {} must not be inside codex cwd {} ({name})",
-                        codex_home.display(),
-                        codex.cwd.display()
-                    ));
-                }
+            if path_is_inside(&codex.codex_home, &codex.cwd) {
+                return Err(anyhow!(
+                    "codex.codex_home {} must not be inside codex cwd {} ({name})",
+                    codex.codex_home.display(),
+                    codex.cwd.display()
+                ));
             }
         }
         Ok(())
@@ -229,7 +227,7 @@ impl Default for WebexAuthConfig {
 pub struct CodexConfig {
     pub bin: String,
     pub cwd: PathBuf,
-    pub codex_home: Option<PathBuf>,
+    pub codex_home: PathBuf,
     pub profile: Option<String>,
     pub model: Option<String>,
     pub model_reasoning_effort: Option<String>,
@@ -247,7 +245,7 @@ impl Default for CodexConfig {
         Self {
             bin: "codex".to_owned(),
             cwd: PathBuf::from("."),
-            codex_home: None,
+            codex_home: PathBuf::from("/var/lib/webex-generic-account-bot/codex-home"),
             profile: None,
             model: None,
             model_reasoning_effort: None,
@@ -296,11 +294,7 @@ impl CodexConfig {
                 "codex.model_reasoning_effort must be one of minimal, low, medium, high, or xhigh"
             ));
         }
-        if self
-            .codex_home
-            .as_ref()
-            .is_some_and(|path| path.as_os_str().is_empty())
-        {
+        if self.codex_home.as_os_str().is_empty() {
             return Err(anyhow!("codex.codex_home must not be empty"));
         }
         self.isolation.validate()
@@ -335,7 +329,7 @@ impl CodexConfigPatch {
             config.cwd = value.clone();
         }
         if let Some(value) = &self.codex_home {
-            config.codex_home = Some(value.clone());
+            config.codex_home = value.clone();
         }
         if let Some(value) = &self.profile {
             config.profile = Some(value.clone());
@@ -570,6 +564,10 @@ allow_all_senders = true
 
         config.validate().unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
+        assert_eq!(
+            config.codex.codex_home,
+            Path::new("/var/lib/webex-generic-account-bot/codex-home")
+        );
         assert_eq!(config.rooms[0].trigger, TriggerMode::Mention);
     }
 
@@ -1002,10 +1000,7 @@ model = "gpt-5.5-mini"
         let codex = config.codex_for_policy(policy);
 
         assert_eq!(codex.cwd, PathBuf::from("/srv/webex-bot/workspace"));
-        assert_eq!(
-            codex.codex_home.as_deref(),
-            Some(Path::new("/srv/webex-bot/codex-home"))
-        );
+        assert_eq!(codex.codex_home, Path::new("/srv/webex-bot/codex-home"));
         assert_eq!(codex.model.as_deref(), Some("gpt-5.5-mini"));
         assert_eq!(codex.timeout_secs, 123);
         assert!(codex.skip_git_repo_check);

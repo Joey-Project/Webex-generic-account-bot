@@ -386,12 +386,10 @@ pub fn scrubbed_env() -> BTreeMap<String, String> {
 
 fn runner_env(config: &CodexConfig) -> BTreeMap<String, String> {
     let mut env = scrubbed_env();
-    if let Some(codex_home) = &config.codex_home {
-        env.insert(
-            "CODEX_HOME".to_owned(),
-            codex_home.to_string_lossy().to_string(),
-        );
-    }
+    env.insert(
+        "CODEX_HOME".to_owned(),
+        config.codex_home.to_string_lossy().to_string(),
+    );
     env
 }
 
@@ -443,6 +441,12 @@ mod tests {
         assert!(!env.contains_key("WEBEX_ACCESS_TOKEN"));
         assert!(!env.contains_key("WEBEX_SIDECAR_TOKEN"));
         assert!(!env.contains_key("CODEX_HOME"));
+        assert_ne!(
+            runner_env(&CodexConfig::default())
+                .get("CODEX_HOME")
+                .map(String::as_str),
+            Some("/tmp/codex-home-with-extra-config")
+        );
 
         unsafe {
             env::remove_var("WEBEX_ACCESS_TOKEN");
@@ -457,7 +461,7 @@ mod tests {
             env::set_var("CODEX_HOME", "/tmp/inherited-codex-home");
         }
         let config = CodexConfig {
-            codex_home: Some(PathBuf::from("/var/lib/webex-bot/codex-home")),
+            codex_home: PathBuf::from("/var/lib/webex-bot/codex-home"),
             ..CodexConfig::default()
         };
 
