@@ -1,5 +1,11 @@
 use std::{
-    env, net::SocketAddr, path::Path, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    env,
+    net::SocketAddr,
+    path::Path,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -20,7 +26,7 @@ use tokio::{
     net::TcpListener,
     process::{Child, Command},
     sync::{Mutex, Semaphore},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
@@ -306,10 +312,13 @@ async fn run_jenkins_context_helper(
             config.node_bin
         )
     })?;
+    #[cfg(unix)]
+    let process_group = child.id().map(|pid| -(pid as i32));
     let capture_limit = helper_capture_limit_bytes(config.output_limit_chars);
     let stdout_task = read_limited_pipe(child.stdout.take(), capture_limit);
     let stderr_task = read_limited_pipe(child.stderr.take(), capture_limit);
-    let status = match timeout(config.timeout(), child.wait()).await {
+    let deadline = Instant::now() + config.timeout();
+    let status = match timeout_at(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             terminate_jenkins_helper(&mut child).await;
@@ -327,12 +336,20 @@ async fn run_jenkins_context_helper(
             ));
         }
     };
-    let stdout = stdout_task
-        .await
-        .context("failed to join Jenkins stdout reader")??;
-    let stderr = stderr_task
-        .await
-        .context("failed to join Jenkins stderr reader")??;
+    #[cfg(unix)]
+    terminate_jenkins_helper_process_group(process_group, SIGTERM);
+    let (stdout, stderr) =
+        match timeout_at(deadline, join_helper_output(stdout_task, stderr_task)).await {
+            Ok(output) => output?,
+            Err(_) => {
+                #[cfg(unix)]
+                terminate_jenkins_helper_process_group(process_group, SIGKILL);
+                return Err(anyhow!(
+                    "Jenkins diagnostics helper timed out after {} seconds",
+                    config.timeout_secs
+                ));
+            }
+        };
 
     if status.success() {
         return Ok(compact_jenkins_helper_output(&stdout));
@@ -344,6 +361,19 @@ async fn run_jenkins_context_helper(
         compact_jenkins_helper_output(&stdout),
         stderr
     ))
+}
+
+async fn join_helper_output(
+    stdout_task: tokio::task::JoinHandle<Result<String>>,
+    stderr_task: tokio::task::JoinHandle<Result<String>>,
+) -> Result<(String, String)> {
+    let stdout = stdout_task
+        .await
+        .context("failed to join Jenkins stdout reader")??;
+    let stderr = stderr_task
+        .await
+        .context("failed to join Jenkins stderr reader")??;
+    Ok((stdout, stderr))
 }
 
 fn apply_jenkins_helper_env(command: &mut Command) {
@@ -374,26 +404,33 @@ async fn terminate_jenkins_helper(child: &mut Child) {
 
 #[cfg(unix)]
 async fn terminate_jenkins_helper_group(child: &mut Child) {
-    const SIGTERM: i32 = 15;
-    const SIGKILL: i32 = 9;
-
     if let Some(pid) = child.id() {
         let process_group = -(pid as i32);
-        unsafe {
-            kill(process_group, SIGTERM);
-        }
+        terminate_jenkins_helper_process_group(Some(process_group), SIGTERM);
         if timeout(Duration::from_millis(250), child.wait())
             .await
             .is_ok()
         {
             return;
         }
-        unsafe {
-            kill(process_group, SIGKILL);
-        }
+        terminate_jenkins_helper_process_group(Some(process_group), SIGKILL);
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+fn terminate_jenkins_helper_process_group(process_group: Option<i32>, signal: i32) {
+    if let Some(process_group) = process_group {
+        unsafe {
+            kill(process_group, signal);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -758,7 +795,7 @@ impl BotApp {
                 output_room_id,
                 None,
                 &source_marker,
-                Some(SOURCE_MARKER_SEARCH_MAX_PAGES),
+                source_marker_search_max_pages(message, self.config.server.attempt_lease()),
             )
             .await
         {
@@ -922,7 +959,7 @@ impl BotApp {
                         context.output_room_id,
                         None,
                         context.source_marker,
-                        Some(SOURCE_MARKER_SEARCH_MAX_PAGES),
+                        None,
                     )
                     .await
                 {
@@ -1349,6 +1386,28 @@ fn message_needs_hydration(
         || message.person_email.is_none()
         || (message.text.is_none() && message.markdown.is_none())
         || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
+}
+
+fn source_marker_search_max_pages(message: &Message, recovery_age: Duration) -> Option<usize> {
+    if message_is_at_least_age(message, recovery_age) {
+        None
+    } else {
+        Some(SOURCE_MARKER_SEARCH_MAX_PAGES)
+    }
+}
+
+fn message_is_at_least_age(message: &Message, min_age: Duration) -> bool {
+    let Some(created) = message.created else {
+        return false;
+    };
+    let created_ms = created.timestamp_millis();
+    if created_ms < 0 {
+        return true;
+    }
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    now.as_millis().saturating_sub(created_ms as u128) >= min_age.as_millis()
 }
 
 fn sanitize_reply_markdown(markdown: &str) -> String {
@@ -1797,6 +1856,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_staging_source_uses_unbounded_source_marker_search() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+        let source_marker = source_marker("message-1");
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("forward-1", OUTPUT_ROOM_ID)));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("reply-1", OUTPUT_ROOM_ID)));
+        harness.runner.push_output("done");
+        let mut message = inbound_message("message-1", "old Jenkins failure");
+        message.created = Some(serde_json::from_str("\"1970-01-01T00:00:00Z\"").unwrap());
+
+        harness
+            .app
+            .process_event(message_event(message))
+            .await
+            .unwrap();
+
+        let searches = harness.webex.marker_searches();
+        assert_eq!(
+            searches[0],
+            (
+                OUTPUT_ROOM_ID.to_owned(),
+                None,
+                source_marker,
+                Some(SELF_PERSON_ID.to_owned()),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_source_guard_blocks_writes_to_source_room() {
         let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
 
@@ -2116,6 +2210,36 @@ mod tests {
 
         assert!(output.contains("[truncated]"));
         assert!(output.len() < 1_200);
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_helper_kills_process_group_before_joining_pipes() {
+        let helper_dir = unique_state_path().with_extension("helper-pipe-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(&script, "sleep 5 &\nprintf 'parent_done\\n'\n").unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 1,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let output = timeout(
+            Duration::from_secs(2),
+            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(output.contains("parent_done"));
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
