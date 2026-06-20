@@ -53,6 +53,7 @@ describe('e2e config rendering', () => {
     assert.match(config, /allowed_person_emails = \["clean\.bot@example\.com"\]/);
     assert.match(config, /trigger = "prefix"/);
     assert.match(config, /prefixes = \["\/codex-e2e"\]/);
+    assert.match(config, /skip_git_repo_check = true/);
     assert.doesNotMatch(config, /secret-token/);
     assert.doesNotMatch(config, /cwd = ".*Webex-generic-account-bot"/);
     assert.match(config, /codex_home = "/);
@@ -85,6 +86,19 @@ describe('e2e config rendering', () => {
     assert.equal(options.cargoBin, '/custom/cargo');
     assert.equal(options.codexBin, '/custom/codex');
     assert.equal(options.codexHome, '/custom/codex-home');
+  });
+
+  it('can require a git repo for custom Codex cwd smoke tests', () => {
+    const options = buildE2eOptions({
+      E2E_BOT_ACCESS_TOKEN: 'secret-token',
+      E2E_BOT_EMAIL: 'clean.bot@example.com',
+      E2E_CODEX_SKIP_GIT_REPO_CHECK: '0',
+      E2E_MARKER: 'marker-1',
+      PATH: '',
+    });
+
+    assert.equal(options.codexSkipGitRepoCheck, false);
+    assert.match(renderBotConfig(options), /skip_git_repo_check = false/);
   });
 
   it('does not forward sender bot secrets to child processes', () => {

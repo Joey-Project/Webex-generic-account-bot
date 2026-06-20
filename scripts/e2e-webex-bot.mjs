@@ -89,7 +89,7 @@ sandbox = ${tomlString(options.codexSandbox)}
 approval_policy = "never"
 timeout_secs = ${options.codexTimeoutSecs}
 output_limit_chars = 4000
-skip_git_repo_check = false
+skip_git_repo_check = ${options.codexSkipGitRepoCheck ? 'true' : 'false'}
 ephemeral = true
 
 [codex.isolation]
@@ -136,6 +136,7 @@ export function buildE2eOptions(env = process.env) {
     codexCwd: path.resolve(env.E2E_CODEX_CWD || DEFAULT_CODEX_CWD),
     codexHome: path.resolve(env.E2E_CODEX_HOME || env.CODEX_HOME || path.join(os.homedir(), '.codex')),
     codexSandbox: env.E2E_CODEX_SANDBOX || 'read-only',
+    codexSkipGitRepoCheck: env.E2E_CODEX_SKIP_GIT_REPO_CHECK !== '0',
     codexTimeoutSecs: parsePositiveInteger(env.E2E_CODEX_TIMEOUT_SECS, 300),
     configPath: path.resolve(env.E2E_CONFIG_PATH || DEFAULT_CONFIG_PATH),
     genericAccountEmail: env.E2E_GENERIC_ACCOUNT_EMAIL || DEFAULT_GENERIC_ACCOUNT_EMAIL,
