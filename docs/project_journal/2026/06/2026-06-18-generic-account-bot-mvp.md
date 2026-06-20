@@ -24,6 +24,7 @@ superseded_by:
 - Live E2E passed after updating the Codex runner to pass approval policy as a top-level Codex CLI option before the `exec` subcommand.
 - The E2E harness now fails if the generic-account reply does not contain the run marker, preventing false positives from Codex error replies.
 - The E2E harness also checks the reply identity when Webex returns `personEmail`, verifies fixed localhost ports are free, and fails if the bot or sidecar exits before the Webex reply is observed.
+- Review hardening added retry-safe Webex reply failure handling, loopback-only unauthenticated sidecar mode, runner timeout coverage for blocked stdin writes, and explicit `codex.codex_home` support for bot-owned Codex auth/config.
 
 ## Next Steps
 - Decide whether the next slice should prioritize durable job recovery or privileged ephemeral Linux user runner support.
@@ -32,3 +33,4 @@ superseded_by:
 - Local source files: `Cargo.toml`, `src/`, `config/example.toml`, `README.md`.
 - E2E harness: `scripts/e2e-webex-bot.mjs`.
 - Live E2E: `node scripts/e2e-webex-bot.mjs` returned `e2e_ok=true` and `marker_found=true` against `miku bot test` on 2026-06-19 after the marker, reply-identity, and child-process assertions were added.
+- Local validation: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo run -- --config config/example.toml --check-config`, `node --test test/setup-ci.node-test.mjs test/e2e-webex-bot.node-test.mjs`, `actionlint .github/workflows/ci.yml`, and `git diff --check`.

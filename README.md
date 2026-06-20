@@ -74,12 +74,14 @@ The default Codex runner uses:
 - `--ephemeral`
 - `--ignore-user-config` and `--ignore-rules`
 - a scrubbed subprocess environment that does not forward Webex token variables
-  or `CODEX_HOME`
+  or an inherited `CODEX_HOME`
 
-Keep Webex token files and config files that contain secrets outside every
-configured Codex `cwd`. The bot rejects explicit token files, and token files
-provided through `WEBEX_ACCESS_TOKEN_FILE`, when they sit under a configured
-Codex working directory.
+If the bot needs a dedicated Codex auth/config directory, set
+`codex.codex_home` in config; this is the only way `CODEX_HOME` is passed to
+the Codex subprocess. Keep Webex token files, `codex.codex_home`, and config
+files that contain secrets outside every configured Codex `cwd`. The bot rejects
+explicit token files, token files provided through `WEBEX_ACCESS_TOKEN_FILE`,
+and `codex.codex_home` when they sit under a configured Codex working directory.
 
 Each room must configure `allowed_person_ids`, `allowed_person_emails`, or the
 explicit `allow_all_senders = true` escape hatch. Use `allow_all_senders` only

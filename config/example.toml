@@ -28,6 +28,8 @@ access_token_file_env = "WEBEX_ACCESS_TOKEN_FILE"
 [codex]
 bin = "codex"
 cwd = "."
+# Optional bot-owned Codex auth/config directory. Keep it outside cwd.
+# codex_home = "/var/lib/webex-generic-account-bot/codex-home"
 model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
 sandbox = "read-only"

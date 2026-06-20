@@ -491,12 +491,7 @@ fn classify_webex_create_failure(
     error: &WebexCallError,
     default_retry: Duration,
 ) -> WebexFailureAction {
-    match error {
-        WebexCallError::Client(WebexError::Api(api)) if matches!(api.status, 401 | 429) => {
-            WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
-        }
-        _ => WebexFailureAction::Stop,
-    }
+    classify_webex_failure(error, default_retry)
 }
 
 #[derive(Debug)]
@@ -867,9 +862,29 @@ mod tests {
     }
 
     #[test]
-    fn webex_create_timeout_errors_stop_to_avoid_duplicate_posts() {
+    fn webex_create_timeout_errors_retry_to_avoid_lost_replies() {
         assert_eq!(
             classify_webex_create_failure(&WebexCallError::TimedOut, Duration::from_secs(30)),
+            WebexFailureAction::Retry(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn webex_create_server_errors_retry() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(503, None))));
+
+        assert_eq!(
+            classify_webex_create_failure(&error, Duration::from_secs(30)),
+            WebexFailureAction::Retry(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn webex_create_permanent_client_errors_stop() {
+        let error = WebexCallError::Client(WebexError::Api(Box::new(api_error(404, None))));
+
+        assert_eq!(
+            classify_webex_create_failure(&error, Duration::from_secs(30)),
             WebexFailureAction::Stop
         );
     }

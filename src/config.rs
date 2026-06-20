@@ -105,6 +105,17 @@ impl BotConfig {
                 }
             }
         }
+        for (name, codex) in self.codex_configs() {
+            if let Some(codex_home) = &codex.codex_home {
+                if path_is_inside(codex_home, &codex.cwd) {
+                    return Err(anyhow!(
+                        "codex.codex_home {} must not be inside codex cwd {} ({name})",
+                        codex_home.display(),
+                        codex.cwd.display()
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -182,9 +193,15 @@ impl ServerConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        self.bind
+        let bind = self
+            .bind
             .parse::<SocketAddr>()
             .map_err(|error| anyhow!("server.bind must be a socket address: {error}"))?;
+        if self.allow_unauthenticated && !bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "server.allow_unauthenticated requires a loopback server.bind"
+            ));
+        }
         Ok(())
     }
 }
@@ -212,6 +229,7 @@ impl Default for WebexAuthConfig {
 pub struct CodexConfig {
     pub bin: String,
     pub cwd: PathBuf,
+    pub codex_home: Option<PathBuf>,
     pub profile: Option<String>,
     pub model: Option<String>,
     pub model_reasoning_effort: Option<String>,
@@ -229,6 +247,7 @@ impl Default for CodexConfig {
         Self {
             bin: "codex".to_owned(),
             cwd: PathBuf::from("."),
+            codex_home: None,
             profile: None,
             model: None,
             model_reasoning_effort: None,
@@ -277,6 +296,13 @@ impl CodexConfig {
                 "codex.model_reasoning_effort must be one of minimal, low, medium, high, or xhigh"
             ));
         }
+        if self
+            .codex_home
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(anyhow!("codex.codex_home must not be empty"));
+        }
         self.isolation.validate()
     }
 }
@@ -286,6 +312,7 @@ impl CodexConfig {
 pub struct CodexConfigPatch {
     pub bin: Option<String>,
     pub cwd: Option<PathBuf>,
+    pub codex_home: Option<PathBuf>,
     pub profile: Option<String>,
     pub model: Option<String>,
     pub model_reasoning_effort: Option<String>,
@@ -306,6 +333,9 @@ impl CodexConfigPatch {
         }
         if let Some(value) = &self.cwd {
             config.cwd = value.clone();
+        }
+        if let Some(value) = &self.codex_home {
+            config.codex_home = Some(value.clone());
         }
         if let Some(value) = &self.profile {
             config.profile = Some(value.clone());
@@ -900,11 +930,60 @@ allow_all_senders = true
     }
 
     #[test]
+    fn unauthenticated_server_requires_loopback_bind() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+bind = "0.0.0.0:8787"
+allow_unauthenticated = true
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("allow_unauthenticated")
+        );
+    }
+
+    #[test]
+    fn rejects_codex_home_inside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[codex]
+cwd = "."
+codex_home = ".codex"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("codex.codex_home")
+        );
+    }
+
+    #[test]
     fn room_codex_override_inherits_global_config() {
         let config: BotConfig = toml::from_str(
             r#"
 [codex]
 cwd = "/srv/webex-bot/workspace"
+codex_home = "/srv/webex-bot/codex-home"
 model = "gpt-5.5"
 timeout_secs = 123
 skip_git_repo_check = true
@@ -923,6 +1002,10 @@ model = "gpt-5.5-mini"
         let codex = config.codex_for_policy(policy);
 
         assert_eq!(codex.cwd, PathBuf::from("/srv/webex-bot/workspace"));
+        assert_eq!(
+            codex.codex_home.as_deref(),
+            Some(Path::new("/srv/webex-bot/codex-home"))
+        );
         assert_eq!(codex.model.as_deref(), Some("gpt-5.5-mini"));
         assert_eq!(codex.timeout_secs, 123);
         assert!(codex.skip_git_repo_check);

@@ -6,7 +6,7 @@ use std::{
     ffi::OsString,
     fs::Permissions,
     path::{Path, PathBuf},
-    process::{self, Stdio},
+    process::{self, ExitStatus, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, ChildStdin, Command},
     time::{sleep, timeout},
 };
 
@@ -63,7 +63,7 @@ async fn run_codex_exec(
     let mut command = Command::new(&config.bin);
     command.args(codex_exec_args(config, &output_path));
     configure_child_process(&mut command);
-    apply_scrubbed_env(&mut command);
+    apply_runner_env(&mut command, config);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -81,19 +81,27 @@ async fn run_codex_exec(
         .stdin
         .take()
         .ok_or_else(|| anyhow!("failed to open codex stdin"))?;
-    stdin
-        .write_all(prompt.as_bytes())
-        .await
-        .context("failed to write prompt to codex stdin")?;
-    stdin.shutdown().await.ok();
-    drop(stdin);
 
     let capture_limit = capture_limit_bytes(config.output_limit_chars);
     let stdout_task = read_pipe(child.stdout.take(), capture_limit);
     let stderr_task = read_pipe(child.stderr.take(), capture_limit);
-    let status = match timeout(config.timeout(), child.wait()).await {
-        Ok(status) => status.context("failed while waiting for codex process")?,
+    let status = match timeout(
+        config.timeout(),
+        write_prompt_and_wait(&mut child, &mut stdin, prompt),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            drop(stdin);
+            terminate_child(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let _ = fs::remove_file(&output_path).await;
+            return Err(error);
+        }
         Err(_) => {
+            drop(stdin);
             terminate_child(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
@@ -124,6 +132,22 @@ async fn run_codex_exec(
         stdout,
         stderr,
     })
+}
+
+async fn write_prompt_and_wait(
+    child: &mut Child,
+    stdin: &mut ChildStdin,
+    prompt: &str,
+) -> Result<ExitStatus> {
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .context("failed to write prompt to codex stdin")?;
+    stdin.shutdown().await.ok();
+    child
+        .wait()
+        .await
+        .context("failed while waiting for codex process")
 }
 
 fn codex_exec_args(config: &CodexConfig, output_path: &Path) -> Vec<OsString> {
@@ -360,9 +384,20 @@ pub fn scrubbed_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn apply_scrubbed_env(command: &mut Command) {
+fn runner_env(config: &CodexConfig) -> BTreeMap<String, String> {
+    let mut env = scrubbed_env();
+    if let Some(codex_home) = &config.codex_home {
+        env.insert(
+            "CODEX_HOME".to_owned(),
+            codex_home.to_string_lossy().to_string(),
+        );
+    }
+    env
+}
+
+fn apply_runner_env(command: &mut Command, config: &CodexConfig) {
     command.env_clear();
-    for (key, value) in scrubbed_env() {
+    for (key, value) in runner_env(config) {
         command.env(key, value);
     }
 }
@@ -412,6 +447,28 @@ mod tests {
         unsafe {
             env::remove_var("WEBEX_ACCESS_TOKEN");
             env::remove_var("WEBEX_SIDECAR_TOKEN");
+            env::remove_var("CODEX_HOME");
+        }
+    }
+
+    #[test]
+    fn runner_env_uses_configured_codex_home() {
+        unsafe {
+            env::set_var("CODEX_HOME", "/tmp/inherited-codex-home");
+        }
+        let config = CodexConfig {
+            codex_home: Some(PathBuf::from("/var/lib/webex-bot/codex-home")),
+            ..CodexConfig::default()
+        };
+
+        let env = runner_env(&config);
+
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/var/lib/webex-bot/codex-home")
+        );
+
+        unsafe {
             env::remove_var("CODEX_HOME");
         }
     }
@@ -571,6 +628,29 @@ mod tests {
             .unwrap();
         sleep(std::time::Duration::from_millis(100)).await;
         assert!(!process_exists(pid));
+
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_covers_blocked_stdin_write() {
+        let root = temp_path("stdin-timeout");
+        std_fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("fake-codex.sh");
+        std_fs::write(&fake_codex, "#!/bin/sh\nsleep 20\n").unwrap();
+        std_fs::set_permissions(&fake_codex, std_fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config = CodexConfig {
+            bin: fake_codex.display().to_string(),
+            cwd: root.clone(),
+            timeout_secs: 1,
+            ..CodexConfig::default()
+        };
+        let prompt = "x".repeat(2_000_000);
+        let result = run_codex_exec(&config, &prompt, "message-stdin-timeout").await;
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
 
         let _ = std_fs::remove_dir_all(root);
     }
