@@ -303,34 +303,41 @@ impl BotApp {
         }
     }
 
-    async fn list_reply_messages(
-        &self,
-        room_id: &str,
-        parent_id: &str,
-    ) -> Result<Vec<Message>, WebexCallError> {
-        let request = ListMessages {
-            room_id: room_id.to_owned(),
-            parent_id: Some(parent_id.to_owned()),
-            max: Some(100),
-            ..ListMessages::default()
-        };
-        match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.list_messages(&request)).await {
-            Ok(Ok(page)) => Ok(page.items),
-            Ok(Err(error)) => Err(WebexCallError::Client(error)),
-            Err(_) => Err(WebexCallError::TimedOut),
-        }
-    }
-
     async fn find_existing_reply_by_marker(
         &self,
         room_id: &str,
         parent_id: &str,
         marker: &str,
     ) -> Result<Option<Message>, WebexCallError> {
-        let replies = self.list_reply_messages(room_id, parent_id).await?;
-        Ok(replies
-            .into_iter()
-            .find(|reply| reply_matches_marker(reply, marker, self.self_person_id.as_deref())))
+        let request = ListMessages {
+            room_id: room_id.to_owned(),
+            parent_id: Some(parent_id.to_owned()),
+            max: Some(100),
+            ..ListMessages::default()
+        };
+        let mut page: webex_headless_messenger::Page<Message> =
+            match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.list_messages(&request)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
+        loop {
+            if let Some(reply) = page
+                .items
+                .into_iter()
+                .find(|reply| reply_matches_marker(reply, marker, self.self_person_id.as_deref()))
+            {
+                return Ok(Some(reply));
+            }
+            let Some(next) = page.next else {
+                return Ok(None);
+            };
+            page = match timeout(WEBEX_REQUEST_TIMEOUT, self.webex.next_page(next)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
+        }
     }
 
     async fn handle_get_message_failure(
