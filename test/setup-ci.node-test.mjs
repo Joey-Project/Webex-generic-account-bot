@@ -218,15 +218,19 @@ describe('setup-ci CLI', () => {
       path.join(scriptDir, 'setup-ci.mjs'),
     );
 
-    const { stdout } = await execFileAsync(
+    await execFileAsync(
       process.execPath,
-      [path.join(scriptDir, 'setup-ci.mjs'), '--list'],
+      [path.join(scriptDir, 'setup-ci.mjs'), '--tool', 'github-actions', '--force'],
       {
         cwd: workDir,
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+        },
       },
     );
 
-    assert.match(stdout, /js-ts: HTML\/JavaScript\/TypeScript/);
+    await fs.stat(path.join(workDir, '.github', 'workflows', 'ci.yml'));
   });
 
   it('can be imported when argv[1] is not a file path', async () => {
