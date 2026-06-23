@@ -1,11 +1,12 @@
 use std::{
+    collections::HashSet,
     env,
     net::SocketAddr,
     path::Path,
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdSyncMutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -50,6 +51,7 @@ const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -281,17 +283,21 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
+    ensure_jenkins_artifact_base_root()
+        .await
+        .with_context(|| "failed to prepare Jenkins diagnostics artifact root")?;
     prune_jenkins_artifact_dirs()
         .await
         .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
 
     let artifact_root = jenkins_artifact_attempt_dir(&context.message_id);
-    fs::create_dir_all(&artifact_root).await.with_context(|| {
+    create_private_dir(&artifact_root).await.with_context(|| {
         format!(
             "failed to create Jenkins diagnostics artifact root {}",
             artifact_root.display()
         )
     })?;
+    register_jenkins_artifact_dir(&artifact_root);
 
     let mut sections = Vec::new();
     let build_result: Result<String> = async {
@@ -326,7 +332,7 @@ async fn jenkins_context_prompt(
             artifact_root,
         })),
         Err(error) => {
-            if let Err(cleanup_error) = remove_jenkins_artifact_dir(&artifact_root).await {
+            if let Err(cleanup_error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
                 warn!(
                     artifact_root = %artifact_root.display(),
                     error = %cleanup_error,
@@ -351,13 +357,38 @@ async fn reset_jenkins_artifact_dir(path: &Path) -> Result<()> {
             });
         }
     }
-    fs::create_dir_all(path).await.with_context(|| {
+    create_private_dir(path).await.with_context(|| {
         format!(
             "failed to create Jenkins diagnostics artifact dir {}",
             path.display()
         )
     })?;
     Ok(())
+}
+
+async fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    set_private_dir_permissions(path).await
+}
+
+async fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| format!("failed to chmod 0700 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn cleanup_jenkins_artifact_dir(path: &Path) -> Result<()> {
+    let result = remove_jenkins_artifact_dir(path).await;
+    unregister_jenkins_artifact_dir(path);
+    result
 }
 
 async fn remove_jenkins_artifact_dir(path: &Path) -> Result<()> {
@@ -459,6 +490,10 @@ async fn prune_jenkins_artifact_dirs() -> Result<()> {
 }
 
 async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
+    let active_dirs = active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .clone();
     let mut entries = match fs::read_dir(&root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -468,12 +503,22 @@ async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
     };
     let mut dirs = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
-        let metadata = entry.metadata().await?;
+        let path = entry.path();
+        if active_dirs.contains(&path) {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        };
         if metadata.is_dir() {
             dirs.push((
                 metadata.modified().unwrap_or(UNIX_EPOCH),
                 entry.file_name(),
-                entry.path(),
+                path,
             ));
         }
     }
@@ -482,14 +527,29 @@ async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
     }
     dirs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     for (_, _, path) in dirs.into_iter().skip(JENKINS_ARTIFACT_RETENTION_LIMIT) {
-        fs::remove_dir_all(&path).await.with_context(|| {
-            format!(
-                "failed to remove old Jenkins artifact dir {}",
-                path.display()
-            )
-        })?;
+        match fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove old Jenkins artifact dir {}",
+                        path.display()
+                    )
+                });
+            }
+        }
     }
     Ok(())
+}
+
+async fn ensure_jenkins_artifact_base_root() -> Result<PathBuf> {
+    let root = jenkins_artifact_root();
+    if let Some(parent) = root.parent() {
+        create_private_dir(parent).await?;
+    }
+    create_private_dir(&root).await?;
+    Ok(root)
 }
 
 fn jenkins_artifact_root() -> PathBuf {
@@ -513,6 +573,24 @@ fn jenkins_artifact_attempt_dir(message_id: &str) -> PathBuf {
 
 fn jenkins_artifact_dir(attempt_root: &Path, index: usize) -> PathBuf {
     attempt_root.join(format!("url-{index}"))
+}
+
+fn active_jenkins_artifact_dirs() -> &'static StdSyncMutex<HashSet<PathBuf>> {
+    ACTIVE_JENKINS_ARTIFACT_DIRS.get_or_init(|| StdSyncMutex::new(HashSet::new()))
+}
+
+fn register_jenkins_artifact_dir(path: &Path) {
+    active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .insert(path.to_path_buf());
+}
+
+fn unregister_jenkins_artifact_dir(path: &Path) {
+    active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .remove(path);
 }
 
 fn safe_path_fragment(value: &str) -> String {
@@ -558,6 +636,12 @@ fn configure_jenkins_helper_process(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
+        unsafe {
+            command.pre_exec(|| {
+                umask(0o077);
+                Ok(())
+            });
+        }
     }
 }
 
@@ -607,6 +691,7 @@ fn terminate_jenkins_helper_process_group(process_group: Option<i32>, signal: i3
 #[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn umask(mask: u32) -> u32;
 }
 
 fn read_limited_pipe<R>(
@@ -873,7 +958,7 @@ impl BotApp {
         }
         let run_result = self.runner.run(&codex_config, &prompt, &message_id).await;
         if let Some(artifact_root) = jenkins_artifact_cleanup {
-            if let Err(error) = remove_jenkins_artifact_dir(&artifact_root).await {
+            if let Err(error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
                 warn!(
                     message_id = %message_id,
                     artifact_root = %artifact_root.display(),
@@ -2653,6 +2738,51 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_private_jenkins_artifact_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_state_path().with_extension("jenkins-private-dir");
+
+        create_private_dir(&dir).await.unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_skips_active_dirs() {
+        let root = unique_state_path().with_extension("jenkins-active-root");
+        for index in 0..(JENKINS_ARTIFACT_RETENTION_LIMIT + 3) {
+            fs::create_dir_all(root.join(format!("message-{index:02}"))).unwrap();
+        }
+        let active = root.join(format!(
+            "message-{:02}",
+            JENKINS_ARTIFACT_RETENTION_LIMIT + 2
+        ));
+        register_jenkins_artifact_dir(&active);
+
+        prune_jenkins_artifact_dirs_in(&root).await.unwrap();
+
+        assert!(active.exists());
+        unregister_jenkins_artifact_dir(&active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_ignores_already_removed_entries() {
+        let root = unique_state_path().with_extension("jenkins-race-root");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("broken-entry")).unwrap();
+
+        prune_jenkins_artifact_dirs_in(&root).await.unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn prepared_reply_includes_reference_marker_within_limit() {
         let marker = reply_marker("message-1");
@@ -2860,6 +2990,57 @@ mod tests {
 
         assert!(output.contains("[truncated]"));
         assert!(output.len() < 1_200);
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jenkins_helper_writes_artifacts_with_private_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper_dir = unique_state_path().with_extension("helper-umask-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        create_private_dir(&artifact_dir).await.unwrap();
+        fs::write(
+            &script,
+            "artifact_dir=\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             --artifact-dir) artifact_dir=\"$2\"; shift 2 ;;\n\
+             *) shift ;;\n\
+             esac\n\
+             done\n\
+             printf secret > \"$artifact_dir/secret.txt\"\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
+
+        let mode = fs::metadata(artifact_dir.join("secret.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
