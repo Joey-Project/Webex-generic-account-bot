@@ -494,6 +494,7 @@ pub struct RoomPolicy {
     pub forward_source_message: bool,
     pub read_only_source: bool,
     pub jenkins_context: Option<JenkinsContextConfig>,
+    pub reply_format: ReplyFormat,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
     pub allow_all_senders: bool,
@@ -512,6 +513,7 @@ impl Default for RoomPolicy {
             forward_source_message: false,
             read_only_source: false,
             jenkins_context: None,
+            reply_format: ReplyFormat::Markdown,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
             allow_all_senders: false,
@@ -608,6 +610,14 @@ impl RoomPolicy {
         }
         requests
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplyFormat {
+    #[default]
+    Markdown,
+    JenkinsDiagnosisJson,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -778,6 +788,25 @@ allow_all_senders = true
             Path::new("/var/lib/webex-generic-account-bot/codex-home")
         );
         assert_eq!(config.rooms[0].trigger, TriggerMode::Mention);
+    }
+
+    #[test]
+    fn parses_room_reply_format() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+reply_format = "jenkins-diagnosis-json"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(
+            config.rooms[0].reply_format,
+            ReplyFormat::JenkinsDiagnosisJson
+        );
     }
 
     #[test]

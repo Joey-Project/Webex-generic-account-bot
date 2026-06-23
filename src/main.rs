@@ -19,9 +19,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
+    fs,
     io::AsyncReadExt,
     net::TcpListener,
     process::{Child, Command},
@@ -30,8 +31,8 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, TriggerMode, render_prompt,
-    should_trigger, trim_to_chars, webex::build_webex_client,
+    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, ReplyFormat, TriggerMode,
+    render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -257,6 +258,7 @@ fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) 
 
 async fn jenkins_context_prompt(
     policy: &webex_generic_account_bot::RoomPolicy,
+    codex_config: &webex_generic_account_bot::CodexConfig,
     context: &MessageContext,
 ) -> Result<Option<String>> {
     let Some(config) = &policy.jenkins_context else {
@@ -271,16 +273,24 @@ async fn jenkins_context_prompt(
     }
 
     let mut sections = Vec::new();
-    for url in urls {
-        let output = run_jenkins_context_helper(config, &url).await?;
+    for (index, url) in urls.into_iter().enumerate() {
+        let artifact_dir = jenkins_artifact_dir(&codex_config.cwd, &context.message_id, index + 1);
+        fs::create_dir_all(&artifact_dir).await.with_context(|| {
+            format!(
+                "failed to create Jenkins diagnostics artifact dir {}",
+                artifact_dir.display()
+            )
+        })?;
+        let output = run_jenkins_context_helper(config, &url, &artifact_dir).await?;
         sections.push(format!(
-            "URL: {url}\n```text\n{}\n```",
+            "URL: {url}\nDiagnostics artifact directory: `{}`\n```text\n{}\n```",
+            artifact_dir.display(),
             trim_to_chars(output.trim(), config.output_limit_chars)
         ));
     }
 
     Ok(Some(format!(
-        "Prefetched Jenkins diagnostics (read-only helper output; use this instead of running Jenkins commands from Codex):\n\n{}",
+        "Prefetched Jenkins diagnostics (read-only helper output and local artifact files; use these instead of running Jenkins commands from Codex):\n\n{}",
         sections.join("\n\n")
     )))
 }
@@ -288,6 +298,7 @@ async fn jenkins_context_prompt(
 async fn run_jenkins_context_helper(
     config: &webex_generic_account_bot::JenkinsContextConfig,
     url: &str,
+    artifact_dir: &Path,
 ) -> Result<String> {
     let mut command = Command::new(&config.node_bin);
     let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
@@ -297,6 +308,8 @@ async fn run_jenkins_context_helper(
         .arg(&config.script)
         .arg("--env-file")
         .arg(&config.env_file)
+        .arg("--artifact-dir")
+        .arg(artifact_dir)
         .arg("diagnose")
         .arg("--url")
         .arg(url)
@@ -361,6 +374,33 @@ async fn run_jenkins_context_helper(
         compact_jenkins_helper_output(&stdout),
         stderr
     ))
+}
+
+fn jenkins_artifact_dir(codex_cwd: &Path, message_id: &str, index: usize) -> PathBuf {
+    codex_cwd
+        .join(".codex-tmp")
+        .join("jenkins-diagnostics")
+        .join(safe_path_fragment(message_id))
+        .join(format!("url-{index}"))
+}
+
+fn safe_path_fragment(value: &str) -> String {
+    let fragment: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let fragment = fragment.trim_matches('_');
+    if fragment.is_empty() {
+        "unknown".to_owned()
+    } else {
+        fragment.chars().take(160).collect()
+    }
 }
 
 async fn join_helper_output(
@@ -683,9 +723,11 @@ impl BotApp {
         };
         let codex_config = self.config.codex_for_policy(policy);
         let mut prompt = render_prompt(&policy.prompt_template, &context);
-        match jenkins_context_prompt(policy, &context).await {
+        let mut prefetched_context = None;
+        match jenkins_context_prompt(policy, &codex_config, &context).await {
             Ok(Some(context_prompt)) => {
                 prompt = append_prefetched_context(&prompt, &context_prompt);
+                prefetched_context = Some(context_prompt);
             }
             Ok(None) => {}
             Err(error) => {
@@ -703,6 +745,11 @@ impl BotApp {
                 "Codex run failed. Check the bot service logs for details.".to_owned()
             }
         };
+        let reply_text = render_reply_text(
+            policy.reply_format,
+            &reply_text,
+            prefetched_context.as_deref(),
+        );
         let reply_markdown = prepare_reply_markdown(&reply_text, &reply_marker);
         let reply_request = reply_markdown_message(
             &reply_thread.room_id,
@@ -1414,6 +1461,138 @@ fn sanitize_reply_markdown(markdown: &str) -> String {
     markdown.replace("<@", "&lt;@")
 }
 
+#[derive(Debug, Deserialize)]
+struct JenkinsDiagnosisReply {
+    verdict: JenkinsDiagnosisVerdict,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    log_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JenkinsDiagnosisVerdict {
+    InfraFalseAlarm,
+    LikelyProductTestFailure,
+    NotEnoughEvidence,
+}
+
+fn render_reply_text(
+    format: ReplyFormat,
+    output: &str,
+    prefetched_context: Option<&str>,
+) -> String {
+    match format {
+        ReplyFormat::Markdown => output.to_owned(),
+        ReplyFormat::JenkinsDiagnosisJson => {
+            render_jenkins_diagnosis_json(output, prefetched_context)
+        }
+    }
+}
+
+fn render_jenkins_diagnosis_json(output: &str, prefetched_context: Option<&str>) -> String {
+    let fallback_log_url = prefetched_context.and_then(extract_first_jenkins_console_url);
+    match parse_jenkins_diagnosis_json(output) {
+        Ok(reply) => render_jenkins_diagnosis_reply(&reply, fallback_log_url.as_deref()),
+        Err(_) => render_jenkins_diagnosis_reply(
+            &JenkinsDiagnosisReply {
+                verdict: JenkinsDiagnosisVerdict::NotEnoughEvidence,
+                reason: "Codex did not return valid diagnosis JSON".to_owned(),
+                log_url: fallback_log_url.clone(),
+            },
+            fallback_log_url.as_deref(),
+        ),
+    }
+}
+
+fn parse_jenkins_diagnosis_json(output: &str) -> Result<JenkinsDiagnosisReply> {
+    let json = extract_json_object(output)
+        .ok_or_else(|| anyhow!("Codex output did not contain a JSON object"))?;
+    serde_json::from_str(json).context("failed to parse Jenkins diagnosis JSON")
+}
+
+fn extract_json_object(output: &str) -> Option<&str> {
+    let trimmed = output.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(output[start..=end].trim())
+}
+
+fn render_jenkins_diagnosis_reply(
+    reply: &JenkinsDiagnosisReply,
+    fallback_log_url: Option<&str>,
+) -> String {
+    let prefix = match reply.verdict {
+        JenkinsDiagnosisVerdict::InfraFalseAlarm => "**Jenkins infra false alarm:**",
+        JenkinsDiagnosisVerdict::LikelyProductTestFailure => "**Likely product/test failure:**",
+        JenkinsDiagnosisVerdict::NotEnoughEvidence => "**Not enough evidence:**",
+    };
+    let reason = concise_reason(&reply.reason);
+    let log_url = reply
+        .log_url
+        .as_deref()
+        .filter(|url| is_valid_jenkins_console_url(url))
+        .or_else(|| fallback_log_url.filter(|url| is_valid_jenkins_console_url(url)));
+    match log_url {
+        Some(url) => format!("{prefix} {reason} [log](<{url}>)"),
+        None => format!("{prefix} {reason}"),
+    }
+}
+
+fn concise_reason(reason: &str) -> String {
+    let normalised = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalised = normalised.trim_matches(['.', '!', '?', ' ', '\t']).trim();
+    if normalised.is_empty() {
+        return "diagnostic evidence is inconclusive".to_owned();
+    }
+    let mut boundary = normalised.len();
+    for (index, ch) in normalised.char_indices() {
+        if matches!(ch, '.' | '!' | '?')
+            && normalised[index + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            boundary = index;
+            break;
+        }
+    }
+    normalised[..boundary]
+        .trim_matches(['.', '!', '?', ' ', '\t'])
+        .to_owned()
+}
+
+fn extract_first_jenkins_console_url(context: &str) -> Option<String> {
+    for line in context.lines() {
+        let Some((_, value)) = line.split_once("jenkins_console:") else {
+            continue;
+        };
+        let url = value.trim();
+        if is_valid_jenkins_console_url(url) {
+            return Some(url.to_owned());
+        }
+    }
+    None
+}
+
+fn is_valid_jenkins_console_url(url: &str) -> bool {
+    let url = url.trim();
+    let path = url.trim_end_matches('/');
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && path.ends_with("/console")
+        && !url.contains("consoleText")
+        && !url.chars().any(|ch| matches!(ch, '<' | '>'))
+        && !url.chars().any(char::is_whitespace)
+        && !url.chars().any(char::is_control)
+}
+
 fn reply_marker(message_id: &str) -> String {
     format!("wgb-ref:{}", marker_hex(message_id))
 }
@@ -2019,6 +2198,68 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_diagnosis_json_reply_is_rendered_deterministically() {
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "the failed leaf could not find any nodes to run the job. Ignore the wrapper failure.",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Jenkins infra false alarm:** the failed leaf could not find any nodes to run the job [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_reply_accepts_fenced_json() {
+        let output = r#"```json
+{
+  "verdict": "likely_product_test_failure",
+  "reason": "the conformance log reports a deterministic mismatch",
+  "log_url": "https://jenkins.example/job/foo/2/console"
+}
+```"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Likely product/test failure:** the conformance log reports a deterministic mismatch [log](<https://jenkins.example/job/foo/2/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_console_url_validation_rejects_console_text() {
+        assert!(is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/console"
+        ));
+        assert!(!is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/consoleText"
+        ));
+        assert!(!is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/console>"
+        ));
+    }
+
+    #[test]
+    fn invalid_jenkins_diagnosis_json_uses_console_url_fallback() {
+        let context = "recommended_reading_order_preview:\n- failed_leaf: foo#1\n  jenkins_console: https://jenkins.example/job/foo/1/console\n";
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, "not json", Some(context),),
+            "**Not enough evidence:** Codex did not return valid diagnosis JSON [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn safe_path_fragment_truncates_without_suffix() {
+        let fragment = safe_path_fragment(&format!("{}{}", "a".repeat(200), " / bad"));
+
+        assert_eq!(fragment.len(), 160);
+        assert!(!fragment.contains("[truncated]"));
+        assert!(!fragment.chars().any(char::is_whitespace));
+    }
+
+    #[test]
     fn prepared_reply_includes_reference_marker_within_limit() {
         let marker = reply_marker("message-1");
         let reply = prepare_reply_markdown(&"x".repeat(7_000), &marker);
@@ -2117,6 +2358,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(&script, "printf 'pwd=%s\\n' \"$PWD\"\n").unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
         let config = webex_generic_account_bot::JenkinsContextConfig {
@@ -2129,10 +2372,13 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains(&format!("pwd={}", helper_dir.display())));
         fs::remove_dir_all(helper_dir).unwrap();
@@ -2148,6 +2394,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(
             &script,
             "printf 'webex=%s\\n' \"${WEBEX_ACCESS_TOKEN-unset}\"\n\
@@ -2165,10 +2413,13 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains("webex=unset"));
         assert!(output.contains("sidecar=unset"));
@@ -2187,6 +2438,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(
             &script,
             "i=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\n",
@@ -2203,10 +2456,13 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains("[truncated]"));
         assert!(output.len() < 1_200);
@@ -2219,6 +2475,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(&script, "sleep 5 &\nprintf 'parent_done\\n'\n").unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
         let config = webex_generic_account_bot::JenkinsContextConfig {
@@ -2233,7 +2491,11 @@ mod tests {
 
         let output = timeout(
             Duration::from_secs(2),
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1"),
+            run_jenkins_context_helper(
+                &config,
+                "https://engci-private-sjc.cisco.com/job/1",
+                &artifact_dir,
+            ),
         )
         .await
         .unwrap()
