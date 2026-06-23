@@ -22,7 +22,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tokio::{
     fs,
@@ -49,6 +49,7 @@ const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
+const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -1845,6 +1846,14 @@ struct JenkinsDiagnosisReply {
     reason: String,
     #[serde(default)]
     log_url: Option<String>,
+    #[serde(default)]
+    excerpt: Option<String>,
+    #[serde(
+        default,
+        alias = "excerpt_style",
+        deserialize_with = "deserialize_jenkins_excerpt_format"
+    )]
+    excerpt_format: JenkinsDiagnosisExcerptFormat,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1853,6 +1862,34 @@ enum JenkinsDiagnosisVerdict {
     InfraFalseAlarm,
     LikelyProductTestFailure,
     NotEnoughEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum JenkinsDiagnosisExcerptFormat {
+    #[default]
+    #[serde(alias = "backtick", alias = "inline")]
+    InlineCode,
+    #[serde(alias = "blockquote", alias = "quote")]
+    BlockQuote,
+}
+
+fn deserialize_jenkins_excerpt_format<'de, D>(
+    deserializer: D,
+) -> std::result::Result<JenkinsDiagnosisExcerptFormat, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(JenkinsDiagnosisExcerptFormat::default());
+    };
+    let Some(value) = value.as_str() else {
+        return Ok(JenkinsDiagnosisExcerptFormat::default());
+    };
+    Ok(match value.trim().to_ascii_lowercase().as_str() {
+        "block_quote" | "blockquote" | "quote" => JenkinsDiagnosisExcerptFormat::BlockQuote,
+        _ => JenkinsDiagnosisExcerptFormat::InlineCode,
+    })
 }
 
 fn render_reply_text(
@@ -1884,6 +1921,8 @@ fn render_jenkins_diagnosis_json(output: &str, prefetched_context: Option<&str>)
                 verdict: JenkinsDiagnosisVerdict::NotEnoughEvidence,
                 reason: "Codex did not return valid diagnosis JSON".to_owned(),
                 log_url: fallback_log_url.map(ToOwned::to_owned),
+                excerpt: None,
+                excerpt_format: JenkinsDiagnosisExcerptFormat::default(),
             },
             &allowed_log_urls,
             fallback_log_url,
@@ -1938,9 +1977,91 @@ fn render_jenkins_diagnosis_reply(
         .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url))
         .or_else(|| fallback_log_url.and_then(normalized_jenkins_console_url));
     match log_url {
-        Some(url) => format!("{prefix} {reason} [log](<{url}>)"),
-        None => format!("{prefix} {reason}"),
+        Some(url) => append_jenkins_excerpt(
+            format!("{prefix} {reason} [log](<{url}>)"),
+            reply.excerpt.as_deref(),
+            reply.excerpt_format,
+        ),
+        None => append_jenkins_excerpt(
+            format!("{prefix} {reason}"),
+            reply.excerpt.as_deref(),
+            reply.excerpt_format,
+        ),
     }
+}
+
+fn append_jenkins_excerpt(
+    mut reply: String,
+    excerpt: Option<&str>,
+    format: JenkinsDiagnosisExcerptFormat,
+) -> String {
+    let Some(excerpt) = excerpt.and_then(sanitize_jenkins_excerpt) else {
+        return reply;
+    };
+    match effective_excerpt_format(&excerpt, format) {
+        JenkinsDiagnosisExcerptFormat::InlineCode => {
+            reply.push('\n');
+            reply.push('`');
+            reply.push_str(&excerpt);
+            reply.push('`');
+        }
+        JenkinsDiagnosisExcerptFormat::BlockQuote => {
+            reply.push('\n');
+            reply.push_str(&blockquote_excerpt(&excerpt));
+        }
+    }
+    reply
+}
+
+fn sanitize_jenkins_excerpt(value: &str) -> Option<String> {
+    let mut sanitized = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_control() && !matches!(ch, '\n' | '\t') {
+            continue;
+        }
+        sanitized.push(ch);
+    }
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(webex_generic_account_bot::policy::trim_to_chars(
+            sanitized,
+            JENKINS_DIAGNOSIS_EXCERPT_LIMIT,
+        ))
+    }
+}
+
+fn effective_excerpt_format(
+    excerpt: &str,
+    requested: JenkinsDiagnosisExcerptFormat,
+) -> JenkinsDiagnosisExcerptFormat {
+    if requested == JenkinsDiagnosisExcerptFormat::InlineCode
+        && !excerpt.contains('`')
+        && !excerpt.contains('\n')
+    {
+        JenkinsDiagnosisExcerptFormat::InlineCode
+    } else {
+        JenkinsDiagnosisExcerptFormat::BlockQuote
+    }
+}
+
+fn blockquote_excerpt(excerpt: &str) -> String {
+    excerpt
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {}", escape_blockquote_excerpt(line))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn escape_blockquote_excerpt(value: &str) -> String {
+    escape_markdown_plain_text(value)
 }
 
 fn concise_reason(reason: &str) -> String {
@@ -2719,13 +2840,81 @@ mod tests {
         let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
         let output = r#"{
             "verdict": "infra_false_alarm",
-            "reason": "the failed leaf could not find any nodes to run the job. Ignore the wrapper failure.",
+            "reason": "the failed job could not find any nodes to run the ARM conformance task. Ignore the wrapper failure.",
             "log_url": "https://jenkins.example/job/foo/1/console"
         }"#;
 
         assert_eq!(
             render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
-            "**Jenkins infra false alarm:** the failed leaf could not find any nodes to run the job [log](<https://jenkins.example/job/foo/1/console>)"
+            "**Jenkins infra false alarm:** the failed job could not find any nodes to run the ARM conformance task [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_allows_inline_exact_excerpt() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure prevented the ARM conformance task from starting",
+            "excerpt": "Still waiting to schedule task; no agents are available",
+            "excerpt_format": "inline_code",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure prevented the ARM conformance task from starting [log](<https://jenkins.example/job/foo/1/console>)\n`Still waiting to schedule task; no agents are available`"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_allows_block_quote_exact_excerpt() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "the failed trigger job did not start because no ARM executor was available",
+            "excerpt": "Trigger build failed before dispatch\nNo nodes are available",
+            "excerpt_format": "block_quote",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** the failed trigger job did not start because no ARM executor was available [log](<https://jenkins.example/job/foo/1/console>)\n> Trigger build failed before dispatch\n> No nodes are available"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_defaults_invalid_excerpt_format() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure prevented the ARM conformance task from starting",
+            "excerpt": "No agents are available",
+            "excerpt_format": "unexpected",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure prevented the ARM conformance task from starting [log](<https://jenkins.example/job/foo/1/console>)\n`No agents are available`"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_defaults_null_excerpt_format() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure prevented the ARM conformance task from starting",
+            "excerpt": "No agents are available",
+            "excerpt_format": null,
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure prevented the ARM conformance task from starting [log](<https://jenkins.example/job/foo/1/console>)\n`No agents are available`"
         );
     }
 
@@ -2865,7 +3054,7 @@ mod tests {
 
     #[test]
     fn invalid_jenkins_diagnosis_json_uses_console_url_fallback() {
-        let context = "recommended_reading_order_preview:\n- failed_leaf: foo#1\n  jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let context = "recommended_reading_order_preview:\n- failed_job: foo#1\n  jenkins_console: https://jenkins.example/job/foo/1/console\n";
 
         assert_eq!(
             render_reply_text(ReplyFormat::JenkinsDiagnosisJson, "not json", Some(context),),

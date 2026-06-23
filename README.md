@@ -54,6 +54,27 @@ prefetch timeout budget, and Webex request margin. Codex then summarises the
 prefetched evidence without needing network access to Jenkins from inside its
 sandbox.
 
+Jenkins triage rooms can set `reply_format = "jenkins-diagnosis-json"` so the
+bot renders deterministic Webex Markdown from compact Codex JSON:
+
+```json
+{
+  "verdict": "infra_false_alarm|likely_product_test_failure|not_enough_evidence",
+  "reason": "one concise clause without Markdown",
+  "log_url": "https://.../console",
+  "excerpt": "optional short exact log excerpt",
+  "excerpt_format": "inline_code|block_quote"
+}
+```
+
+The renderer accepts fenced JSON, escapes model-controlled Markdown in
+`reason`, downgrades blank reasons to `not_enough_evidence`, and only renders
+`log_url` values that match prefetched Jenkins `/console` links. A single
+prefetched log can be used as a fallback; multi-log diagnoses omit an invalid or
+missing link rather than guessing. Optional excerpts are rendered as either
+backtick inline code or a `>` quote block, capped to a short length, and escaped
+as plain text.
+
 Minimum environment:
 
 ```bash

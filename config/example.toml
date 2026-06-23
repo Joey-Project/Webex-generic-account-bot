@@ -83,7 +83,8 @@ trigger = "always"
 allowed_person_emails = ["trusted-sender@example.com"]
 # Optional: keep the default "markdown" for normal rooms. Jenkins triage rooms
 # can use "jenkins-diagnosis-json" so Codex returns structured fields and the
-# bot renders the final Webex Markdown deterministically.
+# bot renders the final Webex Markdown deterministically. The JSON may include
+# optional "excerpt" plus "excerpt_format": "inline_code" or "block_quote".
 # reply_format = "jenkins-diagnosis-json"
 prompt_template = """
 You are processing a read-only production Space message in staging mode.
