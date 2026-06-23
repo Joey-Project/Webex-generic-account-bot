@@ -2,8 +2,7 @@ use std::{
     collections::HashSet,
     env,
     net::SocketAddr,
-    path::Path,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex as StdSyncMutex, OnceLock,
@@ -35,7 +34,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, ReplyFormat, TriggerMode,
+    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, MessageContext, ReplyFormat, TriggerMode,
     render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
@@ -309,6 +308,7 @@ fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) 
 
 async fn jenkins_context_prompt(
     policy: &webex_generic_account_bot::RoomPolicy,
+    codex_config: &CodexConfig,
     context: &MessageContext,
 ) -> Result<Option<JenkinsPrefetchedContext>> {
     let Some(config) = &policy.jenkins_context else {
@@ -322,14 +322,14 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
-    ensure_jenkins_artifact_base_root()
+    ensure_jenkins_artifact_base_root(&codex_config.cwd)
         .await
         .with_context(|| "failed to prepare Jenkins diagnostics artifact root")?;
-    prune_jenkins_artifact_dirs()
+    prune_jenkins_artifact_dirs(&codex_config.cwd)
         .await
         .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
 
-    let artifact_root = jenkins_artifact_attempt_dir(&context.message_id);
+    let artifact_root = jenkins_artifact_attempt_dir(&codex_config.cwd, &context.message_id);
     create_private_dir(&artifact_root).await.with_context(|| {
         format!(
             "failed to create Jenkins diagnostics artifact root {}",
@@ -524,8 +524,66 @@ async fn run_jenkins_context_helper(
     ))
 }
 
-async fn prune_jenkins_artifact_dirs() -> Result<()> {
-    prune_jenkins_artifact_dirs_in(&jenkins_artifact_root()).await
+async fn prune_jenkins_artifact_dirs(codex_cwd: &Path) -> Result<()> {
+    prune_jenkins_artifact_process_roots_in(
+        &jenkins_artifact_base_root(codex_cwd),
+        &jenkins_artifact_process_root(codex_cwd),
+    )
+    .await
+}
+
+async fn prune_jenkins_artifact_process_roots_in(
+    base_root: &Path,
+    current_process_root: &Path,
+) -> Result<()> {
+    let mut entries = match fs::read_dir(base_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", base_root.display()));
+        }
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        if path == current_process_root {
+            prune_jenkins_artifact_dirs_in(&path).await?;
+            continue;
+        }
+
+        let Some(pid) = jenkins_artifact_process_root_pid(&path) else {
+            continue;
+        };
+        if process_may_be_running(pid) {
+            continue;
+        }
+
+        match fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove stale Jenkins process artifact root {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
@@ -582,29 +640,79 @@ async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_jenkins_artifact_base_root() -> Result<PathBuf> {
-    let root = jenkins_artifact_root();
-    if let Some(parent) = root.parent() {
-        create_private_dir(parent).await?;
-    }
-    create_private_dir(&root).await?;
-    Ok(root)
+async fn ensure_jenkins_artifact_base_root(codex_cwd: &Path) -> Result<PathBuf> {
+    let codex_tmp_root = absolute_lexical(codex_cwd).join(".codex-tmp");
+    let base_root = jenkins_artifact_base_root(codex_cwd);
+    let process_root = jenkins_artifact_process_root(codex_cwd);
+    create_private_dir(&codex_tmp_root).await?;
+    create_private_dir(&base_root).await?;
+    create_private_dir(&process_root).await?;
+    Ok(process_root)
 }
 
-fn jenkins_artifact_root() -> PathBuf {
-    env::temp_dir()
-        .join("webex-generic-account-bot")
+fn jenkins_artifact_base_root(codex_cwd: &Path) -> PathBuf {
+    absolute_lexical(codex_cwd)
+        .join(".codex-tmp")
         .join("jenkins-diagnostics")
-        .join(format!("process-{}", std::process::id()))
 }
 
-fn jenkins_artifact_attempt_dir(message_id: &str) -> PathBuf {
+fn jenkins_artifact_process_root(codex_cwd: &Path) -> PathBuf {
+    jenkins_artifact_base_root(codex_cwd).join(format!("process-{}", std::process::id()))
+}
+
+fn jenkins_artifact_process_root_pid(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("process-")?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_may_be_running(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_may_be_running(pid: u32) -> bool {
+    pid == std::process::id()
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(path);
+    }
+    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    normalize_lexical(&base.join(path))
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn jenkins_artifact_attempt_dir(codex_cwd: &Path, message_id: &str) -> PathBuf {
     let counter = JENKINS_ARTIFACT_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_nanos();
-    jenkins_artifact_root().join(format!(
+    jenkins_artifact_process_root(codex_cwd).join(format!(
         "{}-{nanos}-{counter}-{}",
         std::process::id(),
         safe_path_fragment(message_id)
@@ -981,7 +1089,7 @@ impl BotApp {
         let mut prompt = render_prompt(&policy.prompt_template, &context);
         let mut prefetched_context = None;
         let mut jenkins_artifact_cleanup = None;
-        match jenkins_context_prompt(policy, &context).await {
+        match jenkins_context_prompt(policy, &codex_config, &context).await {
             Ok(Some(context_bundle)) => {
                 prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
                 prefetched_context = Some(context_bundle.prompt);
@@ -2221,6 +2329,7 @@ mod tests {
             output_limit_chars: 1024,
             enabled: true,
         });
+        let codex_cwd = config.codex.cwd.clone();
         let harness = TestHarness::with_config(Arc::new(config));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
@@ -2246,7 +2355,7 @@ mod tests {
         let calls = harness.runner.calls();
         let artifact_dir = first_artifact_dir_from_prompt(&calls[0].1);
         let artifact_root = artifact_dir.parent().unwrap();
-        assert!(artifact_root.starts_with(jenkins_artifact_root()));
+        assert!(artifact_root.starts_with(jenkins_artifact_process_root(&codex_cwd)));
         assert!(!artifact_root.exists());
         fs::remove_dir_all(helper_dir).unwrap();
     }
@@ -2774,15 +2883,24 @@ mod tests {
     }
 
     #[test]
-    fn jenkins_artifact_attempt_dirs_are_unique_temp_paths() {
-        let first = jenkins_artifact_attempt_dir("message-1");
-        let second = jenkins_artifact_attempt_dir("message-1");
+    fn jenkins_artifact_attempt_dirs_are_unique_workspace_paths() {
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let first = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
+        let second = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
+        let process_root = jenkins_artifact_process_root(&codex_cwd);
 
         assert_ne!(first, second);
         assert!(first.is_absolute());
-        assert!(first.starts_with(jenkins_artifact_root()));
+        assert!(first.starts_with(&process_root));
+        assert!(
+            process_root.starts_with(
+                absolute_lexical(&codex_cwd)
+                    .join(".codex-tmp")
+                    .join("jenkins-diagnostics")
+            )
+        );
         let process_dir = format!("process-{}", std::process::id());
-        assert!(jenkins_artifact_root().ends_with(Path::new(&process_dir)));
+        assert!(process_root.ends_with(Path::new(&process_dir)));
         assert_eq!(jenkins_artifact_dir(&first, 1), first.join("url-1"));
     }
 
@@ -2814,6 +2932,23 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_jenkins_artifact_roots_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let codex_tmp_root = absolute_lexical(&codex_cwd).join(".codex-tmp");
+        let base_root = jenkins_artifact_base_root(&codex_cwd);
+        let process_root = ensure_jenkins_artifact_base_root(&codex_cwd).await.unwrap();
+
+        for path in [&codex_tmp_root, &base_root, &process_root] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "unexpected mode for {}", path.display());
+        }
+        fs::remove_dir_all(codex_cwd).unwrap();
+    }
+
     #[tokio::test]
     async fn prune_jenkins_artifact_dirs_skips_active_dirs() {
         let root = unique_state_path().with_extension("jenkins-active-root");
@@ -2831,6 +2966,22 @@ mod tests {
         assert!(active.exists());
         unregister_jenkins_artifact_dir(&active);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_removes_dead_process_roots() {
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let base_root = jenkins_artifact_base_root(&codex_cwd);
+        let current_root = jenkins_artifact_process_root(&codex_cwd);
+        let stale_root = base_root.join("process-99999999");
+        fs::create_dir_all(stale_root.join("message-1")).unwrap();
+        fs::create_dir_all(&current_root).unwrap();
+
+        prune_jenkins_artifact_dirs(&codex_cwd).await.unwrap();
+
+        assert!(!stale_root.exists());
+        assert!(current_root.exists());
+        fs::remove_dir_all(codex_cwd).unwrap();
     }
 
     #[cfg(unix)]
