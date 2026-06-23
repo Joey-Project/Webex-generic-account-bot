@@ -81,6 +81,10 @@ forward_source_message = true
 read_only_source = true
 trigger = "always"
 allowed_person_emails = ["trusted-sender@example.com"]
+# Optional: keep the default "markdown" for normal rooms. Jenkins triage rooms
+# can use "jenkins-diagnosis-json" so Codex returns structured fields and the
+# bot renders the final Webex Markdown deterministically.
+# reply_format = "jenkins-diagnosis-json"
 prompt_template = """
 You are processing a read-only production Space message in staging mode.
 The bot must not reply in the production Space. It will first mirror the source

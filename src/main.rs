@@ -1,10 +1,13 @@
 use std::{
+    collections::HashSet,
     env,
     net::SocketAddr,
-    path::Path,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdSyncMutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,9 +22,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
+    fs,
     io::AsyncReadExt,
     net::TcpListener,
     process::{Child, Command},
@@ -30,8 +34,8 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexRunner, ExecCodexRunner, MessageContext, TriggerMode, render_prompt,
-    should_trigger, trim_to_chars, webex::build_webex_client,
+    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, MessageContext, ReplyFormat, TriggerMode,
+    render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -44,6 +48,9 @@ const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
+const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
+static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -146,6 +153,50 @@ struct ReplyThread {
 enum ReplyThreadSetup {
     Ready(ReplyThread),
     Finished(BotAction),
+}
+
+struct JenkinsPrefetchedContext {
+    prompt: String,
+    artifact_root: PathBuf,
+}
+
+struct JenkinsArtifactCleanupGuard {
+    artifact_root: Option<PathBuf>,
+}
+
+impl JenkinsArtifactCleanupGuard {
+    fn new(artifact_root: PathBuf) -> Self {
+        Self {
+            artifact_root: Some(artifact_root),
+        }
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        let Some(artifact_root) = self.artifact_root.take() else {
+            return Ok(());
+        };
+        cleanup_jenkins_artifact_dir(&artifact_root).await
+    }
+}
+
+impl Drop for JenkinsArtifactCleanupGuard {
+    fn drop(&mut self) {
+        let Some(artifact_root) = self.artifact_root.take() else {
+            return;
+        };
+        unregister_jenkins_artifact_dir(&artifact_root);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = remove_jenkins_artifact_dir(&artifact_root).await {
+                    warn!(
+                        artifact_root = %artifact_root.display(),
+                        error = %error,
+                        "failed to clean Jenkins diagnostics artifacts from drop guard"
+                    );
+                }
+            });
+        }
+    }
 }
 
 #[async_trait]
@@ -257,8 +308,9 @@ fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) 
 
 async fn jenkins_context_prompt(
     policy: &webex_generic_account_bot::RoomPolicy,
+    codex_config: &CodexConfig,
     context: &MessageContext,
-) -> Result<Option<String>> {
+) -> Result<Option<JenkinsPrefetchedContext>> {
     let Some(config) = &policy.jenkins_context else {
         return Ok(None);
     };
@@ -270,24 +322,131 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
-    let mut sections = Vec::new();
-    for url in urls {
-        let output = run_jenkins_context_helper(config, &url).await?;
-        sections.push(format!(
-            "URL: {url}\n```text\n{}\n```",
-            trim_to_chars(output.trim(), config.output_limit_chars)
-        ));
-    }
+    ensure_jenkins_artifact_base_root(&codex_config.cwd)
+        .await
+        .with_context(|| "failed to prepare Jenkins diagnostics artifact root")?;
+    prune_jenkins_artifact_dirs(&codex_config.cwd)
+        .await
+        .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
 
-    Ok(Some(format!(
-        "Prefetched Jenkins diagnostics (read-only helper output; use this instead of running Jenkins commands from Codex):\n\n{}",
-        sections.join("\n\n")
-    )))
+    let artifact_root = jenkins_artifact_attempt_dir(&codex_config.cwd, &context.message_id);
+    create_private_dir(&artifact_root).await.with_context(|| {
+        format!(
+            "failed to create Jenkins diagnostics artifact root {}",
+            artifact_root.display()
+        )
+    })?;
+    register_jenkins_artifact_dir(&artifact_root);
+
+    let mut sections = Vec::new();
+    let build_result: Result<String> = async {
+        for (index, url) in urls.into_iter().enumerate() {
+            let artifact_dir = jenkins_artifact_dir(&artifact_root, index + 1);
+            reset_jenkins_artifact_dir(&artifact_dir)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reset Jenkins diagnostics artifact dir {}",
+                        artifact_dir.display()
+                    )
+                })?;
+            let output = run_jenkins_context_helper(config, &url, &artifact_dir).await?;
+            sections.push(format!(
+                "URL: {url}\nDiagnostics artifact directory: `{}`\n```text\n{}\n```",
+                artifact_dir.display(),
+                trim_to_chars(output.trim(), config.output_limit_chars)
+            ));
+        }
+
+        Ok(format!(
+            "Prefetched Jenkins diagnostics (read-only helper output and local artifact files; use these instead of running Jenkins commands from Codex):\n\n{}",
+            sections.join("\n\n")
+        ))
+    }
+    .await;
+
+    match build_result {
+        Ok(prompt) => Ok(Some(JenkinsPrefetchedContext {
+            prompt,
+            artifact_root,
+        })),
+        Err(error) => {
+            if let Err(cleanup_error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
+                warn!(
+                    artifact_root = %artifact_root.display(),
+                    error = %cleanup_error,
+                    "failed to clean Jenkins diagnostics artifacts after prefetch failure"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn reset_jenkins_artifact_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove existing Jenkins artifact dir {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    create_private_dir(path).await.with_context(|| {
+        format!(
+            "failed to create Jenkins diagnostics artifact dir {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    set_private_dir_permissions(path).await
+}
+
+async fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| format!("failed to chmod 0700 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn cleanup_jenkins_artifact_dir(path: &Path) -> Result<()> {
+    let result = remove_jenkins_artifact_dir(path).await;
+    unregister_jenkins_artifact_dir(path);
+    result
+}
+
+async fn remove_jenkins_artifact_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove Jenkins diagnostics artifact dir {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 async fn run_jenkins_context_helper(
     config: &webex_generic_account_bot::JenkinsContextConfig,
     url: &str,
+    artifact_dir: &Path,
 ) -> Result<String> {
     let mut command = Command::new(&config.node_bin);
     let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
@@ -297,6 +456,8 @@ async fn run_jenkins_context_helper(
         .arg(&config.script)
         .arg("--env-file")
         .arg(&config.env_file)
+        .arg("--artifact-dir")
+        .arg(artifact_dir)
         .arg("diagnose")
         .arg("--url")
         .arg(url)
@@ -363,6 +524,242 @@ async fn run_jenkins_context_helper(
     ))
 }
 
+async fn prune_jenkins_artifact_dirs(codex_cwd: &Path) -> Result<()> {
+    prune_jenkins_artifact_process_roots_in(
+        &jenkins_artifact_base_root(codex_cwd),
+        &jenkins_artifact_process_root(codex_cwd),
+    )
+    .await
+}
+
+async fn prune_jenkins_artifact_process_roots_in(
+    base_root: &Path,
+    current_process_root: &Path,
+) -> Result<()> {
+    let mut entries = match fs::read_dir(base_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", base_root.display()));
+        }
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        if path == current_process_root {
+            prune_jenkins_artifact_dirs_in(&path).await?;
+            continue;
+        }
+
+        let Some(pid) = jenkins_artifact_process_root_pid(&path) else {
+            continue;
+        };
+        if process_may_be_running(pid) {
+            continue;
+        }
+
+        match fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove stale Jenkins process artifact root {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
+    let active_dirs = active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .clone();
+    let mut entries = match fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", root.display()));
+        }
+    };
+    let mut dirs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if active_dirs.contains(&path) {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        };
+        if metadata.is_dir() {
+            dirs.push((
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                entry.file_name(),
+                path,
+            ));
+        }
+    }
+    if dirs.len() <= JENKINS_ARTIFACT_RETENTION_LIMIT {
+        return Ok(());
+    }
+    dirs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, _, path) in dirs.into_iter().skip(JENKINS_ARTIFACT_RETENTION_LIMIT) {
+        match fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove old Jenkins artifact dir {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_jenkins_artifact_base_root(codex_cwd: &Path) -> Result<PathBuf> {
+    let codex_tmp_root = absolute_lexical(codex_cwd).join(".codex-tmp");
+    let base_root = jenkins_artifact_base_root(codex_cwd);
+    let process_root = jenkins_artifact_process_root(codex_cwd);
+    create_private_dir(&codex_tmp_root).await?;
+    create_private_dir(&base_root).await?;
+    create_private_dir(&process_root).await?;
+    Ok(process_root)
+}
+
+fn jenkins_artifact_base_root(codex_cwd: &Path) -> PathBuf {
+    absolute_lexical(codex_cwd)
+        .join(".codex-tmp")
+        .join("jenkins-diagnostics")
+}
+
+fn jenkins_artifact_process_root(codex_cwd: &Path) -> PathBuf {
+    jenkins_artifact_base_root(codex_cwd).join(format!("process-{}", std::process::id()))
+}
+
+fn jenkins_artifact_process_root_pid(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("process-")?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_may_be_running(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_may_be_running(pid: u32) -> bool {
+    pid == std::process::id()
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(path);
+    }
+    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    normalize_lexical(&base.join(path))
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn jenkins_artifact_attempt_dir(codex_cwd: &Path, message_id: &str) -> PathBuf {
+    let counter = JENKINS_ARTIFACT_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    jenkins_artifact_process_root(codex_cwd).join(format!(
+        "{}-{nanos}-{counter}-{}",
+        std::process::id(),
+        safe_path_fragment(message_id)
+    ))
+}
+
+fn jenkins_artifact_dir(attempt_root: &Path, index: usize) -> PathBuf {
+    attempt_root.join(format!("url-{index}"))
+}
+
+fn active_jenkins_artifact_dirs() -> &'static StdSyncMutex<HashSet<PathBuf>> {
+    ACTIVE_JENKINS_ARTIFACT_DIRS.get_or_init(|| StdSyncMutex::new(HashSet::new()))
+}
+
+fn register_jenkins_artifact_dir(path: &Path) {
+    active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .insert(path.to_path_buf());
+}
+
+fn unregister_jenkins_artifact_dir(path: &Path) {
+    active_jenkins_artifact_dirs()
+        .lock()
+        .expect("active Jenkins artifact dirs mutex poisoned")
+        .remove(path);
+}
+
+fn safe_path_fragment(value: &str) -> String {
+    let fragment: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let fragment = fragment.trim_matches('_');
+    if fragment.is_empty() {
+        "unknown".to_owned()
+    } else {
+        fragment.chars().take(160).collect()
+    }
+}
+
 async fn join_helper_output(
     stdout_task: tokio::task::JoinHandle<Result<String>>,
     stderr_task: tokio::task::JoinHandle<Result<String>>,
@@ -387,6 +784,12 @@ fn configure_jenkins_helper_process(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
+        unsafe {
+            command.pre_exec(|| {
+                umask(0o077);
+                Ok(())
+            });
+        }
     }
 }
 
@@ -436,6 +839,7 @@ fn terminate_jenkins_helper_process_group(process_group: Option<i32>, signal: i3
 #[cfg(unix)]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn umask(mask: u32) -> u32;
 }
 
 fn read_limited_pipe<R>(
@@ -683,9 +1087,15 @@ impl BotApp {
         };
         let codex_config = self.config.codex_for_policy(policy);
         let mut prompt = render_prompt(&policy.prompt_template, &context);
-        match jenkins_context_prompt(policy, &context).await {
-            Ok(Some(context_prompt)) => {
-                prompt = append_prefetched_context(&prompt, &context_prompt);
+        let mut prefetched_context = None;
+        let mut jenkins_artifact_cleanup = None;
+        match jenkins_context_prompt(policy, &codex_config, &context).await {
+            Ok(Some(context_bundle)) => {
+                prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
+                prefetched_context = Some(context_bundle.prompt);
+                jenkins_artifact_cleanup = Some(JenkinsArtifactCleanupGuard::new(
+                    context_bundle.artifact_root,
+                ));
             }
             Ok(None) => {}
             Err(error) => {
@@ -696,8 +1106,22 @@ impl BotApp {
                 );
             }
         }
-        let reply_text = match self.runner.run(&codex_config, &prompt, &message_id).await {
-            Ok(output) => output.final_message,
+        let run_result = self.runner.run(&codex_config, &prompt, &message_id).await;
+        if let Some(cleanup_guard) = jenkins_artifact_cleanup {
+            if let Err(error) = cleanup_guard.cleanup().await {
+                warn!(
+                    message_id = %message_id,
+                    error = %error,
+                    "failed to clean Jenkins diagnostics artifacts after Codex run"
+                );
+            }
+        }
+        let reply_text = match run_result {
+            Ok(output) => render_reply_text(
+                policy.reply_format,
+                &output.final_message,
+                prefetched_context.as_deref(),
+            ),
             Err(error) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");
                 "Codex run failed. Check the bot service logs for details.".to_owned()
@@ -1414,6 +1838,186 @@ fn sanitize_reply_markdown(markdown: &str) -> String {
     markdown.replace("<@", "&lt;@")
 }
 
+#[derive(Debug, Deserialize)]
+struct JenkinsDiagnosisReply {
+    verdict: JenkinsDiagnosisVerdict,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    log_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JenkinsDiagnosisVerdict {
+    InfraFalseAlarm,
+    LikelyProductTestFailure,
+    NotEnoughEvidence,
+}
+
+fn render_reply_text(
+    format: ReplyFormat,
+    output: &str,
+    prefetched_context: Option<&str>,
+) -> String {
+    match format {
+        ReplyFormat::Markdown => output.to_owned(),
+        ReplyFormat::JenkinsDiagnosisJson => {
+            render_jenkins_diagnosis_json(output, prefetched_context)
+        }
+    }
+}
+
+fn render_jenkins_diagnosis_json(output: &str, prefetched_context: Option<&str>) -> String {
+    let allowed_log_urls = prefetched_context
+        .map(extract_jenkins_console_urls)
+        .unwrap_or_default();
+    let fallback_log_url = if allowed_log_urls.len() == 1 {
+        allowed_log_urls.first().map(String::as_str)
+    } else {
+        None
+    };
+    match parse_jenkins_diagnosis_json(output) {
+        Ok(reply) => render_jenkins_diagnosis_reply(&reply, &allowed_log_urls, fallback_log_url),
+        Err(_) => render_jenkins_diagnosis_reply(
+            &JenkinsDiagnosisReply {
+                verdict: JenkinsDiagnosisVerdict::NotEnoughEvidence,
+                reason: "Codex did not return valid diagnosis JSON".to_owned(),
+                log_url: fallback_log_url.map(ToOwned::to_owned),
+            },
+            &allowed_log_urls,
+            fallback_log_url,
+        ),
+    }
+}
+
+fn parse_jenkins_diagnosis_json(output: &str) -> Result<JenkinsDiagnosisReply> {
+    let json = extract_json_object(output)
+        .ok_or_else(|| anyhow!("Codex output did not contain a JSON object"))?;
+    serde_json::from_str(json).context("failed to parse Jenkins diagnosis JSON")
+}
+
+fn extract_json_object(output: &str) -> Option<&str> {
+    let trimmed = output.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(output[start..=end].trim())
+}
+
+fn render_jenkins_diagnosis_reply(
+    reply: &JenkinsDiagnosisReply,
+    allowed_log_urls: &[String],
+    fallback_log_url: Option<&str>,
+) -> String {
+    let reason_is_blank = reply.reason.split_whitespace().next().is_none();
+    let verdict = if reason_is_blank {
+        JenkinsDiagnosisVerdict::NotEnoughEvidence
+    } else {
+        reply.verdict
+    };
+    let prefix = match verdict {
+        JenkinsDiagnosisVerdict::InfraFalseAlarm => "**Jenkins infra false alarm:**",
+        JenkinsDiagnosisVerdict::LikelyProductTestFailure => "**Likely product/test failure:**",
+        JenkinsDiagnosisVerdict::NotEnoughEvidence => "**Not enough evidence:**",
+    };
+    let reason = if reason_is_blank {
+        "diagnostic evidence is inconclusive".to_owned()
+    } else {
+        escape_markdown_plain_text(&concise_reason(&reply.reason))
+    };
+    let log_url = reply
+        .log_url
+        .as_deref()
+        .and_then(normalized_jenkins_console_url)
+        .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url))
+        .or_else(|| fallback_log_url.and_then(normalized_jenkins_console_url));
+    match log_url {
+        Some(url) => format!("{prefix} {reason} [log](<{url}>)"),
+        None => format!("{prefix} {reason}"),
+    }
+}
+
+fn concise_reason(reason: &str) -> String {
+    let normalised = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalised = normalised.trim_matches(['.', '!', '?', ' ', '\t']).trim();
+    if normalised.is_empty() {
+        return "diagnostic evidence is inconclusive".to_owned();
+    }
+    let mut boundary = normalised.len();
+    for (index, ch) in normalised.char_indices() {
+        if matches!(ch, '.' | '!' | '?')
+            && normalised[index + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            boundary = index;
+            break;
+        }
+    }
+    normalised[..boundary]
+        .trim_matches(['.', '!', '?', ' ', '\t'])
+        .to_owned()
+}
+
+fn escape_markdown_plain_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn extract_jenkins_console_urls(context: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for line in context.lines() {
+        let Some((_, value)) = line.split_once("jenkins_console:") else {
+            continue;
+        };
+        if let Some(url) = normalized_jenkins_console_url(value) {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
+}
+
+fn normalized_jenkins_console_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if is_valid_jenkins_console_url(url) {
+        Some(url.trim_end_matches('/').to_owned())
+    } else {
+        None
+    }
+}
+
+fn is_valid_jenkins_console_url(url: &str) -> bool {
+    let url = url.trim();
+    let path = url.trim_end_matches('/');
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && path.ends_with("/console")
+        && !url.contains("consoleText")
+        && !url.chars().any(|ch| matches!(ch, '<' | '>'))
+        && !url.chars().any(char::is_whitespace)
+        && !url.chars().any(char::is_control)
+}
+
 fn reply_marker(message_id: &str) -> String {
     format!("wgb-ref:{}", marker_hex(message_id))
 }
@@ -1662,6 +2266,98 @@ mod tests {
         assert!(markdown.contains(&reply_marker("message-1")));
         assert_eq!(harness.runner.calls().len(), 1);
         assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn codex_runner_failure_skips_json_reply_rendering() {
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::JenkinsDiagnosisJson;
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+        harness.runner.push_error("runner crashed");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
+        let created = harness.webex.created_requests();
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("Codex run failed. Check the bot service logs for details."));
+        assert!(!markdown.contains("Not enough evidence"));
+    }
+
+    #[tokio::test]
+    async fn process_event_removes_jenkins_artifacts_after_codex_run() {
+        let helper_dir = unique_state_path().with_extension("helper-cleanup-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "artifact_dir=\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             --artifact-dir) artifact_dir=\"$2\"; shift 2 ;;\n\
+             *) shift ;;\n\
+             esac\n\
+             done\n\
+             mkdir -p \"$artifact_dir\"\n\
+             printf evidence > \"$artifact_dir/evidence.txt\"\n\
+             printf 'jenkins_console: https://jenkins.example/job/foo/1/console\\n'\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::JenkinsDiagnosisJson;
+        config.rooms[0].jenkins_context = Some(webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        });
+        let codex_cwd = config.codex.cwd.clone();
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+        harness.runner.push_output(
+            r#"{
+                "verdict": "infra_false_alarm",
+                "reason": "agent capacity failure",
+                "log_url": "https://jenkins.example/job/foo/1/console"
+            }"#,
+        );
+
+        harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed: https://engci-private-sjc.cisco.com/jenkins/job/foo/1/",
+            )))
+            .await
+            .unwrap();
+
+        let calls = harness.runner.calls();
+        let artifact_dir = first_artifact_dir_from_prompt(&calls[0].1);
+        let artifact_root = artifact_dir.parent().unwrap();
+        assert!(artifact_root.starts_with(jenkins_artifact_process_root(&codex_cwd)));
+        assert!(!artifact_root.exists());
+        fs::remove_dir_all(helper_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2019,6 +2715,313 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_diagnosis_json_reply_is_rendered_deterministically() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "the failed leaf could not find any nodes to run the job. Ignore the wrapper failure.",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** the failed leaf could not find any nodes to run the job [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_reply_accepts_fenced_json() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/2/console\n";
+        let output = r#"```json
+{
+  "verdict": "likely_product_test_failure",
+  "reason": "the conformance log reports a deterministic mismatch",
+  "log_url": "https://jenkins.example/job/foo/2/console"
+}
+```"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Likely product/test failure:** the conformance log reports a deterministic mismatch [log](<https://jenkins.example/job/foo/2/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_blank_reason_downgrades_verdict() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": " ",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Not enough evidence:** diagnostic evidence is inconclusive [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_trims_rendered_log_url() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "  https://jenkins.example/job/foo/1/console  "
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_escapes_model_reason_markdown() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "see [bad](https://evil.example) and *bold* <@all>",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** see \\[bad\\]\\(https://evil.example\\) and \\*bold\\* &lt;@all&gt; [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_restricts_log_url_to_prefetched_context() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_canonicalizes_console_urls_before_allowlist_compare() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\njenkins_console: https://jenkins.example/job/bar/2/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://jenkins.example/job/bar/2/console/"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/bar/2/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_omits_fallback_when_multiple_logs_are_prefetched() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\njenkins_console: https://jenkins.example/job/bar/2/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_omits_unprefetched_log_url() {
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Jenkins infra false alarm:** agent capacity failure"
+        );
+    }
+
+    #[test]
+    fn jenkins_console_url_validation_rejects_console_text() {
+        assert!(is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/console"
+        ));
+        assert!(!is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/consoleText"
+        ));
+        assert!(!is_valid_jenkins_console_url(
+            "https://jenkins.example/job/foo/1/console>"
+        ));
+    }
+
+    #[test]
+    fn invalid_jenkins_diagnosis_json_uses_console_url_fallback() {
+        let context = "recommended_reading_order_preview:\n- failed_leaf: foo#1\n  jenkins_console: https://jenkins.example/job/foo/1/console\n";
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, "not json", Some(context),),
+            "**Not enough evidence:** Codex did not return valid diagnosis JSON [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn safe_path_fragment_truncates_without_suffix() {
+        let fragment = safe_path_fragment(&format!("{}{}", "a".repeat(200), " / bad"));
+
+        assert_eq!(fragment.len(), 160);
+        assert!(!fragment.contains("[truncated]"));
+        assert!(!fragment.chars().any(char::is_whitespace));
+    }
+
+    #[test]
+    fn jenkins_artifact_attempt_dirs_are_unique_workspace_paths() {
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let first = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
+        let second = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
+        let process_root = jenkins_artifact_process_root(&codex_cwd);
+
+        assert_ne!(first, second);
+        assert!(first.is_absolute());
+        assert!(first.starts_with(&process_root));
+        assert!(
+            process_root.starts_with(
+                absolute_lexical(&codex_cwd)
+                    .join(".codex-tmp")
+                    .join("jenkins-diagnostics")
+            )
+        );
+        let process_dir = format!("process-{}", std::process::id());
+        assert!(process_root.ends_with(Path::new(&process_dir)));
+        assert_eq!(jenkins_artifact_dir(&first, 1), first.join("url-1"));
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_keeps_recent_message_dirs() {
+        let root = unique_state_path().with_extension("jenkins-retention-root");
+        for index in 0..(JENKINS_ARTIFACT_RETENTION_LIMIT + 3) {
+            fs::create_dir_all(root.join(format!("message-{index}"))).unwrap();
+        }
+
+        prune_jenkins_artifact_dirs_in(&root).await.unwrap();
+
+        let remaining = fs::read_dir(&root).unwrap().count();
+        assert_eq!(remaining, JENKINS_ARTIFACT_RETENTION_LIMIT);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_private_jenkins_artifact_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_state_path().with_extension("jenkins-private-dir");
+
+        create_private_dir(&dir).await.unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_jenkins_artifact_roots_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let codex_tmp_root = absolute_lexical(&codex_cwd).join(".codex-tmp");
+        let base_root = jenkins_artifact_base_root(&codex_cwd);
+        let process_root = ensure_jenkins_artifact_base_root(&codex_cwd).await.unwrap();
+
+        for path in [&codex_tmp_root, &base_root, &process_root] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "unexpected mode for {}", path.display());
+        }
+        fs::remove_dir_all(codex_cwd).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_skips_active_dirs() {
+        let root = unique_state_path().with_extension("jenkins-active-root");
+        for index in 0..(JENKINS_ARTIFACT_RETENTION_LIMIT + 3) {
+            fs::create_dir_all(root.join(format!("message-{index:02}"))).unwrap();
+        }
+        let active = root.join(format!(
+            "message-{:02}",
+            JENKINS_ARTIFACT_RETENTION_LIMIT + 2
+        ));
+        register_jenkins_artifact_dir(&active);
+
+        prune_jenkins_artifact_dirs_in(&root).await.unwrap();
+
+        assert!(active.exists());
+        unregister_jenkins_artifact_dir(&active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_removes_dead_process_roots() {
+        let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        let base_root = jenkins_artifact_base_root(&codex_cwd);
+        let current_root = jenkins_artifact_process_root(&codex_cwd);
+        let stale_root = base_root.join("process-99999999");
+        fs::create_dir_all(stale_root.join("message-1")).unwrap();
+        fs::create_dir_all(&current_root).unwrap();
+
+        prune_jenkins_artifact_dirs(&codex_cwd).await.unwrap();
+
+        assert!(!stale_root.exists());
+        assert!(current_root.exists());
+        fs::remove_dir_all(codex_cwd).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_ignores_already_removed_entries() {
+        let root = unique_state_path().with_extension("jenkins-race-root");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("broken-entry")).unwrap();
+
+        prune_jenkins_artifact_dirs_in(&root).await.unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_artifact_cleanup_guard_removes_artifacts_on_drop() {
+        let dir = unique_state_path().with_extension("jenkins-drop-guard");
+        create_private_dir(&dir).await.unwrap();
+        register_jenkins_artifact_dir(&dir);
+
+        {
+            let _guard = JenkinsArtifactCleanupGuard::new(dir.clone());
+        }
+
+        for _ in 0..50 {
+            if !dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!dir.exists());
+        assert!(
+            !active_jenkins_artifact_dirs()
+                .lock()
+                .unwrap()
+                .contains(&dir)
+        );
+    }
+
+    #[test]
     fn prepared_reply_includes_reference_marker_within_limit() {
         let marker = reply_marker("message-1");
         let reply = prepare_reply_markdown(&"x".repeat(7_000), &marker);
@@ -2117,6 +3120,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(&script, "printf 'pwd=%s\\n' \"$PWD\"\n").unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
         let config = webex_generic_account_bot::JenkinsContextConfig {
@@ -2129,10 +3134,13 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains(&format!("pwd={}", helper_dir.display())));
         fs::remove_dir_all(helper_dir).unwrap();
@@ -2148,6 +3156,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(
             &script,
             "printf 'webex=%s\\n' \"${WEBEX_ACCESS_TOKEN-unset}\"\n\
@@ -2165,10 +3175,13 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains("webex=unset"));
         assert!(output.contains("sidecar=unset"));
@@ -2187,6 +3200,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(
             &script,
             "i=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\n",
@@ -2203,13 +3218,67 @@ mod tests {
             enabled: true,
         };
 
-        let output =
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1")
-                .await
-                .unwrap();
+        let output = run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
 
         assert!(output.contains("[truncated]"));
         assert!(output.len() < 1_200);
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jenkins_helper_writes_artifacts_with_private_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper_dir = unique_state_path().with_extension("helper-umask-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        create_private_dir(&artifact_dir).await.unwrap();
+        fs::write(
+            &script,
+            "artifact_dir=\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             --artifact-dir) artifact_dir=\"$2\"; shift 2 ;;\n\
+             *) shift ;;\n\
+             esac\n\
+             done\n\
+             printf secret > \"$artifact_dir/secret.txt\"\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        run_jenkins_context_helper(
+            &config,
+            "https://engci-private-sjc.cisco.com/job/1",
+            &artifact_dir,
+        )
+        .await
+        .unwrap();
+
+        let mode = fs::metadata(artifact_dir.join("secret.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
@@ -2219,6 +3288,8 @@ mod tests {
         fs::create_dir_all(&helper_dir).unwrap();
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(&script, "sleep 5 &\nprintf 'parent_done\\n'\n").unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
         let config = webex_generic_account_bot::JenkinsContextConfig {
@@ -2233,7 +3304,11 @@ mod tests {
 
         let output = timeout(
             Duration::from_secs(2),
-            run_jenkins_context_helper(&config, "https://engci-private-sjc.cisco.com/job/1"),
+            run_jenkins_context_helper(
+                &config,
+                "https://engci-private-sjc.cisco.com/job/1",
+                &artifact_dir,
+            ),
         )
         .await
         .unwrap()
@@ -2483,6 +3558,10 @@ mod tests {
             }));
         }
 
+        fn push_error(&self, message: impl Into<String>) {
+            self.outputs.lock().unwrap().push_back(Err(message.into()));
+        }
+
         fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
         }
@@ -2584,6 +3663,13 @@ mod tests {
             "webex-generic-account-bot-test-{}-{counter}-{nanos}.jsonl",
             std::process::id()
         ))
+    }
+
+    fn first_artifact_dir_from_prompt(prompt: &str) -> PathBuf {
+        let prefix = "Diagnostics artifact directory: `";
+        let start = prompt.find(prefix).unwrap() + prefix.len();
+        let end = start + prompt[start..].find('`').unwrap();
+        PathBuf::from(&prompt[start..end])
     }
 
     fn message_event(message: Message) -> SidecarEvent {
