@@ -161,6 +161,45 @@ struct JenkinsPrefetchedContext {
     artifact_root: PathBuf,
 }
 
+struct JenkinsArtifactCleanupGuard {
+    artifact_root: Option<PathBuf>,
+}
+
+impl JenkinsArtifactCleanupGuard {
+    fn new(artifact_root: PathBuf) -> Self {
+        Self {
+            artifact_root: Some(artifact_root),
+        }
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        let Some(artifact_root) = self.artifact_root.take() else {
+            return Ok(());
+        };
+        cleanup_jenkins_artifact_dir(&artifact_root).await
+    }
+}
+
+impl Drop for JenkinsArtifactCleanupGuard {
+    fn drop(&mut self) {
+        let Some(artifact_root) = self.artifact_root.take() else {
+            return;
+        };
+        unregister_jenkins_artifact_dir(&artifact_root);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = remove_jenkins_artifact_dir(&artifact_root).await {
+                    warn!(
+                        artifact_root = %artifact_root.display(),
+                        error = %error,
+                        "failed to clean Jenkins diagnostics artifacts from drop guard"
+                    );
+                }
+            });
+        }
+    }
+}
+
 #[async_trait]
 trait WebexApi: Send + Sync {
     async fn me(&self) -> Result<Person, WebexCallError>;
@@ -556,6 +595,7 @@ fn jenkins_artifact_root() -> PathBuf {
     env::temp_dir()
         .join("webex-generic-account-bot")
         .join("jenkins-diagnostics")
+        .join(format!("process-{}", std::process::id()))
 }
 
 fn jenkins_artifact_attempt_dir(message_id: &str) -> PathBuf {
@@ -945,7 +985,9 @@ impl BotApp {
             Ok(Some(context_bundle)) => {
                 prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
                 prefetched_context = Some(context_bundle.prompt);
-                jenkins_artifact_cleanup = Some(context_bundle.artifact_root);
+                jenkins_artifact_cleanup = Some(JenkinsArtifactCleanupGuard::new(
+                    context_bundle.artifact_root,
+                ));
             }
             Ok(None) => {}
             Err(error) => {
@@ -957,11 +999,10 @@ impl BotApp {
             }
         }
         let run_result = self.runner.run(&codex_config, &prompt, &message_id).await;
-        if let Some(artifact_root) = jenkins_artifact_cleanup {
-            if let Err(error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
+        if let Some(cleanup_guard) = jenkins_artifact_cleanup {
+            if let Err(error) = cleanup_guard.cleanup().await {
                 warn!(
                     message_id = %message_id,
-                    artifact_root = %artifact_root.display(),
                     error = %error,
                     "failed to clean Jenkins diagnostics artifacts after Codex run"
                 );
@@ -1723,7 +1764,11 @@ fn render_jenkins_diagnosis_json(output: &str, prefetched_context: Option<&str>)
     let allowed_log_urls = prefetched_context
         .map(extract_jenkins_console_urls)
         .unwrap_or_default();
-    let fallback_log_url = allowed_log_urls.first().map(String::as_str);
+    let fallback_log_url = if allowed_log_urls.len() == 1 {
+        allowed_log_urls.first().map(String::as_str)
+    } else {
+        None
+    };
     match parse_jenkins_diagnosis_json(output) {
         Ok(reply) => render_jenkins_diagnosis_reply(&reply, &allowed_log_urls, fallback_log_url),
         Err(_) => render_jenkins_diagnosis_reply(
@@ -2668,6 +2713,21 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_diagnosis_json_omits_fallback_when_multiple_logs_are_prefetched() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\njenkins_console: https://jenkins.example/job/bar/2/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure"
+        );
+    }
+
+    #[test]
     fn jenkins_diagnosis_json_omits_unprefetched_log_url() {
         let output = r#"{
             "verdict": "infra_false_alarm",
@@ -2721,6 +2781,8 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_absolute());
         assert!(first.starts_with(jenkins_artifact_root()));
+        let process_dir = format!("process-{}", std::process::id());
+        assert!(jenkins_artifact_root().ends_with(Path::new(&process_dir)));
         assert_eq!(jenkins_artifact_dir(&first, 1), first.join("url-1"));
     }
 
@@ -2781,6 +2843,31 @@ mod tests {
         prune_jenkins_artifact_dirs_in(&root).await.unwrap();
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_artifact_cleanup_guard_removes_artifacts_on_drop() {
+        let dir = unique_state_path().with_extension("jenkins-drop-guard");
+        create_private_dir(&dir).await.unwrap();
+        register_jenkins_artifact_dir(&dir);
+
+        {
+            let _guard = JenkinsArtifactCleanupGuard::new(dir.clone());
+        }
+
+        for _ in 0..50 {
+            if !dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!dir.exists());
+        assert!(
+            !active_jenkins_artifact_dirs()
+                .lock()
+                .unwrap()
+                .contains(&dir)
+        );
     }
 
     #[test]
