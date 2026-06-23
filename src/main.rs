@@ -377,11 +377,36 @@ async fn run_jenkins_context_helper(
 }
 
 fn jenkins_artifact_dir(codex_cwd: &Path, message_id: &str, index: usize) -> PathBuf {
-    codex_cwd
+    absolute_lexical(codex_cwd)
         .join(".codex-tmp")
         .join("jenkins-diagnostics")
         .join(safe_path_fragment(message_id))
         .join(format!("url-{index}"))
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    normalize_lexical(&joined)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn safe_path_fragment(value: &str) -> String {
@@ -739,17 +764,16 @@ impl BotApp {
             }
         }
         let reply_text = match self.runner.run(&codex_config, &prompt, &message_id).await {
-            Ok(output) => output.final_message,
+            Ok(output) => render_reply_text(
+                policy.reply_format,
+                &output.final_message,
+                prefetched_context.as_deref(),
+            ),
             Err(error) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");
                 "Codex run failed. Check the bot service logs for details.".to_owned()
             }
         };
-        let reply_text = render_reply_text(
-            policy.reply_format,
-            &reply_text,
-            prefetched_context.as_deref(),
-        );
         let reply_markdown = prepare_reply_markdown(&reply_text, &reply_marker);
         let reply_request = reply_markdown_message(
             &reply_thread.room_id,
@@ -1470,7 +1494,7 @@ struct JenkinsDiagnosisReply {
     log_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum JenkinsDiagnosisVerdict {
     InfraFalseAlarm,
@@ -1529,17 +1553,27 @@ fn render_jenkins_diagnosis_reply(
     reply: &JenkinsDiagnosisReply,
     fallback_log_url: Option<&str>,
 ) -> String {
-    let prefix = match reply.verdict {
+    let reason_is_blank = reply.reason.split_whitespace().next().is_none();
+    let verdict = if reason_is_blank {
+        JenkinsDiagnosisVerdict::NotEnoughEvidence
+    } else {
+        reply.verdict
+    };
+    let prefix = match verdict {
         JenkinsDiagnosisVerdict::InfraFalseAlarm => "**Jenkins infra false alarm:**",
         JenkinsDiagnosisVerdict::LikelyProductTestFailure => "**Likely product/test failure:**",
         JenkinsDiagnosisVerdict::NotEnoughEvidence => "**Not enough evidence:**",
     };
-    let reason = concise_reason(&reply.reason);
+    let reason = if reason_is_blank {
+        "diagnostic evidence is inconclusive".to_owned()
+    } else {
+        concise_reason(&reply.reason)
+    };
     let log_url = reply
         .log_url
         .as_deref()
-        .filter(|url| is_valid_jenkins_console_url(url))
-        .or_else(|| fallback_log_url.filter(|url| is_valid_jenkins_console_url(url)));
+        .and_then(normalized_jenkins_console_url)
+        .or_else(|| fallback_log_url.and_then(normalized_jenkins_console_url));
     match log_url {
         Some(url) => format!("{prefix} {reason} [log](<{url}>)"),
         None => format!("{prefix} {reason}"),
@@ -1574,12 +1608,20 @@ fn extract_first_jenkins_console_url(context: &str) -> Option<String> {
         let Some((_, value)) = line.split_once("jenkins_console:") else {
             continue;
         };
-        let url = value.trim();
-        if is_valid_jenkins_console_url(url) {
-            return Some(url.to_owned());
+        if let Some(url) = normalized_jenkins_console_url(value) {
+            return Some(url);
         }
     }
     None
+}
+
+fn normalized_jenkins_console_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if is_valid_jenkins_console_url(url) {
+        Some(url.to_owned())
+    } else {
+        None
+    }
 }
 
 fn is_valid_jenkins_console_url(url: &str) -> bool {
@@ -1841,6 +1883,34 @@ mod tests {
         assert!(markdown.contains(&reply_marker("message-1")));
         assert_eq!(harness.runner.calls().len(), 1);
         assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn codex_runner_failure_skips_json_reply_rendering() {
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::JenkinsDiagnosisJson;
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+        harness.runner.push_error("runner crashed");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
+        let created = harness.webex.created_requests();
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("Codex run failed. Check the bot service logs for details."));
+        assert!(!markdown.contains("Not enough evidence"));
     }
 
     #[tokio::test]
@@ -2228,6 +2298,34 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_diagnosis_json_blank_reason_downgrades_verdict() {
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": " ",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Not enough evidence:** diagnostic evidence is inconclusive [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_trims_rendered_log_url() {
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "  https://jenkins.example/job/foo/1/console  "
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
     fn jenkins_console_url_validation_rejects_console_text() {
         assert!(is_valid_jenkins_console_url(
             "https://jenkins.example/job/foo/1/console"
@@ -2257,6 +2355,14 @@ mod tests {
         assert_eq!(fragment.len(), 160);
         assert!(!fragment.contains("[truncated]"));
         assert!(!fragment.chars().any(char::is_whitespace));
+    }
+
+    #[test]
+    fn jenkins_artifact_dir_is_absolute_for_relative_codex_cwd() {
+        let artifact_dir = jenkins_artifact_dir(Path::new("."), "message-1", 1);
+
+        assert!(artifact_dir.is_absolute());
+        assert!(artifact_dir.ends_with(".codex-tmp/jenkins-diagnostics/message-1/url-1"));
     }
 
     #[test]
@@ -2743,6 +2849,10 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             }));
+        }
+
+        fn push_error(&self, message: impl Into<String>) {
+            self.outputs.lock().unwrap().push_back(Err(message.into()));
         }
 
         fn calls(&self) -> Vec<(String, String)> {
