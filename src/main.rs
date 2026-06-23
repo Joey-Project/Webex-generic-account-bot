@@ -45,6 +45,7 @@ const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
+const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -272,6 +273,10 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
+    prune_jenkins_artifact_dirs(&codex_config.cwd)
+        .await
+        .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
+
     let mut sections = Vec::new();
     for (index, url) in urls.into_iter().enumerate() {
         let artifact_dir = jenkins_artifact_dir(&codex_config.cwd, &context.message_id, index + 1);
@@ -288,6 +293,9 @@ async fn jenkins_context_prompt(
             trim_to_chars(output.trim(), config.output_limit_chars)
         ));
     }
+    prune_jenkins_artifact_dirs(&codex_config.cwd)
+        .await
+        .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
 
     Ok(Some(format!(
         "Prefetched Jenkins diagnostics (read-only helper output and local artifact files; use these instead of running Jenkins commands from Codex):\n\n{}",
@@ -376,10 +384,49 @@ async fn run_jenkins_context_helper(
     ))
 }
 
-fn jenkins_artifact_dir(codex_cwd: &Path, message_id: &str, index: usize) -> PathBuf {
+async fn prune_jenkins_artifact_dirs(codex_cwd: &Path) -> Result<()> {
+    let root = jenkins_artifact_root(codex_cwd);
+    let mut entries = match fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", root.display()));
+        }
+    };
+    let mut dirs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = entry.metadata().await?;
+        if metadata.is_dir() {
+            dirs.push((
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                entry.file_name(),
+                entry.path(),
+            ));
+        }
+    }
+    if dirs.len() <= JENKINS_ARTIFACT_RETENTION_LIMIT {
+        return Ok(());
+    }
+    dirs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, _, path) in dirs.into_iter().skip(JENKINS_ARTIFACT_RETENTION_LIMIT) {
+        fs::remove_dir_all(&path).await.with_context(|| {
+            format!(
+                "failed to remove old Jenkins artifact dir {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn jenkins_artifact_root(codex_cwd: &Path) -> PathBuf {
     absolute_lexical(codex_cwd)
         .join(".codex-tmp")
         .join("jenkins-diagnostics")
+}
+
+fn jenkins_artifact_dir(codex_cwd: &Path, message_id: &str, index: usize) -> PathBuf {
+    jenkins_artifact_root(codex_cwd)
         .join(safe_path_fragment(message_id))
         .join(format!("url-{index}"))
 }
@@ -1516,16 +1563,20 @@ fn render_reply_text(
 }
 
 fn render_jenkins_diagnosis_json(output: &str, prefetched_context: Option<&str>) -> String {
-    let fallback_log_url = prefetched_context.and_then(extract_first_jenkins_console_url);
+    let allowed_log_urls = prefetched_context
+        .map(extract_jenkins_console_urls)
+        .unwrap_or_default();
+    let fallback_log_url = allowed_log_urls.first().map(String::as_str);
     match parse_jenkins_diagnosis_json(output) {
-        Ok(reply) => render_jenkins_diagnosis_reply(&reply, fallback_log_url.as_deref()),
+        Ok(reply) => render_jenkins_diagnosis_reply(&reply, &allowed_log_urls, fallback_log_url),
         Err(_) => render_jenkins_diagnosis_reply(
             &JenkinsDiagnosisReply {
                 verdict: JenkinsDiagnosisVerdict::NotEnoughEvidence,
                 reason: "Codex did not return valid diagnosis JSON".to_owned(),
-                log_url: fallback_log_url.clone(),
+                log_url: fallback_log_url.map(ToOwned::to_owned),
             },
-            fallback_log_url.as_deref(),
+            &allowed_log_urls,
+            fallback_log_url,
         ),
     }
 }
@@ -1551,6 +1602,7 @@ fn extract_json_object(output: &str) -> Option<&str> {
 
 fn render_jenkins_diagnosis_reply(
     reply: &JenkinsDiagnosisReply,
+    allowed_log_urls: &[String],
     fallback_log_url: Option<&str>,
 ) -> String {
     let reason_is_blank = reply.reason.split_whitespace().next().is_none();
@@ -1567,12 +1619,13 @@ fn render_jenkins_diagnosis_reply(
     let reason = if reason_is_blank {
         "diagnostic evidence is inconclusive".to_owned()
     } else {
-        concise_reason(&reply.reason)
+        escape_markdown_plain_text(&concise_reason(&reply.reason))
     };
     let log_url = reply
         .log_url
         .as_deref()
         .and_then(normalized_jenkins_console_url)
+        .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url))
         .or_else(|| fallback_log_url.and_then(normalized_jenkins_console_url));
     match log_url {
         Some(url) => format!("{prefix} {reason} [log](<{url}>)"),
@@ -1603,16 +1656,36 @@ fn concise_reason(reason: &str) -> String {
         .to_owned()
 }
 
-fn extract_first_jenkins_console_url(context: &str) -> Option<String> {
+fn escape_markdown_plain_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn extract_jenkins_console_urls(context: &str) -> Vec<String> {
+    let mut urls = Vec::new();
     for line in context.lines() {
         let Some((_, value)) = line.split_once("jenkins_console:") else {
             continue;
         };
         if let Some(url) = normalized_jenkins_console_url(value) {
-            return Some(url);
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
         }
     }
-    None
+    urls
 }
 
 fn normalized_jenkins_console_url(url: &str) -> Option<String> {
@@ -2269,6 +2342,7 @@ mod tests {
 
     #[test]
     fn jenkins_diagnosis_json_reply_is_rendered_deterministically() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
         let output = r#"{
             "verdict": "infra_false_alarm",
             "reason": "the failed leaf could not find any nodes to run the job. Ignore the wrapper failure.",
@@ -2276,13 +2350,14 @@ mod tests {
         }"#;
 
         assert_eq!(
-            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
             "**Jenkins infra false alarm:** the failed leaf could not find any nodes to run the job [log](<https://jenkins.example/job/foo/1/console>)"
         );
     }
 
     #[test]
     fn jenkins_diagnosis_json_reply_accepts_fenced_json() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/2/console\n";
         let output = r#"```json
 {
   "verdict": "likely_product_test_failure",
@@ -2292,13 +2367,14 @@ mod tests {
 ```"#;
 
         assert_eq!(
-            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
             "**Likely product/test failure:** the conformance log reports a deterministic mismatch [log](<https://jenkins.example/job/foo/2/console>)"
         );
     }
 
     #[test]
     fn jenkins_diagnosis_json_blank_reason_downgrades_verdict() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
         let output = r#"{
             "verdict": "infra_false_alarm",
             "reason": " ",
@@ -2306,13 +2382,14 @@ mod tests {
         }"#;
 
         assert_eq!(
-            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
             "**Not enough evidence:** diagnostic evidence is inconclusive [log](<https://jenkins.example/job/foo/1/console>)"
         );
     }
 
     #[test]
     fn jenkins_diagnosis_json_trims_rendered_log_url() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
         let output = r#"{
             "verdict": "infra_false_alarm",
             "reason": "agent capacity failure",
@@ -2320,8 +2397,52 @@ mod tests {
         }"#;
 
         assert_eq!(
-            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
             "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_escapes_model_reason_markdown() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "see [bad](https://evil.example) and *bold* <@all>",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** see \\[bad\\]\\(https://evil.example\\) and \\*bold\\* &lt;@all&gt; [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_restricts_log_url_to_prefetched_context() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
+        );
+    }
+
+    #[test]
+    fn jenkins_diagnosis_json_omits_unprefetched_log_url() {
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, None),
+            "**Jenkins infra false alarm:** agent capacity failure"
         );
     }
 
@@ -2363,6 +2484,21 @@ mod tests {
 
         assert!(artifact_dir.is_absolute());
         assert!(artifact_dir.ends_with(".codex-tmp/jenkins-diagnostics/message-1/url-1"));
+    }
+
+    #[tokio::test]
+    async fn prune_jenkins_artifact_dirs_keeps_recent_message_dirs() {
+        let codex_cwd = unique_state_path().with_extension("jenkins-retention");
+        let root = jenkins_artifact_root(&codex_cwd);
+        for index in 0..(JENKINS_ARTIFACT_RETENTION_LIMIT + 3) {
+            fs::create_dir_all(root.join(format!("message-{index}"))).unwrap();
+        }
+
+        prune_jenkins_artifact_dirs(&codex_cwd).await.unwrap();
+
+        let remaining = fs::read_dir(&root).unwrap().count();
+        assert_eq!(remaining, JENKINS_ARTIFACT_RETENTION_LIMIT);
+        fs::remove_dir_all(codex_cwd).unwrap();
     }
 
     #[test]
