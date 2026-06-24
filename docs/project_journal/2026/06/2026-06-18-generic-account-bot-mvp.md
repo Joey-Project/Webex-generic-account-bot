@@ -3,7 +3,7 @@ id: 20260618-generic-account-bot-mvp
 title: Generic Account Bot MVP
 status: active
 created: 2026-06-18
-updated: 2026-06-23
+updated: 2026-06-24
 branch:
 pr:
 supersedes: []
@@ -26,9 +26,11 @@ superseded_by:
 - The E2E harness also checks the reply identity when Webex returns `personEmail`, verifies fixed localhost ports are free, and fails if the bot or sidecar exits before the Webex reply is observed.
 - Review hardening added retry-safe Webex reply failure handling with stable marker reconciliation, loopback-only unauthenticated sidecar mode, authenticated health metadata, runner timeout coverage for blocked stdin writes, and `codex.codex_home` support for bot-owned Codex auth/config.
 - WME Jenkins staging now supports recursive read-only diagnostics bundles under the Codex cwd, mirrored production-source messages into the staging output room, and an opt-in `jenkins-diagnosis-json` reply format so Codex returns structured diagnosis fields while the bot renders deterministic Webex Markdown.
+- Follow-up MVP is implemented behind opt-in room config: allowed users can mention the generic account in an existing bot thread, the bot resolves the prior source message through hidden markers, includes recent thread context in the Codex prompt, and replies in the same thread while preserving staging output/read-only source boundaries. Quoted-reply follow-up is supported when the incoming Webex payload preserves the bot marker, but still needs live client payload validation.
 
 ## Next Steps
 - Let the WME Jenkins staging deployment run for a few days before moving replies from staging output to the production space.
+- Enable follow-up config in the staging deployment and validate live `@miku.gen` follow-ups; separately test whether Webex quoted replies preserve hidden marker content in webhook or hydrated message payloads.
 - Decide whether the next platform slice should prioritize durable job recovery or privileged ephemeral Linux user runner support.
 
 ## Evidence
@@ -37,3 +39,4 @@ superseded_by:
 - Live E2E: `node scripts/e2e-webex-bot.mjs` returned `e2e_ok=true` and `marker_found=true` against `miku bot test` on 2026-06-19 after the marker, reply-identity, and child-process assertions were added.
 - Local validation: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo run -- --config config/example.toml --check-config`, `node --test test/setup-ci.node-test.mjs test/e2e-webex-bot.node-test.mjs`, `actionlint .github/workflows/ci.yml`, and `git diff --check`.
 - WME Jenkins staging validation on 2026-06-23: recursive helper bundle identified failed downstream leaves for `Pipeline-AV1-Test` replays, and `env REPLAY_LIMIT=3 node .codex-tmp/local-deploy/replay-production-source.mjs` produced three staging replies classified as Jenkins infra false alarms with GUI `/console` log links.
+- Follow-up local validation on 2026-06-24: `cargo fmt --check`, `cargo test --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo run --all-features -- --config config/example.toml --check-config`, and `git diff --check`.

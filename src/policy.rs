@@ -104,7 +104,7 @@ pub fn trim_to_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
+pub fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
     if policy.allow_all_senders {
         return true;
     }

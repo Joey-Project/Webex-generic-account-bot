@@ -60,6 +60,32 @@ User message:
 {body}
 """
 
+# Optional: let allowed users ask follow-up questions in an existing bot thread.
+# The thread must already contain a bot marker from a prior reply, so unrelated
+# Webex threads do not trigger new Codex runs.
+[rooms.followup]
+enabled = false
+triggers = ["mention"]
+# When unset, follow-ups inherit the parent room sender allowlist.
+# allowed_person_emails = ["operator@example.com"]
+# allow_all_senders = false
+max_thread_messages = 30
+max_thread_context_chars = 12000
+prompt_template = """
+You are responding to a follow-up in an existing Webex thread.
+
+Reply concisely. Use the thread context only as background, and answer the current follow-up directly.
+
+Original message:
+{original_body}
+
+Recent thread:
+{thread_context}
+
+Current follow-up from {person_email}:
+{body}
+"""
+
 [[rooms]]
 name = "Prefix command room"
 room_id = "ANOTHER_WEBEX_ROOM_ID"

@@ -34,8 +34,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, MessageContext, ReplyFormat, TriggerMode,
-    render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
+    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FollowupTrigger, MessageContext,
+    ReplyFormat, TriggerMode, render_prompt, should_trigger, trim_to_chars,
+    webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -151,6 +152,12 @@ struct ReplyThread {
     parent_id: String,
 }
 
+struct FollowupRun {
+    reply_thread: ReplyThread,
+    source_context: MessageContext,
+    thread_context: String,
+}
+
 enum ReplyThreadSetup {
     Ready(ReplyThread),
     Finished(BotAction),
@@ -204,6 +211,12 @@ impl Drop for JenkinsArtifactCleanupGuard {
 trait WebexApi: Send + Sync {
     async fn me(&self) -> Result<Person, WebexCallError>;
     async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError>;
+    async fn list_thread_messages(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>, WebexCallError>;
     async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError>;
     async fn find_message_by_marker(
         &self,
@@ -235,6 +248,49 @@ impl WebexApi for WebexClient {
             Ok(Ok(message)) => Ok(message),
             Ok(Err(error)) => Err(WebexCallError::Client(error)),
             Err(_) => Err(WebexCallError::TimedOut),
+        }
+    }
+
+    async fn list_thread_messages(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>, WebexCallError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let request = ListMessages {
+            room_id: room_id.to_owned(),
+            parent_id: Some(parent_id.to_owned()),
+            max: Some(limit.min(100) as u16),
+            ..ListMessages::default()
+        };
+        let mut page: Page<Message> =
+            match timeout(WEBEX_REQUEST_TIMEOUT, self.list_messages(&request)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) if parent_message_listing_is_empty(Some(parent_id), &error) => {
+                    return Ok(Vec::new());
+                }
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
+        let mut messages = Vec::new();
+        loop {
+            for message in page.items {
+                if messages.len() >= limit {
+                    return Ok(messages);
+                }
+                messages.push(message);
+            }
+            let Some(next) = page.next else {
+                return Ok(messages);
+            };
+            page = match timeout(WEBEX_REQUEST_TIMEOUT, self.next_page(next)).await {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => return Err(WebexCallError::Client(error)),
+                Err(_) => return Err(WebexCallError::TimedOut),
+            };
         }
     }
 
@@ -991,7 +1047,9 @@ impl BotApp {
                 None,
             ));
         };
-        let Some(policy) = self.config.policy_for_room(&room_id) else {
+        let direct_policy = self.config.policy_for_room(&room_id);
+        let followup_policies = self.config.followup_policies_for_event_room(&room_id);
+        if direct_policy.is_none() && followup_policies.is_empty() {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
                 "no_room_policy",
@@ -999,7 +1057,7 @@ impl BotApp {
                 Some(room_id),
             ));
         };
-        if message_needs_hydration(policy, &message) {
+        if event_message_needs_hydration(direct_policy, &followup_policies, &message) {
             match self.get_message(&message_id).await {
                 Ok(hydrated) => merge_message(&mut message, hydrated),
                 Err(error) => {
@@ -1022,6 +1080,54 @@ impl BotApp {
             ));
         }
 
+        for policy in followup_policies {
+            let followup_run = match self
+                .resolve_followup(policy, &message, &message_id, &room_id)
+                .await
+            {
+                Ok(Some(run)) => run,
+                Ok(None) => continue,
+                Err(error) => {
+                    return self
+                        .handle_reconciliation_failure(&attempt, &message_id, error)
+                        .await;
+                }
+            };
+            let Some(context) = MessageContext::from_message(&message) else {
+                self.mark_processed(&attempt).await?;
+                return Ok(BotAction::ignored(
+                    "incomplete_message_context",
+                    Some(message_id),
+                    Some(room_id),
+                ));
+            };
+            let prompt = render_followup_prompt(
+                &policy.followup.prompt_template,
+                &context,
+                &followup_run.source_context,
+                &followup_run.thread_context,
+            );
+            return self
+                .run_codex_reply(
+                    &attempt,
+                    policy,
+                    &message_id,
+                    followup_run.reply_thread,
+                    prompt,
+                    Some(&followup_run.source_context),
+                )
+                .await;
+        }
+
+        let Some(policy) = direct_policy else {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "not_followup",
+                Some(message_id),
+                Some(room_id),
+            ));
+        };
+
         let trigger = should_trigger(policy, &message, self.self_person_id.as_deref());
         if !matches!(trigger, webex_generic_account_bot::TriggerDecision::Matched) {
             self.mark_processed(&attempt).await?;
@@ -1036,7 +1142,6 @@ impl BotApp {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
-        let reply_marker = reply_marker(&message_id);
         let reply_thread = match self
             .prepare_reply_thread(
                 policy,
@@ -1051,6 +1156,37 @@ impl BotApp {
             ReplyThreadSetup::Ready(reply_thread) => reply_thread,
             ReplyThreadSetup::Finished(action) => return Ok(action),
         };
+
+        let Some(context) = MessageContext::from_message(&message) else {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "incomplete_message_context",
+                Some(message_id),
+                Some(room_id),
+            ));
+        };
+        let prompt = render_prompt(&policy.prompt_template, &context);
+        self.run_codex_reply(
+            &attempt,
+            policy,
+            &message_id,
+            reply_thread,
+            prompt,
+            Some(&context),
+        )
+        .await
+    }
+
+    async fn run_codex_reply(
+        &self,
+        attempt: &AttemptLease,
+        policy: &webex_generic_account_bot::RoomPolicy,
+        message_id: &str,
+        reply_thread: ReplyThread,
+        mut prompt: String,
+        jenkins_context: Option<&MessageContext>,
+    ) -> Result<BotAction, HttpError> {
+        let reply_marker = reply_marker(message_id);
         match self
             .find_existing_message_by_marker(
                 &reply_thread.room_id,
@@ -1062,9 +1198,9 @@ impl BotApp {
         {
             Ok(Some(reply)) => {
                 let reply_chars = existing_reply_chars(&reply);
-                self.mark_processed(&attempt).await?;
+                self.mark_processed(attempt).await?;
                 return Ok(BotAction::replied(
-                    message_id,
+                    message_id.to_owned(),
                     reply_thread.room_id,
                     reply.id,
                     reply_chars,
@@ -1073,41 +1209,34 @@ impl BotApp {
             Ok(None) => {}
             Err(error) => {
                 return self
-                    .handle_reconciliation_failure(&attempt, &message_id, error)
+                    .handle_reconciliation_failure(attempt, message_id, error)
                     .await;
             }
         }
 
-        let Some(context) = MessageContext::from_message(&message) else {
-            self.mark_processed(&attempt).await?;
-            return Ok(BotAction::ignored(
-                "incomplete_message_context",
-                Some(message_id),
-                Some(room_id),
-            ));
-        };
         let codex_config = self.config.codex_for_policy(policy);
-        let mut prompt = render_prompt(&policy.prompt_template, &context);
         let mut prefetched_context = None;
         let mut jenkins_artifact_cleanup = None;
-        match jenkins_context_prompt(policy, &codex_config, &context).await {
-            Ok(Some(context_bundle)) => {
-                prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
-                prefetched_context = Some(context_bundle.prompt);
-                jenkins_artifact_cleanup = Some(JenkinsArtifactCleanupGuard::new(
-                    context_bundle.artifact_root,
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(message_id = %message_id, error = %error, "failed to prefetch Jenkins diagnostics");
-                prompt = append_prefetched_context(
-                    &prompt,
-                    &format!("Jenkins diagnostics helper failed before Codex run: {error}"),
-                );
+        if let Some(jenkins_context) = jenkins_context {
+            match jenkins_context_prompt(policy, &codex_config, jenkins_context).await {
+                Ok(Some(context_bundle)) => {
+                    prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
+                    prefetched_context = Some(context_bundle.prompt);
+                    jenkins_artifact_cleanup = Some(JenkinsArtifactCleanupGuard::new(
+                        context_bundle.artifact_root,
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(message_id = %message_id, error = %error, "failed to prefetch Jenkins diagnostics");
+                    prompt = append_prefetched_context(
+                        &prompt,
+                        &format!("Jenkins diagnostics helper failed before Codex run: {error}"),
+                    );
+                }
             }
         }
-        let run_result = self.runner.run(&codex_config, &prompt, &message_id).await;
+        let run_result = self.runner.run(&codex_config, &prompt, message_id).await;
         if let Some(cleanup_guard) = jenkins_artifact_cleanup {
             if let Err(error) = cleanup_guard.cleanup().await {
                 warn!(
@@ -1139,11 +1268,11 @@ impl BotApp {
             Err(error) => {
                 return self
                     .handle_create_message_failure(
-                        &attempt,
+                        attempt,
                         ReplyCreateContext {
-                            message_id: &message_id,
+                            message_id,
                             room_id: &reply_thread.room_id,
-                            parent_id: reply_request.parent_id.as_deref().unwrap_or(&message_id),
+                            parent_id: reply_request.parent_id.as_deref().unwrap_or(message_id),
                             reply_marker: &reply_marker,
                             reply_chars: reply_markdown.len(),
                         },
@@ -1153,18 +1282,85 @@ impl BotApp {
             }
         };
         let action = BotAction::replied(
-            message_id,
+            message_id.to_owned(),
             reply_thread.room_id,
             reply.id,
             reply_markdown.len(),
         );
-        if let Err(error) = self.mark_processed(&attempt).await {
+        if let Err(error) = self.mark_processed(attempt).await {
             error!(
                 error = %error.message,
                 "failed to mark message processed after Webex accepted reply"
             );
         }
         Ok(action)
+    }
+
+    async fn resolve_followup(
+        &self,
+        policy: &webex_generic_account_bot::RoomPolicy,
+        message: &Message,
+        message_id: &str,
+        event_room_id: &str,
+    ) -> Result<Option<FollowupRun>, WebexCallError> {
+        if !followup_candidate_matches(policy, message, self.self_person_id.as_deref()) {
+            return Ok(None);
+        }
+        let Some(parent_id) = message.parent_id.as_deref() else {
+            return Ok(None);
+        };
+
+        let root_message = self.webex.get_message(parent_id).await?;
+        let mut thread_messages = self
+            .webex
+            .list_thread_messages(
+                event_room_id,
+                parent_id,
+                policy.followup.max_thread_messages,
+            )
+            .await?;
+        if !thread_messages
+            .iter()
+            .any(|thread_message| thread_message.id.as_deref() == Some(message_id))
+        {
+            thread_messages.push(message.clone());
+        }
+
+        let Some(source_message_id) = followup_source_message_id(
+            &root_message,
+            &thread_messages,
+            message,
+            self.self_person_id.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let source_message = if root_message.id.as_deref() == Some(source_message_id.as_str()) {
+            root_message.clone()
+        } else {
+            self.webex.get_message(&source_message_id).await?
+        };
+        let Some(source_context) = MessageContext::from_message(&source_message) else {
+            return Ok(None);
+        };
+        if source_context.room_id != policy.room_id {
+            return Ok(None);
+        }
+
+        let thread_context = render_thread_context(
+            &root_message,
+            &thread_messages,
+            message_id,
+            self.self_person_id.as_deref(),
+            policy.followup.max_thread_context_chars,
+        );
+        Ok(Some(FollowupRun {
+            reply_thread: ReplyThread {
+                room_id: event_room_id.to_owned(),
+                parent_id: parent_id.to_owned(),
+            },
+            source_context,
+            thread_context,
+        }))
     }
 
     async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
@@ -1802,6 +1998,17 @@ fn merge_message(target: &mut Message, hydrated: Message) {
     }
 }
 
+fn event_message_needs_hydration(
+    direct_policy: Option<&webex_generic_account_bot::RoomPolicy>,
+    followup_policies: &[&webex_generic_account_bot::RoomPolicy],
+    message: &Message,
+) -> bool {
+    direct_policy.is_some_and(|policy| message_needs_hydration(policy, message))
+        || followup_policies
+            .iter()
+            .any(|policy| followup_message_needs_hydration(policy, message))
+}
+
 fn message_needs_hydration(
     policy: &webex_generic_account_bot::RoomPolicy,
     message: &Message,
@@ -1811,6 +2018,263 @@ fn message_needs_hydration(
         || message.person_email.is_none()
         || (message.text.is_none() && message.markdown.is_none())
         || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
+}
+
+fn followup_message_needs_hydration(
+    policy: &webex_generic_account_bot::RoomPolicy,
+    message: &Message,
+) -> bool {
+    message.room_id.is_none()
+        || message.parent_id.is_none()
+        || message.person_id.is_none()
+        || message.person_email.is_none()
+        || (message.text.is_none() && message.markdown.is_none() && message.html.is_none())
+        || (policy.followup.triggers.contains(&FollowupTrigger::Mention)
+            && message.mentioned_people.is_empty())
+}
+
+fn followup_candidate_matches(
+    policy: &webex_generic_account_bot::RoomPolicy,
+    message: &Message,
+    self_person_id: Option<&str>,
+) -> bool {
+    if message.parent_id.is_none() || !followup_sender_allowed(policy, message) {
+        return false;
+    }
+
+    policy
+        .followup
+        .triggers
+        .iter()
+        .any(|trigger| match trigger {
+            FollowupTrigger::Mention => self_person_id.is_some_and(|self_id| {
+                message
+                    .mentioned_people
+                    .iter()
+                    .any(|person_id| person_id == self_id)
+            }),
+            FollowupTrigger::QuotedBotReply => message_contains_marker(message, "wgb-ref:"),
+        })
+}
+
+fn followup_sender_allowed(
+    policy: &webex_generic_account_bot::RoomPolicy,
+    message: &Message,
+) -> bool {
+    let followup = &policy.followup;
+    if followup.allow_all_senders {
+        return true;
+    }
+    if followup.allowed_person_ids.is_empty() && followup.allowed_person_emails.is_empty() {
+        return webex_generic_account_bot::policy::sender_allowed(policy, message);
+    }
+
+    let person_id_allowed = message
+        .person_id
+        .as_deref()
+        .is_some_and(|person_id| followup.allowed_person_ids.iter().any(|id| id == person_id));
+    let person_email_allowed = message.person_email.as_deref().is_some_and(|email| {
+        followup
+            .allowed_person_emails
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(email))
+    });
+
+    person_id_allowed || person_email_allowed
+}
+
+fn followup_source_message_id(
+    root_message: &Message,
+    thread_messages: &[Message],
+    current_message: &Message,
+    self_person_id: Option<&str>,
+) -> Option<String> {
+    marker_message_ids(root_message, "wgb-source-ref:", self_person_id, true)
+        .into_iter()
+        .chain(thread_messages.iter().flat_map(|message| {
+            marker_message_ids(message, "wgb-source-ref:", self_person_id, true)
+        }))
+        .chain(marker_message_ids(
+            current_message,
+            "wgb-source-ref:",
+            self_person_id,
+            false,
+        ))
+        .chain(marker_message_ids(
+            root_message,
+            "wgb-ref:",
+            self_person_id,
+            true,
+        ))
+        .chain(
+            thread_messages
+                .iter()
+                .flat_map(|message| marker_message_ids(message, "wgb-ref:", self_person_id, true)),
+        )
+        .chain(marker_message_ids(
+            current_message,
+            "wgb-ref:",
+            self_person_id,
+            false,
+        ))
+        .next()
+}
+
+fn message_contains_marker(message: &Message, marker_prefix: &str) -> bool {
+    reply_body(message).contains(marker_prefix)
+}
+
+fn marker_message_ids(
+    message: &Message,
+    marker_prefix: &str,
+    self_person_id: Option<&str>,
+    require_self_message: bool,
+) -> Vec<String> {
+    if require_self_message {
+        let Some(self_person_id) = self_person_id else {
+            return Vec::new();
+        };
+        if message.person_id.as_deref() != Some(self_person_id) {
+            return Vec::new();
+        }
+    }
+    marker_message_ids_from_body(&reply_body(message), marker_prefix)
+}
+
+fn marker_message_ids_from_body(body: &str, marker_prefix: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut remaining = body;
+    while let Some(index) = remaining.find(marker_prefix) {
+        let after_prefix = &remaining[index + marker_prefix.len()..];
+        let hex: String = after_prefix
+            .chars()
+            .take_while(|ch| ch.is_ascii_hexdigit())
+            .collect();
+        if let Some(message_id) = decode_marker_hex(&hex) {
+            if !ids.contains(&message_id) {
+                ids.push(message_id);
+            }
+        }
+        remaining = &after_prefix[hex.len()..];
+    }
+    ids
+}
+
+fn decode_marker_hex(hex: &str) -> Option<String> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn render_followup_prompt(
+    template: &str,
+    context: &MessageContext,
+    source_context: &MessageContext,
+    thread_context: &str,
+) -> String {
+    template
+        .replace("{room_id}", &context.room_id)
+        .replace("{message_id}", &context.message_id)
+        .replace("{person_id}", context.person_id.as_deref().unwrap_or(""))
+        .replace(
+            "{person_email}",
+            context.person_email.as_deref().unwrap_or(""),
+        )
+        .replace("{body}", &context.body)
+        .replace("{original_room_id}", &source_context.room_id)
+        .replace("{original_message_id}", &source_context.message_id)
+        .replace(
+            "{original_person_id}",
+            source_context.person_id.as_deref().unwrap_or(""),
+        )
+        .replace(
+            "{original_person_email}",
+            source_context.person_email.as_deref().unwrap_or(""),
+        )
+        .replace("{original_body}", &source_context.body)
+        .replace("{thread_context}", thread_context)
+}
+
+fn render_thread_context(
+    root_message: &Message,
+    thread_messages: &[Message],
+    current_message_id: &str,
+    self_person_id: Option<&str>,
+    max_chars: usize,
+) -> String {
+    let mut entries = Vec::with_capacity(thread_messages.len().saturating_add(1));
+    entries.push(render_thread_message(
+        "root",
+        root_message,
+        self_person_id,
+        max_chars,
+    ));
+    let mut replies = thread_messages.to_vec();
+    replies.sort_by_key(|message| message.created);
+    for message in replies {
+        if message.id.as_deref() == Some(current_message_id) {
+            continue;
+        }
+        entries.push(render_thread_message(
+            "reply",
+            &message,
+            self_person_id,
+            max_chars,
+        ));
+    }
+    let rendered = entries
+        .into_iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    trim_to_chars(&rendered, max_chars)
+}
+
+fn render_thread_message(
+    role: &str,
+    message: &Message,
+    self_person_id: Option<&str>,
+    max_chars: usize,
+) -> String {
+    let id = message.id.as_deref().unwrap_or("unknown");
+    let sender =
+        if self_person_id.is_some_and(|self_id| message.person_id.as_deref() == Some(self_id)) {
+            "bot"
+        } else {
+            message
+                .person_email
+                .as_deref()
+                .or(message.person_id.as_deref())
+                .unwrap_or("unknown")
+        };
+    let created = message
+        .created
+        .map(|created| created.to_rfc3339())
+        .unwrap_or_else(|| "unknown-time".to_owned());
+    let body_limit = max_chars.clamp(1, 1_200);
+    let body = trim_to_chars(&clean_prompt_message_body(message), body_limit);
+    format!("[{role}] {created} {sender} ({id})\n{body}")
+}
+
+fn clean_prompt_message_body(message: &Message) -> String {
+    let body = message
+        .markdown
+        .as_deref()
+        .or(message.text.as_deref())
+        .or(message.html.as_deref())
+        .unwrap_or("");
+    body.lines()
+        .filter(|line| !line.contains("<!-- wgb-ref:") && !line.contains("<!-- wgb-source-ref:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 fn source_marker_search_max_pages(message: &Message, recovery_age: Duration) -> Option<usize> {
@@ -2670,6 +3134,227 @@ mod tests {
         assert!(harness.runner.calls().is_empty());
         assert!(harness.webex.created_requests().is_empty());
         assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn mention_in_existing_source_thread_runs_followup_prompt() {
+        let harness = TestHarness::with_config(followup_test_config(unique_state_path()));
+        let mut prior_reply = message_with_marker("bot-reply-1", ROOM_ID, &reply_marker("root-1"));
+        prior_reply.parent_id = Some("root-1".to_owned());
+        prior_reply.markdown = Some(format!(
+            "Previous diagnosis\n\n{}",
+            hidden_marker_comment(&reply_marker("root-1"))
+        ));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original Jenkins failure")));
+        harness.webex.push_thread_messages(Ok(vec![prior_reply]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "root-1",
+                "@miku.gen can you explain why this is infra?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(ROOM_ID));
+        assert_eq!(action.reply_id.as_deref(), Some("followup-reply-1"));
+        assert_eq!(
+            harness.webex.thread_requests(),
+            vec![(ROOM_ID.to_owned(), "root-1".to_owned(), 30)]
+        );
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "followup-1");
+        assert!(
+            calls[0]
+                .1
+                .contains("Original root-1: Original Jenkins failure")
+        );
+        assert!(calls[0].1.contains("Previous diagnosis"));
+        assert!(calls[0].1.contains("Follow-up followup-1"));
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].parent_id.as_deref(), Some("root-1"));
+        assert!(
+            created[0]
+                .markdown
+                .as_deref()
+                .unwrap()
+                .contains(&reply_marker("followup-1"))
+        );
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn followup_can_use_sender_allowlist_separate_from_root_trigger() {
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].allow_all_senders = false;
+        config.rooms[0].allowed_person_emails = vec!["wmejenkin@sparkbot.io".to_owned()];
+        config.rooms[0].followup.enabled = true;
+        config.rooms[0].followup.allowed_person_emails = vec![SENDER_EMAIL.to_owned()];
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original Jenkins failure")));
+        harness
+            .webex
+            .push_thread_messages(Ok(vec![message_with_marker(
+                "bot-reply-1",
+                ROOM_ID,
+                &reply_marker("root-1"),
+            )]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "root-1",
+                "@miku.gen please expand",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn quoted_bot_reply_marker_can_trigger_followup_without_mention() {
+        let state_path = unique_state_path();
+        let mut config = (*followup_test_config(state_path)).clone();
+        config.rooms[0].followup.triggers = vec![FollowupTrigger::QuotedBotReply];
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original failure")));
+        harness.webex.push_thread_messages(Ok(Vec::new()));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Quoted follow-up answer");
+        let mut followup =
+            inbound_thread_message("followup-1", ROOM_ID, "root-1", "Can you expand?");
+        followup.mentioned_people.clear();
+        followup.markdown = Some(format!(
+            "Can you expand?\n\n{}",
+            hidden_marker_comment(&reply_marker("root-1"))
+        ));
+
+        let action = harness
+            .app
+            .process_event(message_event(followup))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("followup-reply-1"));
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn mention_in_staging_output_thread_maps_back_to_source_message() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        harness.webex.push_get_message(Ok(message_with_marker(
+            "forward-1",
+            OUTPUT_ROOM_ID,
+            &source_marker("source-1"),
+        )));
+        harness
+            .webex
+            .push_thread_messages(Ok(vec![message_with_marker(
+                "bot-reply-1",
+                OUTPUT_ROOM_ID,
+                &reply_marker("source-1"),
+            )]));
+        harness.webex.push_get_message(Ok(inbound_message(
+            "source-1",
+            "Original production failure",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("followup-reply-1", OUTPUT_ROOM_ID)));
+        harness.runner.push_output("Staging follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                OUTPUT_ROOM_ID,
+                "forward-1",
+                "@miku.gen can you check the downstream job?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .1
+                .contains("Original source-1: Original production failure")
+        );
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(created[0].parent_id.as_deref(), Some("forward-1"));
+        assert!(
+            created
+                .iter()
+                .all(|request| request.room_id.as_deref() != Some(ROOM_ID))
+        );
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn output_thread_without_existing_bot_marker_is_not_followup() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        harness.webex.push_get_message(Ok(message_with_room(
+            "forward-without-marker",
+            OUTPUT_ROOM_ID,
+        )));
+        harness.webex.push_thread_messages(Ok(Vec::new()));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                OUTPUT_ROOM_ID,
+                "forward-without-marker",
+                "@miku.gen should not run yet",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("not_followup"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("followup-1").await);
     }
 
     #[tokio::test]
@@ -3658,13 +4343,24 @@ mod tests {
 
     #[derive(Default)]
     struct FakeWebex {
+        get_message_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
+        thread_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
         marker_search_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
         create_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
         created_requests: StdMutex<Vec<CreateMessage>>,
+        thread_requests: StdMutex<Vec<(String, String, usize)>>,
         marker_search_requests: StdMutex<Vec<MarkerSearchRequest>>,
     }
 
     impl FakeWebex {
+        fn push_get_message(&self, result: Result<Message, WebexCallError>) {
+            self.get_message_results.lock().unwrap().push_back(result);
+        }
+
+        fn push_thread_messages(&self, result: Result<Vec<Message>, WebexCallError>) {
+            self.thread_results.lock().unwrap().push_back(result);
+        }
+
         fn push_reply_search(&self, result: Result<Vec<Message>, WebexCallError>) {
             self.marker_search_results.lock().unwrap().push_back(result);
         }
@@ -3680,6 +4376,10 @@ mod tests {
         fn marker_searches(&self) -> Vec<MarkerSearchRequest> {
             self.marker_search_requests.lock().unwrap().clone()
         }
+
+        fn thread_requests(&self) -> Vec<(String, String, usize)> {
+            self.thread_requests.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -3692,7 +4392,29 @@ mod tests {
         }
 
         async fn get_message(&self, _message_id: &str) -> Result<Message, WebexCallError> {
-            panic!("unexpected message hydration in test")
+            self.get_message_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected message hydration in test"))
+        }
+
+        async fn list_thread_messages(
+            &self,
+            room_id: &str,
+            parent_id: &str,
+            limit: usize,
+        ) -> Result<Vec<Message>, WebexCallError> {
+            self.thread_requests.lock().unwrap().push((
+                room_id.to_owned(),
+                parent_id.to_owned(),
+                limit,
+            ));
+            self.thread_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
         }
 
         async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
@@ -3842,6 +4564,24 @@ mod tests {
         Arc::new(config)
     }
 
+    fn followup_test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].followup.enabled = true;
+        config.rooms[0].followup.prompt_template =
+            "Original {original_message_id}: {original_body}\nThread:\n{thread_context}\nFollow-up {message_id}: {body}".to_owned();
+        config.validate().unwrap();
+        Arc::new(config)
+    }
+
+    fn staging_followup_test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let mut config = (*staging_test_config(state_path)).clone();
+        config.rooms[0].followup.enabled = true;
+        config.rooms[0].followup.prompt_template =
+            "Original {original_message_id}: {original_body}\nThread:\n{thread_context}\nFollow-up {message_id}: {body}".to_owned();
+        config.validate().unwrap();
+        Arc::new(config)
+    }
+
     fn unique_state_path() -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -3875,6 +4615,19 @@ mod tests {
             markdown: Some(body.to_owned()),
             ..Message::default()
         }
+    }
+
+    fn inbound_thread_message(
+        message_id: &str,
+        room_id: &str,
+        parent_id: &str,
+        body: &str,
+    ) -> Message {
+        let mut message = inbound_message(message_id, body);
+        message.room_id = Some(room_id.to_owned());
+        message.parent_id = Some(parent_id.to_owned());
+        message.mentioned_people = vec![SELF_PERSON_ID.to_owned()];
+        message
     }
 
     fn reply_message(reply_id: &str) -> Message {

@@ -86,6 +86,17 @@ impl BotConfig {
         self.rooms.iter().find(|policy| policy.room_id == room_id)
     }
 
+    pub fn followup_policies_for_event_room(&self, room_id: &str) -> Vec<&RoomPolicy> {
+        self.rooms
+            .iter()
+            .filter(|policy| {
+                policy.followup.enabled
+                    && (policy.room_id == room_id
+                        || policy.output_room_id.as_deref() == Some(room_id))
+            })
+            .collect()
+    }
+
     pub fn room_is_read_only_source(&self, room_id: &str) -> bool {
         self.rooms
             .iter()
@@ -494,6 +505,7 @@ pub struct RoomPolicy {
     pub forward_source_message: bool,
     pub read_only_source: bool,
     pub jenkins_context: Option<JenkinsContextConfig>,
+    pub followup: FollowupConfig,
     pub reply_format: ReplyFormat,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
@@ -513,6 +525,7 @@ impl Default for RoomPolicy {
             forward_source_message: false,
             read_only_source: false,
             jenkins_context: None,
+            followup: FollowupConfig::default(),
             reply_format: ReplyFormat::Markdown,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
@@ -600,6 +613,9 @@ impl RoomPolicy {
                 .validate()
                 .with_context(|| format!("invalid jenkins_context for room {}", self.room_id))?;
         }
+        self.followup
+            .validate()
+            .with_context(|| format!("invalid followup for room {}", self.room_id))?;
         Ok(())
     }
 
@@ -618,6 +634,61 @@ pub enum ReplyFormat {
     #[default]
     Markdown,
     JenkinsDiagnosisJson,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FollowupConfig {
+    pub enabled: bool,
+    pub triggers: Vec<FollowupTrigger>,
+    pub allow_all_senders: bool,
+    pub allowed_person_ids: Vec<String>,
+    pub allowed_person_emails: Vec<String>,
+    pub max_thread_messages: usize,
+    pub max_thread_context_chars: usize,
+    pub prompt_template: String,
+}
+
+impl Default for FollowupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            triggers: vec![FollowupTrigger::Mention],
+            allow_all_senders: false,
+            allowed_person_ids: Vec::new(),
+            allowed_person_emails: Vec::new(),
+            max_thread_messages: 30,
+            max_thread_context_chars: 12_000,
+            prompt_template: DEFAULT_FOLLOWUP_PROMPT_TEMPLATE.to_owned(),
+        }
+    }
+}
+
+impl FollowupConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled && self.triggers.is_empty() {
+            return Err(anyhow!("triggers must not be empty when enabled = true"));
+        }
+        if self.max_thread_messages == 0 {
+            return Err(anyhow!("max_thread_messages must be greater than zero"));
+        }
+        if self.max_thread_context_chars == 0 {
+            return Err(anyhow!(
+                "max_thread_context_chars must be greater than zero"
+            ));
+        }
+        if self.prompt_template.trim().is_empty() {
+            return Err(anyhow!("prompt_template must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowupTrigger {
+    Mention,
+    QuotedBotReply,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -706,6 +777,24 @@ Message ID: {message_id}
 Sender: {person_email}
 
 Message:
+{body}
+"#;
+
+const DEFAULT_FOLLOWUP_PROMPT_TEMPLATE: &str = r#"You are responding to a follow-up in an existing Webex thread.
+
+Reply concisely. Use the thread context only as background, and answer the current follow-up directly.
+
+Original message:
+{original_body}
+
+Recent thread:
+{thread_context}
+
+Current follow-up:
+Room: {room_id}
+Message ID: {message_id}
+Sender: {person_email}
+
 {body}
 "#;
 
@@ -807,6 +896,39 @@ reply_format = "jenkins-diagnosis-json"
             config.rooms[0].reply_format,
             ReplyFormat::JenkinsDiagnosisJson
         );
+    }
+
+    #[test]
+    fn parses_room_followup_config() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+triggers = ["mention", "quoted-bot-reply"]
+allowed_person_emails = ["operator@example.com"]
+max_thread_messages = 12
+max_thread_context_chars = 4096
+prompt_template = "Follow up on {original_message_id}: {body}"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert!(config.rooms[0].followup.enabled);
+        assert_eq!(
+            config.rooms[0].followup.triggers,
+            vec![FollowupTrigger::Mention, FollowupTrigger::QuotedBotReply]
+        );
+        assert_eq!(
+            config.rooms[0].followup.allowed_person_emails,
+            vec!["operator@example.com"]
+        );
+        assert_eq!(config.rooms[0].followup.max_thread_messages, 12);
+        assert_eq!(config.rooms[0].followup.max_thread_context_chars, 4096);
     }
 
     #[test]
