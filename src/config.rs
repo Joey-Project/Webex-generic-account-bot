@@ -14,6 +14,7 @@ const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
 const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
 pub const WEBEX_LIST_PAGE_SIZE: usize = 100;
 pub const FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE;
+pub const FOLLOWUP_REPLY_MARKER_SEARCH_MIN_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE * 3;
 const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
 const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
     STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
@@ -691,11 +692,21 @@ impl FollowupConfig {
     }
 
     fn webex_requests_per_attempt(&self) -> u64 {
-        FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT.saturating_add(webex_page_requests(
+        let thread_context_pages = webex_page_requests(
             self.max_thread_messages
                 .max(FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES),
-        ))
+        );
+        let reply_marker_pages =
+            followup_reply_marker_search_max_pages(self.max_thread_messages) as u64;
+        FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+            .saturating_add(thread_context_pages)
+            .saturating_add(reply_marker_pages)
     }
+}
+
+pub fn followup_reply_marker_search_max_pages(max_thread_messages: usize) -> usize {
+    let item_limit = max_thread_messages.max(FOLLOWUP_REPLY_MARKER_SEARCH_MIN_MESSAGES);
+    item_limit.saturating_add(WEBEX_LIST_PAGE_SIZE - 1) / WEBEX_LIST_PAGE_SIZE
 }
 
 fn webex_page_requests(item_limit: usize) -> u64 {
@@ -921,6 +932,9 @@ reply_format = "jenkins-diagnosis-json"
     fn parses_room_followup_config() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [[rooms]]
 room_id = "room-1"
 allow_all_senders = true
@@ -1307,15 +1321,22 @@ max_thread_messages = 250
 
         assert_eq!(
             single_page.rooms[0].followup.webex_requests_per_attempt(),
-            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 1
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 1
+                + followup_reply_marker_search_max_pages(30) as u64
         );
         assert_eq!(
             paged.rooms[0].followup.webex_requests_per_attempt(),
-            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 3
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 3
+                + followup_reply_marker_search_max_pages(250) as u64
         );
         assert_eq!(
             paged.rooms[0].webex_requests_per_attempt(),
-            WEBEX_REQUESTS_PER_ATTEMPT + FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 3
+            WEBEX_REQUESTS_PER_ATTEMPT
+                + FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 3
+                + followup_reply_marker_search_max_pages(250) as u64
         );
     }
 

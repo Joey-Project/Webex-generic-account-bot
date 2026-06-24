@@ -36,8 +36,8 @@ use tracing::{error, info, warn};
 use webex_generic_account_bot::{
     BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES,
     FollowupTrigger, MessageContext, ReplyFormat, TriggerMode, WEBEX_LIST_PAGE_SIZE,
-    message_matches_prefix, render_prompt, should_trigger, trim_to_chars,
-    webex::build_webex_client,
+    followup_reply_marker_search_max_pages, message_matches_prefix, render_prompt, should_trigger,
+    trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -50,7 +50,6 @@ const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
-const FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 1;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1124,13 +1123,26 @@ impl BotApp {
                     CodexReplyRequest {
                         message_id: &message_id,
                         reply_format: policy.followup.reply_format.unwrap_or(policy.reply_format),
-                        reply_marker_search_max_pages: Some(FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES),
+                        reply_marker_search_max_pages: Some(
+                            followup_reply_marker_search_max_pages(
+                                policy.followup.max_thread_messages,
+                            ),
+                        ),
                         reply_thread: followup_run.reply_thread,
                         prompt,
                     },
                     Some(&followup_run.source_context),
                 )
                 .await;
+        }
+
+        if message.parent_id.is_some() && self.config.room_is_read_only_source(&room_id) {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "not_followup",
+                Some(message_id),
+                Some(room_id),
+            ));
         }
 
         let Some(policy) = direct_policy else {
@@ -1358,13 +1370,21 @@ impl BotApp {
             .cloned()
             .collect::<Vec<_>>();
 
-        let Some(source_message_id) = followup_source_message_id(
-            &root_message,
-            &thread_messages,
-            message,
-            self.self_person_id.as_deref(),
-        ) else {
-            return Ok(None);
+        let source_message_id = if event_room_id == policy.room_id
+            && policy.read_only_source
+            && policy.output_room_id.is_some()
+        {
+            parent_id.to_owned()
+        } else {
+            let Some(source_message_id) = followup_source_message_id(
+                &root_message,
+                &thread_messages,
+                message,
+                self.self_person_id.as_deref(),
+            ) else {
+                return Ok(None);
+            };
+            source_message_id
         };
         let source_message = if root_message.id.as_deref() == Some(source_message_id.as_str()) {
             root_message.clone()
@@ -1382,6 +1402,36 @@ impl BotApp {
             return Ok(None);
         }
 
+        let reply_thread = if event_room_id == policy.room_id && policy.read_only_source {
+            let Some(output_room_id) = policy.output_room_id.as_deref() else {
+                return Ok(None);
+            };
+            let source_marker = source_marker(&source_context.message_id);
+            let forward = self
+                .find_existing_message_by_marker(
+                    output_room_id,
+                    None,
+                    &source_marker,
+                    source_marker_search_max_pages(
+                        &source_message,
+                        self.config.server.attempt_lease(),
+                    ),
+                )
+                .await?;
+            let Some(parent_id) = forward.and_then(|message| message.id) else {
+                return Ok(None);
+            };
+            ReplyThread {
+                room_id: output_room_id.to_owned(),
+                parent_id,
+            }
+        } else {
+            ReplyThread {
+                room_id: event_room_id.to_owned(),
+                parent_id: parent_id.to_owned(),
+            }
+        };
+
         let thread_context = render_thread_context(
             &root_message,
             &thread_context_messages,
@@ -1390,10 +1440,7 @@ impl BotApp {
             policy.followup.max_thread_context_chars,
         );
         Ok(Some(FollowupRun {
-            reply_thread: ReplyThread {
-                room_id: event_room_id.to_owned(),
-                parent_id: parent_id.to_owned(),
-            },
+            reply_thread,
             source_context,
             thread_context,
         }))
@@ -3413,7 +3460,7 @@ mod tests {
                 Some("root-1".to_owned()),
                 reply_marker("followup-1"),
                 Some(SELF_PERSON_ID.to_owned()),
-                Some(FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES)
+                Some(followup_reply_marker_search_max_pages(30))
             )]
         );
         assert!(
@@ -3489,6 +3536,7 @@ mod tests {
     async fn followup_can_use_sender_allowlist_separate_from_root_trigger() {
         let state_path = unique_state_path();
         let mut config = (*test_config(state_path)).clone();
+        config.server.attempt_lease_secs = 600;
         config.rooms[0].allow_all_senders = false;
         config.rooms[0].allowed_person_emails = vec!["wmejenkin@sparkbot.io".to_owned()];
         config.rooms[0].followup.enabled = true;
@@ -3899,6 +3947,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mention_in_read_only_source_thread_replies_in_existing_output_thread() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        harness.webex.push_get_message(Ok(inbound_message(
+            "source-1",
+            "Original production failure",
+        )));
+        harness.webex.push_thread_messages(Ok(Vec::new()));
+        harness.webex.push_reply_search(Ok(vec![message_with_marker(
+            "forward-1",
+            OUTPUT_ROOM_ID,
+            &source_marker("source-1"),
+        )]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("followup-reply-1", OUTPUT_ROOM_ID)));
+        harness.runner.push_output("Source-space follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "source-1",
+                "@miku.gen can you check this from production?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .1
+                .contains("Original source-1: Original production failure")
+        );
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].room_id.as_deref(), Some(OUTPUT_ROOM_ID));
+        assert_eq!(created[0].parent_id.as_deref(), Some("forward-1"));
+        assert!(
+            created
+                .iter()
+                .all(|request| request.room_id.as_deref() != Some(ROOM_ID))
+        );
+        assert_eq!(
+            harness.webex.marker_searches(),
+            vec![
+                (
+                    OUTPUT_ROOM_ID.to_owned(),
+                    None,
+                    source_marker("source-1"),
+                    Some(SELF_PERSON_ID.to_owned()),
+                    Some(SOURCE_MARKER_SEARCH_MAX_PAGES)
+                ),
+                (
+                    OUTPUT_ROOM_ID.to_owned(),
+                    Some("forward-1".to_owned()),
+                    reply_marker("followup-1"),
+                    Some(SELF_PERSON_ID.to_owned()),
+                    Some(followup_reply_marker_search_max_pages(30))
+                )
+            ]
+        );
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn source_followup_without_existing_output_thread_is_ignored_before_codex() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        harness.webex.push_get_message(Ok(inbound_message(
+            "source-1",
+            "Original production failure",
+        )));
+        harness.webex.push_thread_messages(Ok(Vec::new()));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "source-1",
+                "@miku.gen can you check this from production?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("not_followup"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert_eq!(harness.webex.marker_searches().len(), 1);
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
     async fn copied_reply_marker_in_forwarded_root_does_not_override_thread_reply_marker() {
         let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
         let mut forward =
@@ -3993,6 +4140,59 @@ mod tests {
             )]
         );
         assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn followup_reply_reconciliation_uses_configured_marker_window() {
+        let state_path = unique_state_path();
+        let mut config = (*followup_test_config(state_path)).clone();
+        config.server.attempt_lease_secs = 900;
+        config.rooms[0].followup.max_thread_messages = 350;
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original Jenkins failure")));
+        harness
+            .webex
+            .push_thread_messages(Ok(vec![message_with_marker(
+                "bot-reply-1",
+                ROOM_ID,
+                &reply_marker("root-1"),
+            )]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "root-1",
+                "@miku.gen can you explain more?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(
+            harness.webex.marker_searches(),
+            vec![(
+                ROOM_ID.to_owned(),
+                Some("root-1".to_owned()),
+                reply_marker("followup-1"),
+                Some(SELF_PERSON_ID.to_owned()),
+                Some(followup_reply_marker_search_max_pages(350))
+            )]
+        );
+        assert_eq!(
+            harness.webex.thread_requests(),
+            vec![(ROOM_ID.to_owned(), "root-1".to_owned(), 350)]
+        );
         assert!(harness.processed("followup-1").await);
     }
 
@@ -5357,6 +5557,7 @@ mod tests {
 
     fn followup_test_config(state_path: PathBuf) -> Arc<BotConfig> {
         let mut config = (*test_config(state_path)).clone();
+        config.server.attempt_lease_secs = 600;
         config.rooms[0].followup.enabled = true;
         config.rooms[0].followup.prompt_template =
             "Original {original_message_id}: {original_body}\nThread:\n{thread_context}\nFollow-up {message_id}: {body}".to_owned();
