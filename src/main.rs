@@ -34,8 +34,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FollowupTrigger, MessageContext,
-    ReplyFormat, TriggerMode, message_matches_prefix, render_prompt, should_trigger, trim_to_chars,
+    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES,
+    FollowupTrigger, MessageContext, ReplyFormat, TriggerMode, WEBEX_LIST_PAGE_SIZE,
+    message_matches_prefix, render_prompt, should_trigger, trim_to_chars,
     webex::build_webex_client,
 };
 use webex_headless_messenger::{
@@ -270,7 +271,7 @@ impl WebexApi for WebexClient {
         let request = ListMessages {
             room_id: room_id.to_owned(),
             parent_id: Some(parent_id.to_owned()),
-            max: Some(limit.min(100) as u16),
+            max: Some(limit.min(WEBEX_LIST_PAGE_SIZE) as u16),
             ..ListMessages::default()
         };
         let mut page: Page<Message> =
@@ -325,7 +326,7 @@ impl WebexApi for WebexClient {
         let request = ListMessages {
             room_id: room_id.to_owned(),
             parent_id: parent_id.map(ToOwned::to_owned),
-            max: Some(100),
+            max: Some(WEBEX_LIST_PAGE_SIZE as u16),
             ..ListMessages::default()
         };
         let mut page: Page<Message> =
@@ -1332,13 +1333,13 @@ impl BotApp {
             Err(error) if webex_call_is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
+        let thread_fetch_limit = policy
+            .followup
+            .max_thread_messages
+            .max(FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES);
         let mut thread_messages = self
             .webex
-            .list_thread_messages(
-                event_room_id,
-                parent_id,
-                policy.followup.max_thread_messages,
-            )
+            .list_thread_messages(event_room_id, parent_id, thread_fetch_limit)
             .await?;
         if !thread_messages
             .iter()
@@ -1346,6 +1347,11 @@ impl BotApp {
         {
             thread_messages.push(message.clone());
         }
+        let thread_context_messages = thread_messages
+            .iter()
+            .take(policy.followup.max_thread_messages)
+            .cloned()
+            .collect::<Vec<_>>();
 
         let Some(source_message_id) = followup_source_message_id(
             &root_message,
@@ -1373,7 +1379,7 @@ impl BotApp {
 
         let thread_context = render_thread_context(
             &root_message,
-            &thread_messages,
+            &thread_context_messages,
             message_id,
             self.self_person_id.as_deref(),
             policy.followup.max_thread_context_chars,
@@ -2184,8 +2190,13 @@ fn followup_source_message_id(
     let current_message_id = current_message.id.as_deref();
     let mut ordered_thread_messages = thread_messages.iter().collect::<Vec<_>>();
     ordered_thread_messages.sort_by_key(|message| message.created);
+    let root_reply_markers = if message_contains_marker(root_message, "wgb-source-ref:") {
+        Vec::new()
+    } else {
+        marker_message_ids(root_message, "wgb-ref:", self_person_id, true)
+    };
 
-    marker_message_ids(root_message, "wgb-ref:", self_person_id, true)
+    root_reply_markers
         .into_iter()
         .chain(ordered_thread_messages.iter().flat_map(|message| {
             if message.id.as_deref() == current_message_id {
@@ -3332,7 +3343,11 @@ mod tests {
         assert_eq!(action.reply_id.as_deref(), Some("followup-reply-1"));
         assert_eq!(
             harness.webex.thread_requests(),
-            vec![(ROOM_ID.to_owned(), "root-1".to_owned(), 30)]
+            vec![(
+                ROOM_ID.to_owned(),
+                "root-1".to_owned(),
+                FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES
+            )]
         );
         let calls = harness.runner.calls();
         assert_eq!(calls.len(), 1);
@@ -3743,6 +3758,104 @@ mod tests {
                 .iter()
                 .all(|request| request.room_id.as_deref() != Some(ROOM_ID))
         );
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn copied_reply_marker_in_forwarded_root_does_not_override_thread_reply_marker() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        let mut forward =
+            message_with_marker("forward-1", OUTPUT_ROOM_ID, &reply_marker("wrong-source"));
+        forward.markdown = Some(format!(
+            "Forwarded user text copied from a bot reply\n\n{}\n{}",
+            hidden_marker_comment(&reply_marker("wrong-source")),
+            hidden_marker_comment(&source_marker("source-1"))
+        ));
+        harness.webex.push_get_message(Ok(forward));
+        harness
+            .webex
+            .push_thread_messages(Ok(vec![message_with_marker(
+                "bot-reply-1",
+                OUTPUT_ROOM_ID,
+                &reply_marker("source-1"),
+            )]));
+        harness.webex.push_get_message(Ok(inbound_message(
+            "source-1",
+            "Original production failure",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("followup-reply-1", OUTPUT_ROOM_ID)));
+        harness.runner.push_output("Follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                OUTPUT_ROOM_ID,
+                "forward-1",
+                "@miku.gen can you check this?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        let get_requests = harness.webex.get_message_requests();
+        assert!(get_requests.contains(&"source-1".to_owned()));
+        assert!(!get_requests.contains(&"wrong-source".to_owned()));
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .1
+                .contains("Original source-1: Original production failure")
+        );
+        assert!(!calls[0].1.contains("wrong-source"));
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn followup_marker_scan_extends_beyond_prompt_context_window() {
+        let state_path = unique_state_path();
+        let mut config = (*followup_test_config(state_path)).clone();
+        config.rooms[0].followup.max_thread_messages = 1;
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original Jenkins failure")));
+        harness.webex.push_thread_messages(Ok(vec![
+            inbound_thread_message("recent-reply", ROOM_ID, "root-1", "recent reply"),
+            message_with_marker("old-bot-reply", ROOM_ID, &reply_marker("root-1")),
+        ]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Follow-up answer");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "root-1",
+                "@miku.gen can you explain more?",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(
+            harness.webex.thread_requests(),
+            vec![(
+                ROOM_ID.to_owned(),
+                "root-1".to_owned(),
+                FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES
+            )]
+        );
+        assert_eq!(harness.runner.calls().len(), 1);
         assert!(harness.processed("followup-1").await);
     }
 
@@ -4876,6 +4989,7 @@ mod tests {
     #[derive(Default)]
     struct FakeWebex {
         get_message_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
+        get_message_requests: StdMutex<Vec<String>>,
         thread_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
         marker_search_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
         create_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
@@ -4887,6 +5001,10 @@ mod tests {
     impl FakeWebex {
         fn push_get_message(&self, result: Result<Message, WebexCallError>) {
             self.get_message_results.lock().unwrap().push_back(result);
+        }
+
+        fn get_message_requests(&self) -> Vec<String> {
+            self.get_message_requests.lock().unwrap().clone()
         }
 
         fn push_thread_messages(&self, result: Result<Vec<Message>, WebexCallError>) {
@@ -4923,7 +5041,11 @@ mod tests {
             })
         }
 
-        async fn get_message(&self, _message_id: &str) -> Result<Message, WebexCallError> {
+        async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
+            self.get_message_requests
+                .lock()
+                .unwrap()
+                .push(message_id.to_owned());
             self.get_message_results
                 .lock()
                 .unwrap()

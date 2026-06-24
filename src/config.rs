@@ -11,7 +11,9 @@ use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
-const FOLLOWUP_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
+const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
+pub const WEBEX_LIST_PAGE_SIZE: usize = 100;
+pub const FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE;
 const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
 const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
     STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
@@ -626,7 +628,7 @@ impl RoomPolicy {
             requests = requests.saturating_add(STAGING_WEBEX_REQUESTS_PER_ATTEMPT);
         }
         if self.followup.enabled {
-            requests = requests.saturating_add(FOLLOWUP_WEBEX_REQUESTS_PER_ATTEMPT);
+            requests = requests.saturating_add(self.followup.webex_requests_per_attempt());
         }
         requests
     }
@@ -689,6 +691,18 @@ impl FollowupConfig {
         }
         Ok(())
     }
+
+    fn webex_requests_per_attempt(&self) -> u64 {
+        FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT.saturating_add(webex_page_requests(
+            self.max_thread_messages
+                .max(FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES),
+        ))
+    }
+}
+
+fn webex_page_requests(item_limit: usize) -> u64 {
+    let pages = item_limit.saturating_add(WEBEX_LIST_PAGE_SIZE - 1) / WEBEX_LIST_PAGE_SIZE;
+    pages.try_into().unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -1198,6 +1212,36 @@ allow_all_senders = true
 
 [rooms.followup]
 enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn rejects_paged_followup_thread_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 300
+
+[codex]
+timeout_secs = 20
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 250
 "#,
         )
         .unwrap();
