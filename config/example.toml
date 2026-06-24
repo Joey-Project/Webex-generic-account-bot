@@ -46,6 +46,9 @@ trusted_prompt_authors = true
 name = "Mention-driven Codex room"
 room_id = "WEBEX_ROOM_ID_HERE"
 trigger = "mention"
+# Optional text fallback for follow-up mention triggers. This is useful for
+# API-driven E2E senders that cannot populate Webex mentionedPeople.
+prefixes = ["@miku.gen"]
 allowed_person_emails = ["joey@example.com"]
 prompt_template = """
 You are Codex running from a Webex generic-account bot.
@@ -57,6 +60,34 @@ Message ID: {message_id}
 Sender: {person_email}
 
 User message:
+{body}
+"""
+
+# Optional: let allowed users ask follow-up questions in an existing bot thread.
+# The thread must already contain a bot marker from a prior reply, so unrelated
+# Webex threads do not trigger new Codex runs.
+[rooms.followup]
+enabled = false
+triggers = ["mention"]
+# When unset, follow-ups inherit the parent room sender allowlist.
+# allowed_person_emails = ["operator@example.com"]
+# allow_all_senders = false
+max_thread_messages = 30
+max_thread_context_chars = 12000
+# Optional: override the room reply renderer for follow-ups.
+# reply_format = "jenkins-followup-json"
+prompt_template = """
+You are responding to a follow-up in an existing Webex thread.
+
+Reply concisely. Use the thread context only as background, and answer the current follow-up directly.
+
+Original message:
+{original_body}
+
+Recent thread:
+{thread_context}
+
+Current follow-up from {person_email}:
 {body}
 """
 

@@ -65,12 +65,7 @@ pub fn should_trigger(
             }
         }
         TriggerMode::Prefix => {
-            let body = message_body(message);
-            if policy
-                .prefixes
-                .iter()
-                .any(|prefix| prefix_matches(&body, prefix))
-            {
+            if message_matches_prefix(message, &policy.prefixes) {
                 TriggerDecision::Matched
             } else {
                 TriggerDecision::PrefixNotMatched
@@ -104,7 +99,12 @@ pub fn trim_to_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
+pub fn message_matches_prefix(message: &Message, prefixes: &[String]) -> bool {
+    let body = message_body(message);
+    prefixes.iter().any(|prefix| prefix_matches(&body, prefix))
+}
+
+pub fn sender_allowed(policy: &RoomPolicy, message: &Message) -> bool {
     if policy.allow_all_senders {
         return true;
     }

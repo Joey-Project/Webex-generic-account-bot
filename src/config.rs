@@ -11,6 +11,10 @@ use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
+pub const WEBEX_LIST_PAGE_SIZE: usize = 100;
+pub const FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE;
+pub const FOLLOWUP_REPLY_MARKER_SEARCH_MIN_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE * 3;
 const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
 const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
     STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
@@ -84,6 +88,17 @@ impl BotConfig {
 
     pub fn policy_for_room(&self, room_id: &str) -> Option<&RoomPolicy> {
         self.rooms.iter().find(|policy| policy.room_id == room_id)
+    }
+
+    pub fn followup_policies_for_event_room(&self, room_id: &str) -> Vec<&RoomPolicy> {
+        self.rooms
+            .iter()
+            .filter(|policy| {
+                policy.followup.enabled
+                    && (policy.room_id == room_id
+                        || policy.output_room_id.as_deref() == Some(room_id))
+            })
+            .collect()
     }
 
     pub fn room_is_read_only_source(&self, room_id: &str) -> bool {
@@ -494,6 +509,7 @@ pub struct RoomPolicy {
     pub forward_source_message: bool,
     pub read_only_source: bool,
     pub jenkins_context: Option<JenkinsContextConfig>,
+    pub followup: FollowupConfig,
     pub reply_format: ReplyFormat,
     pub trigger: TriggerMode,
     pub prefixes: Vec<String>,
@@ -513,6 +529,7 @@ impl Default for RoomPolicy {
             forward_source_message: false,
             read_only_source: false,
             jenkins_context: None,
+            followup: FollowupConfig::default(),
             reply_format: ReplyFormat::Markdown,
             trigger: TriggerMode::Mention,
             prefixes: Vec::new(),
@@ -571,23 +588,21 @@ impl RoomPolicy {
                 self.room_id
             ));
         }
-        if matches!(self.trigger, TriggerMode::Prefix) {
-            if self.prefixes.is_empty() {
-                return Err(anyhow!(
-                    "rooms[{}].prefixes is required when trigger = \"prefix\"",
-                    self.room_id
-                ));
-            }
-            if self
-                .prefixes
-                .iter()
-                .any(|prefix| prefix.trim().is_empty() || prefix.trim() != prefix)
-            {
-                return Err(anyhow!(
-                    "rooms[{}].prefixes must be non-empty without surrounding whitespace",
-                    self.room_id
-                ));
-            }
+        if matches!(self.trigger, TriggerMode::Prefix) && self.prefixes.is_empty() {
+            return Err(anyhow!(
+                "rooms[{}].prefixes is required when trigger = \"prefix\"",
+                self.room_id
+            ));
+        }
+        if self
+            .prefixes
+            .iter()
+            .any(|prefix| prefix.trim().is_empty() || prefix.trim() != prefix)
+        {
+            return Err(anyhow!(
+                "rooms[{}].prefixes must be non-empty without surrounding whitespace",
+                self.room_id
+            ));
         }
         if self.prompt_template.trim().is_empty() {
             return Err(anyhow!(
@@ -600,6 +615,9 @@ impl RoomPolicy {
                 .validate()
                 .with_context(|| format!("invalid jenkins_context for room {}", self.room_id))?;
         }
+        self.followup
+            .validate()
+            .with_context(|| format!("invalid followup for room {}", self.room_id))?;
         Ok(())
     }
 
@@ -607,6 +625,9 @@ impl RoomPolicy {
         let mut requests = WEBEX_REQUESTS_PER_ATTEMPT;
         if self.output_room_id.is_some() {
             requests = requests.saturating_add(STAGING_WEBEX_REQUESTS_PER_ATTEMPT);
+        }
+        if self.followup.enabled {
+            requests = requests.saturating_add(self.followup.webex_requests_per_attempt());
         }
         requests
     }
@@ -618,6 +639,86 @@ pub enum ReplyFormat {
     #[default]
     Markdown,
     JenkinsDiagnosisJson,
+    JenkinsFollowupJson,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FollowupConfig {
+    pub enabled: bool,
+    pub triggers: Vec<FollowupTrigger>,
+    pub allow_all_senders: bool,
+    pub allowed_person_ids: Vec<String>,
+    pub allowed_person_emails: Vec<String>,
+    pub max_thread_messages: usize,
+    pub max_thread_context_chars: usize,
+    pub reply_format: Option<ReplyFormat>,
+    pub prompt_template: String,
+}
+
+impl Default for FollowupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            triggers: vec![FollowupTrigger::Mention],
+            allow_all_senders: false,
+            allowed_person_ids: Vec::new(),
+            allowed_person_emails: Vec::new(),
+            max_thread_messages: 30,
+            max_thread_context_chars: 12_000,
+            reply_format: None,
+            prompt_template: DEFAULT_FOLLOWUP_PROMPT_TEMPLATE.to_owned(),
+        }
+    }
+}
+
+impl FollowupConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled && self.triggers.is_empty() {
+            return Err(anyhow!("triggers must not be empty when enabled = true"));
+        }
+        if self.max_thread_messages == 0 {
+            return Err(anyhow!("max_thread_messages must be greater than zero"));
+        }
+        if self.max_thread_context_chars == 0 {
+            return Err(anyhow!(
+                "max_thread_context_chars must be greater than zero"
+            ));
+        }
+        if self.prompt_template.trim().is_empty() {
+            return Err(anyhow!("prompt_template must not be empty"));
+        }
+        Ok(())
+    }
+
+    fn webex_requests_per_attempt(&self) -> u64 {
+        let thread_context_pages = webex_page_requests(
+            self.max_thread_messages
+                .max(FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES),
+        );
+        let reply_marker_pages =
+            followup_reply_marker_search_max_pages(self.max_thread_messages) as u64;
+        FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+            .saturating_add(thread_context_pages)
+            .saturating_add(reply_marker_pages)
+    }
+}
+
+pub fn followup_reply_marker_search_max_pages(max_thread_messages: usize) -> usize {
+    let item_limit = max_thread_messages.max(FOLLOWUP_REPLY_MARKER_SEARCH_MIN_MESSAGES);
+    item_limit.saturating_add(WEBEX_LIST_PAGE_SIZE - 1) / WEBEX_LIST_PAGE_SIZE
+}
+
+fn webex_page_requests(item_limit: usize) -> u64 {
+    let pages = item_limit.saturating_add(WEBEX_LIST_PAGE_SIZE - 1) / WEBEX_LIST_PAGE_SIZE;
+    pages.try_into().unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowupTrigger {
+    Mention,
+    QuotedBotReply,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -706,6 +807,24 @@ Message ID: {message_id}
 Sender: {person_email}
 
 Message:
+{body}
+"#;
+
+const DEFAULT_FOLLOWUP_PROMPT_TEMPLATE: &str = r#"You are responding to a follow-up in an existing Webex thread.
+
+Reply concisely. Use the thread context only as background, and answer the current follow-up directly.
+
+Original message:
+{original_body}
+
+Recent thread:
+{thread_context}
+
+Current follow-up:
+Room: {room_id}
+Message ID: {message_id}
+Sender: {person_email}
+
 {body}
 "#;
 
@@ -810,6 +929,47 @@ reply_format = "jenkins-diagnosis-json"
     }
 
     #[test]
+    fn parses_room_followup_config() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 1200
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+triggers = ["mention", "quoted-bot-reply"]
+allowed_person_emails = ["operator@example.com"]
+max_thread_messages = 12
+max_thread_context_chars = 4096
+reply_format = "jenkins-followup-json"
+prompt_template = "Follow up on {original_message_id}: {body}"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert!(config.rooms[0].followup.enabled);
+        assert_eq!(
+            config.rooms[0].followup.triggers,
+            vec![FollowupTrigger::Mention, FollowupTrigger::QuotedBotReply]
+        );
+        assert_eq!(
+            config.rooms[0].followup.allowed_person_emails,
+            vec!["operator@example.com"]
+        );
+        assert_eq!(config.rooms[0].followup.max_thread_messages, 12);
+        assert_eq!(config.rooms[0].followup.max_thread_context_chars, 4096);
+        assert_eq!(
+            config.rooms[0].followup.reply_format,
+            Some(ReplyFormat::JenkinsFollowupJson)
+        );
+    }
+
+    #[test]
     fn rejects_ephemeral_user_until_runner_support_exists() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -886,6 +1046,31 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("non-empty")
+        );
+    }
+
+    #[test]
+    fn followup_prefix_fallback_rejects_untrimmed_prefixes() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+prefixes = [" @miku.gen"]
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+triggers = ["mention"]
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("without surrounding whitespace")
         );
     }
 
@@ -1045,6 +1230,113 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn rejects_followup_webex_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 300
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn rejects_paged_followup_thread_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 300
+
+[codex]
+timeout_secs = 20
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 250
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn followup_webex_budget_counts_marker_scan_pages() {
+        let single_page: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 30
+"#,
+        )
+        .unwrap();
+        let paged: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 250
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            single_page.rooms[0].followup.webex_requests_per_attempt(),
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 1
+                + followup_reply_marker_search_max_pages(30) as u64
+        );
+        assert_eq!(
+            paged.rooms[0].followup.webex_requests_per_attempt(),
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 3
+                + followup_reply_marker_search_max_pages(250) as u64
+        );
+        assert_eq!(
+            paged.rooms[0].webex_requests_per_attempt(),
+            WEBEX_REQUESTS_PER_ATTEMPT
+                + FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT
+                + 3
+                + followup_reply_marker_search_max_pages(250) as u64
         );
     }
 
