@@ -2058,7 +2058,7 @@ fn event_message_needs_hydration(
     direct_policy.is_some_and(|policy| message_needs_hydration(policy, message))
         || followup_policies
             .iter()
-            .any(|policy| followup_event_needs_hydration(policy, message, direct_policy.is_some()))
+            .any(|policy| followup_event_needs_hydration(policy, message))
 }
 
 fn message_needs_hydration(
@@ -2097,9 +2097,8 @@ fn followup_message_needs_hydration(
 fn followup_event_needs_hydration(
     policy: &webex_generic_account_bot::RoomPolicy,
     message: &Message,
-    has_direct_policy: bool,
 ) -> bool {
-    if !followup_event_may_match(policy, message, has_direct_policy) {
+    if !followup_event_may_match(policy, message) {
         return false;
     }
     followup_message_needs_hydration(policy, message)
@@ -2108,7 +2107,6 @@ fn followup_event_needs_hydration(
 fn followup_event_may_match(
     policy: &webex_generic_account_bot::RoomPolicy,
     message: &Message,
-    has_direct_policy: bool,
 ) -> bool {
     if message.parent_id.is_some() {
         return true;
@@ -2123,9 +2121,7 @@ fn followup_event_may_match(
                 !message.mentioned_people.is_empty()
                     || message_matches_prefix(message, &policy.prefixes)
             }
-            FollowupTrigger::QuotedBotReply => {
-                message_contains_marker(message, "wgb-ref:") || !has_direct_policy
-            }
+            FollowupTrigger::QuotedBotReply => message_contains_marker(message, "wgb-ref:"),
         })
 }
 
@@ -3473,8 +3469,32 @@ mod tests {
         assert_eq!(action.action, "replied");
         assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
         assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.webex.get_message_requests().is_empty());
         assert_eq!(harness.webex.thread_requests(), Vec::new());
         assert!(harness.processed("root-command-1").await);
+    }
+
+    #[tokio::test]
+    async fn top_level_output_room_message_does_not_hydrate_as_quoted_followup() {
+        let state_path = unique_state_path();
+        let mut config = (*staging_followup_test_config(state_path)).clone();
+        config.rooms[0].followup.triggers = vec![FollowupTrigger::QuotedBotReply];
+        let harness = TestHarness::with_config(Arc::new(config));
+        let mut message = inbound_message("output-top-level-1", "ordinary output-room message");
+        message.room_id = Some(OUTPUT_ROOM_ID.to_owned());
+
+        let action = harness
+            .app
+            .process_event(message_event(message))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("not_followup"));
+        assert!(harness.webex.get_message_requests().is_empty());
+        assert_eq!(harness.webex.thread_requests(), Vec::new());
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.processed("output-top-level-1").await);
     }
 
     #[tokio::test]

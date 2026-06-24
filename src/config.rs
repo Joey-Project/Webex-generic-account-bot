@@ -1256,6 +1256,47 @@ max_thread_messages = 250
     }
 
     #[test]
+    fn followup_webex_budget_counts_marker_scan_pages() {
+        let single_page: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 30
+"#,
+        )
+        .unwrap();
+        let paged: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+max_thread_messages = 250
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            single_page.rooms[0].followup.webex_requests_per_attempt(),
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 1
+        );
+        assert_eq!(
+            paged.rooms[0].followup.webex_requests_per_attempt(),
+            FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 3
+        );
+        assert_eq!(
+            paged.rooms[0].webex_requests_per_attempt(),
+            WEBEX_REQUESTS_PER_ATTEMPT + FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + 3
+        );
+    }
+
+    #[test]
     fn rejects_blank_self_person_id() {
         let config: BotConfig = toml::from_str(
             r#"
