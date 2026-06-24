@@ -50,6 +50,7 @@ const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
+const FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 1;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -162,6 +163,7 @@ struct FollowupRun {
 struct CodexReplyRequest<'a> {
     message_id: &'a str,
     reply_format: ReplyFormat,
+    reply_marker_search_max_pages: Option<usize>,
     reply_thread: ReplyThread,
     prompt: String,
 }
@@ -1122,6 +1124,7 @@ impl BotApp {
                     CodexReplyRequest {
                         message_id: &message_id,
                         reply_format: policy.followup.reply_format.unwrap_or(policy.reply_format),
+                        reply_marker_search_max_pages: Some(FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES),
                         reply_thread: followup_run.reply_thread,
                         prompt,
                     },
@@ -1183,6 +1186,7 @@ impl BotApp {
             CodexReplyRequest {
                 message_id: &message_id,
                 reply_format: policy.reply_format,
+                reply_marker_search_max_pages: None,
                 reply_thread,
                 prompt,
             },
@@ -1199,6 +1203,7 @@ impl BotApp {
         jenkins_context: Option<&MessageContext>,
     ) -> Result<BotAction, HttpError> {
         let message_id = request.message_id;
+        let reply_marker_search_max_pages = request.reply_marker_search_max_pages;
         let reply_thread = request.reply_thread;
         let reply_marker = reply_marker(message_id);
         match self
@@ -1206,7 +1211,7 @@ impl BotApp {
                 &reply_thread.room_id,
                 Some(&reply_thread.parent_id),
                 &reply_marker,
-                None,
+                reply_marker_search_max_pages,
             )
             .await
         {
@@ -2262,27 +2267,54 @@ fn render_followup_prompt(
     source_context: &MessageContext,
     thread_context: &str,
 ) -> String {
-    template
-        .replace("{room_id}", &context.room_id)
-        .replace("{message_id}", &context.message_id)
-        .replace("{person_id}", context.person_id.as_deref().unwrap_or(""))
-        .replace(
-            "{person_email}",
-            context.person_email.as_deref().unwrap_or(""),
-        )
-        .replace("{body}", &context.body)
-        .replace("{original_room_id}", &source_context.room_id)
-        .replace("{original_message_id}", &source_context.message_id)
-        .replace(
-            "{original_person_id}",
-            source_context.person_id.as_deref().unwrap_or(""),
-        )
-        .replace(
-            "{original_person_email}",
-            source_context.person_email.as_deref().unwrap_or(""),
-        )
-        .replace("{original_body}", &source_context.body)
-        .replace("{thread_context}", thread_context)
+    render_template_once(
+        template,
+        &[
+            ("{room_id}", &context.room_id),
+            ("{message_id}", &context.message_id),
+            ("{person_id}", context.person_id.as_deref().unwrap_or("")),
+            (
+                "{person_email}",
+                context.person_email.as_deref().unwrap_or(""),
+            ),
+            ("{body}", &context.body),
+            ("{original_room_id}", &source_context.room_id),
+            ("{original_message_id}", &source_context.message_id),
+            (
+                "{original_person_id}",
+                source_context.person_id.as_deref().unwrap_or(""),
+            ),
+            (
+                "{original_person_email}",
+                source_context.person_email.as_deref().unwrap_or(""),
+            ),
+            ("{original_body}", &source_context.body),
+            ("{thread_context}", thread_context),
+        ],
+    )
+}
+
+fn render_template_once(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while !remaining.is_empty() {
+        if let Some((placeholder, value)) = replacements
+            .iter()
+            .find(|(placeholder, _)| remaining.starts_with(*placeholder))
+        {
+            rendered.push_str(value);
+            remaining = &remaining[placeholder.len()..];
+            continue;
+        }
+
+        let ch = remaining
+            .chars()
+            .next()
+            .expect("remaining template is not empty");
+        rendered.push(ch);
+        remaining = &remaining[ch.len_utf8()..];
+    }
+    rendered
 }
 
 fn render_thread_context(
@@ -2292,26 +2324,42 @@ fn render_thread_context(
     self_person_id: Option<&str>,
     max_chars: usize,
 ) -> String {
-    let mut entries = Vec::with_capacity(thread_messages.len().saturating_add(1));
-    entries.push(render_thread_message(
-        "root",
-        root_message,
-        self_person_id,
-        max_chars,
-    ));
+    let root_entry = render_thread_message("root", root_message, self_person_id, max_chars);
     let mut replies = thread_messages.to_vec();
     replies.sort_by_key(|message| message.created);
-    for message in replies {
-        if message.id.as_deref() == Some(current_message_id) {
-            continue;
+    let reply_entries = replies
+        .into_iter()
+        .filter(|message| message.id.as_deref() != Some(current_message_id))
+        .map(|message| render_thread_message("reply", &message, self_person_id, max_chars))
+        .filter(|entry| !entry.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    let max_chars = max_chars.max(1);
+    let root_entry = trim_to_chars(&root_entry, max_chars);
+    let mut selected_replies = Vec::new();
+    let mut selected_chars = root_entry.chars().count();
+    for entry in reply_entries.into_iter().rev() {
+        let separator_chars = if root_entry.trim().is_empty() && selected_replies.is_empty() {
+            0
+        } else {
+            2
+        };
+        let entry_chars = entry.chars().count();
+        if selected_chars
+            .saturating_add(separator_chars)
+            .saturating_add(entry_chars)
+            > max_chars
+        {
+            break;
         }
-        entries.push(render_thread_message(
-            "reply",
-            &message,
-            self_person_id,
-            max_chars,
-        ));
+        selected_chars += separator_chars + entry_chars;
+        selected_replies.push(entry);
     }
+    selected_replies.reverse();
+
+    let mut entries = Vec::with_capacity(selected_replies.len().saturating_add(1));
+    entries.push(root_entry);
+    entries.extend(selected_replies);
     let rendered = entries
         .into_iter()
         .filter(|entry| !entry.trim().is_empty())
@@ -3358,6 +3406,16 @@ mod tests {
         let created = harness.webex.created_requests();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].parent_id.as_deref(), Some("root-1"));
+        assert_eq!(
+            harness.webex.marker_searches(),
+            vec![(
+                ROOM_ID.to_owned(),
+                Some("root-1".to_owned()),
+                reply_marker("followup-1"),
+                Some(SELF_PERSON_ID.to_owned()),
+                Some(FOLLOWUP_REPLY_MARKER_SEARCH_MAX_PAGES)
+            )]
+        );
         assert!(
             created[0]
                 .markdown
@@ -3366,6 +3424,65 @@ mod tests {
                 .contains(&reply_marker("followup-1"))
         );
         assert!(harness.processed("followup-1").await);
+    }
+
+    #[test]
+    fn followup_prompt_preserves_literal_placeholder_text() {
+        let context = MessageContext {
+            message_id: "followup-1".to_owned(),
+            room_id: ROOM_ID.to_owned(),
+            person_id: Some(SENDER_PERSON_ID.to_owned()),
+            person_email: Some(SENDER_EMAIL.to_owned()),
+            body: "Please explain {thread_context} without expanding it".to_owned(),
+        };
+        let source_context = MessageContext {
+            message_id: "root-1".to_owned(),
+            room_id: ROOM_ID.to_owned(),
+            person_id: Some("source-person".to_owned()),
+            person_email: Some("source@example.com".to_owned()),
+            body: "Original body with {body} literally".to_owned(),
+        };
+
+        let prompt = render_followup_prompt(
+            "Current: {body}\nOriginal: {original_body}\nThread: {thread_context}",
+            &context,
+            &source_context,
+            "Rendered thread context",
+        );
+
+        assert!(prompt.contains("Current: Please explain {thread_context} without expanding it"));
+        assert!(prompt.contains("Original: Original body with {body} literally"));
+        assert!(prompt.contains("Thread: Rendered thread context"));
+    }
+
+    #[test]
+    fn followup_thread_context_keeps_recent_replies_when_trimmed() {
+        let root = inbound_message("root-1", "Root failure");
+        let mut old_reply = inbound_thread_message(
+            "old-reply",
+            ROOM_ID,
+            "root-1",
+            "old reply should be trimmed",
+        );
+        old_reply.created = Some(serde_json::from_str("\"2026-06-24T01:00:00Z\"").unwrap());
+        let mut recent_reply =
+            inbound_thread_message("recent-reply", ROOM_ID, "root-1", "recent reply must stay");
+        recent_reply.created = Some(serde_json::from_str("\"2026-06-24T03:00:00Z\"").unwrap());
+        let mut current = inbound_thread_message("current", ROOM_ID, "root-1", "current follow-up");
+        current.created = Some(serde_json::from_str("\"2026-06-24T04:00:00Z\"").unwrap());
+
+        let context = render_thread_context(
+            &root,
+            &[old_reply, recent_reply, current],
+            "current",
+            Some(SELF_PERSON_ID),
+            170,
+        );
+
+        assert!(context.contains("Root failure"));
+        assert!(context.contains("recent reply must stay"));
+        assert!(!context.contains("old reply should be trimmed"));
+        assert!(!context.contains("current follow-up"));
     }
 
     #[tokio::test]

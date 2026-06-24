@@ -587,23 +587,21 @@ impl RoomPolicy {
                 self.room_id
             ));
         }
-        if matches!(self.trigger, TriggerMode::Prefix) {
-            if self.prefixes.is_empty() {
-                return Err(anyhow!(
-                    "rooms[{}].prefixes is required when trigger = \"prefix\"",
-                    self.room_id
-                ));
-            }
-            if self
-                .prefixes
-                .iter()
-                .any(|prefix| prefix.trim().is_empty() || prefix.trim() != prefix)
-            {
-                return Err(anyhow!(
-                    "rooms[{}].prefixes must be non-empty without surrounding whitespace",
-                    self.room_id
-                ));
-            }
+        if matches!(self.trigger, TriggerMode::Prefix) && self.prefixes.is_empty() {
+            return Err(anyhow!(
+                "rooms[{}].prefixes is required when trigger = \"prefix\"",
+                self.room_id
+            ));
+        }
+        if self
+            .prefixes
+            .iter()
+            .any(|prefix| prefix.trim().is_empty() || prefix.trim() != prefix)
+        {
+            return Err(anyhow!(
+                "rooms[{}].prefixes must be non-empty without surrounding whitespace",
+                self.room_id
+            ));
         }
         if self.prompt_template.trim().is_empty() {
             return Err(anyhow!(
@@ -1034,6 +1032,31 @@ allow_all_senders = true
                 .unwrap_err()
                 .to_string()
                 .contains("non-empty")
+        );
+    }
+
+    #[test]
+    fn followup_prefix_fallback_rejects_untrimmed_prefixes() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+prefixes = [" @miku.gen"]
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
+triggers = ["mention"]
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("without surrounding whitespace")
         );
     }
 
