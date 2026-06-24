@@ -634,6 +634,7 @@ pub enum ReplyFormat {
     #[default]
     Markdown,
     JenkinsDiagnosisJson,
+    JenkinsFollowupJson,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -646,6 +647,7 @@ pub struct FollowupConfig {
     pub allowed_person_emails: Vec<String>,
     pub max_thread_messages: usize,
     pub max_thread_context_chars: usize,
+    pub reply_format: Option<ReplyFormat>,
     pub prompt_template: String,
 }
 
@@ -659,6 +661,7 @@ impl Default for FollowupConfig {
             allowed_person_emails: Vec::new(),
             max_thread_messages: 30,
             max_thread_context_chars: 12_000,
+            reply_format: None,
             prompt_template: DEFAULT_FOLLOWUP_PROMPT_TEMPLATE.to_owned(),
         }
     }
@@ -912,6 +915,7 @@ triggers = ["mention", "quoted-bot-reply"]
 allowed_person_emails = ["operator@example.com"]
 max_thread_messages = 12
 max_thread_context_chars = 4096
+reply_format = "jenkins-followup-json"
 prompt_template = "Follow up on {original_message_id}: {body}"
 "#,
         )
@@ -929,6 +933,10 @@ prompt_template = "Follow up on {original_message_id}: {body}"
         );
         assert_eq!(config.rooms[0].followup.max_thread_messages, 12);
         assert_eq!(config.rooms[0].followup.max_thread_context_chars, 4096);
+        assert_eq!(
+            config.rooms[0].followup.reply_format,
+            Some(ReplyFormat::JenkinsFollowupJson)
+        );
     }
 
     #[test]

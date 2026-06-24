@@ -35,7 +35,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
     BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FollowupTrigger, MessageContext,
-    ReplyFormat, TriggerMode, render_prompt, should_trigger, trim_to_chars,
+    ReplyFormat, TriggerMode, message_matches_prefix, render_prompt, should_trigger, trim_to_chars,
     webex::build_webex_client,
 };
 use webex_headless_messenger::{
@@ -156,6 +156,13 @@ struct FollowupRun {
     reply_thread: ReplyThread,
     source_context: MessageContext,
     thread_context: String,
+}
+
+struct CodexReplyRequest<'a> {
+    message_id: &'a str,
+    reply_format: ReplyFormat,
+    reply_thread: ReplyThread,
+    prompt: String,
 }
 
 enum ReplyThreadSetup {
@@ -1111,9 +1118,12 @@ impl BotApp {
                 .run_codex_reply(
                     &attempt,
                     policy,
-                    &message_id,
-                    followup_run.reply_thread,
-                    prompt,
+                    CodexReplyRequest {
+                        message_id: &message_id,
+                        reply_format: policy.followup.reply_format.unwrap_or(policy.reply_format),
+                        reply_thread: followup_run.reply_thread,
+                        prompt,
+                    },
                     Some(&followup_run.source_context),
                 )
                 .await;
@@ -1169,9 +1179,12 @@ impl BotApp {
         self.run_codex_reply(
             &attempt,
             policy,
-            &message_id,
-            reply_thread,
-            prompt,
+            CodexReplyRequest {
+                message_id: &message_id,
+                reply_format: policy.reply_format,
+                reply_thread,
+                prompt,
+            },
             Some(&context),
         )
         .await
@@ -1181,11 +1194,11 @@ impl BotApp {
         &self,
         attempt: &AttemptLease,
         policy: &webex_generic_account_bot::RoomPolicy,
-        message_id: &str,
-        reply_thread: ReplyThread,
-        mut prompt: String,
+        mut request: CodexReplyRequest<'_>,
         jenkins_context: Option<&MessageContext>,
     ) -> Result<BotAction, HttpError> {
+        let message_id = request.message_id;
+        let reply_thread = request.reply_thread;
         let reply_marker = reply_marker(message_id);
         match self
             .find_existing_message_by_marker(
@@ -1220,7 +1233,8 @@ impl BotApp {
         if let Some(jenkins_context) = jenkins_context {
             match jenkins_context_prompt(policy, &codex_config, jenkins_context).await {
                 Ok(Some(context_bundle)) => {
-                    prompt = append_prefetched_context(&prompt, &context_bundle.prompt);
+                    request.prompt =
+                        append_prefetched_context(&request.prompt, &context_bundle.prompt);
                     prefetched_context = Some(context_bundle.prompt);
                     jenkins_artifact_cleanup = Some(JenkinsArtifactCleanupGuard::new(
                         context_bundle.artifact_root,
@@ -1229,14 +1243,17 @@ impl BotApp {
                 Ok(None) => {}
                 Err(error) => {
                     warn!(message_id = %message_id, error = %error, "failed to prefetch Jenkins diagnostics");
-                    prompt = append_prefetched_context(
-                        &prompt,
+                    request.prompt = append_prefetched_context(
+                        &request.prompt,
                         &format!("Jenkins diagnostics helper failed before Codex run: {error}"),
                     );
                 }
             }
         }
-        let run_result = self.runner.run(&codex_config, &prompt, message_id).await;
+        let run_result = self
+            .runner
+            .run(&codex_config, &request.prompt, message_id)
+            .await;
         if let Some(cleanup_guard) = jenkins_artifact_cleanup {
             if let Err(error) = cleanup_guard.cleanup().await {
                 warn!(
@@ -1248,7 +1265,7 @@ impl BotApp {
         }
         let reply_text = match run_result {
             Ok(output) => render_reply_text(
-                policy.reply_format,
+                request.reply_format,
                 &output.final_message,
                 prefetched_context.as_deref(),
             ),
@@ -1310,7 +1327,11 @@ impl BotApp {
             return Ok(None);
         };
 
-        let root_message = self.webex.get_message(parent_id).await?;
+        let root_message = match self.webex.get_message(parent_id).await {
+            Ok(message) => message,
+            Err(error) if webex_call_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let mut thread_messages = self
             .webex
             .list_thread_messages(
@@ -1337,7 +1358,11 @@ impl BotApp {
         let source_message = if root_message.id.as_deref() == Some(source_message_id.as_str()) {
             root_message.clone()
         } else {
-            self.webex.get_message(&source_message_id).await?
+            match self.webex.get_message(&source_message_id).await {
+                Ok(message) => message,
+                Err(error) if webex_call_is_not_found(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            }
         };
         let Some(source_context) = MessageContext::from_message(&source_message) else {
             return Ok(None);
@@ -1843,6 +1868,14 @@ fn classify_webex_api_error(api: &ApiError, default_retry: Duration) -> WebexFai
     WebexFailureAction::Retry(api.retry_after.unwrap_or(default_retry))
 }
 
+fn webex_call_is_not_found(error: &WebexCallError) -> bool {
+    matches!(
+        error,
+        WebexCallError::Client(WebexError::Api(api))
+            if api.status == StatusCode::NOT_FOUND.as_u16()
+    )
+}
+
 fn classify_webex_create_failure(
     error: &WebexCallError,
     default_retry: Duration,
@@ -2031,6 +2064,7 @@ fn followup_message_needs_hydration(
         || (message.text.is_none() && message.markdown.is_none() && message.html.is_none())
         || (policy.followup.triggers.contains(&FollowupTrigger::Mention)
             && message.mentioned_people.is_empty())
+            && !message_matches_prefix(message, &policy.prefixes)
 }
 
 fn followup_candidate_matches(
@@ -2047,12 +2081,14 @@ fn followup_candidate_matches(
         .triggers
         .iter()
         .any(|trigger| match trigger {
-            FollowupTrigger::Mention => self_person_id.is_some_and(|self_id| {
-                message
-                    .mentioned_people
-                    .iter()
-                    .any(|person_id| person_id == self_id)
-            }),
+            FollowupTrigger::Mention => {
+                self_person_id.is_some_and(|self_id| {
+                    message
+                        .mentioned_people
+                        .iter()
+                        .any(|person_id| person_id == self_id)
+                }) || message_matches_prefix(message, &policy.prefixes)
+            }
             FollowupTrigger::QuotedBotReply => message_contains_marker(message, "wgb-ref:"),
         })
 }
@@ -2320,6 +2356,24 @@ struct JenkinsDiagnosisReply {
     excerpt_format: JenkinsDiagnosisExcerptFormat,
 }
 
+#[derive(Debug, Deserialize)]
+struct JenkinsFollowupReply {
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    include_evidence: bool,
+    #[serde(default)]
+    log_url: Option<String>,
+    #[serde(default)]
+    excerpt: Option<String>,
+    #[serde(
+        default,
+        alias = "excerpt_style",
+        deserialize_with = "deserialize_jenkins_excerpt_format"
+    )]
+    excerpt_format: JenkinsDiagnosisExcerptFormat,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum JenkinsDiagnosisVerdict {
@@ -2366,6 +2420,9 @@ fn render_reply_text(
         ReplyFormat::JenkinsDiagnosisJson => {
             render_jenkins_diagnosis_json(output, prefetched_context)
         }
+        ReplyFormat::JenkinsFollowupJson => {
+            render_jenkins_followup_json(output, prefetched_context)
+        }
     }
 }
 
@@ -2400,6 +2457,31 @@ fn parse_jenkins_diagnosis_json(output: &str) -> Result<JenkinsDiagnosisReply> {
     serde_json::from_str(json).context("failed to parse Jenkins diagnosis JSON")
 }
 
+fn render_jenkins_followup_json(output: &str, prefetched_context: Option<&str>) -> String {
+    let allowed_log_urls = prefetched_context
+        .map(extract_jenkins_console_urls)
+        .unwrap_or_default();
+    match parse_jenkins_followup_json(output) {
+        Ok(reply) => render_jenkins_followup_reply(&reply, &allowed_log_urls),
+        Err(_) => render_jenkins_followup_reply(
+            &JenkinsFollowupReply {
+                answer: "I could not parse the follow-up answer".to_owned(),
+                include_evidence: false,
+                log_url: None,
+                excerpt: None,
+                excerpt_format: JenkinsDiagnosisExcerptFormat::default(),
+            },
+            &allowed_log_urls,
+        ),
+    }
+}
+
+fn parse_jenkins_followup_json(output: &str) -> Result<JenkinsFollowupReply> {
+    let json = extract_json_object(output)
+        .ok_or_else(|| anyhow!("Codex output did not contain a JSON object"))?;
+    serde_json::from_str(json).context("failed to parse Jenkins follow-up JSON")
+}
+
 fn extract_json_object(output: &str) -> Option<&str> {
     let trimmed = output.trim();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
@@ -2411,6 +2493,34 @@ fn extract_json_object(output: &str) -> Option<&str> {
         return None;
     }
     Some(output[start..=end].trim())
+}
+
+fn render_jenkins_followup_reply(
+    reply: &JenkinsFollowupReply,
+    allowed_log_urls: &[String],
+) -> String {
+    let answer = concise_followup_answer(&reply.answer);
+    let answer = escape_markdown_plain_text(&answer);
+    let (log_url, excerpt) = if reply.include_evidence {
+        (
+            reply
+                .log_url
+                .as_deref()
+                .and_then(normalized_jenkins_console_url)
+                .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url)),
+            reply.excerpt.as_deref(),
+        )
+    } else {
+        (None, None)
+    };
+    match log_url {
+        Some(url) => append_jenkins_excerpt(
+            format!("{answer} [log](<{url}>)"),
+            excerpt,
+            reply.excerpt_format,
+        ),
+        None => append_jenkins_excerpt(answer, excerpt, reply.excerpt_format),
+    }
 }
 
 fn render_jenkins_diagnosis_reply(
@@ -2451,6 +2561,16 @@ fn render_jenkins_diagnosis_reply(
             reply.excerpt.as_deref(),
             reply.excerpt_format,
         ),
+    }
+}
+
+fn concise_followup_answer(answer: &str) -> String {
+    let normalised = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalised = normalised.trim_matches(['.', '!', '?', ' ', '\t']).trim();
+    if normalised.is_empty() {
+        "I do not have enough evidence to answer that follow-up".to_owned()
+    } else {
+        webex_generic_account_bot::policy::trim_to_chars(normalised, REPLY_LIMIT_CHARS / 2)
     }
 }
 
@@ -3239,6 +3359,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn followup_mention_trigger_accepts_configured_text_prefix() {
+        let state_path = unique_state_path();
+        let mut config = (*followup_test_config(state_path)).clone();
+        config.rooms[0].prefixes = vec!["@miku.gen".to_owned()];
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness
+            .webex
+            .push_get_message(Ok(inbound_message("root-1", "Original Jenkins failure")));
+        harness
+            .webex
+            .push_thread_messages(Ok(vec![message_with_marker(
+                "bot-reply-1",
+                ROOM_ID,
+                &reply_marker("root-1"),
+            )]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output("Follow-up answer");
+        let mut followup =
+            inbound_thread_message("followup-1", ROOM_ID, "root-1", "@miku.gen please expand");
+        followup.mentioned_people.clear();
+
+        let action = harness
+            .app
+            .process_event(message_event(followup))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("followup-reply-1"));
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
     async fn quoted_bot_reply_marker_can_trigger_followup_without_mention() {
         let state_path = unique_state_path();
         let mut config = (*followup_test_config(state_path)).clone();
@@ -3346,6 +3504,39 @@ mod tests {
                 OUTPUT_ROOM_ID,
                 "forward-without-marker",
                 "@miku.gen should not run yet",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("not_followup"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn output_thread_with_unreadable_source_marker_is_not_followup() {
+        let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
+        harness.webex.push_get_message(Ok(message_with_marker(
+            "forward-1",
+            OUTPUT_ROOM_ID,
+            &source_marker("source-replay-1"),
+        )));
+        harness.webex.push_thread_messages(Ok(Vec::new()));
+        harness
+            .webex
+            .push_get_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(404, None),
+            )))));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                OUTPUT_ROOM_ID,
+                "forward-1",
+                "@miku.gen should not retry forever",
             )))
             .await
             .unwrap();
@@ -3566,6 +3757,62 @@ mod tests {
         assert_eq!(
             render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
             "**Jenkins infra false alarm:** the failed trigger job did not start because no ARM executor was available [log](<https://jenkins.example/job/foo/1/console>)\n> Trigger build failed before dispatch\n> No nodes are available"
+        );
+    }
+
+    #[test]
+    fn jenkins_followup_json_answers_without_diagnosis_prefix() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "answer": "No Jenkins agent machine, IP address, or username was assigned because Jenkins could not find any nodes to run the job.",
+            "include_evidence": true,
+            "excerpt": "Failed: cannot find any nodes to run the job",
+            "excerpt_format": "inline_code",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsFollowupJson, output, Some(context)),
+            "No Jenkins agent machine, IP address, or username was assigned because Jenkins could not find any nodes to run the job [log](<https://jenkins.example/job/foo/1/console>)\n`Failed: cannot find any nodes to run the job`"
+        );
+    }
+
+    #[test]
+    fn jenkins_followup_json_ignores_log_and_excerpt_without_evidence_gate() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "answer": "No Jenkins agent machine, IP address, or username was assigned.",
+            "excerpt": "Failed: cannot find any nodes to run the job",
+            "excerpt_format": "inline_code",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsFollowupJson, output, Some(context)),
+            "No Jenkins agent machine, IP address, or username was assigned"
+        );
+    }
+
+    #[test]
+    fn jenkins_followup_json_does_not_add_log_or_excerpt_when_omitted() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "answer": "No Jenkins agent machine, IP address, or username was assigned."
+        }"#;
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsFollowupJson, output, Some(context)),
+            "No Jenkins agent machine, IP address, or username was assigned"
+        );
+    }
+
+    #[test]
+    fn invalid_jenkins_followup_json_uses_followup_fallback() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsFollowupJson, "not json", Some(context)),
+            "I could not parse the follow-up answer"
         );
     }
 
