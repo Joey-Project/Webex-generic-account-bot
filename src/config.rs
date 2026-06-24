@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+const FOLLOWUP_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
 const STAGING_SOURCE_MARKER_SEARCH_PAGES: u64 = 3;
 const STAGING_WEBEX_REQUESTS_PER_ATTEMPT: u64 =
     STAGING_SOURCE_MARKER_SEARCH_PAGES + 1 + STAGING_SOURCE_MARKER_SEARCH_PAGES;
@@ -624,6 +625,9 @@ impl RoomPolicy {
         if self.output_room_id.is_some() {
             requests = requests.saturating_add(STAGING_WEBEX_REQUESTS_PER_ATTEMPT);
         }
+        if self.followup.enabled {
+            requests = requests.saturating_add(FOLLOWUP_WEBEX_REQUESTS_PER_ATTEMPT);
+        }
         requests
     }
 }
@@ -1165,6 +1169,35 @@ output_room_id = "staging-room"
 forward_source_message = true
 read_only_source = true
 allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Webex request timeout margin")
+        );
+    }
+
+    #[test]
+    fn rejects_followup_webex_budget_that_exceeds_attempt_lease() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 300
+
+[codex]
+timeout_secs = 100
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.followup]
+enabled = true
 "#,
         )
         .unwrap();
