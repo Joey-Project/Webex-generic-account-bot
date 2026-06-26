@@ -40,10 +40,11 @@ superseded_by:
 - Verify that the active bot binary, host-installed deployment entrypoint, and any release artifact to be reloaded match a protected, reviewed bot revision before accepting a reload.
 - Record the deployed bot/config revisions and verified artifact identities in status output and install metadata.
 - Run any allowed config-repo helper with a scrubbed, credential-free environment and constrained filesystem/network access; it must not receive GitHub/SSH fetch credentials, deployment tokens, production token files, or host reload privileges.
+- Host-owned deployment policy must resolve and validate runtime secret paths and env selectors itself, including production token-file values that are intentionally absent from the helper environment; `--check-config` is an additional bot-schema check, not the sole secret-boundary check.
 - Before install, enforce a deny-by-default host deployment policy for every security-relevant rendered config field. Fields that can run programs, grant access to secrets, select environment variables, disable authentication, widen filesystem scope, alter Webex routing/authorization, change Codex runtime policy, expose listeners, or consume host resources must be fixed by host policy or explicitly allowlisted.
 - Boundary checks must cover Codex binaries, global and per-room `codex.cwd`, `codex.codex_home`, `state_file`, Jenkins artifact roots, Webex token file/env selectors, sidecar token env selectors, configured `self_person_id`, Jenkins helper binaries/scripts, Jenkins env files, future launcher helpers, and any equivalent override fields.
 - The configured bot identity must be fixed or verified against the active Webex token identity so config cannot spoof another account for mention triggers, marker ownership, or reply reconciliation.
-- Codex execution policy fields must be fixed or explicitly allowlisted, including global and per-room `profile`, `sandbox`, `approval_policy`, `skip_git_repo_check`, `ephemeral`, model/reasoning controls, and future runtime-mode fields.
+- Codex execution policy fields must be fixed or explicitly allowlisted, including global and per-room `profile`, `sandbox`, `approval_policy`, `skip_git_repo_check`, `ephemeral`, `codex.isolation.mode`, `codex.isolation.trusted_prompt_authors`, model/reasoning controls, and future runtime-mode fields.
 - Webex routing, sender authorization, and write-policy fields must be fixed or explicitly allowlisted, including source rooms, staging/output rooms, admin command rooms, `allowed_person_ids`, `allowed_person_emails`, `allow_all_senders`, follow-up sender overrides, `read_only_source`, `forward_source_message`, trigger/follow-up policy, and any production-space write permission downgrade.
 - Production room and follow-up policies must reject `allow_all_senders = true` unless a host-owned policy explicitly permits that exact room and mode.
 - Listener and resource-control fields must be host-owned or explicitly bounded, including `server.bind`, concurrency limits, Webex attempt leases, Codex timeouts/output limits, Jenkins URL/time/output limits, and any retry or budget fields that can expose the service or exhaust host resources.
@@ -52,7 +53,7 @@ superseded_by:
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
 - Enforce single-flight deployment with a host-wide/interprocess lock; a process-local mutex may only be an additional guard. Define explicit duplicate-request semantics and machine-readable in-progress/status output.
-- Include unit/smoke tests for argument parsing, failed validation, protected bot/config revision checks, helper credential scrubbing, boundary allowlist rejection, identity mismatch rejection, sender-authorization rejection, authentication downgrade rejection, resource-limit rejection, symlink/ownership rejection, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
+- Include unit/smoke tests for argument parsing, failed validation, protected bot/config revision checks, runtime secret-path validation, helper credential/filesystem/network isolation, boundary allowlist rejection, identity mismatch rejection, isolation downgrade rejection, sender-authorization rejection, authentication downgrade rejection, resource-limit rejection, symlink/ownership rejection, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
@@ -76,10 +77,11 @@ superseded_by:
 ### PR 4: Ephemeral Linux User Launcher
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Implement the privileged isolation backend with a narrow root-owned launcher or `systemd-run DynamicUser`.
-- Each Codex run should get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
+- Each Codex run must get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
 - Codex auth must use brokered, tool-inaccessible credentials or one-time revocable per-run material that prompt-controlled code cannot read; writable home/cache/state directories must be per-run temporary paths that cannot persist data across Webex prompts.
-- Network access must default to no egress or an explicit allowlist; the launcher preflight and smoke tests must cover blocked localhost, host admin endpoints, metadata services, and non-allowlisted internal networks.
-- Add tests showing one ephemeral run cannot read files, cache state, or credentials left by another run.
+- Network access must default to no egress or an explicit allowlist; any Codex API or auth-broker egress must be unavailable to prompt-controlled tool subprocesses.
+- Launcher preflight and smoke tests must cover blocked localhost, host admin endpoints, metadata services, non-allowlisted internal networks, non-allowlisted public Internet, and DNS egress.
+- Add tests showing one ephemeral run cannot read files, cache state, or credentials left by another run after success, failure, or timeout cleanup paths.
 - Add negative tests showing an ephemeral run cannot read its own Codex auth material, bot/deployment secrets such as Webex token files, Jenkins env files, persistent Codex home, or host-owned config and deployment metadata.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
