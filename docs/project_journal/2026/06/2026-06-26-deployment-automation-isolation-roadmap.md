@@ -29,14 +29,16 @@ superseded_by:
 - Add a deployment-host sync entrypoint that fetches the config repo, renders production config, validates it, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
 - The privileged entrypoint must come from a host-installed or otherwise trusted fixed path, not from the newly pulled config repo checkout.
 - Treat the pulled config repo as data until validation succeeds; any repo-provided render helper must run as a low-privilege deployment user or inside a constrained workspace that cannot read production secrets or reload the bot.
-- Failure must leave the currently deployed config and running service untouched.
+- Failure before the commit point must leave the currently deployed config and running service untouched.
+- The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
 - Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, and dry-run/status output.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
 - Add allowlisted fixed commands for an admin configuration Space, initially `/config status`, `/config pull`, `/config reload`, and `/config sync`.
 - Commands must call fixed argv only; user message text must never be interpolated into a shell command.
-- Use the PR 1 deployment script as the backend.
+- Use the PR 1 deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
+- Until durable background job recovery exists, mutating commands must acknowledge first and then hand off to an out-of-process status-tracked action, or be limited to status/dry-run commands.
 
 ### PR 3: Runner Backend Abstraction for Existing Isolation Config
 - Repository: `Joey-Project/Webex-generic-account-bot`.
@@ -51,7 +53,7 @@ superseded_by:
 - Launcher integration must be covered by unit tests and, where host permissions allow, an opt-in integration smoke test.
 
 ## Current Open Decisions
-- Whether the deployment host should use a system service reload, tmux-local restart, or a configurable reload command in the first production script.
+- Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.
 - Whether the fixed Webex config commands should live in a dedicated room policy type or a fixed-command section attached to an existing room policy.
 - Whether the privileged launcher should standardise on `systemd-run DynamicUser` first or ship a minimal root-owned helper first.
 
