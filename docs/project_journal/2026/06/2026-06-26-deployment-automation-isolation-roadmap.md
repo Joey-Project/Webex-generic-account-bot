@@ -24,20 +24,27 @@ superseded_by:
 
 ## Planned PRs
 
-### PR 1: Deployment Host Pull/Validate/Reload
+### PR 1a: Low-Privilege Config Render and Validation
 - Repository: `WebexServices-staging/webex-generic-account-bot-config`.
-- Add a deployment-host sync entrypoint that fetches the config repo, renders production config, validates it, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
-- The privileged entrypoint must come from a host-installed or otherwise trusted fixed path, not from the newly pulled config repo checkout.
-- Treat the pulled config repo as data until validation succeeds; any repo-provided render helper must run as a low-privilege deployment user or inside a constrained workspace that cannot read production secrets or reload the bot.
+- Keep this repo limited to config data, render helpers, static validation, bot `--check-config`, and documentation.
+- Add any helper tests needed for deployment-host use, but do not add a privileged install/reload entrypoint here.
+- Repo-provided helpers must be safe to run as a low-privilege deployment user or inside a constrained workspace that cannot read production secrets or reload the bot.
+
+### PR 1b: Trusted Deployment Host Entry Point
+- Repository: `Joey-Project/Webex-generic-account-bot` or a host-installed package delivered from the bot release process.
+- Add the trusted fixed-path deployment entrypoint that fetches the config repo as data, invokes the low-privilege render/validation path, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
+- The privileged entrypoint must never be executed from the newly pulled config repo checkout.
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
-- Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, and dry-run/status output.
+- Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, dry-run/status output, and rollback/old-service health checks.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
 - Add allowlisted fixed commands for an admin configuration Space, initially `/config status`, `/config pull`, `/config reload`, and `/config sync`.
 - Commands must call fixed argv only; user message text must never be interpolated into a shell command.
-- Use the PR 1 deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
+- Require both a configured admin room and an explicit sender allowlist by person ID or email; `allow_all_senders` must not be available for the config command surface.
+- Include wrong-room and wrong-sender tests for every mutating command.
+- Use the PR 1b deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
 - Until durable background job recovery exists, mutating commands must acknowledge first and then hand off to an out-of-process status-tracked action, or be limited to status/dry-run commands.
 
 ### PR 3: Runner Backend Abstraction for Existing Isolation Config

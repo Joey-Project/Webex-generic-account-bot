@@ -32,7 +32,7 @@ superseded_by:
 ## Next Steps
 - Let the WME Jenkins staging deployment run for a few days before moving replies from staging output to the production space.
 - Enable follow-up config in the staging deployment and validate live `@miku.gen` follow-ups; separately test whether Webex quoted replies preserve hidden marker content in webhook or hydrated message payloads.
-- Execute the deployment automation and runner isolation roadmap, starting with deployment-host pull/validate/reload automation.
+- Execute the deployment automation and runner isolation roadmap, starting with low-privilege config render/validation support.
 
 ## Evidence
 - Local source files: `Cargo.toml`, `src/`, `config/example.toml`, `README.md`.
