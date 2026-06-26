@@ -29,14 +29,16 @@ superseded_by:
 - Keep this repo limited to config data, render helpers, static validation, bot `--check-config`, and documentation.
 - Add any helper tests needed for deployment-host use, but do not add a privileged install/reload entrypoint here.
 - Repo-provided helpers must be safe to run as a low-privilege deployment user or inside a constrained workspace that cannot read production secrets or reload the bot.
+- Production config must not be able to choose arbitrary executable paths that later run with bot or deployment privileges; executable fields such as `codex.bin`, Jenkins `node_bin`, Jenkins helper `script`, and future launcher paths must be fixed by host policy or validated against a deployment allowlist.
 
 ### PR 1b: Trusted Deployment Host Entry Point
 - Repository: `Joey-Project/Webex-generic-account-bot` or a host-installed package delivered from the bot release process.
 - Add the trusted fixed-path deployment entrypoint that fetches the config repo as data, invokes the low-privilege render/validation path, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
 - The privileged entrypoint must never be executed from the newly pulled config repo checkout.
+- Before install, enforce the host executable/secret-path allowlist for rendered config fields that can run programs or grant access to secrets, including Codex binaries, Jenkins helper binaries/scripts, future launcher helpers, and env-file paths.
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
-- Enforce single-flight deployment with a process-wide or host-wide lock, explicit duplicate-request semantics, and machine-readable in-progress/status output.
+- Enforce single-flight deployment with a host-wide/interprocess lock; a process-local mutex may only be an additional guard. Define explicit duplicate-request semantics and machine-readable in-progress/status output.
 - Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
 
 ### PR 2: Configuration Space Fixed Commands
@@ -52,7 +54,7 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Connect the existing `codex.isolation` configuration and `IsolationMode` model to an internal runner backend abstraction while keeping current-user execution as the default.
 - Do not add a second isolation schema; preserve the existing `current-user` and `ephemeral-linux-user` mode names.
-- Until PR 4 lands, `ephemeral-linux-user` must continue to fail validation or return an explicit unavailable-backend error; it must never silently fall back to current-user execution.
+- Until PR 4 lands, deployable configs that set `ephemeral-linux-user` must continue to fail validation and `--check-config`; it must never become a runtime-only failure or silently fall back to current-user execution.
 - Keep existing Codex execution behaviour unchanged for current configs, but route execution through a replaceable backend that PR 4 can implement.
 
 ### PR 4: Ephemeral Linux User Launcher
