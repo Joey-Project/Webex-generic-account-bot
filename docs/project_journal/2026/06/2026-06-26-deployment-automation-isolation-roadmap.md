@@ -35,16 +35,21 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot` or a host-installed package delivered from the bot release process.
 - Add the trusted fixed-path deployment entrypoint that fetches the config repo as data, invokes the low-privilege render/validation path, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
 - The privileged entrypoint must never be executed from the newly pulled config repo checkout.
-- Before install, enforce the host executable/secret-path allowlist for rendered config fields that can run programs or grant access to secrets, including Codex binaries, Jenkins helper binaries/scripts, future launcher helpers, and env-file paths.
+- Resolve the config source to an immutable commit SHA before install, verify that the selected revision passed the required protected-branch checks, and record the deployed bot/config revisions in status output and install metadata.
+- Before install, enforce the host executable, read-root, write-root, secret, and authentication allowlists for rendered config fields that can run programs, grant access to secrets, select environment variables, disable authentication, or widen filesystem scope.
+- Boundary checks must cover Codex binaries, global and per-room `codex.cwd`, `codex.codex_home`, `state_file`, Jenkins artifact roots, Webex token file/env selectors, sidecar token env selectors, Jenkins helper binaries/scripts, Jenkins env files, future launcher helpers, and any equivalent override fields.
+- Production deployment must require sidecar authentication and reject `server.allow_unauthenticated = true`.
+- Path checks must canonicalise symlinks and verify ownership/permissions so approved roots cannot be bypassed through writable directories or symlink swaps.
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
 - Enforce single-flight deployment with a host-wide/interprocess lock; a process-local mutex may only be an additional guard. Define explicit duplicate-request semantics and machine-readable in-progress/status output.
-- Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
+- Include unit/smoke tests for argument parsing, failed validation, protected-revision checks, boundary allowlist rejection, authentication downgrade rejection, symlink/ownership rejection, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
 - Add allowlisted fixed commands for an admin configuration Space, initially `/config status`, `/config pull`, `/config reload`, and `/config sync`.
 - Commands must call fixed argv only; user message text must never be interpolated into a shell command.
+- Mutating commands must delegate to PR 1b's trusted entrypoint and deploy only an immutable revision that passed required checks; status replies must show the currently deployed bot/config revisions and any in-progress target revision.
 - Require both a configured admin room and an explicit sender allowlist by person ID or email; `allow_all_senders` must not be available for the config command surface.
 - Include wrong-room and wrong-sender tests for every fixed config command, including status and dry-run commands.
 - Use the PR 1b deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
@@ -61,7 +66,11 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Implement the privileged isolation backend with a narrow root-owned launcher or `systemd-run DynamicUser`.
 - Each Codex run should get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
-- Launcher integration must be covered by unit tests and, where host permissions allow, an opt-in integration smoke test.
+- Codex auth must be provided as minimal read-only or copied per-run material, while writable home/cache/state directories must be per-run temporary paths that cannot persist data across Webex prompts.
+- Add tests showing one ephemeral run cannot read files, cache state, or credentials left by another run.
+- Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
+- If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
+- Launcher integration must be covered by unit tests plus at least one permission-capable opt-in integration smoke test before the mode is considered deployable.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.
