@@ -35,6 +35,7 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot` or a host-installed package delivered from the bot release process.
 - Add the trusted fixed-path deployment entrypoint that fetches the config repo as data, invokes the low-privilege render/validation path, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
 - The privileged entrypoint must never be executed from the newly pulled config repo checkout.
+- Treat the Git checkout itself as untrusted data: disable hooks, smudge filters, LFS smudge, submodule recursion, unsafe local Git config, and unexpected protocol redirects before verification; allow only the expected remote/protocol/ref and test malicious `.gitattributes`, `.gitmodules`, and LFS config cannot execute or egress.
 - Resolve the config source to an immutable commit SHA and verify expected repo/ref reachability plus required protected-branch checks before executing any config-repo-provided helper code or installing any rendered output.
 - If that pre-helper verification cannot be made strong enough, render/validation code must be host-owned and config-repo checkouts must remain data-only.
 - Verify that the active bot binary, host-installed deployment entrypoint, and any release artifact to be reloaded match a protected, reviewed bot revision before accepting a reload.
@@ -55,13 +56,16 @@ superseded_by:
 - Path checks must canonicalise symlinks and verify ownership/permissions so approved roots cannot be bypassed through writable directories or symlink swaps.
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
+- Reload and handoff must define in-flight Webex attempt and Codex-run semantics: active work must drain, transfer its lease, or be retried without lost or duplicate replies before any old process is stopped.
 - Enforce single-flight deployment with a host-wide/interprocess lock; a process-local mutex may only be an additional guard. Define explicit duplicate-request semantics and machine-readable in-progress/status output.
-- Include unit/smoke tests for argument parsing, failed validation, protected bot/config revision checks, runtime secret-path validation, helper credential/filesystem/network/fd/socket isolation, helper resource-exhaustion rejection, status/error redaction and truncation, boundary allowlist rejection, identity mismatch rejection, isolation downgrade rejection, sender-authorization rejection, prompt/rendering policy rejection, authentication downgrade rejection, resource/listener rejection, symlink/ownership rejection, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
+- Include unit/smoke tests for argument parsing, failed validation, protected bot/config revision checks, safe Git checkout settings, runtime secret-path validation, helper credential/filesystem/network/fd/socket isolation, helper resource-exhaustion rejection, status/error redaction and truncation, boundary allowlist rejection, identity mismatch rejection, isolation downgrade rejection, sender-authorization rejection, prompt/rendering policy rejection, authentication downgrade rejection, resource/listener rejection, symlink/ownership rejection, atomic install behaviour, dry-run/status output, in-flight attempt handoff/drain, rollback/old-service health checks, and concurrent invocation handling.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
 - Add allowlisted fixed commands for an admin configuration Space, initially `/config status`, `/config pull`, `/config reload`, and `/config sync`.
 - Commands must call fixed argv only; user message text must never be interpolated into a shell command.
+- All bot decisions that can trigger Codex execution or Webex writes must use authoritative Webex-hydrated room, sender, body, mentions, and parent/thread fields; sidecar event payload fields may only be hints.
+- Include forged payload and sidecar-versus-hydrated mismatch tests for ordinary prompt execution, follow-up execution, routing, and reply/write decisions.
 - Mutating commands must delegate to PR 1b's trusted entrypoint and deploy only an immutable revision that passed required checks; status replies must show the currently deployed bot/config revisions and any in-progress target revision.
 - Commands must not accept user-provided source/output/admin Space IDs or execution-policy overrides; those must come from the host allowlist and reviewed config revision only.
 - Require both a configured admin room and an explicit sender allowlist by person ID or email; `allow_all_senders` must not be available for the config command surface.
@@ -82,12 +86,13 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Implement the privileged isolation backend with a narrow root-owned launcher or `systemd-run DynamicUser`.
 - Each Codex run must get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
+- Filesystem access must be deny-by-default with a mount/filesystem namespace, bind-mounted workspace and allowlisted inputs, private temporary storage, protected home paths, restricted `/proc`, `/run`, and device access, and negative tests for host canary files, symlink escapes, procfs/run leaks, and device paths.
 - Codex auth must use brokered, tool-inaccessible credentials or one-time revocable per-run material that prompt-controlled code cannot read; writable home/cache/state directories must be per-run temporary paths that cannot persist data across Webex prompts.
 - Network access must default to no egress or an explicit allowlist; any Codex API or auth-broker egress must be unavailable to prompt-controlled tool subprocesses while the Codex runner itself remains able to reach the required model/auth channel.
 - Egress controls must block proxy env variables, SSH agents, inherited file descriptors, Unix/abstract sockets, local proxy sockets, and equivalent non-TCP/DNS bypasses unless each is explicitly needed and isolated from prompt-controlled subprocesses.
 - Launcher preflight and smoke tests must prove Codex model/auth access still works, prove prompt-controlled subprocesses cannot reuse that channel, and cover blocked localhost, host admin endpoints, metadata services, non-allowlisted internal networks, non-allowlisted public Internet, DNS egress, proxy/agent/socket bypasses, and inherited descriptor leaks.
 - The launcher must apply OS or cgroup resource limits for CPU, memory, process/PID count, open files, and temporary disk/file size, with negative tests for fork, memory, and disk exhaustion attempts.
-- Add tests showing one ephemeral run cannot read files, cache state, or credentials left by another run after success, failure, or timeout cleanup paths.
+- Add tests showing one ephemeral run cannot read files, cache state, workspace data, or credentials from another simultaneous run, or left by another run after success, failure, or timeout cleanup paths.
 - Add negative tests showing an ephemeral run cannot read its own Codex auth material, bot/deployment secrets such as Webex token files, Jenkins env files, persistent Codex home, or host-owned config and deployment metadata.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
