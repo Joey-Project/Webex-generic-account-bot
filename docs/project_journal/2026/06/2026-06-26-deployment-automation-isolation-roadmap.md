@@ -52,6 +52,7 @@ superseded_by:
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Connect the existing `codex.isolation` configuration and `IsolationMode` model to an internal runner backend abstraction while keeping current-user execution as the default.
 - Do not add a second isolation schema; preserve the existing `current-user` and `ephemeral-linux-user` mode names.
+- Until PR 4 lands, `ephemeral-linux-user` must continue to fail validation or return an explicit unavailable-backend error; it must never silently fall back to current-user execution.
 - Keep existing Codex execution behaviour unchanged for current configs, but route execution through a replaceable backend that PR 4 can implement.
 
 ### PR 4: Ephemeral Linux User Launcher
