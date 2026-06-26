@@ -26,7 +26,9 @@ superseded_by:
 
 ### PR 1: Deployment Host Pull/Validate/Reload
 - Repository: `WebexServices-staging/webex-generic-account-bot-config`.
-- Add a deployment-host sync script that fetches the config repo, renders production config, validates it with `scripts/validate-config.sh`, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
+- Add a deployment-host sync entrypoint that fetches the config repo, renders production config, validates it, runs bot `--check-config`, and only then installs the rendered config and reloads the bot.
+- The privileged entrypoint must come from a host-installed or otherwise trusted fixed path, not from the newly pulled config repo checkout.
+- Treat the pulled config repo as data until validation succeeds; any repo-provided render helper must run as a low-privilege deployment user or inside a constrained workspace that cannot read production secrets or reload the bot.
 - Failure must leave the currently deployed config and running service untouched.
 - Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, and dry-run/status output.
 
