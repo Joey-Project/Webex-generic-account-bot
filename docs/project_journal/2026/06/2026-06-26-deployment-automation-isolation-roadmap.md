@@ -36,14 +36,15 @@ superseded_by:
 - The privileged entrypoint must never be executed from the newly pulled config repo checkout.
 - Failure before the commit point must leave the currently deployed config and running service untouched.
 - The reload mechanism must either be a true in-process reload or a supervised handoff that keeps the old service healthy until the new config is validated and accepted; stop/start restarts are not sufficient for this safety target.
-- Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, dry-run/status output, and rollback/old-service health checks.
+- Enforce single-flight deployment with a process-wide or host-wide lock, explicit duplicate-request semantics, and machine-readable in-progress/status output.
+- Include unit/smoke tests for argument parsing, failed validation, atomic install behaviour, dry-run/status output, rollback/old-service health checks, and concurrent invocation handling.
 
 ### PR 2: Configuration Space Fixed Commands
 - Repository: `Joey-Project/Webex-generic-account-bot`, with matching config updates if needed.
 - Add allowlisted fixed commands for an admin configuration Space, initially `/config status`, `/config pull`, `/config reload`, and `/config sync`.
 - Commands must call fixed argv only; user message text must never be interpolated into a shell command.
 - Require both a configured admin room and an explicit sender allowlist by person ID or email; `allow_all_senders` must not be available for the config command surface.
-- Include wrong-room and wrong-sender tests for every mutating command.
+- Include wrong-room and wrong-sender tests for every fixed config command, including status and dry-run commands.
 - Use the PR 1b deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
 - Until durable background job recovery exists, mutating commands must acknowledge first and then hand off to an out-of-process status-tracked action, or be limited to status/dry-run commands.
 
