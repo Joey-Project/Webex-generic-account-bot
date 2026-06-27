@@ -2047,6 +2047,81 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('removes renamed staged metadata when its directory fsync fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const renderedDirectory = path.dirname(plan.renderedConfig);
+    await fs.mkdir(renderedDirectory, { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
+    let metadataRenamed = false;
+    let metadataDirectorySyncFailed = false;
+    const fsApi = {
+      ...fs,
+      async rename(source, destination) {
+        await fs.rename(source, destination);
+        if (destination === plan.stagedMetadataFile) {
+          metadataRenamed = true;
+        }
+      },
+      async open(file, ...args) {
+        const handle = await fs.open(file, ...args);
+        if (
+          file === renderedDirectory
+          && metadataRenamed
+          && !metadataDirectorySyncFailed
+        ) {
+          return {
+            async sync() {
+              metadataDirectorySyncFailed = true;
+              throw new Error('staged metadata directory fsync failed');
+            },
+            async close() {
+              await handle.close();
+            },
+          };
+        }
+        return handle;
+      },
+    };
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new staged config\n', 'utf8');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'f'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /staged metadata directory fsync failed/,
+    );
+
+    assert.equal(metadataDirectorySyncFailed, true);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'live config\n');
+    assert.equal(await fs.readFile(plan.stagedConfig, 'utf8'), 'new staged config\n');
+    await assert.rejects(fs.stat(plan.stagedMetadataFile), { code: 'ENOENT' });
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('apply executes commands with scrubbed env, installs metadata, and releases flock', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(

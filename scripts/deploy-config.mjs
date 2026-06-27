@@ -1805,7 +1805,18 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     service: plan.service,
     prepared_at: new Date().toISOString(),
   };
-  await writeMetadataAtomically(plan.stagedMetadataFile, metadata, fsApi, { mode: 0o600 });
+  try {
+    await writeMetadataAtomically(plan.stagedMetadataFile, metadata, fsApi, { mode: 0o600 });
+  } catch (error) {
+    try {
+      await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
+    } catch (cleanupError) {
+      throw new Error(
+        `${error.message}; failed to remove incomplete staged metadata: ${cleanupError.message}`,
+      );
+    }
+    throw error;
+  }
   return metadata;
 }
 
