@@ -114,8 +114,12 @@ superseded_by:
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.
-- Whether the fixed Webex config commands should live in a dedicated room policy type or a fixed-command section attached to an existing room policy.
 - Whether the privileged launcher should standardise on `systemd-run DynamicUser` first or ship a minimal root-owned helper first.
+
+## Resolved Decisions
+- Fixed Webex config commands use a dedicated top-level `[config_commands]`
+  section, separate from ordinary room policies and with an explicit admin
+  Space and sender allowlist.
 
 ## Evidence
 - Main bot PR #6 merged as `b44e509`.

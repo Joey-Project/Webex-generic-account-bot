@@ -92,11 +92,9 @@ impl Default for FileConfigStatusProvider {
 #[async_trait]
 impl ConfigStatusProvider for FileConfigStatusProvider {
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
-        if read_optional_bounded_file(&self.transaction_file)
-            .await?
-            .is_some()
-        {
-            return Ok(ConfigStatusSnapshot::recovery_required());
+        match read_optional_bounded_file(&self.transaction_file).await {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
         }
         let Some(contents) = read_optional_bounded_file(&self.status_file).await? else {
             return Ok(ConfigStatusSnapshot::unknown());
@@ -263,6 +261,17 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
             "deployment status contains an invalid service_action"
         ));
     }
+    match status {
+        "deployed" if restart_skipped || config_revision.is_none() => {
+            return Err(anyhow!("deployed status metadata is inconsistent"));
+        }
+        "installed_without_restart" if !restart_skipped || config_revision.is_none() => {
+            return Err(anyhow!(
+                "installed_without_restart status metadata is inconsistent"
+            ));
+        }
+        _ => {}
+    }
     if status.starts_with("failed_") && !object.get("reason").is_some_and(Value::is_string) {
         return Err(anyhow!("failed deployment status must contain a reason"));
     }
@@ -326,6 +335,20 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert!(!snapshot.markdown().contains("must not leak"));
+
+        let mut installed_without_restart = deployment_metadata(
+            "installed_without_restart",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
+        installed_without_restart["service_restart_skipped"] = Value::Bool(true);
+        installed_without_restart["service_action"] = Value::Null;
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&installed_without_restart).unwrap(),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "installed_without_restart");
         std_fs::remove_dir_all(root).unwrap();
     }
 
@@ -366,6 +389,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn malformed_transaction_files_fail_closed_to_recovery_required() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+
+        for contents in [
+            Vec::new(),
+            b"{not valid json".to_vec(),
+            vec![b'x'; STATUS_FILE_MAX_BYTES as usize + 1],
+        ] {
+            std_fs::write(&provider.transaction_file, contents).unwrap();
+            let snapshot = provider.status().await.unwrap();
+            assert_eq!(snapshot.status, "recovery_required");
+        }
+
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn missing_metadata_is_unknown() {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
@@ -400,6 +443,32 @@ mod tests {
         assert!(provider.status().await.is_err());
         std_fs::write(
             &provider.status_file,
+            serde_json::to_vec(&deployment_metadata("deployed", None)).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        let mut skipped_deploy =
+            deployment_metadata("deployed", Some("0123456789abcdef0123456789abcdef01234567"));
+        skipped_deploy["service_restart_skipped"] = Value::Bool(true);
+        skipped_deploy["service_action"] = Value::Null;
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&skipped_deploy).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "installed_without_restart",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
             vec![b'x'; STATUS_FILE_MAX_BYTES as usize + 1],
         )
         .unwrap();
@@ -418,7 +487,11 @@ mod tests {
         let target = root.join("target.json");
         std_fs::write(
             &target,
-            r#"{"status":"deployed","config_revision":null,"service":"webex-generic-account-bot"}"#,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         symlink(target, &provider.status_file).unwrap();
@@ -437,7 +510,11 @@ mod tests {
         std_fs::create_dir_all(&real_root).unwrap();
         std_fs::write(
             real_root.join("status.json"),
-            r#"{"status":"deployed","config_revision":null,"service":"webex-generic-account-bot"}"#,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         symlink(&real_root, &linked_root).unwrap();
@@ -446,7 +523,8 @@ mod tests {
             transaction_file: linked_root.join("transaction.json"),
         };
 
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "recovery_required");
         std_fs::remove_dir_all(root).unwrap();
     }
 

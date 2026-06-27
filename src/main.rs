@@ -1520,11 +1520,8 @@ impl BotApp {
             .config_commands
             .as_ref()
             .is_some_and(|config_commands| config_commands.room_id == room_id);
-        let is_config_command = message
-            .text
-            .as_deref()
-            .or(message.markdown.as_deref())
-            .is_some_and(is_config_command_namespace);
+        let is_config_command =
+            config_command_body(&message).is_some_and(is_config_command_namespace);
         if self.config.config_commands.is_some() && is_config_command && !is_config_command_room {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
@@ -1709,11 +1706,7 @@ impl BotApp {
                 Some(room_id.to_owned()),
             ));
         }
-        let body = message
-            .text
-            .as_deref()
-            .or(message.markdown.as_deref())
-            .unwrap_or_default();
+        let body = config_command_body(message).unwrap_or_default();
         let Some(command) = parse_config_command(body) else {
             self.mark_processed(attempt).await?;
             return Ok(BotAction::ignored(
@@ -3003,6 +2996,13 @@ fn clean_prompt_message_body(message: &Message) -> String {
         .to_owned()
 }
 
+fn config_command_body(message: &Message) -> Option<&str> {
+    [message.text.as_deref(), message.markdown.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|body| !body.trim().is_empty())
+}
+
 fn source_marker_search_max_pages(message: &Message, recovery_age: Duration) -> Option<usize> {
     if message_is_at_least_age(message, recovery_age) {
         None
@@ -4155,6 +4155,44 @@ mod tests {
         assert_eq!(harness.config_status.calls(), 0);
         assert!(harness.webex.created_requests().is_empty());
         assert!(harness.processed("config-status-existing").await);
+    }
+
+    #[tokio::test]
+    async fn config_command_uses_markdown_when_authoritative_text_is_blank() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.config_status.push_snapshot(ConfigStatusSnapshot {
+            status: "deployed".to_owned(),
+            config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            service: Some("webex-generic-account-bot".to_owned()),
+        });
+        let mut authoritative = admin_message(
+            "config-status-blank-text",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        );
+        authoritative.text = Some("  \n".to_owned());
+        harness.webex.push_event_message(Ok(authoritative));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness.webex.push_create_result(Ok(message_with_room(
+            "status-reply-blank-text",
+            ADMIN_ROOM_ID,
+        )));
+
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "config-status-blank-text",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "forged body",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(harness.config_status.calls(), 1);
+        assert!(harness.runner.calls().is_empty());
     }
 
     #[tokio::test]

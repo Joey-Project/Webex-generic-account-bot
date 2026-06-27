@@ -43,7 +43,8 @@ Codex model settings can be configured globally under `[codex]` or overridden
 per room under `[rooms.codex]`, including `model` and
 `model_reasoning_effort`.
 
-The optional `[config_commands]` table is separate from ordinary room policy:
+The binary supports an optional `[config_commands]` table separate from
+ordinary room policy:
 
 ```toml
 [config_commands]
@@ -60,6 +61,10 @@ metadata with no-follow and size checks, returns only allowlisted fields, and
 uses the normal idempotent Webex reply marker. `pull`, `reload`, and `sync` are
 reserved command names but remain undeployable until the durable external
 action worker is implemented; configuration validation rejects them.
+The current production host policy also rejects the entire table until a
+companion config PR pins the exact admin Space and sender allowlist. The example
+above is therefore for local validation and the upcoming reviewed deployment,
+not yet for `scripts/deploy-config.mjs --apply`.
 
 For staging production Space behaviour, a room policy can set
 `output_room_id`, `forward_source_message = true`, and
