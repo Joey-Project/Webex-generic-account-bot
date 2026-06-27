@@ -35,10 +35,11 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexConfig, CodexRunner, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner,
-    FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FollowupTrigger, MessageContext, ReplyFormat, TriggerMode,
-    WEBEX_LIST_PAGE_SIZE, followup_reply_marker_search_max_pages, message_matches_prefix,
-    render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
+    BotConfig, CodexConfig, CodexRunner, ConfigCommand, ConfigStatusProvider,
+    DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES,
+    FileConfigStatusProvider, FollowupTrigger, MessageContext, ReplyFormat, WEBEX_LIST_PAGE_SIZE,
+    followup_reply_marker_search_max_pages, is_config_command_namespace, message_matches_prefix,
+    parse_config_command, render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         webex,
         state: Mutex::new(state_store),
         runner: Arc::new(ExecCodexRunner),
+        config_status: Arc::new(FileConfigStatusProvider::default()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
     });
 
@@ -141,6 +143,7 @@ struct BotApp {
     webex: Arc<dyn WebexApi>,
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
+    config_status: Arc<dyn ConfigStatusProvider>,
     request_slots: Arc<Semaphore>,
 }
 
@@ -263,6 +266,11 @@ impl Drop for JenkinsArtifactCleanupGuard {
 #[async_trait]
 trait WebexApi: Send + Sync {
     async fn me(&self) -> Result<Person, WebexCallError>;
+    async fn get_event_message(
+        &self,
+        message_id: &str,
+        sidecar_hint: &Message,
+    ) -> Result<Message, WebexCallError>;
     async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError>;
     async fn list_thread_messages(
         &self,
@@ -302,6 +310,14 @@ impl WebexApi for WebexClient {
             Ok(Err(error)) => Err(WebexCallError::Client(error)),
             Err(_) => Err(WebexCallError::TimedOut),
         }
+    }
+
+    async fn get_event_message(
+        &self,
+        message_id: &str,
+        _sidecar_hint: &Message,
+    ) -> Result<Message, WebexCallError> {
+        <Self as WebexApi>::get_message(self, message_id).await
     }
 
     async fn list_thread_messages(
@@ -1445,9 +1461,9 @@ impl BotApp {
             ));
         }
 
-        let mut message: Message = serde_json::from_value(event.data)
+        let sidecar_message: Message = serde_json::from_value(event.data)
             .map_err(|error| HttpError::bad_request(format!("invalid message payload: {error}")))?;
-        let Some(message_id) = message.id.clone() else {
+        let Some(message_id) = sidecar_message.id.clone() else {
             return Ok(BotAction::ignored("missing_message_id", None, None));
         };
         let attempt = match self.begin_attempt(&message_id).await? {
@@ -1456,7 +1472,7 @@ impl BotApp {
                 return Ok(BotAction::ignored(
                     "duplicate_message",
                     Some(message_id),
-                    message.room_id.clone(),
+                    None,
                 ));
             }
             AttemptStart::Leased(retry_after) => {
@@ -1468,15 +1484,25 @@ impl BotApp {
             }
         };
 
-        if message.room_id.is_none() {
-            match self.get_message(&message_id).await {
-                Ok(hydrated) => merge_message(&mut message, hydrated),
-                Err(error) => {
-                    return self
-                        .handle_get_message_failure(&attempt, &message_id, &message, error)
-                        .await;
-                }
+        let message = match self
+            .webex
+            .get_event_message(&message_id, &sidecar_message)
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                return self
+                    .handle_get_message_failure(&attempt, &message_id, error)
+                    .await;
             }
+        };
+        if message.id.as_deref() != Some(message_id.as_str()) {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "hydrated_message_id_mismatch",
+                Some(message_id),
+                None,
+            ));
         }
 
         let Some(room_id) = message.room_id.clone() else {
@@ -1489,7 +1515,25 @@ impl BotApp {
         };
         let direct_policy = self.config.policy_for_room(&room_id);
         let followup_policies = self.config.followup_policies_for_event_room(&room_id);
-        if direct_policy.is_none() && followup_policies.is_empty() {
+        let is_config_command_room = self
+            .config
+            .config_commands
+            .as_ref()
+            .is_some_and(|config_commands| config_commands.room_id == room_id);
+        let is_config_command = message
+            .text
+            .as_deref()
+            .or(message.markdown.as_deref())
+            .is_some_and(is_config_command_namespace);
+        if is_config_command && !is_config_command_room {
+            self.mark_processed(&attempt).await?;
+            return Ok(BotAction::ignored(
+                "config_command_wrong_room",
+                Some(message_id),
+                Some(room_id),
+            ));
+        }
+        if direct_policy.is_none() && followup_policies.is_empty() && !is_config_command_room {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
                 "no_room_policy",
@@ -1497,16 +1541,6 @@ impl BotApp {
                 Some(room_id),
             ));
         };
-        if event_message_needs_hydration(direct_policy, &followup_policies, &message) {
-            match self.get_message(&message_id).await {
-                Ok(hydrated) => merge_message(&mut message, hydrated),
-                Err(error) => {
-                    return self
-                        .handle_get_message_failure(&attempt, &message_id, &message, error)
-                        .await;
-                }
-            }
-        }
         if self
             .self_person_id
             .as_deref()
@@ -1518,6 +1552,12 @@ impl BotApp {
                 Some(message_id),
                 Some(room_id),
             ));
+        }
+
+        if is_config_command_room {
+            return self
+                .process_config_command(&attempt, &message, &message_id, &room_id)
+                .await;
         }
 
         for policy in followup_policies {
@@ -1636,6 +1676,165 @@ impl BotApp {
             Some(&context),
         )
         .await
+    }
+
+    async fn process_config_command(
+        &self,
+        attempt: &AttemptLease,
+        message: &Message,
+        message_id: &str,
+        room_id: &str,
+    ) -> Result<BotAction, HttpError> {
+        let config_commands = self
+            .config
+            .config_commands
+            .as_ref()
+            .expect("config command routing requires config_commands");
+        if message.parent_id.is_some() {
+            self.mark_processed(attempt).await?;
+            return Ok(BotAction::ignored(
+                "config_command_must_be_top_level",
+                Some(message_id.to_owned()),
+                Some(room_id.to_owned()),
+            ));
+        }
+        if !config_commands.sender_allowed(
+            message.person_id.as_deref(),
+            message.person_email.as_deref(),
+        ) {
+            self.mark_processed(attempt).await?;
+            return Ok(BotAction::ignored(
+                "config_command_sender_not_allowed",
+                Some(message_id.to_owned()),
+                Some(room_id.to_owned()),
+            ));
+        }
+        let body = message
+            .text
+            .as_deref()
+            .or(message.markdown.as_deref())
+            .unwrap_or_default();
+        let Some(command) = parse_config_command(body) else {
+            self.mark_processed(attempt).await?;
+            return Ok(BotAction::ignored(
+                "unsupported_config_command",
+                Some(message_id.to_owned()),
+                Some(room_id.to_owned()),
+            ));
+        };
+        if !config_commands.command_allowed(command) {
+            self.mark_processed(attempt).await?;
+            return Ok(BotAction::ignored(
+                "config_command_not_allowed",
+                Some(message_id.to_owned()),
+                Some(room_id.to_owned()),
+            ));
+        }
+        if let Some(action) = self
+            .reconcile_fixed_reply(attempt, message_id, room_id, message_id)
+            .await?
+        {
+            return Ok(action);
+        }
+        let reply = match command {
+            ConfigCommand::Status => match self.config_status.status().await {
+                Ok(snapshot) => snapshot.markdown(),
+                Err(error) => {
+                    warn!(error = %error, "failed to read config deployment status");
+                    "**Config deployment status**\n\nState unavailable. Check the bot service logs."
+                        .to_owned()
+                }
+            },
+            ConfigCommand::Pull | ConfigCommand::Reload | ConfigCommand::Sync => {
+                self.mark_processed(attempt).await?;
+                return Ok(BotAction::ignored(
+                    "config_command_not_implemented",
+                    Some(message_id.to_owned()),
+                    Some(room_id.to_owned()),
+                ));
+            }
+        };
+        self.send_fixed_reply(attempt, message_id, room_id, message_id, &reply)
+            .await
+    }
+
+    async fn send_fixed_reply(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        room_id: &str,
+        parent_id: &str,
+        text: &str,
+    ) -> Result<BotAction, HttpError> {
+        let marker = reply_marker(message_id);
+        let markdown = prepare_reply_markdown(text, &marker);
+        let request = reply_markdown_message(room_id, parent_id, &markdown);
+        let reply = match self.create_message(&request).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                return self
+                    .handle_create_message_failure(
+                        attempt,
+                        ReplyCreateContext {
+                            message_id,
+                            room_id,
+                            parent_id,
+                            reply_marker: &marker,
+                            marker_search_max_pages: Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES),
+                            reply_chars: markdown.len(),
+                        },
+                        error,
+                    )
+                    .await;
+            }
+        };
+        if let Err(error) = self.mark_processed(attempt).await {
+            error!(
+                error = %error.message,
+                "failed to mark config command processed after Webex accepted reply"
+            );
+        }
+        Ok(BotAction::replied(
+            message_id.to_owned(),
+            room_id.to_owned(),
+            reply.id,
+            markdown.len(),
+        ))
+    }
+
+    async fn reconcile_fixed_reply(
+        &self,
+        attempt: &AttemptLease,
+        message_id: &str,
+        room_id: &str,
+        parent_id: &str,
+    ) -> Result<Option<BotAction>, HttpError> {
+        let marker = reply_marker(message_id);
+        match self
+            .find_existing_message_by_marker(
+                room_id,
+                Some(parent_id),
+                &marker,
+                Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES),
+            )
+            .await
+        {
+            Ok(Some(reply)) => {
+                let reply_chars = existing_reply_chars(&reply);
+                self.mark_processed(attempt).await?;
+                Ok(Some(BotAction::replied(
+                    message_id.to_owned(),
+                    room_id.to_owned(),
+                    reply.id,
+                    reply_chars,
+                )))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => self
+                .handle_reconciliation_failure(attempt, message_id, error)
+                .await
+                .map(Some),
+        }
     }
 
     async fn run_codex_reply(
@@ -1919,10 +2118,6 @@ impl BotApp {
         }))
     }
 
-    async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
-        self.webex.get_message(message_id).await
-    }
-
     async fn create_message(&self, request: &CreateMessage) -> Result<Message, WebexCallError> {
         if let Some(room_id) = request.room_id.as_deref() {
             if self.config.room_is_read_only_source(room_id) {
@@ -2036,7 +2231,6 @@ impl BotApp {
         &self,
         attempt: &AttemptLease,
         message_id: &str,
-        message: &Message,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
         match classify_webex_failure(&error, self.config.server.attempt_lease()) {
@@ -2045,7 +2239,7 @@ impl BotApp {
                 Ok(BotAction::ignored(
                     "message_unavailable",
                     Some(message_id.to_owned()),
-                    message.room_id.clone(),
+                    None,
                 ))
             }
             WebexFailureAction::Retry(retry_after) => {
@@ -2528,127 +2722,6 @@ async fn resolve_self_person_id(
         }
     })?;
     Ok(me.id)
-}
-
-fn merge_message(target: &mut Message, hydrated: Message) {
-    let promote_hydrated_marker_body = !message_contains_marker(target, "wgb-ref:")
-        && message_contains_marker(&hydrated, "wgb-ref:");
-    let hydrated_text = hydrated.text.clone();
-    let hydrated_markdown = hydrated.markdown.clone();
-    let hydrated_html = hydrated.html.clone();
-    if target.id.is_none() {
-        target.id = hydrated.id;
-    }
-    if target.parent_id.is_none() {
-        target.parent_id = hydrated.parent_id;
-    }
-    if target.room_id.is_none() {
-        target.room_id = hydrated.room_id;
-    }
-    if target.room_type.is_none() {
-        target.room_type = hydrated.room_type;
-    }
-    if target.person_id.is_none() {
-        target.person_id = hydrated.person_id;
-    }
-    if target.person_email.is_none() {
-        target.person_email = hydrated.person_email;
-    }
-    if target.text.is_none() {
-        target.text = hydrated.text;
-    }
-    if target.markdown.is_none() {
-        target.markdown = hydrated.markdown;
-    }
-    if target.html.is_none() {
-        target.html = hydrated.html;
-    }
-    if target.mentioned_people.is_empty() {
-        target.mentioned_people = hydrated.mentioned_people;
-    }
-    if target.mentioned_groups.is_empty() {
-        target.mentioned_groups = hydrated.mentioned_groups;
-    }
-    if promote_hydrated_marker_body {
-        target.text = hydrated_text;
-        target.markdown = hydrated_markdown;
-        target.html = hydrated_html;
-    }
-}
-
-fn event_message_needs_hydration(
-    direct_policy: Option<&webex_generic_account_bot::RoomPolicy>,
-    followup_policies: &[&webex_generic_account_bot::RoomPolicy],
-    message: &Message,
-) -> bool {
-    direct_policy.is_some_and(|policy| message_needs_hydration(policy, message))
-        || followup_policies
-            .iter()
-            .any(|policy| followup_event_needs_hydration(policy, message))
-}
-
-fn message_needs_hydration(
-    policy: &webex_generic_account_bot::RoomPolicy,
-    message: &Message,
-) -> bool {
-    message.room_id.is_none()
-        || message.person_id.is_none()
-        || message.person_email.is_none()
-        || (message.text.is_none() && message.markdown.is_none())
-        || (matches!(policy.trigger, TriggerMode::Mention) && message.mentioned_people.is_empty())
-}
-
-fn followup_message_needs_hydration(
-    policy: &webex_generic_account_bot::RoomPolicy,
-    message: &Message,
-) -> bool {
-    let mention_needs_hydration = policy.followup.triggers.contains(&FollowupTrigger::Mention)
-        && message.mentioned_people.is_empty()
-        && !message_matches_prefix(message, &policy.prefixes);
-    let quoted_reply_needs_hydration = policy
-        .followup
-        .triggers
-        .contains(&FollowupTrigger::QuotedBotReply)
-        && !message_contains_marker(message, "wgb-ref:");
-
-    message.room_id.is_none()
-        || message.parent_id.is_none()
-        || message.person_id.is_none()
-        || message.person_email.is_none()
-        || (message.text.is_none() && message.markdown.is_none() && message.html.is_none())
-        || mention_needs_hydration
-        || quoted_reply_needs_hydration
-}
-
-fn followup_event_needs_hydration(
-    policy: &webex_generic_account_bot::RoomPolicy,
-    message: &Message,
-) -> bool {
-    if !followup_event_may_match(policy, message) {
-        return false;
-    }
-    followup_message_needs_hydration(policy, message)
-}
-
-fn followup_event_may_match(
-    policy: &webex_generic_account_bot::RoomPolicy,
-    message: &Message,
-) -> bool {
-    if message.parent_id.is_some() {
-        return true;
-    }
-
-    policy
-        .followup
-        .triggers
-        .iter()
-        .any(|trigger| match trigger {
-            FollowupTrigger::Mention => {
-                !message.mentioned_people.is_empty()
-                    || message_matches_prefix(message, &policy.prefixes)
-            }
-            FollowupTrigger::QuotedBotReply => message_contains_marker(message, "wgb-ref:"),
-        })
 }
 
 fn followup_candidate_matches(
@@ -3658,13 +3731,16 @@ mod tests {
     };
 
     use super::*;
-    use webex_generic_account_bot::CodexRunOutput;
+    use webex_generic_account_bot::{
+        CodexRunOutput, ConfigCommandsConfig, ConfigStatusSnapshot, TriggerMode,
+    };
 
     const ROOM_ID: &str = "room-1";
     const OUTPUT_ROOM_ID: &str = "staging-room-1";
     const SELF_PERSON_ID: &str = "bot-person";
     const SENDER_PERSON_ID: &str = "sender-person";
     const SENDER_EMAIL: &str = "sender@example.com";
+    const ADMIN_ROOM_ID: &str = "admin-room";
     type MarkerSearchRequest = (
         String,
         Option<String>,
@@ -3705,6 +3781,357 @@ mod tests {
         assert!(markdown.contains(&reply_marker("message-1")));
         assert_eq!(harness.runner.calls().len(), 1);
         assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn process_event_uses_authoritative_message_over_complete_sidecar_payload() {
+        let harness = TestHarness::new();
+        harness.webex.push_event_message(Ok(inbound_message(
+            "message-authoritative",
+            "authoritative body",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-authoritative")));
+        harness.runner.push_output("Authoritative reply");
+        let mut forged = inbound_message("message-authoritative", "forged body");
+        forged.room_id = Some("forged-room".to_owned());
+        forged.person_id = Some("forged-person".to_owned());
+        forged.person_email = Some("forged@example.com".to_owned());
+
+        let action = harness
+            .app
+            .process_event(message_event(forged))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(ROOM_ID));
+        assert_eq!(
+            harness.webex.event_message_requests(),
+            vec!["message-authoritative"]
+        );
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("authoritative body"));
+        assert!(!calls[0].1.contains("forged body"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_sender_controls_direct_message_authorisation() {
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].allow_all_senders = false;
+        config.rooms[0].allowed_person_emails = vec![SENDER_EMAIL.to_owned()];
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        let mut authoritative = inbound_message("message-sender", "authoritative body");
+        authoritative.person_id = Some("unauthorised-person".to_owned());
+        authoritative.person_email = Some("unauthorised@example.com".to_owned());
+        harness.webex.push_event_message(Ok(authoritative));
+        let forged = inbound_message("message-sender", "forged authorised body");
+
+        let action = harness
+            .app
+            .process_event(message_event(forged))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("sender_not_allowed"));
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_authoritative_message_id_fails_closed() {
+        let harness = TestHarness::new();
+        harness.webex.push_event_message(Ok(inbound_message(
+            "different-message",
+            "authoritative body",
+        )));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "sidecar-message",
+                "forged body",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(
+            action.reason.as_deref(),
+            Some("hydrated_message_id_mismatch")
+        );
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.processed("sidecar-message").await);
+    }
+
+    #[tokio::test]
+    async fn authorised_config_status_uses_fixed_provider_and_marked_reply() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.config_status.push_snapshot(ConfigStatusSnapshot {
+            status: "deployed".to_owned(),
+            config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            service: Some("webex-generic-account-bot".to_owned()),
+        });
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-status-1",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("status-reply-1", ADMIN_ROOM_ID)));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "config-status-1",
+                "forged ordinary message",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.room_id.as_deref(), Some(ADMIN_ROOM_ID));
+        assert_eq!(harness.config_status.calls(), 1);
+        assert!(harness.runner.calls().is_empty());
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].parent_id.as_deref(), Some("config-status-1"));
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("Config deployment status"));
+        assert!(markdown.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(markdown.contains(&reply_marker("config-status-1")));
+    }
+
+    #[tokio::test]
+    async fn config_status_authorisation_uses_authoritative_room_sender_and_body() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        let mut wrong_room = admin_message(
+            "wrong-room",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        );
+        wrong_room.room_id = Some("unknown-room".to_owned());
+        harness.webex.push_event_message(Ok(wrong_room));
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "wrong-room",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(action.reason.as_deref(), Some("config_command_wrong_room"));
+
+        harness.webex.push_event_message(Ok(admin_message(
+            "wrong-sender",
+            "attacker-person",
+            "attacker@example.com",
+            "/config status",
+        )));
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "wrong-sender",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            action.reason.as_deref(),
+            Some("config_command_sender_not_allowed")
+        );
+
+        harness.webex.push_event_message(Ok(admin_message(
+            "wrong-body",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config sync",
+        )));
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "wrong-body",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(action.reason.as_deref(), Some("config_command_not_allowed"));
+
+        assert_eq!(harness.config_status.calls(), 0);
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recognised_config_commands_never_reach_codex_outside_admin_room() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+
+        for (index, command) in [
+            "/config status",
+            "/config pull",
+            "/config reload",
+            "/config sync",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message_id = format!("wrong-room-command-{index}");
+            let action = harness
+                .app
+                .process_event(message_event(inbound_message(&message_id, command)))
+                .await
+                .unwrap();
+
+            assert_eq!(action.action, "ignored");
+            assert_eq!(action.reason.as_deref(), Some("config_command_wrong_room"));
+            assert!(harness.processed(&message_id).await);
+        }
+
+        assert_eq!(harness.config_status.calls(), 0);
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_namespace_never_reaches_codex_outside_admin_room() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+
+        for (index, command) in [
+            "/config",
+            "/config status now",
+            "/config help",
+            "/config future-command",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message_id = format!("wrong-room-namespace-{index}");
+            let action = harness
+                .app
+                .process_event(message_event(inbound_message(&message_id, command)))
+                .await
+                .unwrap();
+
+            assert_eq!(action.action, "ignored");
+            assert_eq!(action.reason.as_deref(), Some("config_command_wrong_room"));
+        }
+
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_commands_must_be_top_level() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        let mut authoritative = admin_message(
+            "thread-status",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        );
+        authoritative.parent_id = Some("parent-1".to_owned());
+        harness.webex.push_event_message(Ok(authoritative));
+
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "thread-status",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            action.reason.as_deref(),
+            Some("config_command_must_be_top_level")
+        );
+        assert_eq!(harness.config_status.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_status_failure_returns_bounded_generic_reply() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.config_status.push_error("secret backend failure");
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-status-error",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("status-reply-error", ADMIN_ROOM_ID)));
+
+        harness
+            .app
+            .process_event(message_event(admin_message(
+                "config-status-error",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+
+        let markdown = harness.webex.created_requests()[0]
+            .markdown
+            .clone()
+            .unwrap();
+        assert!(markdown.contains("State unavailable"));
+        assert!(!markdown.contains("secret backend failure"));
+    }
+
+    #[tokio::test]
+    async fn existing_config_status_reply_is_reused_before_reading_status() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-status-existing",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config status",
+        )));
+        let mut existing = message_with_room("status-reply-existing", ADMIN_ROOM_ID);
+        existing.markdown = Some(format!(
+            "**Config deployment status**\n\n{}",
+            reply_marker("config-status-existing")
+        ));
+        harness.webex.push_reply_search(Ok(vec![existing]));
+
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "config-status-existing",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("status-reply-existing"));
+        assert_eq!(harness.config_status.calls(), 0);
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("config-status-existing").await);
     }
 
     #[tokio::test]
@@ -4541,7 +4968,7 @@ mod tests {
             "Can you expand?\n\n{}",
             hidden_marker_comment(&reply_marker("root-1"))
         ));
-        harness.webex.push_get_message(Ok(hydrated));
+        harness.webex.push_event_message(Ok(hydrated));
         harness
             .webex
             .push_get_message(Ok(inbound_message("root-1", "Original failure")));
@@ -4669,7 +5096,7 @@ mod tests {
     #[tokio::test]
     async fn output_thread_missing_parent_id_is_hydrated_before_followup_check() {
         let harness = TestHarness::with_config(staging_followup_test_config(unique_state_path()));
-        harness.webex.push_get_message(Ok(inbound_thread_message(
+        harness.webex.push_event_message(Ok(inbound_thread_message(
             "followup-1",
             OUTPUT_ROOM_ID,
             "forward-1",
@@ -5184,81 +5611,6 @@ mod tests {
 
         assert_eq!(value["action"], "ignored");
         assert_eq!(value["reason"], "not_mentioned");
-    }
-
-    #[test]
-    fn merge_message_fills_missing_fields() {
-        let mut target = Message {
-            id: Some("message-1".to_owned()),
-            ..Message::default()
-        };
-        let hydrated = Message {
-            room_id: Some("room-1".to_owned()),
-            person_id: Some("person-1".to_owned()),
-            mentioned_people: vec!["bot-person".to_owned()],
-            ..Message::default()
-        };
-
-        merge_message(&mut target, hydrated);
-
-        assert_eq!(target.room_id.as_deref(), Some("room-1"));
-        assert_eq!(target.person_id.as_deref(), Some("person-1"));
-        assert_eq!(target.mentioned_people, vec!["bot-person"]);
-    }
-
-    #[test]
-    fn metadata_only_message_needs_hydration() {
-        let policy = webex_generic_account_bot::RoomPolicy {
-            allow_all_senders: true,
-            ..webex_generic_account_bot::RoomPolicy::default()
-        };
-        let message = Message {
-            id: Some("message-1".to_owned()),
-            room_id: Some("room-1".to_owned()),
-            person_id: Some("person-1".to_owned()),
-            ..Message::default()
-        };
-
-        assert!(message_needs_hydration(&policy, &message));
-    }
-
-    #[test]
-    fn complete_mention_message_does_not_need_hydration() {
-        let policy = webex_generic_account_bot::RoomPolicy {
-            allow_all_senders: true,
-            ..webex_generic_account_bot::RoomPolicy::default()
-        };
-        let message = Message {
-            id: Some("message-1".to_owned()),
-            room_id: Some("room-1".to_owned()),
-            person_id: Some("person-1".to_owned()),
-            person_email: Some("joey@example.com".to_owned()),
-            markdown: Some("@bot run".to_owned()),
-            mentioned_people: vec!["bot-person".to_owned()],
-            ..Message::default()
-        };
-
-        assert!(!message_needs_hydration(&policy, &message));
-    }
-
-    #[test]
-    fn prefix_message_does_not_need_mentions_to_skip_hydration() {
-        let policy = webex_generic_account_bot::RoomPolicy {
-            trigger: TriggerMode::Prefix,
-            prefixes: vec!["/codex".to_owned()],
-            allow_all_senders: true,
-            ..webex_generic_account_bot::RoomPolicy::default()
-        };
-        let message = Message {
-            id: Some("message-1".to_owned()),
-            room_id: Some("room-1".to_owned()),
-            person_id: Some("person-1".to_owned()),
-            person_email: Some("joey@example.com".to_owned()),
-            text: Some("/codex run".to_owned()),
-            ..Message::default()
-        };
-
-        assert!(!message_needs_hydration(&policy, &message));
     }
 
     #[test]
@@ -6497,6 +6849,7 @@ mod tests {
         app: BotApp,
         webex: Arc<FakeWebex>,
         runner: Arc<FakeRunner>,
+        config_status: Arc<FakeConfigStatus>,
         state_path: PathBuf,
         codex_cwd: PathBuf,
     }
@@ -6514,6 +6867,7 @@ mod tests {
             let state = JsonlStateStore::load(config.state_file.clone()).unwrap();
             let webex = Arc::new(FakeWebex::default());
             let runner = Arc::new(FakeRunner::default());
+            let config_status = Arc::new(FakeConfigStatus::default());
             let app = BotApp {
                 config,
                 sidecar_token: None,
@@ -6521,12 +6875,14 @@ mod tests {
                 webex: webex.clone(),
                 state: Mutex::new(state),
                 runner: runner.clone(),
+                config_status: config_status.clone(),
                 request_slots: Arc::new(Semaphore::new(4)),
             };
             Self {
                 app,
                 webex,
                 runner,
+                config_status,
                 state_path,
                 codex_cwd,
             }
@@ -6550,6 +6906,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeWebex {
+        event_message_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
+        event_message_requests: StdMutex<Vec<String>>,
         get_message_results: StdMutex<VecDeque<Result<Message, WebexCallError>>>,
         get_message_requests: StdMutex<Vec<String>>,
         thread_results: StdMutex<VecDeque<Result<Vec<Message>, WebexCallError>>>,
@@ -6561,6 +6919,14 @@ mod tests {
     }
 
     impl FakeWebex {
+        fn push_event_message(&self, result: Result<Message, WebexCallError>) {
+            self.event_message_results.lock().unwrap().push_back(result);
+        }
+
+        fn event_message_requests(&self) -> Vec<String> {
+            self.event_message_requests.lock().unwrap().clone()
+        }
+
         fn push_get_message(&self, result: Result<Message, WebexCallError>) {
             self.get_message_results.lock().unwrap().push_back(result);
         }
@@ -6601,6 +6967,22 @@ mod tests {
                 id: Some(SELF_PERSON_ID.to_owned()),
                 ..Person::default()
             })
+        }
+
+        async fn get_event_message(
+            &self,
+            message_id: &str,
+            sidecar_hint: &Message,
+        ) -> Result<Message, WebexCallError> {
+            self.event_message_requests
+                .lock()
+                .unwrap()
+                .push(message_id.to_owned());
+            self.event_message_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(sidecar_hint.clone()))
         }
 
         async fn get_message(&self, message_id: &str) -> Result<Message, WebexCallError> {
@@ -6730,6 +7112,45 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeConfigStatus {
+        results: StdMutex<VecDeque<std::result::Result<ConfigStatusSnapshot, String>>>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeConfigStatus {
+        fn push_snapshot(&self, snapshot: ConfigStatusSnapshot) {
+            self.results.lock().unwrap().push_back(Ok(snapshot));
+        }
+
+        fn push_error(&self, message: impl Into<String>) {
+            self.results.lock().unwrap().push_back(Err(message.into()));
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ConfigStatusProvider for FakeConfigStatus {
+        async fn status(&self) -> Result<ConfigStatusSnapshot> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(ConfigStatusSnapshot {
+                        status: "unknown".to_owned(),
+                        config_revision: None,
+                        service: None,
+                    })
+                })
+                .map_err(|message| anyhow!(message))
+        }
+    }
+
     fn test_config(state_path: PathBuf) -> Arc<BotConfig> {
         let codex_cwd = state_path.with_extension("codex-work");
         let codex_home = state_path.with_extension("codex-home");
@@ -6756,6 +7177,18 @@ mod tests {
             }],
             ..BotConfig::default()
         };
+        config.validate().unwrap();
+        Arc::new(config)
+    }
+
+    fn config_command_test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let mut config = (*test_config(state_path)).clone();
+        config.config_commands = Some(ConfigCommandsConfig {
+            room_id: ADMIN_ROOM_ID.to_owned(),
+            allowed_person_ids: vec![SENDER_PERSON_ID.to_owned()],
+            allowed_person_emails: vec![SENDER_EMAIL.to_owned()],
+            allowed_commands: vec![ConfigCommand::Status],
+        });
         config.validate().unwrap();
         Arc::new(config)
     }
@@ -6859,6 +7292,18 @@ mod tests {
         message.parent_id = Some(parent_id.to_owned());
         message.mentioned_people = vec![SELF_PERSON_ID.to_owned()];
         message
+    }
+
+    fn admin_message(message_id: &str, person_id: &str, person_email: &str, body: &str) -> Message {
+        Message {
+            id: Some(message_id.to_owned()),
+            room_id: Some(ADMIN_ROOM_ID.to_owned()),
+            person_id: Some(person_id.to_owned()),
+            person_email: Some(person_email.to_owned()),
+            text: Some(body.to_owned()),
+            markdown: Some(body.to_owned()),
+            ..Message::default()
+        }
     }
 
     fn reply_message(reply_id: &str) -> Message {

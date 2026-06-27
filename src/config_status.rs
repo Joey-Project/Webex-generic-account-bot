@@ -1,0 +1,397 @@
+use std::{
+    io::{self, ErrorKind},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
+    path::Component,
+};
+
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::{fs, io::AsyncReadExt, task, time::timeout};
+
+const DEPLOY_STATUS_FILE: &str = "/var/lib/webex-generic-account-bot/rendered/deploy-status.json";
+const DEPLOY_TRANSACTION_FILE: &str =
+    "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
+const STATUS_FILE_MAX_BYTES: u64 = 64 * 1024;
+const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DEPLOYMENT_STATUSES: &[&str] = &[
+    "deployed",
+    "installed_without_restart",
+    "failed_apply",
+    "failed_restart_rollback_failed",
+    "failed_restart_rollback_restart_failed",
+    "failed_restart_rolled_back",
+    "failed_after_commit",
+    "failed_after_commit_cleanup",
+    "failed_cleanup",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigStatusSnapshot {
+    pub status: String,
+    pub config_revision: Option<String>,
+    pub service: Option<String>,
+}
+
+impl ConfigStatusSnapshot {
+    pub fn markdown(&self) -> String {
+        let revision = self.config_revision.as_deref().unwrap_or("unknown");
+        let service = self.service.as_deref().unwrap_or("unknown");
+        format!(
+            "**Config deployment status**\n\n- State: `{}`\n- Config revision: `{revision}`\n- Service: `{service}`",
+            self.status
+        )
+    }
+
+    fn unknown() -> Self {
+        Self {
+            status: "unknown".to_owned(),
+            config_revision: None,
+            service: None,
+        }
+    }
+
+    fn recovery_required() -> Self {
+        Self {
+            status: "recovery_required".to_owned(),
+            config_revision: None,
+            service: Some("webex-generic-account-bot".to_owned()),
+        }
+    }
+}
+
+#[async_trait]
+pub trait ConfigStatusProvider: Send + Sync {
+    async fn status(&self) -> Result<ConfigStatusSnapshot>;
+}
+
+pub struct FileConfigStatusProvider {
+    status_file: PathBuf,
+    transaction_file: PathBuf,
+}
+
+impl Default for FileConfigStatusProvider {
+    fn default() -> Self {
+        Self {
+            status_file: PathBuf::from(DEPLOY_STATUS_FILE),
+            transaction_file: PathBuf::from(DEPLOY_TRANSACTION_FILE),
+        }
+    }
+}
+
+#[async_trait]
+impl ConfigStatusProvider for FileConfigStatusProvider {
+    async fn status(&self) -> Result<ConfigStatusSnapshot> {
+        if read_optional_bounded_file(&self.transaction_file)
+            .await?
+            .is_some()
+        {
+            return Ok(ConfigStatusSnapshot::recovery_required());
+        }
+        let Some(contents) = read_optional_bounded_file(&self.status_file).await? else {
+            return Ok(ConfigStatusSnapshot::unknown());
+        };
+        parse_deployment_status(&contents)
+    }
+}
+
+async fn read_optional_bounded_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let open_path = path.to_path_buf();
+    let file = match timeout(
+        STATUS_READ_TIMEOUT,
+        task::spawn_blocking(move || open_no_symlink_components(&open_path)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(Some(file)))) => fs::File::from_std(file),
+        Ok(Ok(Ok(None))) => return Ok(None),
+        Ok(Ok(Err(error))) => {
+            return Err(error).with_context(|| format!("failed to open {}", path.display()));
+        }
+        Ok(Err(error)) => {
+            return Err(anyhow!(error)).context("status file open task failed");
+        }
+        Err(_) => return Err(anyhow!("timed out opening {}", path.display())),
+    };
+    let metadata = timeout(STATUS_READ_TIMEOUT, file.metadata())
+        .await
+        .map_err(|_| anyhow!("timed out stating {}", path.display()))?
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("status input must be a regular file"));
+    }
+    if metadata.len() == 0 || metadata.len() > STATUS_FILE_MAX_BYTES {
+        return Err(anyhow!("status input size is invalid"));
+    }
+    let mut contents = Vec::new();
+    timeout(
+        STATUS_READ_TIMEOUT,
+        file.take(STATUS_FILE_MAX_BYTES + 1)
+            .read_to_end(&mut contents),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out reading {}", path.display()))?
+    .with_context(|| format!("failed to read {}", path.display()))?;
+    if contents.len() as u64 > STATUS_FILE_MAX_BYTES {
+        return Err(anyhow!("status input exceeded the size limit"));
+    }
+    Ok(Some(contents))
+}
+
+#[cfg(unix)]
+fn open_no_symlink_components(path: &Path) -> io::Result<Option<std::fs::File>> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "status input path must be absolute",
+        ));
+    }
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(component) => Some(Ok(component)),
+            _ => Some(Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "status input path must contain only normal components",
+            ))),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "status input path must name a file",
+        ));
+    }
+
+    let mut root_options = std::fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let root = root_options.open("/")?;
+    let mut directory = OwnedFd::from(root);
+
+    for (index, component) in components.iter().enumerate() {
+        let name = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "status input contains a NUL byte")
+        })?;
+        let is_file = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if is_file { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: `directory` is an open directory fd and `name` is a live,
+        // NUL-terminated component without path separators.
+        let raw_fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // SAFETY: a successful `openat` returns a new fd owned by this process.
+        let opened = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        if is_file {
+            return Ok(Some(std::fs::File::from(opened)));
+        }
+        directory = opened;
+    }
+
+    unreachable!("non-empty path components always return from the loop")
+}
+
+#[cfg(not(unix))]
+fn open_no_symlink_components(_path: &Path) -> io::Result<Option<std::fs::File>> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "secure config status file access requires Unix openat semantics",
+    ))
+}
+
+fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
+    let value: Value =
+        serde_json::from_slice(contents).context("invalid deployment status JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("deployment status must be a JSON object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| DEPLOYMENT_STATUSES.contains(status))
+        .ok_or_else(|| anyhow!("deployment status contains an invalid state"))?;
+    let config_revision = match object.get("config_revision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(revision)) if valid_revision(revision) => Some(revision.clone()),
+        _ => return Err(anyhow!("deployment status contains an invalid revision")),
+    };
+    let service = object
+        .get("service")
+        .and_then(Value::as_str)
+        .filter(|service| *service == "webex-generic-account-bot")
+        .ok_or_else(|| anyhow!("deployment status contains an invalid service"))?;
+    Ok(ConfigStatusSnapshot {
+        status: status.to_owned(),
+        config_revision,
+        service: Some(service.to_owned()),
+    })
+}
+
+fn valid_revision(revision: &str) -> bool {
+    (40..=64).contains(&revision.len())
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs as std_fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reads_allowlisted_status_fields() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            r#"{"status":"deployed","config_revision":"0123456789abcdef0123456789abcdef01234567","service":"webex-generic-account-bot","reason":"must not leak"}"#,
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(!snapshot.markdown().contains("must not leak"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transaction_takes_precedence_without_exposing_contents() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(&provider.transaction_file, "secret transaction details").unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "recovery_required");
+        assert!(!snapshot.markdown().contains("secret"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_metadata_is_unknown() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let snapshot = provider_in(&root).status().await.unwrap();
+        assert_eq!(snapshot.status, "unknown");
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_invalid_or_oversized_metadata() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(&provider.status_file, r#"{"status":"unexpected"}"#).unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
+            r#"{"status":"deployed","config_revision":"ABCDEF0123456789ABCDEF0123456789ABCDEF01","service":"webex-generic-account-bot"}"#,
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
+            vec![b'x'; STATUS_FILE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlink_status_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        let target = root.join("target.json");
+        std_fs::write(
+            &target,
+            r#"{"status":"deployed","config_revision":null,"service":"webex-generic-account-bot"}"#,
+        )
+        .unwrap();
+        symlink(target, &provider.status_file).unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlinked_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let real_root = root.join("real");
+        let linked_root = root.join("linked");
+        std_fs::create_dir_all(&real_root).unwrap();
+        std_fs::write(
+            real_root.join("status.json"),
+            r#"{"status":"deployed","config_revision":null,"service":"webex-generic-account-bot"}"#,
+        )
+        .unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+        let provider = FileConfigStatusProvider {
+            status_file: linked_root.join("status.json"),
+            transaction_file: linked_root.join("transaction.json"),
+        };
+
+        assert!(provider.status().await.is_err());
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    fn provider_in(root: &std::path::Path) -> FileConfigStatusProvider {
+        FileConfigStatusProvider {
+            status_file: root.join("status.json"),
+            transaction_file: root.join("transaction.json"),
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "webex-config-status-test-{}-{counter}",
+            std::process::id()
+        ))
+    }
+}

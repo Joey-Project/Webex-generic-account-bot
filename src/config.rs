@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use crate::config_commands::ConfigCommandsConfig;
+
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 3;
 const DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 2;
@@ -31,6 +33,7 @@ pub struct BotConfig {
     pub self_person_id: Option<String>,
     pub codex: CodexConfig,
     pub rooms: Vec<RoomPolicy>,
+    pub config_commands: Option<ConfigCommandsConfig>,
 }
 
 impl Default for BotConfig {
@@ -42,6 +45,7 @@ impl Default for BotConfig {
             self_person_id: None,
             codex: CodexConfig::default(),
             rooms: Vec::new(),
+            config_commands: None,
         }
     }
 }
@@ -78,6 +82,12 @@ impl BotConfig {
         self.validate_room_ids()?;
         for room in &self.rooms {
             room.validate()?;
+        }
+        if let Some(config_commands) = &self.config_commands {
+            config_commands
+                .validate()
+                .context("invalid config_commands")?;
+            self.validate_config_commands_room(config_commands)?;
         }
         for (name, codex) in self.codex_configs() {
             codex
@@ -123,6 +133,24 @@ impl BotConfig {
         for room in &self.rooms {
             if !seen.insert(room.room_id.as_str()) {
                 return Err(anyhow!("duplicate rooms.room_id {}", room.room_id));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_config_commands_room(&self, config_commands: &ConfigCommandsConfig) -> Result<()> {
+        for room in &self.rooms {
+            if room.room_id == config_commands.room_id {
+                return Err(anyhow!(
+                    "config_commands.room_id must differ from rooms.room_id {}",
+                    room.room_id
+                ));
+            }
+            if room.output_room_id.as_deref() == Some(config_commands.room_id.as_str()) {
+                return Err(anyhow!(
+                    "config_commands.room_id must differ from rooms.output_room_id {}",
+                    config_commands.room_id
+                ));
             }
         }
         Ok(())
@@ -910,6 +938,74 @@ allow_all_senders = true
             Path::new("/var/lib/webex-generic-account-bot/codex-home")
         );
         assert_eq!(config.rooms[0].trigger, TriggerMode::Mention);
+    }
+
+    #[test]
+    fn parses_status_only_config_commands() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[config_commands]
+room_id = "admin-room"
+allowed_person_ids = []
+allowed_person_emails = ["operator@example.com"]
+allowed_commands = ["status"]
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let config_commands = config.config_commands.as_ref().unwrap();
+        assert!(config_commands.command_allowed(crate::config_commands::ConfigCommand::Status));
+        assert!(config_commands.sender_allowed(None, Some("operator@example.com")));
+    }
+
+    #[test]
+    fn config_commands_room_must_not_match_input_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[config_commands]
+room_id = "room-1"
+allowed_person_ids = ["person-1"]
+allowed_person_emails = []
+allowed_commands = ["status"]
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("rooms.room_id"));
+    }
+
+    #[test]
+    fn config_commands_room_must_not_match_output_room() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[config_commands]
+room_id = "output-room"
+allowed_person_ids = ["person-1"]
+allowed_person_emails = []
+allowed_commands = ["status"]
+
+[[rooms]]
+room_id = "room-1"
+output_room_id = "output-room"
+forward_source_message = true
+read_only_source = true
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("rooms.output_room_id"));
     }
 
     #[test]

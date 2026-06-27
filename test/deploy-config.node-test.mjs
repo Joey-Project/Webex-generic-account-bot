@@ -519,6 +519,34 @@ describe('trusted config policy', () => {
     assert.match(result.stderr, /room_id is not allowlisted by host policy: attacker-controlled-room/);
   });
 
+  it('keeps config commands disabled until host policy pins the admin Space', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'config-commands.toml');
+    const rendered = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    const firstRoom = rendered.indexOf('[[rooms]]');
+    assert.notEqual(firstRoom, -1);
+    const configCommands = [
+      '[config_commands]',
+      'room_id = "unreviewed-admin-room"',
+      'allowed_person_ids = ["unreviewed-person"]',
+      'allowed_person_emails = []',
+      'allowed_commands = ["status"]',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      config,
+      `${rendered.slice(0, firstRoom)}${configCommands}${rendered.slice(firstRoom)}`,
+      'utf8',
+    );
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /config\.config_commands is not an allowed production config field/);
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
   it('rejects appended instructions in host-pinned Jenkins prompts', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
     const config = path.join(temp, 'tampered-prompt.toml');

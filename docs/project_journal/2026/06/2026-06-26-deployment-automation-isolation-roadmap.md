@@ -15,6 +15,13 @@ superseded_by:
 ## Summary
 - Split deployment automation and Codex runner isolation into small PRs with independent worktrees and merge gates.
 
+## Current Progress
+- Trusted deployment entrypoint merged in bot PR #8.
+- Host-owned config layout migration merged in config PRs #13, #14, and #15.
+- Configuration Space delivery is split into PR 2a (authoritative hydration,
+  admin schema, read-only status) and PR 2b (durable external action worker for
+  pull/reload/sync). Mutating commands remain undeployable until PR 2b lands.
+
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
 - After each PR merges, refresh the target branch locally before creating the next worktree.
