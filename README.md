@@ -171,6 +171,8 @@ aborts; active child process groups are terminated and an installed but
 uncommitted candidate follows the normal rollback and failure-metadata path.
 Existing checkout and lock-parent directories must be owned by the
 deployment user and mode `0700`.
+Missing rendered-config and metadata directories are created one component at
+a time, and each new directory entry is made durable by fsyncing its parent.
 Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
 entrypoint creates the lock parent directory when host permissions allow it and

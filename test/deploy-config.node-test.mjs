@@ -2142,8 +2142,14 @@ describe('deploy-config CLI and execution', () => {
 
     const candidateSync = synced.indexOf(plan.candidateConfig);
     const metadataSync = synced.findIndex((file) => file.includes('.deploy-status.json.'));
+    const outputParentSyncs = synced
+      .map((file, index) => [file, index])
+      .filter(([file]) => file === temp)
+      .map(([, index]) => index);
     assert(candidateSync >= 0);
     assert(metadataSync > candidateSync);
+    assert(outputParentSyncs.length >= 2);
+    assert(outputParentSyncs[1] < candidateSync);
     assert(synced.includes(path.dirname(plan.renderedConfig)));
   });
 
@@ -2272,6 +2278,71 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.status, 'failed_apply');
     assert.match(failureMetadata.reason, /interrupted by SIGTERM/);
     await assert.rejects(() => fs.access(plan.backupConfig));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores and verifies the old service when interrupted during restart', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-signal-test-'));
+    const controller = new AbortController();
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let restartAttempts = 0;
+    let activeChecks = 0;
+    let readinessChecks = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        signal: controller.signal,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+            if (restartAttempts === 1) {
+              controller.abort(new Error('deployment interrupted by SIGTERM'));
+            }
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'is-active') {
+            activeChecks += 1;
+          }
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '200',
+            stderr: '',
+          };
+        },
+      }),
+      /interrupted by SIGTERM/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 2);
+    assert.equal(activeChecks, 1);
+    assert.equal(readinessChecks, 1);
+    await assert.rejects(() => fs.access(plan.transactionFile));
+    assert.equal(
+      JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status,
+      'failed_restart_rolled_back',
+    );
     await assertLockReleased(plan.lockDir);
   });
 

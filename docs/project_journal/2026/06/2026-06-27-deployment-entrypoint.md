@@ -34,7 +34,9 @@ superseded_by:
   trusted rendering, including on Git 2.43 hosts.
 - Rendered-config and metadata parent directories are checked for symlink-free
   canonical paths, trusted ownership, and non-writable group/world modes before
-  candidate cleanup or failure-status writes.
+  candidate cleanup or failure-status writes. Missing persistent output
+  directory components are created individually and each parent directory is
+  fsynced before deployment continues.
 - Mutable checkout, lock, output, metadata, bot-code, and credential paths must
   be topologically disjoint when host overrides are enabled. Existing ancestors
   are canonicalised and symlink ancestors are rejected before lock creation or

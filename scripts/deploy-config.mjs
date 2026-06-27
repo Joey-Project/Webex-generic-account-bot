@@ -1505,13 +1505,47 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
       continue;
     }
     seen.add(directory);
-    await fsApi.mkdir(directory, { recursive: true, mode: 0o755 });
+    await createDirectoryDurably(directory, 0o755, fsApi);
     const resolved = await fsApi.realpath(directory);
     if (resolved !== path.resolve(directory)) {
       throw new Error(`${label} must not contain symlinks: ${directory}`);
     }
     const directoryStat = await fsApi.lstat(directory);
     assertTrustedOutputDirectory(directory, directoryStat, label);
+  }
+}
+
+async function createDirectoryDurably(directory, mode, fsApi) {
+  const resolved = path.resolve(directory);
+  const missing = [];
+  let current = resolved;
+  for (;;) {
+    try {
+      const stat = await fsApi.lstat(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error(`deployment output ancestor must be a real directory: ${current}`);
+      }
+      break;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      missing.unshift(current);
+      current = parent;
+    }
+  }
+  for (const child of missing) {
+    await fsApi.mkdir(child, { mode });
+    const childStat = await fsApi.lstat(child);
+    if (!childStat.isDirectory() || childStat.isSymbolicLink()) {
+      throw new Error(`deployment output directory must be a real directory: ${child}`);
+    }
+    await syncDirectory(current, fsApi);
+    current = child;
   }
 }
 

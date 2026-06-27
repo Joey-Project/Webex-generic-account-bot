@@ -737,7 +737,7 @@ impl Default for JenkinsContextConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            node_bin: "/usr/bin/node".to_owned(),
+            node_bin: "node".to_owned(),
             script: PathBuf::new(),
             env_file: PathBuf::from("/etc/webex-generic-account-bot/jenkins.env"),
             timeout_secs: 30,
@@ -1644,6 +1644,7 @@ output_limit_chars = 2048
         config.validate().unwrap();
         let jenkins_context = config.rooms[0].jenkins_context.as_ref().unwrap();
         assert!(jenkins_context.enabled);
+        assert_eq!(jenkins_context.node_bin, "node");
         assert!(jenkins_context.script.is_absolute());
         assert_eq!(jenkins_context.timeout_secs, 15);
         assert_eq!(jenkins_context.max_urls, 2);
