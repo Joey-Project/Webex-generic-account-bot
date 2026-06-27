@@ -110,6 +110,14 @@ class UsageError extends Error {
   }
 }
 
+class CommittedRecoveryError extends Error {
+  constructor(message, configRevision) {
+    super(message);
+    this.name = 'CommittedRecoveryError';
+    this.configRevision = configRevision;
+  }
+}
+
 export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   const options = {
     ...DEFAULTS,
@@ -524,9 +532,13 @@ export async function executePlan({
   let failureMetadataError = null;
   let recordedFailureStatus = null;
   let outputDirectoriesTrusted = false;
-  const recordFailure = async (status, reason) => {
+  const recordFailure = async (
+    status,
+    reason,
+    configRevision = captures.configRevision || null,
+  ) => {
     try {
-      await writeFailureMetadata(plan, captures.configRevision || null, status, reason, fsApi);
+      await writeFailureMetadata(plan, configRevision, status, reason, fsApi);
       failureMetadataWritten = true;
       recordedFailureStatus = status;
     } catch (error) {
@@ -637,7 +649,12 @@ export async function executePlan({
   } catch (error) {
     primaryError = error;
     if (outputDirectoriesTrusted && !failureMetadataWritten && !failureMetadataError) {
-      await recordFailure(commitReached ? 'failed_after_commit' : 'failed_apply', error.message);
+      const recoveredCommit = error instanceof CommittedRecoveryError;
+      await recordFailure(
+        commitReached || recoveredCommit ? 'failed_after_commit' : 'failed_apply',
+        error.message,
+        recoveredCommit ? error.configRevision : captures.configRevision || null,
+      );
     }
     throw error;
   } finally {
@@ -1730,27 +1747,31 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
     committedAt: transaction.committed_at,
   };
   if (transaction.phase === 'committed_pending_metadata') {
-    const metadata = deploymentMetadataFromInstallState(
-      {
-        ...plan,
-        configRepo: transaction.config_repo,
-        configRef: transaction.config_ref,
-        botCodeDir: transaction.bot_code_dir,
-        renderedConfig: transaction.rendered_config,
-        metadataFile: transaction.metadata_file,
-        service: transaction.service,
-        skipRestart: !transaction.service_restart_required,
-        serviceAction: transaction.service_restart_required ? 'restart' : null,
-      },
-      installState,
-    );
-    await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
-    await clearInstallTransaction(plan, fsApi);
     try {
-      await removeDurablyIfPresent(plan.backupConfig, fsApi);
-    } catch (error) {
-      metadata.backup_cleanup_error = redact(error.message);
+      const metadata = deploymentMetadataFromInstallState(
+        {
+          ...plan,
+          configRepo: transaction.config_repo,
+          configRef: transaction.config_ref,
+          botCodeDir: transaction.bot_code_dir,
+          renderedConfig: transaction.rendered_config,
+          metadataFile: transaction.metadata_file,
+          service: transaction.service,
+          skipRestart: !transaction.service_restart_required,
+          serviceAction: transaction.service_restart_required ? 'restart' : null,
+        },
+        installState,
+      );
       await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+      await clearInstallTransaction(plan, fsApi);
+      try {
+        await removeDurablyIfPresent(plan.backupConfig, fsApi);
+      } catch (error) {
+        metadata.backup_cleanup_error = redact(error.message);
+        await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+      }
+    } catch (error) {
+      throw new CommittedRecoveryError(error.message, transaction.config_revision);
     }
     return;
   }
@@ -2045,11 +2066,27 @@ function assertSafePlanPathTopology(plan) {
       throw new UsageError(`${label} must not overlap deployment lock directory`);
     }
   }
+  for (const [label, protectedPath] of [...outputPaths, ...credentialPaths]) {
+    if (pathsOverlap(checkoutRoot, protectedPath)) {
+      throw new UsageError(`${label} must not overlap checkout directory`);
+    }
+  }
   if (pathsOverlap(checkoutRoot, lockDir)) {
     throw new UsageError('deployment lock directory must not overlap checkout directory');
   }
   if (pathsOverlap(checkoutRoot, botCodeDir)) {
     throw new UsageError('bot code directory must not overlap checkout directory');
+  }
+  for (let index = 0; index < credentialPaths.length; index += 1) {
+    const [credentialLabel, credentialPath] = credentialPaths[index];
+    if (pathsOverlap(botCodeDir, credentialPath)) {
+      throw new UsageError(`${credentialLabel} must not overlap bot code directory`);
+    }
+    for (const [otherLabel, otherPath] of credentialPaths.slice(index + 1)) {
+      if (pathsOverlap(credentialPath, otherPath)) {
+        throw new UsageError(`${credentialLabel} must not overlap ${otherLabel}`);
+      }
+    }
   }
   for (let index = 0; index < outputPaths.length; index += 1) {
     const [leftLabel, leftPath] = outputPaths[index];

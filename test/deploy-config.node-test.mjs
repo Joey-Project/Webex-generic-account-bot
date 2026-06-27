@@ -219,6 +219,36 @@ describe('deploy-config plan', () => {
     assert.throws(
       () => buildDeployPlan(parseArgsAllow([
         '--apply',
+        '--checkout-dir',
+        '/tmp/webex-config-checkout',
+        '--ssh-key',
+        '/tmp/webex-config-checkout/deploy/id_ed25519',
+      ])),
+      /SSH key must not overlap checkout directory/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--bot-code-dir',
+        '/opt/webex-bot/code',
+        '--ssh-key',
+        '/opt/webex-bot/code/deploy/id_ed25519',
+      ])),
+      /SSH key must not overlap bot code directory/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--ssh-key',
+        '/tmp/webex-deploy/credential',
+        '--ssh-known-hosts',
+        '/tmp/webex-deploy/credential',
+      ])),
+      /SSH key must not overlap SSH known-hosts file/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
         '--metadata-file',
         '/tmp/webex-deploy-key',
         '--ssh-key',
@@ -407,10 +437,16 @@ describe('trusted config policy', () => {
       'utf8',
     );
 
+    const repoRoot = process.cwd();
+    const cargoBin = process.env.CARGO_BIN || path.join(
+      process.env.CARGO_HOME || path.join(os.homedir(), '.cargo'),
+      'bin',
+      'cargo',
+    );
     const result = spawnSync(
       '/usr/bin/bash',
       [
-        'scripts/config-policy/validate-config.sh',
+        path.join(repoRoot, 'scripts/config-policy/validate-config.sh'),
         '--source-root',
         sourceRoot,
         '--env',
@@ -419,20 +455,15 @@ describe('trusted config policy', () => {
         output,
       ],
       {
-        cwd: process.cwd(),
+        cwd: '/',
         encoding: 'utf8',
         timeout: 180_000,
-        env: {
-          ...process.env,
-          WEBEX_BOT_CODE_DIR: process.cwd(),
+        env: scrubEnv(process.env, {
+          WEBEX_BOT_CODE_DIR: repoRoot,
           NODE_BIN: process.execPath,
           PYTHON_BIN: '/usr/bin/python3',
-          CARGO_BIN: process.env.CARGO_BIN || path.join(
-            process.env.CARGO_HOME || path.join(os.homedir(), '.cargo'),
-            'bin',
-            'cargo',
-          ),
-        },
+          CARGO_BIN: cargoBin,
+        }),
       },
     );
 
@@ -2676,6 +2707,75 @@ describe('deploy-config CLI and execution', () => {
 
     assert.deepEqual(calls, ['/usr/bin/git']);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('classifies failures after committed recovery as post-commit', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'committed config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: 'a'.repeat(40),
+      serviceRestartRequired: true,
+      phase: 'committed_pending_metadata',
+    });
+    let metadataRenames = 0;
+    let commandRan = false;
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (target === plan.metadataFile) {
+          metadataRenames += 1;
+          if (metadataRenames === 2) {
+            throw new Error('recovered metadata update failed');
+          }
+        }
+        return await fs.rename(source, target);
+      },
+      async rm(file, options) {
+        if (file === plan.backupConfig) {
+          throw new Error('backup cleanup failed');
+        }
+        return await fs.rm(file, options);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /recovered metadata update failed/,
+    );
+
+    assert.equal(commandRan, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
+    await assert.rejects(() => fs.access(plan.transactionFile));
+    assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_after_commit');
+    assert.equal(failureMetadata.config_revision, 'a'.repeat(40));
+    assert.equal(metadataRenames, 3);
     await assertLockReleased(plan.lockDir);
   });
 
