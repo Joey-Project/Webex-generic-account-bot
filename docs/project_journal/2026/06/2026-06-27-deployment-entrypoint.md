@@ -33,6 +33,8 @@ superseded_by:
 - Rendered-config and metadata parent directories are checked for symlink-free
   canonical paths, trusted ownership, and non-writable group/world modes before
   candidate cleanup or failure-status writes.
+- Mutable checkout, lock, output, metadata, bot-code, and credential paths must
+  be topologically disjoint when host overrides are enabled.
 - Host policy overrides for executable paths, repo paths, timeouts, and output
   caps require `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`.
 - The entrypoint defaults to dry-run/status and requires `--apply` for mutation.
@@ -45,6 +47,11 @@ superseded_by:
   distinguishes skipped restarts, records generic apply and restart failure
   states, uses `failed_after_commit` for metadata failures after a successful
   restart, and rolls back the rendered config if restart fails.
+- Restart success is followed by a fixed settle period and `systemctl
+  is-active`; failed post-restart health rolls back through the same path.
+- Deployment metadata uses a same-directory fsynced temporary file plus atomic
+  rename. Cleanup failures are merged into the reported error and residual lock
+  state is recorded when possible.
 - Child commands have per-command deadlines and bounded stdout/stderr capture;
   the lock parent and checkout directory must be deployment-user-owned `0700`
   directories.
@@ -58,6 +65,9 @@ superseded_by:
   target.
 - Oversized per-node log attempts debit their reserved bytes from the aggregate
   log budget, preventing repeated failed reads from bypassing the total cap.
+- Every streamed console byte, including bytes from failed retry attempts, is
+  charged to the aggregate budget. Derived diagnostics cap both line length and
+  retained line count, and redact PEM private keys and common API-key fields.
 - Console lines retained in graph and summary artifacts are capped at 4 KiB
   after redaction, preventing one log line from amplifying derived artifacts.
 - Jenkins helper stdout exposes every prefetched GUI console URL for reply
@@ -70,6 +80,10 @@ superseded_by:
   `miku bot test` room set.
 - Jenkins diagnosis and follow-up prompts must match full host-owned normalized
   template hashes; fragment-preserving instruction injection is rejected.
+- Host policy pins `/usr/bin/node`, the helper `PATH`, the global Codex model,
+  and Jenkins timeout/fan-out/output values. Jenkins-format replies fail closed
+  without verifiable prefetched console URLs, and excerpts require a rendered
+  allowlisted log link.
 - Failure metadata write errors are surfaced together with the primary apply
   error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a

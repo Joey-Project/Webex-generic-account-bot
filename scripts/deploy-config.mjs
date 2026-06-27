@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -45,6 +46,8 @@ const MAX_CONFIG_TREE_FILES = 128;
 const MAX_CONFIG_BLOB_BYTES = 1024 * 1024;
 const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
 const MAX_CONFIG_PATH_BYTES = 512;
+const SERVICE_HEALTH_SETTLE_BIN = '/usr/bin/sleep';
+const SERVICE_HEALTH_SETTLE_SECONDS = '2';
 const HOST_OVERRIDE_KEYS = new Set([
   'configRepo',
   'configRef',
@@ -332,8 +335,18 @@ export function buildDeployPlan(options) {
   const serviceCommand = options.skipRestart
     ? null
     : command(options.systemctlBin, ['restart', '--', options.service], commandDefaults);
+  const serviceVerificationCommands = options.skipRestart
+    ? []
+    : [
+        command(SERVICE_HEALTH_SETTLE_BIN, [SERVICE_HEALTH_SETTLE_SECONDS], commandDefaults),
+        command(
+          options.systemctlBin,
+          ['is-active', '--quiet', '--', options.service],
+          commandDefaults,
+        ),
+      ];
 
-  return {
+  const plan = {
     checkoutDir,
     checkoutWorkDir,
     renderedConfig,
@@ -347,6 +360,7 @@ export function buildDeployPlan(options) {
     lockDir: path.resolve(options.lockDir),
     commands,
     serviceCommand,
+    serviceVerificationCommands,
     skipRestart: options.skipRestart,
     serviceAction: options.skipRestart ? null : 'restart',
     sshKey: path.resolve(options.sshKey),
@@ -354,6 +368,8 @@ export function buildDeployPlan(options) {
     commandTimeoutMs: options.commandTimeoutMs,
     outputLimitBytes: options.outputLimitBytes,
   };
+  assertSafePlanPathTopology(plan);
+  return plan;
 }
 
 export function scrubEnv(parentEnv = process.env, extra = {}) {
@@ -442,7 +458,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     installState = await installCandidateConfig(plan, fsApi);
     if (plan.serviceCommand) {
       try {
-        await runner(plan.serviceCommand, scrubEnv(parentEnv, plan.serviceCommand.env));
+        await runServiceTransition(plan, runner, parentEnv);
       } catch (error) {
         let rollbackError = null;
         try {
@@ -460,7 +476,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
           throw new Error(`${error.message}; failed to restore previous config: ${rollbackError.message}`);
         }
         try {
-          await runner(plan.serviceCommand, scrubEnv(parentEnv, plan.serviceCommand.env));
+          await runServiceTransition(plan, runner, parentEnv);
         } catch (restoreError) {
           await recordFailure(
             'failed_restart_rollback_restart_failed',
@@ -496,11 +512,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     if (backupCleanupError) {
       metadata.backup_cleanup_error = redact(backupCleanupError.message);
     }
-    await fsApi.mkdir(path.dirname(plan.metadataFile), { recursive: true, mode: 0o755 });
-    await fsApi.writeFile(plan.metadataFile, `${JSON.stringify(metadata, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o644,
-    });
+    await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
     return metadata;
   } catch (error) {
     primaryError = error;
@@ -510,11 +522,15 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     throw error;
   } finally {
     let cleanupError = null;
+    let rollbackCleanupFailed = false;
+    let candidateCleanupFailed = false;
+    let lockCleanupFailed = false;
     if (installState) {
       try {
         await rollbackCandidateConfig(plan, installState, fsApi);
       } catch (error) {
         cleanupError = error;
+        rollbackCleanupFailed = true;
       }
     }
     if (outputDirectoriesTrusted) {
@@ -522,16 +538,49 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
         await removeIfPresent(plan.candidateConfig, fsApi);
       } catch (error) {
         cleanupError ??= error;
+        candidateCleanupFailed = true;
       }
     }
     try {
       await fsApi.rm(plan.lockDir, { recursive: true, force: true });
     } catch (error) {
       cleanupError ??= error;
+      lockCleanupFailed = true;
     }
-    if (cleanupError && !primaryError) {
-      throw cleanupError;
+    if (cleanupError) {
+      let combinedReason = primaryError
+        ? `${primaryError.message}; deployment cleanup failed: ${cleanupError.message}`
+        : `deployment cleanup failed: ${cleanupError.message}`;
+      if (outputDirectoriesTrusted) {
+        try {
+          await writeFailureMetadata(
+            plan,
+            captures.configRevision || null,
+            commitReached ? 'failed_after_commit_cleanup' : 'failed_cleanup',
+            combinedReason,
+            fsApi,
+            {
+              rollback_cleanup_failed: rollbackCleanupFailed,
+              candidate_cleanup_failed: candidateCleanupFailed,
+              lock_cleanup_failed: lockCleanupFailed,
+            },
+          );
+        } catch (metadataError) {
+          combinedReason = `${combinedReason}; failed to record cleanup state: ${metadataError.message}`;
+        }
+      }
+      throw new Error(combinedReason);
     }
+  }
+}
+
+async function runServiceTransition(plan, runner, parentEnv) {
+  await runner(plan.serviceCommand, scrubEnv(parentEnv, plan.serviceCommand.env));
+  for (const verificationCommand of plan.serviceVerificationCommands) {
+    await runner(
+      verificationCommand,
+      scrubEnv(parentEnv, verificationCommand.env),
+    );
   }
 }
 
@@ -912,7 +961,14 @@ function validateRef(value) {
   }
 }
 
-async function writeFailureMetadata(plan, configRevision, status, reason, fsApi) {
+async function writeFailureMetadata(
+  plan,
+  configRevision,
+  status,
+  reason,
+  fsApi,
+  details = {},
+) {
   const metadata = {
     status,
     reason: redact(reason),
@@ -925,12 +981,38 @@ async function writeFailureMetadata(plan, configRevision, status, reason, fsApi)
     service_action: plan.serviceAction,
     service_restart_skipped: plan.skipRestart,
     deployed_at: new Date().toISOString(),
+    ...details,
   };
-  await fsApi.mkdir(path.dirname(plan.metadataFile), { recursive: true, mode: 0o755 });
-  await fsApi.writeFile(plan.metadataFile, `${JSON.stringify(metadata, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o644,
-  });
+  await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+}
+
+async function writeMetadataAtomically(file, metadata, fsApi) {
+  const directory = path.dirname(file);
+  const temporary = path.join(
+    directory,
+    `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  await fsApi.mkdir(directory, { recursive: true, mode: 0o755 });
+  let handle = null;
+  try {
+    handle = await fsApi.open(temporary, 'wx', 0o644);
+    await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fsApi.rename(temporary, file);
+    const directoryHandle = await fsApi.open(directory, 'r');
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+  } finally {
+    if (handle) {
+      await handle.close().catch(() => {});
+    }
+    await fsApi.rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 function validateRepo(value) {
@@ -1052,7 +1134,7 @@ async function removeIfPresent(file, fsApi) {
 
 function assertManagedSubpath(child, parent, label) {
   const relative = path.relative(parent, child);
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+  if (!relative || isParentTraversal(relative) || path.isAbsolute(relative)) {
     throw new Error(`${label} must stay inside checkout-dir`);
   }
 }
@@ -1094,7 +1176,66 @@ function assertConfigRevision(value) {
 }
 
 function allPlanCommands(plan) {
-  return plan.serviceCommand ? [...plan.commands, plan.serviceCommand] : plan.commands;
+  return plan.serviceCommand
+    ? [...plan.commands, plan.serviceCommand, ...plan.serviceVerificationCommands]
+    : plan.commands;
+}
+
+function assertSafePlanPathTopology(plan) {
+  const checkoutRoot = path.resolve(plan.checkoutDir);
+  const checkoutWork = path.resolve(plan.checkoutWorkDir);
+  const lockDir = path.resolve(plan.lockDir);
+  const botCodeDir = path.resolve(plan.botCodeDir);
+  const outputPaths = [
+    ['rendered config', path.resolve(plan.renderedConfig)],
+    ['candidate config', path.resolve(plan.candidateConfig)],
+    ['backup config', path.resolve(plan.backupConfig)],
+    ['metadata file', path.resolve(plan.metadataFile)],
+  ];
+  const protectedPaths = [
+    ...outputPaths,
+    ['bot code directory', botCodeDir],
+    ['SSH key', path.resolve(plan.sshKey)],
+    ['SSH known-hosts file', path.resolve(plan.sshKnownHosts)],
+  ];
+  for (const [label, protectedPath] of protectedPaths) {
+    if (pathsOverlap(checkoutWork, protectedPath)) {
+      throw new UsageError(`${label} must not overlap checkout work directory`);
+    }
+    if (pathsOverlap(lockDir, protectedPath)) {
+      throw new UsageError(`${label} must not overlap deployment lock directory`);
+    }
+  }
+  if (pathsOverlap(checkoutRoot, lockDir)) {
+    throw new UsageError('deployment lock directory must not overlap checkout directory');
+  }
+  if (pathsOverlap(checkoutRoot, botCodeDir)) {
+    throw new UsageError('bot code directory must not overlap checkout directory');
+  }
+  for (let index = 0; index < outputPaths.length; index += 1) {
+    const [leftLabel, leftPath] = outputPaths[index];
+    if (pathsOverlap(botCodeDir, leftPath)) {
+      throw new UsageError(`${leftLabel} must not overlap bot code directory`);
+    }
+    for (const [rightLabel, rightPath] of outputPaths.slice(index + 1)) {
+      if (pathsOverlap(leftPath, rightPath)) {
+        throw new UsageError(`${leftLabel} must not overlap ${rightLabel}`);
+      }
+    }
+  }
+}
+
+function pathsOverlap(left, right) {
+  return isPathWithin(left, right) || isPathWithin(right, left);
+}
+
+function isPathWithin(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === '' || (!isParentTraversal(relative) && !path.isAbsolute(relative));
+}
+
+function isParentTraversal(relative) {
+  return relative === '..' || relative.startsWith(`..${path.sep}`);
 }
 
 function assertSafeRenderedConfigMetadata(file, fileStat) {

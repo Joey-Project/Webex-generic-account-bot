@@ -737,7 +737,7 @@ impl Default for JenkinsContextConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            node_bin: "node".to_owned(),
+            node_bin: "/usr/bin/node".to_owned(),
             script: PathBuf::new(),
             env_file: PathBuf::from("/etc/webex-generic-account-bot/jenkins.env"),
             timeout_secs: 30,

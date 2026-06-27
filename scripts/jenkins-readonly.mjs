@@ -17,6 +17,7 @@ const DEFAULT_FETCH_RETRIES = 3;
 const DEFAULT_MAX_PARALLEL_FETCHES = 6;
 const MAX_JENKINS_URL_CHARS = 4096;
 const MAX_RETAINED_LOG_LINE_BYTES = 4096;
+const MAX_RETAINED_LOG_LINES = 20_000;
 
 export function parseEnvFile(contents) {
   const env = {};
@@ -252,16 +253,11 @@ class GraphFetcher {
           this.limits.maxApiResponseBytes ?? DEFAULT_MAX_API_RESPONSE_BYTES,
         fetchTimeoutMs: this.limits.maxFetchSeconds * 1000,
         fetchRetries: this.limits.fetchRetries,
+        onLogBytesRead: (bytes) => this.consumeLogBytes(bytes),
       });
       const logBudgetExceeded = /exceeded max_log_bytes_per_node=/.test(
         report.consoleFetchError ?? '',
       );
-      this.totalLogBytes += logBudgetExceeded ? reservedLogBytes : report.logBytes;
-      if (this.totalLogBytes > this.limits.maxTotalLogBytes) {
-        throw new JenkinsBudgetStopError(
-          `Jenkins diagnostics exceeded max_total_log_bytes=${this.limits.maxTotalLogBytes}`,
-        );
-      }
       const logFile = report.consoleFetchError
         ? null
         : path.join(this.logsDir, jenkinsLogFileName(report, buildUrl));
@@ -328,6 +324,17 @@ class GraphFetcher {
     const reserved = Math.min(this.limits.maxLogBytesPerNode, remaining);
     this.reservedLogBytes += reserved;
     return reserved;
+  }
+
+  consumeLogBytes(bytes) {
+    const nextTotal = this.totalLogBytes + bytes;
+    if (nextTotal > this.limits.maxTotalLogBytes) {
+      this.totalLogBytes = this.limits.maxTotalLogBytes;
+      throw new JenkinsBudgetStopError(
+        this.stop(`Jenkins diagnostics exceeded max_total_log_bytes=${this.limits.maxTotalLogBytes}`),
+      );
+    }
+    this.totalLogBytes = nextTotal;
   }
 
   releaseLogBytes(bytes) {
@@ -438,6 +445,7 @@ export async function fetchBuildReport({
   maxApiResponseBytes = DEFAULT_MAX_API_RESPONSE_BYTES,
   fetchTimeoutMs,
   fetchRetries,
+  onLogBytesRead = () => {},
 }) {
   const buildUrl = buildUrlFromJenkinsUrl(url, config.baseUrl);
   const buildApiUrl = new URL('api/json', buildUrl);
@@ -473,10 +481,14 @@ export async function fetchBuildReport({
       () => getTextLimited(consoleTextUrl, config, {
         maxBytes: maxLogBytes,
         timeoutMs: fetchTimeoutMs,
+        onBytesRead: onLogBytesRead,
       }),
       fetchRetries,
     );
   } catch (error) {
+    if (error instanceof JenkinsBudgetStopError) {
+      throw error;
+    }
     consoleFetchError = redactLog(error.message);
   }
   const redactedConsoleLines = redactedConsoleLinesFromText(consoleText);
@@ -686,6 +698,15 @@ export async function diagnoseBuild({ config, url, tailLines, limits }) {
   const consoleUrl = guiConsoleUrl(buildUrl);
   const fetchTimeoutMs = limits.maxFetchSeconds * 1000;
   const maxLogBytes = Math.min(limits.maxLogBytesPerNode, limits.maxTotalLogBytes);
+  let downloadedLogBytes = 0;
+  const consumeLogBytes = (bytes) => {
+    downloadedLogBytes += bytes;
+    if (downloadedLogBytes > limits.maxTotalLogBytes) {
+      throw new JenkinsBudgetStopError(
+        `Jenkins diagnostics exceeded max_total_log_bytes=${limits.maxTotalLogBytes}`,
+      );
+    }
+  };
 
   const [build, consoleText] = await Promise.all([
     withRetries(
@@ -699,6 +720,7 @@ export async function diagnoseBuild({ config, url, tailLines, limits }) {
       () => getTextLimited(consoleTextUrl, config, {
         maxBytes: maxLogBytes,
         timeoutMs: fetchTimeoutMs,
+        onBytesRead: consumeLogBytes,
       }),
       limits.fetchRetries,
     ),
@@ -1073,7 +1095,7 @@ async function withRetries(operation, retries) {
     try {
       return await operation();
     } catch (error) {
-      if (error instanceof JenkinsResponseBudgetError) {
+      if (error instanceof JenkinsResponseBudgetError || error instanceof JenkinsBudgetStopError) {
         throw error;
       }
       lastError = error;
@@ -1095,7 +1117,7 @@ class JenkinsLogBudgetError extends JenkinsResponseBudgetError {}
 
 class JenkinsApiBudgetError extends JenkinsResponseBudgetError {}
 
-async function getTextLimited(url, config, { maxBytes, timeoutMs }) {
+async function getTextLimited(url, config, { maxBytes, timeoutMs, onBytesRead = () => {} }) {
   const response = await get(url, config, { timeoutMs });
   const body = await readResponseBodyLimited(
     response,
@@ -1103,6 +1125,7 @@ async function getTextLimited(url, config, { maxBytes, timeoutMs }) {
     maxBytes,
     'max_log_bytes_per_node',
     JenkinsLogBudgetError,
+    onBytesRead,
   );
   return body.toString('utf8');
 }
@@ -1119,7 +1142,14 @@ async function getJsonLimited(url, config, { maxBytes, timeoutMs }) {
   return JSON.parse(body.toString('utf8'));
 }
 
-async function readResponseBodyLimited(response, url, maxBytes, budgetName, ErrorType) {
+async function readResponseBodyLimited(
+  response,
+  url,
+  maxBytes,
+  budgetName,
+  ErrorType,
+  onBytesRead = () => {},
+) {
   const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     await response.body?.cancel?.().catch(() => {});
@@ -1137,6 +1167,12 @@ async function readResponseBodyLimited(response, url, maxBytes, budgetName, Erro
     if (done) {
       break;
     }
+    try {
+      onBytesRead(value.byteLength);
+    } catch (error) {
+      await reader.cancel?.().catch(() => {});
+      throw error;
+    }
     total += value.byteLength;
     if (total > maxBytes) {
       await reader.cancel?.().catch(() => {});
@@ -1148,26 +1184,51 @@ async function readResponseBodyLimited(response, url, maxBytes, budgetName, Erro
 }
 
 export function redactLog(text) {
-  const secretKey = '[A-Za-z0-9_.-]*(?:password|passwd|token|secret|credential)[A-Za-z0-9_.-]*';
+  const secretKey = [
+    '[A-Za-z0-9_.-]*(?:password|passwd|token|secret|credential)[A-Za-z0-9_.-]*',
+    '[A-Za-z0-9_.-]*(?:api|access|private|client)[_.-]?key[A-Za-z0-9_.-]*',
+  ].join('|');
   return text
+    .replace(
+      /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g,
+      '[REDACTED PRIVATE KEY]',
+    )
     .replace(/(https?:\/\/)([^/\s:@]+(?::[^@\s/]*)?)(@)/gi, '$1[REDACTED]$3')
     .replace(
-      new RegExp(`(["']${secretKey}["']\\s*:\\s*)(["'])([^\\r\\n"']*)(\\2)`, 'gi'),
+      new RegExp(`(["'](?:${secretKey})["']\\s*:\\s*)(["'])([^\\r\\n"']*)(\\2)`, 'gi'),
       '$1$2[REDACTED]$4',
     )
     .replace(
-      new RegExp(`(\\b${secretKey}\\b\\s*[:=]\\s*)(["'])([^\\r\\n"']*)(\\2)`, 'gi'),
+      new RegExp(`(\\b(?:${secretKey})\\b\\s*[:=]\\s*)(["'])([^\\r\\n"']*)(\\2)`, 'gi'),
       '$1$2[REDACTED]$4',
     )
     .replace(
-      new RegExp(`(\\b${secretKey}\\b\\s*[:=]\\s*)([^\\s'"<>]+)`, 'gi'),
+      new RegExp(`(\\b(?:${secretKey})\\b\\s*[:=]\\s*)([^\\s'"<>]+)`, 'gi'),
       '$1[REDACTED]',
     )
     .replace(/(Authorization:\s*(?:Basic|Bearer)\s+)([A-Za-z0-9._~+/=-]+)/gi, '$1[REDACTED]');
 }
 
 export function redactedConsoleLinesFromText(text) {
-  return redactLog(text).split(/\r?\n/).map(limitRetainedLogLine);
+  const redacted = redactLog(text);
+  const lines = [];
+  let end = redacted.length;
+  while (lines.length < MAX_RETAINED_LOG_LINES && end >= 0) {
+    const newline = redacted.lastIndexOf('\n', end - 1);
+    const start = newline + 1;
+    const line = redacted.slice(start, end).replace(/\r$/, '');
+    lines.push(limitRetainedLogLine(line));
+    if (newline < 0) {
+      end = -1;
+      break;
+    }
+    end = newline;
+  }
+  lines.reverse();
+  if (end >= 0) {
+    lines[0] = '[earlier log lines omitted]';
+  }
+  return lines;
 }
 
 function limitRetainedLogLine(line) {

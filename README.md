@@ -125,13 +125,16 @@ Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
 Normal apply renders and validates a candidate config first, installs it
 atomically, restarts the service, and restores the previous rendered config if
-`systemctl restart` fails. Failed fetch, validation, install, or restart paths
-write machine-readable failure metadata. If that failure metadata cannot be
-written, the apply reports both the primary error and the metadata error; an
-existing status file must then be treated as stale. If metadata writing fails
-after the new config has been installed and the service restart has succeeded,
-the entrypoint records `status=failed_after_commit` when possible instead of
-implying the apply was rolled back.
+`systemctl restart` fails or the service is not active after a fixed settle
+period. Failed fetch, validation, install, restart, health, or cleanup paths
+write machine-readable failure metadata. Metadata is fsynced to a same-directory
+temporary file and atomically renamed, so existing links are replaced rather
+than followed and a failed write preserves the last complete status. If failure
+metadata cannot be written, the apply reports both the primary error and the
+metadata error; an existing status file must then be treated as stale. If
+metadata writing or cleanup fails after the new config has been installed and
+the service restart has succeeded, the entrypoint records a post-commit failure
+state when possible instead of implying the apply was rolled back.
 Child command stdout/stderr capture is bounded and each child has a deadline so
 a stuck fetch, validation, or restart cannot hold the deployment lock forever.
 Existing checkout and lock directories must be owned by the deployment user and
@@ -154,17 +157,24 @@ process, and file-descriptor limits, in addition to the command deadline and
 output cap. Rendered-config and metadata parent directories are also rejected
 before cleanup or status writes if they contain symlinks, have unexpected
 ownership, or are group/world writable.
+Host path overrides are also rejected when checkout, lock, rendered config,
+metadata, bot code, or credential paths overlap a mutable deployment tree.
 
 The host-owned static policy allowlists every deployable Webex room and pins its
 sender, routing, trigger, Codex, follow-up, and Jenkins policy. Jenkins prompts
 must match host-owned full-template SHA-256 values; retaining a few guardrail
 phrases while appending conflicting instructions is rejected. The Jenkins
-helper accepts only `/job/.../<build-number>/` URLs, rejects HTTP redirects
-rather than forwarding credentials, caps JSON API responses at 1 MiB, charges
-oversized log attempts against the aggregate budget, and bounds retained
-console lines before graph or summary generation. It also emits a
-control-character-safe console URL block and keeps the complete structured URL
-allowlist separate from the prompt text truncation used for Codex context.
+helper uses fixed `/usr/bin/node` and `PATH=/usr/bin:/bin`, accepts only
+`/job/.../<build-number>/` URLs, rejects HTTP redirects rather than forwarding
+credentials, caps JSON API responses at 1 MiB, and charges every streamed log
+byte, including failed retries, against the aggregate budget. Derived evidence
+also caps retained line length and count, and redacts private-key blocks and
+common API-key assignments. Jenkins replies fail closed when prefetch produces
+no verifiable console URL; exact excerpts are rendered only beside an
+allowlisted log link. The helper emits a control-character-safe console URL
+block and keeps the complete structured URL allowlist separate from the prompt
+text truncation used for Codex context. Host policy pins the global Codex model
+and Jenkins prefetch fan-out/resource settings.
 
 Point the `webex-headless-messenger` JS sidecar at the bot:
 

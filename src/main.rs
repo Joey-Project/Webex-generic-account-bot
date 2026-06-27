@@ -873,6 +873,7 @@ fn apply_jenkins_helper_env(command: &mut Command) {
     for (key, value) in webex_generic_account_bot::runner::scrubbed_env() {
         command.env(key, value);
     }
+    command.env("PATH", "/usr/bin:/bin");
 }
 
 fn configure_jenkins_helper_process(command: &mut Command) {
@@ -1320,6 +1321,11 @@ impl BotApp {
         let codex_config = self.config.codex_for_policy(policy);
         let mut prefetched_console_urls = Vec::new();
         let mut jenkins_artifact_cleanup = None;
+        let prefetch_required = matches!(
+            request.reply_format,
+            ReplyFormat::JenkinsDiagnosisJson | ReplyFormat::JenkinsFollowupJson
+        );
+        let mut jenkins_prefetch_failed = false;
         if let Some(jenkins_context) = jenkins_context {
             match jenkins_context_prompt(policy, &codex_config, jenkins_context).await {
                 Ok(Some(context_bundle)) => {
@@ -1328,25 +1334,36 @@ impl BotApp {
                         artifact_root,
                         console_urls,
                     } = context_bundle;
-                    request.prompt = append_prefetched_context(&request.prompt, &prompt);
-                    prefetched_console_urls = console_urls;
                     jenkins_artifact_cleanup =
                         Some(JenkinsArtifactCleanupGuard::new(artifact_root));
+                    if prefetch_required && console_urls.is_empty() {
+                        warn!(message_id = %message_id, "Jenkins diagnostics contained no verifiable console URLs");
+                        jenkins_prefetch_failed = true;
+                    } else {
+                        request.prompt = append_prefetched_context(&request.prompt, &prompt);
+                        prefetched_console_urls = console_urls;
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    jenkins_prefetch_failed = prefetch_required;
+                }
                 Err(error) => {
                     warn!(message_id = %message_id, error = %error, "failed to prefetch Jenkins diagnostics");
-                    request.prompt = append_prefetched_context(
-                        &request.prompt,
-                        &format!("Jenkins diagnostics helper failed before Codex run: {error}"),
-                    );
+                    jenkins_prefetch_failed = prefetch_required;
                 }
             }
+        } else {
+            jenkins_prefetch_failed = prefetch_required;
         }
-        let run_result = self
-            .runner
-            .run(&codex_config, &request.prompt, message_id)
-            .await;
+        let run_result = if jenkins_prefetch_failed {
+            None
+        } else {
+            Some(
+                self.runner
+                    .run(&codex_config, &request.prompt, message_id)
+                    .await,
+            )
+        };
         if let Some(cleanup_guard) = jenkins_artifact_cleanup {
             if let Err(error) = cleanup_guard.cleanup().await {
                 warn!(
@@ -1357,12 +1374,13 @@ impl BotApp {
             }
         }
         let reply_text = match run_result {
-            Ok(output) => render_reply_text_with_allowed_urls(
+            None => "**Not enough evidence:** Jenkins diagnostics could not be fetched; check the bot service logs for details.".to_owned(),
+            Some(Ok(output)) => render_reply_text_with_allowed_urls(
                 request.reply_format,
                 &output.final_message,
                 &prefetched_console_urls,
             ),
-            Err(error) => {
+            Some(Err(error)) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");
                 "Codex run failed. Check the bot service logs for details.".to_owned()
             }
@@ -2749,7 +2767,7 @@ fn render_jenkins_followup_reply(
             excerpt,
             reply.excerpt_format,
         ),
-        None => append_jenkins_excerpt(answer, excerpt, reply.excerpt_format),
+        None => answer,
     }
 }
 
@@ -2786,11 +2804,7 @@ fn render_jenkins_diagnosis_reply(
             reply.excerpt.as_deref(),
             reply.excerpt_format,
         ),
-        None => append_jenkins_excerpt(
-            format!("{prefix} {reason}"),
-            reply.excerpt.as_deref(),
-            reply.excerpt_format,
-        ),
+        None => format!("{prefix} {reason}"),
     }
 }
 
@@ -3233,11 +3247,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_runner_failure_skips_json_reply_rendering() {
+    async fn codex_runner_failure_returns_service_log_message() {
         let state_path = unique_state_path();
-        let mut config = (*test_config(state_path)).clone();
-        config.rooms[0].reply_format = ReplyFormat::JenkinsDiagnosisJson;
-        let harness = TestHarness::with_config(Arc::new(config));
+        let harness = TestHarness::with_config(test_config(state_path));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
@@ -3258,6 +3270,53 @@ mod tests {
         let markdown = created[0].markdown.as_deref().unwrap();
         assert!(markdown.contains("Codex run failed. Check the bot service logs for details."));
         assert!(!markdown.contains("Not enough evidence"));
+    }
+
+    #[tokio::test]
+    async fn jenkins_prefetch_without_verifiable_evidence_fails_closed() {
+        let helper_dir = unique_state_path().with_extension("helper-no-evidence-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "printf 'helper failed before producing evidence\\n'\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::JenkinsDiagnosisJson;
+        config.rooms[0].jenkins_context = Some(webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        });
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+
+        harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed: https://engci-private-sjc.cisco.com/jenkins/job/foo/1/",
+            )))
+            .await
+            .unwrap();
+
+        assert!(harness.runner.calls().is_empty());
+        let created = harness.webex.created_requests();
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("**Not enough evidence:**"));
+        assert!(markdown.contains("Jenkins diagnostics could not be fetched"));
+        fs::remove_dir_all(helper_dir).unwrap();
     }
 
     #[tokio::test]
@@ -4866,6 +4925,41 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_diagnosis_json_drops_excerpt_without_verifiable_log_url() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\njenkins_console: https://jenkins.example/job/bar/2/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "excerpt": "fabricated exact excerpt",
+            "excerpt_format": "inline_code",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        let rendered = render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context));
+        assert_eq!(
+            rendered,
+            "**Jenkins infra false alarm:** agent capacity failure"
+        );
+        assert!(!rendered.contains("fabricated"));
+    }
+
+    #[test]
+    fn jenkins_followup_json_drops_excerpt_without_verifiable_log_url() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "answer": "The task did not start.",
+            "include_evidence": true,
+            "excerpt": "fabricated exact excerpt",
+            "excerpt_format": "inline_code",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        let rendered = render_reply_text(ReplyFormat::JenkinsFollowupJson, output, Some(context));
+        assert_eq!(rendered, "The task did not start");
+        assert!(!rendered.contains("fabricated"));
+    }
+
+    #[test]
     fn jenkins_console_url_validation_rejects_console_text() {
         assert!(is_valid_jenkins_console_url(
             "https://jenkins.example/job/foo/1/console"
@@ -5200,7 +5294,8 @@ mod tests {
         fs::write(
             &script,
             "printf 'webex=%s\\n' \"${WEBEX_ACCESS_TOKEN-unset}\"\n\
-             printf 'sidecar=%s\\n' \"${WEBEX_SIDECAR_TOKEN-unset}\"\n",
+             printf 'sidecar=%s\\n' \"${WEBEX_SIDECAR_TOKEN-unset}\"\n\
+             printf 'path=%s\\n' \"${PATH-unset}\"\n",
         )
         .unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
@@ -5224,6 +5319,7 @@ mod tests {
 
         assert!(output.contains("webex=unset"));
         assert!(output.contains("sidecar=unset"));
+        assert!(output.contains("path=/usr/bin:/bin"));
         assert!(!output.contains("secret-webex-token"));
         assert!(!output.contains("secret-sidecar-token"));
         unsafe {

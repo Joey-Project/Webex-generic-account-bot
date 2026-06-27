@@ -125,6 +125,13 @@ describe('deploy-config plan', () => {
     assert(commands.some(([bin, args]) => bin === '/usr/bin/bash' && args.includes('--source-root')));
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
+    assert.deepEqual(
+      plan.serviceVerificationCommands.map((command) => [command.bin, command.args]),
+      [
+        ['/usr/bin/sleep', ['2']],
+        ['/usr/bin/systemctl', ['is-active', '--quiet', '--', plan.service]],
+      ],
+    );
 
     const validate = plan.commands.find((command) => command.bin === '/usr/bin/bash');
     assert.equal(validate.args[0], path.join(plan.botCodeDir, 'scripts/config-policy/validate-config.sh'));
@@ -147,6 +154,50 @@ describe('deploy-config plan', () => {
     const plan = buildDeployPlan(parseArgs(['--apply', '--skip-restart']));
 
     assert.equal(plan.serviceCommand, null);
+    assert.deepEqual(plan.serviceVerificationCommands, []);
+  });
+
+  it('rejects mutable deployment paths that overlap the checkout or lock', () => {
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        '/tmp/webex-config-checkout',
+        '--lock-dir',
+        '/tmp/webex-config-checkout/work/deploy.lock',
+      ])),
+      /lock directory must not overlap checkout directory/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        '/tmp/webex-config-checkout',
+        '--metadata-file',
+        '/tmp/webex-config-checkout/work/deploy-status.json',
+      ])),
+      /metadata file must not overlap checkout work directory/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--rendered-config',
+        '/tmp/webex-output/production.toml',
+        '--metadata-file',
+        '/tmp/webex-output/production.toml/status.json',
+      ])),
+      /rendered config must not overlap metadata file/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        '/tmp/webex-config-checkout',
+        '--metadata-file',
+        '/tmp/webex-config-checkout/work/..status.json',
+      ])),
+      /metadata file must not overlap checkout work directory/,
+    );
   });
 });
 
@@ -303,6 +354,32 @@ describe('trusted config policy', () => {
     assert.match(result.stderr, /prompt_template must match the host-pinned prompt template/);
   });
 
+  it('pins the global Codex model used by generic rooms', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'wrong-model.toml');
+    const allowed = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    await fs.writeFile(config, allowed.replace('model = "gpt-5.5"', 'model = "gpt-4"'), 'utf8');
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /codex\.model must be 'gpt-5\.5'/);
+  });
+
+  it('pins Jenkins prefetch fan-out and helper resource settings', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'expanded-prefetch.toml');
+    const allowed = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    await fs.writeFile(config, allowed.replace('max_urls = 3', 'max_urls = 10'), 'utf8');
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /jenkins_context\.max_urls must be 3/);
+  });
+
   it('bounds rendered config output before shell redirection writes it', () => {
     assert.doesNotThrow(() => assertMaxRenderedBytes('abc', 3));
     assert.throws(() => assertMaxRenderedBytes('abcd', 3), /rendered config exceeds max bytes/);
@@ -351,6 +428,24 @@ describe('trusted config policy', () => {
 
     assert(Buffer.byteLength(line, 'utf8') <= 4096);
     assert.match(line, / \[line truncated\]$/);
+  });
+
+  it('bounds the number of retained Jenkins console lines', () => {
+    const lines = redactedConsoleLinesFromText('x\n'.repeat(25_000));
+
+    assert(lines.length <= 20_000);
+    assert.equal(lines[0], '[earlier log lines omitted]');
+  });
+
+  it('redacts private keys and common API key assignments', () => {
+    const lines = redactedConsoleLinesFromText(
+      'API_KEY=abc123\nPRIVATE_KEY: hidden\n-----BEGIN PRIVATE KEY-----\nraw-key-material\n-----END PRIVATE KEY-----',
+    );
+    const redacted = lines.join('\n');
+
+    assert.doesNotMatch(redacted, /abc123|hidden|raw-key-material/);
+    assert.match(redacted, /API_KEY=\[REDACTED\]/);
+    assert.match(redacted, /\[REDACTED PRIVATE KEY\]/);
   });
 
   it('redacts graph-derived Jenkins diagnostics before summaries or stdout can use them', () => {
@@ -747,7 +842,53 @@ describe('trusted config policy', () => {
           '/job/child-1/1/consoleText',
           '/job/child-2/1/consoleText',
         ].reduce((total, pathname) => total + fetchCallCount(pathname), 0);
-        assert.equal(consoleFetches, 2);
+        assert.equal(consoleFetches, 1);
+        assert.equal(bundle.graph.partial, true);
+        assert.match(bundle.graph.stop_reason, /exceeded max_total_log_bytes=10/);
+      },
+    );
+  });
+
+  it('charges failed retry bytes against the aggregate log budget', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jenkins-bundle-test-'));
+    const encoder = new TextEncoder();
+    await withMockedJenkinsFetch(
+      {
+        '/job/root/1/api/json': {
+          fullDisplayName: 'root',
+          number: 1,
+          result: 'FAILURE',
+          artifacts: [],
+        },
+        '/job/root/1/consoleText': () => {
+          let emitted = false;
+          return new Response(new ReadableStream({
+            pull(controller) {
+              if (!emitted) {
+                emitted = true;
+                controller.enqueue(encoder.encode('123456'));
+              } else {
+                controller.error(new Error('connection reset'));
+              }
+            },
+          }));
+        },
+      },
+      async () => {
+        const bundle = await diagnoseBundle({
+          config: jenkinsConfig(),
+          url: 'https://jenkins.example/job/root/1/',
+          tailLines: 10,
+          artifactDir: temp,
+          limits: {
+            ...jenkinsLimits(),
+            maxTotalLogBytes: 10,
+            maxLogBytesPerNode: 10,
+            fetchRetries: 3,
+          },
+        });
+
+        assert.equal(fetchCallCount('/job/root/1/consoleText'), 2);
         assert.equal(bundle.graph.partial, true);
         assert.match(bundle.graph.stop_reason, /exceeded max_total_log_bytes=10/);
       },
@@ -992,7 +1133,7 @@ describe('trusted config policy', () => {
             tailLines: 10,
             limits: {
               ...jenkinsLimits(),
-              maxTotalLogBytes: 5,
+              maxTotalLogBytes: 100,
               maxLogBytesPerNode: 5,
             },
           }),
@@ -1337,6 +1478,44 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).backup_cleanup_error, 'backup cleanup failed');
   });
 
+  it('atomically replaces metadata symlinks without following them', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const outside = path.join(temp, 'outside-status.json');
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.metadataFile), { recursive: true, mode: 0o755 });
+    await fs.writeFile(outside, 'outside remains unchanged\n', 'utf8');
+    await fs.symlink(outside, plan.metadataFile);
+
+    await executePlan({
+      plan,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+        }
+        return { stdout: command.capture === 'configRevision' ? `${'6'.repeat(40)}\n` : '', stderr: '' };
+      },
+    });
+
+    assert.equal(await fs.readFile(outside, 'utf8'), 'outside remains unchanged\n');
+    assert.equal((await fs.lstat(plan.metadataFile)).isSymbolicLink(), false);
+    assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status, 'installed_without_restart');
+  });
+
   it('records post-commit metadata failures without implying apply rollback', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -1354,13 +1533,17 @@ describe('deploy-config CLI and execution', () => {
         path.join(temp, 'bot-code'),
       ]),
     );
+    let metadataRenameAttempts = 0;
     const fsApi = {
       ...fs,
-      async writeFile(file, data, options) {
-        if (file === plan.metadataFile && String(data).includes('"status": "deployed"')) {
-          throw new Error('metadata write failed');
+      async rename(source, target) {
+        if (target === plan.metadataFile) {
+          metadataRenameAttempts += 1;
+          if (metadataRenameAttempts === 1) {
+            throw new Error('metadata write failed');
+          }
         }
-        return await fs.writeFile(file, data, options);
+        return await fs.rename(source, target);
       },
     };
     let restartAttempts = 0;
@@ -1374,7 +1557,7 @@ describe('deploy-config CLI and execution', () => {
             await fs.mkdir(path.dirname(plan.candidateConfig), { recursive: true });
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
             restartAttempts += 1;
           }
           return { stdout: command.capture === 'configRevision' ? `${'8'.repeat(40)}\n` : '', stderr: '' };
@@ -1466,12 +1649,12 @@ describe('deploy-config CLI and execution', () => {
     let metadataWriteAttempts = 0;
     const fsApi = {
       ...fs,
-      async writeFile(file, data, options) {
-        if (file === plan.metadataFile) {
+      async rename(source, target) {
+        if (target === plan.metadataFile) {
           metadataWriteAttempts += 1;
           throw new Error('metadata write failed');
         }
-        return await fs.writeFile(file, data, options);
+        return await fs.rename(source, target);
       },
     };
 
@@ -1491,6 +1674,55 @@ describe('deploy-config CLI and execution', () => {
 
     assert.equal(metadataWriteAttempts, 1);
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status, 'deployed');
+  });
+
+  it('reports lock cleanup failures and records the residual lock state', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const fsApi = {
+      ...fs,
+      async rm(file, options) {
+        if (file === plan.lockDir) {
+          throw new Error('lock cleanup failed');
+        }
+        return await fs.rm(file, options);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            throw new Error('validation failed');
+          }
+          return { stdout: command.capture === 'configRevision' ? `${'5'.repeat(40)}\n` : '', stderr: '' };
+        },
+      }),
+      /validation failed; deployment cleanup failed: lock cleanup failed/,
+    );
+
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_cleanup');
+    assert.equal(failureMetadata.lock_cleanup_failed, true);
+    assert.equal((await fs.stat(plan.lockDir)).isDirectory(), true);
+    await fs.rm(plan.lockDir, { recursive: true, force: true });
   });
 
   it('rolls back the rendered config and records failure metadata if service restart fails', async () => {
@@ -1521,7 +1753,7 @@ describe('deploy-config CLI and execution', () => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
             restartAttempts += 1;
             if (restartAttempts === 1) {
               throw new Error('restart failed');
@@ -1539,6 +1771,58 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
     assert.equal(failureMetadata.config_revision, 'c'.repeat(40));
     await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
+  it('rolls back when restart returns success but the service is not active', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let restartAttempts = 0;
+    let healthChecks = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'is-active') {
+            healthChecks += 1;
+            if (healthChecks === 1) {
+              throw new Error('service failed post-restart health check');
+            }
+          }
+          return { stdout: command.capture === 'configRevision' ? `${'a'.repeat(40)}\n` : '', stderr: '' };
+        },
+      }),
+      /failed post-restart health check/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 2);
+    assert.equal(healthChecks, 2);
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
+    assert.match(failureMetadata.reason, /failed post-restart health check/);
   });
 
   it('records failure metadata if rollback succeeds but service still cannot restart', async () => {
@@ -1569,7 +1853,7 @@ describe('deploy-config CLI and execution', () => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
             restartAttempts += 1;
             throw new Error(`restart failed ${restartAttempts}`);
           }
@@ -1629,7 +1913,7 @@ describe('deploy-config CLI and execution', () => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
             failRollback = true;
             throw new Error('restart failed');
           }
@@ -1788,7 +2072,7 @@ model_reasoning_effort = "xhigh"
 
 [rooms.jenkins_context]
 enabled = true
-node_bin = "node"
+node_bin = "/usr/bin/node"
 script = "${jenkinsHelperPath}"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 600
@@ -1822,7 +2106,7 @@ model_reasoning_effort = "xhigh"
 
 [rooms.jenkins_context]
 enabled = true
-node_bin = "node"
+node_bin = "/usr/bin/node"
 script = "${jenkinsHelperPath}"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 600

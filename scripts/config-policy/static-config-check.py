@@ -289,6 +289,7 @@ class Validator:
             "/var/lib/webex-generic-account-bot/codex-home",
             require_fixed,
         )
+        self.expect_or_require_equal(codex, path, "model", "gpt-5.5", require_fixed)
         if "profile" in codex and not allow_profile:
             self.error(f"{path}.profile is deployment-host policy and must not be set here")
         if "model_reasoning_effort" in codex:
@@ -298,6 +299,13 @@ class Validator:
                 "model_reasoning_effort",
                 {"minimal", "low", "medium", "high", "xhigh"},
             )
+        self.expect_or_require_equal(
+            codex,
+            path,
+            "model_reasoning_effort",
+            "xhigh",
+            require_fixed,
+        )
         self.expect_or_require_equal(codex, path, "sandbox", "read-only", require_fixed)
         self.expect_or_require_equal(codex, path, "approval_policy", "never", require_fixed)
         self.expect_int_range(codex, path, "timeout_secs", 1, 1200, required=require_fixed)
@@ -548,7 +556,7 @@ class Validator:
         enabled = context.get("enabled", True)
         if "enabled" in context and not isinstance(enabled, bool):
             self.error(f"{path}.enabled must be true or false")
-        self.expect_equal(context, path, "node_bin", "node")
+        self.expect_equal(context, path, "node_bin", "/usr/bin/node")
         self.expect_enum(context, path, "script", ALLOWED_JENKINS_HELPERS)
         self.expect_equal(context, path, "env_file", "/etc/webex-generic-account-bot/jenkins.env")
         self.expect_int_range(context, path, "timeout_secs", 1, 600)
@@ -558,12 +566,12 @@ class Validator:
             if require_enabled:
                 self.error(f"{path}.enabled must not be false for Jenkins reply formats")
             return
-        self.require_equal(context, path, "node_bin", "node")
+        self.require_equal(context, path, "node_bin", "/usr/bin/node")
         self.require_enum(context, path, "script", ALLOWED_JENKINS_HELPERS)
         self.require_equal(context, path, "env_file", "/etc/webex-generic-account-bot/jenkins.env")
-        self.expect_int_range(context, path, "timeout_secs", 1, 600, required=True)
-        self.expect_int_range(context, path, "max_urls", 1, 10, required=True)
-        self.expect_int_range(context, path, "output_limit_chars", 1, 20_000, required=True)
+        self.require_equal(context, path, "timeout_secs", 600)
+        self.require_equal(context, path, "max_urls", 3)
+        self.require_equal(context, path, "output_limit_chars", 5000)
 
     def reject_secret_material(self, value: Any, path: str) -> None:
         if isinstance(value, dict):
