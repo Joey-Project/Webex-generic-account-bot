@@ -623,6 +623,38 @@ describe('trusted config policy', () => {
 
     assert.doesNotMatch(summary, /\n\[Injected\]/);
     assert(summary.includes('child \\[Injected\\](evil)#2'));
+
+    const backtickUrl = 'https://jenkins.example/job/child%60%60%60Injected/3/';
+    const backtickGraph = buildGraphSummary({
+      initialUrl: backtickUrl,
+      rootUrl: backtickUrl,
+      limits: jenkinsLimits(),
+      nodes: [
+        {
+          buildUrl: backtickUrl,
+          consoleUrl: `${backtickUrl}console`,
+          consoleTextUrl: `${backtickUrl}consoleText`,
+          parentUrls: new Set(),
+          childUrls: new Set(),
+          fullDisplayName: 'untrusted child',
+          number: '3',
+          result: 'FAILURE',
+          signalLines: [],
+          infraSignals: [],
+          logBytes: 1,
+          localLog: '/tmp/logs/child.log',
+        },
+      ],
+    });
+    const stdout = formatBundleStdout({
+      artifactDir: '/tmp/jenkins-artifacts',
+      summaryPath: '/tmp/jenkins-artifacts/summary.md',
+      graphPath: '/tmp/jenkins-artifacts/graph.json',
+      logIndexPath: '/tmp/jenkins-artifacts/logs/index.json',
+      graph: backtickGraph,
+    });
+    assert.doesNotMatch(stdout, /```/);
+    assert.match(stdout, /child'''Injected#3/);
   });
 
   it('limits Jenkins downstream graph fetches to max_parallel_fetches', async () => {

@@ -1588,6 +1588,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",

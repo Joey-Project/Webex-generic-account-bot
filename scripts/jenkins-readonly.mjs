@@ -1033,7 +1033,10 @@ export function formatBundleStdout(bundle) {
 }
 
 function stdoutScalar(value) {
-  return String(value).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  return String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/`/g, "'")
+    .trim();
 }
 
 function summaryScalar(value) {

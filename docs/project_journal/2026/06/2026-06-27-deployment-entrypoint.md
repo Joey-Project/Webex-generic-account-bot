@@ -135,6 +135,9 @@ superseded_by:
 - Jenkins prefetch uses the effective direct or follow-up reply format when
   deciding whether structured local evidence is required. The Node CI job also
   installs Rust explicitly before exercising the renderer-to-bot contract.
+- Local evidence gets a pre-run SHA-256 snapshot; post-run excerpt checks reject
+  any changed log before testing exact text. Helper stdout is represented as
+  fixed-prefix data lines rather than a model-closeable Markdown fence.
 
 ## Follow-Ups
 - Wire fixed Webex admin commands to this entrypoint in the next PR.
