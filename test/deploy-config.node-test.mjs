@@ -20,6 +20,7 @@ import {
   usage,
   validateConfigTreeManifest,
   validateConfigTreePaths,
+  validateDeploymentLockProvisioning,
 } from '../scripts/deploy-config.mjs';
 import {
   assertMaxRenderedBytes,
@@ -52,6 +53,7 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.stagingDir, '/var/lib/webex-generic-account-bot/config-staging');
     assert.equal(options.renderedConfig, '/var/lib/webex-generic-account-bot/rendered/production.toml');
     assert.equal(options.botCodeDir, '/opt/webex-generic-account-bot/code');
+    assert.equal(options.lockDir, '/run/webex-config-deploy/deploy-config.lock');
     assert.equal(options.gitBin, '/usr/bin/git');
     assert.equal(options.bashBin, '/usr/bin/bash');
     assert.equal(options.nodeBin, '/usr/bin/node');
@@ -147,6 +149,152 @@ describe('deploy-config argument parsing', () => {
       () => parseArgs(['--prepare', '--request-id', 'A'.repeat(64)]),
       /64 lowercase hexadecimal/,
     );
+  });
+});
+
+describe('deploy-config lock policy', () => {
+  const sharedLock = '/run/webex-config-deploy/deploy-config.lock';
+  const rootUid = 0;
+  const workerUid = 1001;
+  const sharedGid = 2001;
+  const workerProcess = fakeProcessIdentity(workerUid, sharedGid, [sharedGid]);
+  const rootProcess = fakeProcessIdentity(rootUid, 0, [0]);
+
+  it('accepts the root-owned shared lock for both worker and root callers', async () => {
+    const fsApi = fakeLockProvisioningFs(sharedLock, {
+      rootUid,
+      parentUid: rootUid,
+      parentGid: sharedGid,
+      parentMode: 0o750,
+      lockUid: rootUid,
+      lockGid: sharedGid,
+      lockMode: 0o660,
+    });
+
+    assert.equal(
+      (await validateDeploymentLockProvisioning(sharedLock, fsApi, workerProcess)).policy,
+      'shared',
+    );
+    assert.equal(
+      (await validateDeploymentLockProvisioning(sharedLock, fsApi, rootProcess)).policy,
+      'shared',
+    );
+  });
+
+  it('accepts a private custom lock owned by the current deployment identity', async () => {
+    const privateLock = '/tmp/webex-config-test/deploy-config.lock';
+    const fsApi = fakeLockProvisioningFs(privateLock, {
+      rootUid,
+      parentUid: workerUid,
+      parentGid: sharedGid,
+      parentMode: 0o700,
+      lockUid: workerUid,
+      lockGid: sharedGid,
+      lockMode: 0o600,
+    });
+
+    assert.equal(
+      (await validateDeploymentLockProvisioning(privateLock, fsApi, workerProcess)).policy,
+      'private',
+    );
+  });
+
+  it('fails closed when shared lock provisioning is absent', async () => {
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, { rootUid, missing: 'parent' }),
+        workerProcess,
+      ),
+      /shared deployment lock parent is not provisioned/,
+    );
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, {
+          rootUid,
+          parentUid: rootUid,
+          parentGid: sharedGid,
+          parentMode: 0o750,
+          missing: 'lock',
+        }),
+        workerProcess,
+      ),
+      /shared deployment lock is not provisioned/,
+    );
+  });
+
+  it('rejects misowned, mis-moded, or symlinked shared provisioning', async () => {
+    const valid = {
+      rootUid,
+      parentUid: rootUid,
+      parentGid: sharedGid,
+      parentMode: 0o750,
+      lockUid: rootUid,
+      lockGid: sharedGid,
+      lockMode: 0o660,
+    };
+    const cases = [
+      [{ parentUid: workerUid }, /shared lock parent ownership is not trusted/],
+      [{ lockUid: workerUid }, /shared deployment lock ownership is not trusted/],
+      [{ lockGid: sharedGid + 1 }, /shared deployment lock ownership is not trusted/],
+      [{ parentMode: 0o770 }, /shared lock parent mode is not trusted/],
+      [{ lockMode: 0o600 }, /shared deployment lock mode is not trusted/],
+      [{ parentKind: 'symlink' }, /lock parent must be a real directory/],
+      [{ lockKind: 'symlink' }, /deployment lock must be a real file/],
+    ];
+
+    for (const [override, expected] of cases) {
+      await assert.rejects(
+        () => validateDeploymentLockProvisioning(
+          sharedLock,
+          fakeLockProvisioningFs(sharedLock, { ...valid, ...override }),
+          workerProcess,
+        ),
+        expected,
+      );
+    }
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, valid),
+        fakeProcessIdentity(workerUid, sharedGid + 1, [sharedGid + 1]),
+      ),
+      /shared lock parent ownership is not trusted/,
+    );
+  });
+
+  it('pins the shared lock systemd and tmpfiles defaults', async () => {
+    const service = await fs.readFile(
+      path.join(REPO_ROOT, 'deploy/systemd/webex-config-pull-worker.service'),
+      'utf8',
+    );
+    const tmpfiles = await fs.readFile(
+      path.join(REPO_ROOT, 'deploy/systemd/webex-config-pull-worker.tmpfiles.conf'),
+      'utf8',
+    );
+    const servicePaths = service
+      .split('\n')
+      .filter((line) => /^(ReadOnlyPaths|ReadWritePaths)=/.test(line));
+
+    assert.deepEqual(servicePaths, [
+      'ReadOnlyPaths=/run/webex-config-deploy',
+      'ReadWritePaths=/run/webex-config-deploy/deploy-config.lock',
+      'ReadWritePaths=/run/webex-config-pull',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-actions',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-checkout',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-staging',
+      'ReadOnlyPaths=-/var/lib/webex-generic-account-bot/rendered',
+    ]);
+    assert.doesNotMatch(service, /^RuntimeDirectory=/m);
+    assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
+    assert.deepEqual(tmpfiles.trim().split('\n'), [
+      'd /run/webex-config-deploy 0750 root webex-config-pull -',
+      'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
+      'd /run/webex-config-pull 0750 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-checkout 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-staging 0700 webex-config-deploy webex-config-pull -',
+    ]);
   });
 });
 
@@ -4795,6 +4943,61 @@ async function protectPrepareLiveDirectories(renderedConfig, metadataFile) {
   for (const parent of parents) {
     await fs.chmod(parent, 0o555);
   }
+}
+
+function fakeProcessIdentity(uid, gid, groups) {
+  return {
+    getuid: () => uid,
+    getgid: () => gid,
+    getgroups: () => groups,
+  };
+}
+
+function fakeLockProvisioningFs(
+  lockFile,
+  {
+    rootUid = 0,
+    parentUid = rootUid,
+    parentGid = 0,
+    parentMode = 0o750,
+    parentKind = 'directory',
+    lockUid = rootUid,
+    lockGid = parentGid,
+    lockMode = 0o660,
+    lockKind = 'file',
+    missing = null,
+  },
+) {
+  const root = path.parse(path.resolve(lockFile)).root;
+  const parent = path.dirname(lockFile);
+  const stats = new Map([
+    [root, fakeLockStat('directory', rootUid, 0, 0o755)],
+    [parent, fakeLockStat(parentKind, parentUid, parentGid, parentMode)],
+    [lockFile, fakeLockStat(lockKind, lockUid, lockGid, lockMode)],
+  ]);
+  return {
+    async lstat(candidate) {
+      if ((missing === 'parent' && candidate === parent) || (missing === 'lock' && candidate === lockFile)) {
+        const error = new Error(`ENOENT: no such file or directory, lstat '${candidate}'`);
+        error.code = 'ENOENT';
+        throw error;
+      }
+      const stat = stats.get(candidate);
+      assert(stat, `unexpected lstat path: ${candidate}`);
+      return stat;
+    },
+  };
+}
+
+function fakeLockStat(kind, uid, gid, mode) {
+  return {
+    uid,
+    gid,
+    mode,
+    isDirectory: () => kind === 'directory',
+    isFile: () => kind === 'file',
+    isSymbolicLink: () => kind === 'symlink',
+  };
 }
 
 function parseArgsAllow(args) {

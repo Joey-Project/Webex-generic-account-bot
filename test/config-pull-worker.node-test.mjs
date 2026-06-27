@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import net from 'node:net';
@@ -26,7 +27,8 @@ import {
 import { buildDeployPlan, parseArgs } from '../scripts/deploy-config.mjs';
 
 const CONFIG_REVISION = 'a'.repeat(40);
-const CONFIG_SHA256 = 'b'.repeat(64);
+const STAGED_CONFIG = '[bot]\nname = "production"\n';
+const CONFIG_SHA256 = createHash('sha256').update(STAGED_CONFIG).digest('hex');
 const PREPARE_ACTION_ID = 'c'.repeat(64);
 const PREPARED_AT = '2026-06-27T12:00:00.000Z';
 const PREPARED_RESULT = Object.freeze({
@@ -111,6 +113,177 @@ describe('config pull worker socket protocol', () => {
     assert.equal(second.action_id, first.action_id);
     assert.equal(executions, 1);
     assert.deepEqual(await fs.readdir(fixture.queueDir), [`${first.action_id}.json`]);
+  });
+
+  it('ignores a trusted request temporary file exposed during a live drain', async (context) => {
+    const layout = await createLayout(context);
+    const tempExposed = deferred();
+    const tempInspected = deferred();
+    const releasePublication = deferred();
+    let observeLivePublication = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'link') {
+          return async (source, destination) => {
+            if (
+              observeLivePublication
+              && path.dirname(source) === layout.queueDir
+              && path.basename(source).startsWith('.request-')
+            ) {
+              tempExposed.resolve();
+              await releasePublication.promise;
+            }
+            return target.link(source, destination);
+          };
+        }
+        if (property === 'readdir') {
+          return async (directory, options) => {
+            if (observeLivePublication && directory === layout.queueDir) {
+              await tempExposed.promise;
+            }
+            return target.readdir(directory, options);
+          };
+        }
+        if (property === 'lstat') {
+          return async (file) => {
+            const stat = await target.lstat(file);
+            if (
+              observeLivePublication
+              && path.dirname(file) === layout.queueDir
+              && path.basename(file).startsWith('.request-')
+            ) {
+              tempInspected.resolve();
+            }
+            return stat;
+          };
+        }
+        return target[property];
+      },
+    });
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => {
+      releasePublication.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+    observeLivePublication = true;
+
+    const responsePromise = sendRequest(layout.socketPath, {
+      version: 1,
+      message_id: 'live-request-temporary',
+      action: 'pull',
+    });
+    await tempInspected.promise;
+    releasePublication.resolve();
+    const response = await responsePromise;
+    await worker.waitForIdle();
+
+    assert.equal(response.status, 'queued');
+    assert.equal((await readActionState(layout.stateDir, response.action_id)).status, 'succeeded');
+  });
+
+  it('waits out a durable request published before its state during a live drain', async (context) => {
+    const layout = await createLayout(context);
+    const messageId = 'live-request-before-state';
+    const actionId = actionIdForMessageId(messageId);
+    const stateFile = path.join(layout.stateDir, `${actionId}.json`);
+    const stateWriteBlocked = deferred();
+    const drainObservedMissingState = deferred();
+    const releaseStateWrite = deferred();
+    let observeLivePublication = false;
+    let stateReads = 0;
+    let blockedStateWrite = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'readdir') {
+          return async (directory, options) => {
+            if (observeLivePublication && directory === layout.queueDir) {
+              await stateWriteBlocked.promise;
+            }
+            return target.readdir(directory, options);
+          };
+        }
+        if (property === 'open') {
+          return async (file, flags, ...rest) => {
+            if (observeLivePublication && file === stateFile) {
+              stateReads += 1;
+              try {
+                return await target.open(file, flags, ...rest);
+              } finally {
+                if (stateReads >= 2) drainObservedMissingState.resolve();
+              }
+            }
+            if (
+              observeLivePublication
+              && !blockedStateWrite
+              && flags === 'wx'
+              && path.dirname(file) === layout.stateDir
+              && path.basename(file).startsWith(`.atomic-${actionId}.json-`)
+            ) {
+              blockedStateWrite = true;
+              stateWriteBlocked.resolve();
+              await releaseStateWrite.promise;
+            }
+            return target.open(file, flags, ...rest);
+          };
+        }
+        return target[property];
+      },
+    });
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => {
+      releaseStateWrite.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+    observeLivePublication = true;
+
+    const responsePromise = sendRequest(layout.socketPath, {
+      version: 1,
+      message_id: messageId,
+      action: 'pull',
+    });
+    await drainObservedMissingState.promise;
+    releaseStateWrite.resolve();
+    const response = await responsePromise;
+    await worker.waitForIdle();
+
+    assert.equal(response.action_id, actionId);
+    assert.equal((await readActionState(layout.stateDir, actionId)).status, 'succeeded');
+  });
+
+  it('does not regress public status when an older action is replayed out of order', async (context) => {
+    let timestamp = Date.parse('2026-06-27T13:00:00.000Z');
+    const fixture = await startWorker(context, {
+      now: () => {
+        const current = new Date(timestamp);
+        timestamp += 1_000;
+        return current;
+      },
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    const olderRequest = { version: 1, message_id: 'older-action', action: 'pull' };
+    const newerRequest = { version: 1, message_id: 'newer-action', action: 'pull' };
+
+    await sendRequest(fixture.socketPath, olderRequest);
+    await fixture.worker.waitForIdle();
+    const newer = await sendRequest(fixture.socketPath, newerRequest);
+    await fixture.worker.waitForIdle();
+    const duplicate = await sendRequest(fixture.socketPath, olderRequest);
+    await fixture.worker.waitForIdle();
+
+    const publicStatus = JSON.parse(await fs.readFile(fixture.publicStatusFile, 'utf8'));
+    assert.equal(duplicate.status, 'existing');
+    assert.equal(publicStatus.action_id, newer.action_id);
+    assert.equal(publicStatus.state, 'succeeded');
   });
 
   it('republishes durable public status before acknowledging a duplicate retry', async (context) => {
@@ -213,6 +386,34 @@ describe('config pull worker socket protocol', () => {
 });
 
 describe('config pull worker recovery', () => {
+  it('cleans a stale trusted temporary and recovers its durable request without state', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const request = { version: 1, message_id: 'crash-before-request-state', action: 'pull' };
+    const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+    const staleTemporary = path.join(
+      layout.queueDir,
+      `.request-${publication.actionId}-1234-12345678-1234-4123-8123-123456789abc.tmp`,
+    );
+    await fs.writeFile(staleTemporary, 'stale publication\n', { mode: 0o600 });
+    let executions = 0;
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => {
+        executions += 1;
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => worker.stop());
+
+    await worker.start();
+    await worker.waitForIdle();
+
+    assert.equal(executions, 1);
+    assert.deepEqual(await fs.readdir(layout.queueDir), [`${publication.actionId}.json`]);
+    assert.equal((await readActionState(layout.stateDir, publication.actionId)).status, 'succeeded');
+  });
+
   it('replays a running request after restart', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
@@ -250,14 +451,18 @@ describe('config pull worker recovery', () => {
       stateDir: layout.stateDir,
       state: actionState(publication.actionId, 'running', '2026-06-27T12:01:30.000Z'),
     });
+    await fs.writeFile(layout.stagedConfigFile, STAGED_CONFIG, { mode: 0o600 });
     await fs.writeFile(
       layout.stagedMetadataFile,
       `${JSON.stringify({ ...PREPARED_RESULT, request_id: publication.actionId })}\n`,
       { mode: 0o600 },
     );
+    const durabilityEvents = [];
+    const fsApi = durabilityRecordingFsApi(layout, publication.actionId, durabilityEvents);
     let executions = 0;
     const worker = new ConfigPullWorker({
       ...layout,
+      fsApi,
       prepareRunner: async () => {
         executions += 1;
         return PREPARED_PROJECTION;
@@ -273,6 +478,77 @@ describe('config pull worker recovery', () => {
     assert.equal(recovered.status, 'succeeded');
     assert.equal(recovered.config_revision, CONFIG_REVISION);
     assert.equal(recovered.config_sha256, CONFIG_SHA256);
+    assert.deepEqual(durabilityEvents.slice(0, 4), [
+      'staged-config-sync',
+      'staged-metadata-sync',
+      'staging-directory-sync',
+      'state-write',
+    ]);
+  });
+
+  it('requeues running work when staged config validation or durability fails', async (context) => {
+    for (const scenario of [
+      { name: 'digest mismatch', contents: 'tampered config\n', mode: 0o600 },
+      { name: 'oversized config', contents: Buffer.alloc(4 * 1024 * 1024 + 1, 0x78), mode: 0o600 },
+      { name: 'untrusted mode', contents: STAGED_CONFIG, mode: 0o644 },
+      {
+        name: 'metadata fsync failure',
+        contents: STAGED_CONFIG,
+        mode: 0o600,
+        failSyncLabel: 'staged-metadata-sync',
+      },
+      {
+        name: 'directory fsync failure',
+        contents: STAGED_CONFIG,
+        mode: 0o600,
+        failSyncLabel: 'staging-directory-sync',
+      },
+    ]) {
+      await context.test(scenario.name, async (subcontext) => {
+        const layout = await createLayout(subcontext);
+        await prepareStorage(layout);
+        const request = {
+          version: 1,
+          message_id: `staged-${scenario.name.replaceAll(' ', '-')}`,
+          action: 'pull',
+        };
+        const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+        await writeActionState({
+          stateDir: layout.stateDir,
+          state: actionState(publication.actionId, 'running', '2026-06-27T12:01:35.000Z'),
+        });
+        await fs.writeFile(layout.stagedConfigFile, scenario.contents, { mode: scenario.mode });
+        await fs.writeFile(
+          layout.stagedMetadataFile,
+          `${JSON.stringify({ ...PREPARED_RESULT, request_id: publication.actionId })}\n`,
+          { mode: 0o600 },
+        );
+        const fsApi = scenario.failSyncLabel
+          ? durabilityRecordingFsApi(layout, publication.actionId, [], {
+              failSyncLabel: scenario.failSyncLabel,
+            })
+          : fs;
+        let executions = 0;
+        const worker = new ConfigPullWorker({
+          ...layout,
+          fsApi,
+          prepareRunner: async () => {
+            executions += 1;
+            return PREPARED_PROJECTION;
+          },
+        });
+        subcontext.after(async () => worker.stop());
+
+        await worker.start();
+        await worker.waitForIdle();
+
+        assert.equal(executions, 1);
+        assert.equal(
+          (await readActionState(layout.stateDir, publication.actionId)).status,
+          'succeeded',
+        );
+      });
+    }
   });
 
   it('reruns a running request when staged metadata belongs to another action', async (context) => {
@@ -411,6 +687,18 @@ describe('config pull worker recovery', () => {
   });
 
   it('fails closed on symlink and corrupt immutable records', async (context) => {
+    await context.test('unexpected temporary record', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      await fs.writeFile(path.join(layout.queueDir, '.request-untrusted.tmp'), 'unexpected\n', {
+        mode: 0o600,
+      });
+      const worker = new ConfigPullWorker({ ...layout, prepareRunner: async () => PREPARED_PROJECTION });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /unexpected temporary entry/);
+    });
+
     await context.test('symlink record', async (subcontext) => {
       const layout = await createLayout(subcontext);
       await prepareStorage(layout);
@@ -535,6 +823,7 @@ describe('config pull worker durable files', () => {
     });
     assert.equal(new Date(publicStatus.updated_at).toISOString(), publicStatus.updated_at);
     assert.equal((await fs.stat(fixture.publicStatusFile)).mode & 0o777, 0o644);
+    assert.equal((await fs.stat(fixture.stateRoot)).mode & 0o777, 0o755);
     assert.equal((await fs.stat(fixture.queueDir)).mode & 0o777, 0o700);
     assert.equal((await fs.stat(fixture.stateDir)).mode & 0o777, 0o700);
   });
@@ -613,9 +902,12 @@ describe('config pull worker systemd boundary', () => {
       /^ExecStart=\/usr\/bin\/node \/opt\/webex-generic-account-bot\/code\/scripts\/config-pull-worker\.mjs$/m,
     );
     assert.match(unit, /^Restart=on-failure$/m);
-    assert.match(unit, /^RuntimeDirectoryMode=0700$/m);
-    assert.match(unit, /^RuntimeDirectoryPreserve=yes$/m);
+    assert.match(unit, /^StateDirectory=webex-generic-account-bot\/config-actions$/m);
+    assert.match(unit, /^StateDirectoryMode=0755$/m);
+    assert.match(unit, /^ReadOnlyPaths=\/run\/webex-config-deploy$/m);
+    assert.match(unit, /^ReadWritePaths=\/run\/webex-config-deploy\/deploy-config\.lock$/m);
     assert.match(unit, /^ReadWritePaths=\/run\/webex-config-pull$/m);
+    assert.doesNotMatch(unit, /^ReadWritePaths=\/run\/webex-generic-account-bot$/m);
     assert.match(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/config-staging$/m);
     assert.match(unit, /^ReadOnlyPaths=-\/var\/lib\/webex-generic-account-bot\/rendered$/m);
     assert.doesNotMatch(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/rendered$/m);
@@ -628,7 +920,7 @@ describe('config pull worker systemd boundary', () => {
     assert.doesNotMatch(unit, /^User=root$/m);
 
     const plan = buildDeployPlan(parseArgs(['--prepare']));
-    assert.equal(path.dirname(plan.lockDir), '/run/webex-generic-account-bot');
+    assert.equal(plan.lockDir, '/run/webex-config-deploy/deploy-config.lock');
     assert.equal(path.dirname(DEFAULTS.socketPath), '/run/webex-config-pull');
     assert.notEqual(path.dirname(plan.lockDir), path.dirname(DEFAULTS.socketPath));
     assert.equal(plan.stagedConfig, PREPARED_RESULT.staged_config);
@@ -636,7 +928,7 @@ describe('config pull worker systemd boundary', () => {
   });
 
   it('provisions only the worker identity and host-owned writable deployment roots', async () => {
-    const [sysusers, tmpfiles, botDropIn] = await Promise.all([
+    const [sysusers, tmpfiles] = await Promise.all([
       fs.readFile(
         new URL('../deploy/systemd/webex-config-pull-worker.sysusers.conf', import.meta.url),
         'utf8',
@@ -645,20 +937,26 @@ describe('config pull worker systemd boundary', () => {
         new URL('../deploy/systemd/webex-config-pull-worker.tmpfiles.conf', import.meta.url),
         'utf8',
       ),
-      fs.readFile(
-        new URL(
-          '../deploy/systemd/webex-generic-account-bot.service.d/10-config-pull.conf',
-          import.meta.url,
-        ),
-        'utf8',
-      ),
     ]);
 
     assert.match(sysusers, /^u webex-config-deploy /m);
     assert.match(sysusers, /^g webex-config-pull -$/m);
     assert.doesNotMatch(sysusers, /^m /m);
     assert.doesNotMatch(sysusers, /^m webex-config-deploy webex-generic-account-bot$/m);
-    assert.match(botDropIn, /^SupplementaryGroups=webex-config-pull$/m);
+    await assert.rejects(
+      fs.stat(
+        new URL(
+          '../deploy/systemd/webex-generic-account-bot.service.d/10-config-pull.conf',
+          import.meta.url,
+        ),
+      ),
+      { code: 'ENOENT' },
+    );
+    assert.match(tmpfiles, /^d \/run\/webex-config-deploy 0750 root webex-config-pull -$/m);
+    assert.match(
+      tmpfiles,
+      /^f \/run\/webex-config-deploy\/deploy-config\.lock 0660 root webex-config-pull -$/m,
+    );
     assert.match(
       tmpfiles,
       /^d \/run\/webex-config-pull 0750 webex-config-deploy webex-config-pull -$/m,
@@ -689,6 +987,8 @@ async function createLayout(context) {
   await fs.chmod(root, 0o750);
   context.after(async () => fs.rm(root, { recursive: true, force: true }));
   const stateRoot = path.join(root, 'data');
+  const stagingDir = path.join(root, 'config-staging');
+  await fs.mkdir(stagingDir, { mode: 0o700 });
   return {
     root,
     socketPath: path.join(root, 'config-pull.sock'),
@@ -696,11 +996,67 @@ async function createLayout(context) {
     queueDir: path.join(stateRoot, 'queue'),
     stateDir: path.join(stateRoot, 'state'),
     publicStatusFile: path.join(stateRoot, 'public-status.json'),
-    stagedMetadataFile: path.join(root, 'production.toml.staged.json'),
+    stagedConfigFile: path.join(stagingDir, 'production.toml.staged'),
+    stagedMetadataFile: path.join(stagingDir, 'production.toml.staged.json'),
     requestTimeoutMs: 500,
     commandTimeoutMs: 1_000,
     outputLimitBytes: 4_096,
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function durabilityRecordingFsApi(
+  layout,
+  actionId,
+  events,
+  { failSyncLabel = null } = {},
+) {
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'open') return target[property];
+      return async (file, flags, ...rest) => {
+        if (
+          flags === 'wx'
+          && path.dirname(file) === layout.stateDir
+          && path.basename(file).startsWith(`.atomic-${actionId}.json-`)
+        ) {
+          events.push('state-write');
+        }
+        const handle = await target.open(file, flags, ...rest);
+        let syncLabel = null;
+        if (file === layout.stagedConfigFile) syncLabel = 'staged-config-sync';
+        if (file === layout.stagedMetadataFile) syncLabel = 'staged-metadata-sync';
+        if (file === path.dirname(layout.stagedConfigFile) && flags === 'r') {
+          syncLabel = 'staging-directory-sync';
+        }
+        if (!syncLabel) return handle;
+        return new Proxy(handle, {
+          get(handleTarget, handleProperty) {
+            if (handleProperty === 'sync') {
+              return async () => {
+                events.push(syncLabel);
+                if (syncLabel === failSyncLabel) {
+                  const error = new Error(`injected ${syncLabel} failure`);
+                  error.code = 'EIO';
+                  throw error;
+                }
+                return handleTarget.sync();
+              };
+            }
+            const value = Reflect.get(handleTarget, handleProperty, handleTarget);
+            return typeof value === 'function' ? value.bind(handleTarget) : value;
+          },
+        });
+      };
+    },
+  });
 }
 
 async function sendRequest(socketPath, request) {

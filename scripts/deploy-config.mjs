@@ -7,6 +7,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
+const SHARED_DEPLOYMENT_LOCK = '/run/webex-config-deploy/deploy-config.lock';
+
 const DEFAULTS = Object.freeze({
   configRepo: 'git@github.com:WebexServices-staging/webex-generic-account-bot-config.git',
   configRef: 'main',
@@ -15,7 +17,7 @@ const DEFAULTS = Object.freeze({
   renderedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml',
   botCodeDir: '/opt/webex-generic-account-bot/code',
   service: 'webex-generic-account-bot',
-  lockDir: '/run/webex-generic-account-bot/deploy-config.lock',
+  lockDir: SHARED_DEPLOYMENT_LOCK,
   metadataFile: '/var/lib/webex-generic-account-bot/rendered/deploy-status.json',
   gitBin: '/usr/bin/git',
   bashBin: '/usr/bin/bash',
@@ -268,7 +270,7 @@ Options:
       --rendered-config <path>    Final rendered config path.
       --bot-code-dir <path>       Host-installed bot code directory.
       --service <name>            systemd service name.
-      --lock-dir <path>           Single-flight lock directory.
+      --lock-dir <path>           Single-flight lock file.
       --metadata-file <path>      Deployment metadata JSON path.
       --git-bin <path>            Fixed Git executable path.
       --bash-bin <path>           Fixed Bash executable path.
@@ -947,20 +949,93 @@ function validateDeploymentMetadata(metadata) {
   return metadata;
 }
 
+export async function validateDeploymentLockProvisioning(
+  lockDir,
+  fsApi = fs,
+  processApi = process,
+) {
+  const lockParent = path.dirname(lockDir);
+  const policy = deploymentLockPolicy(lockDir);
+  const rootStat = await fsApi.lstat(path.parse(path.resolve(lockDir)).root);
+  let lockParentStat;
+  let lockStat;
+  try {
+    lockParentStat = await fsApi.lstat(lockParent);
+  } catch (error) {
+    if (policy === 'shared' && error?.code === 'ENOENT') {
+      throw new Error(`shared deployment lock parent is not provisioned: ${lockParent}`);
+    }
+    throw error;
+  }
+  try {
+    lockStat = await fsApi.lstat(lockDir);
+  } catch (error) {
+    if (policy === 'shared' && error?.code === 'ENOENT') {
+      throw new Error(`shared deployment lock is not provisioned: ${lockDir}`);
+    }
+    throw error;
+  }
+  assertTrustedDeploymentLockParent(
+    lockParent,
+    lockParentStat,
+    policy,
+    rootStat.uid,
+    processApi,
+  );
+  assertTrustedDeploymentLock(
+    lockDir,
+    lockStat,
+    policy,
+    lockParentStat,
+    rootStat.uid,
+    processApi,
+  );
+  return { policy, lockParentStat, lockStat, rootUid: rootStat.uid };
+}
+
 async function acquireLock(lockDir, fsApi) {
   const lockParent = path.dirname(lockDir);
-  await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
-  const lockParentStat = await fsApi.lstat(lockParent);
-  assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
+  const policy = deploymentLockPolicy(lockDir);
+  let lockParentStat;
+  let provisionedLockStat = null;
+  let rootUid = null;
+  if (policy === 'shared') {
+    const provisioning = await validateDeploymentLockProvisioning(lockDir, fsApi);
+    lockParentStat = provisioning.lockParentStat;
+    provisionedLockStat = provisioning.lockStat;
+    rootUid = provisioning.rootUid;
+  } else {
+    await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
+    lockParentStat = await fsApi.lstat(lockParent);
+    assertTrustedDeploymentLockParent(lockParent, lockParentStat, policy);
+  }
   const openFlags = fsConstants.O_RDWR
-    | fsConstants.O_CREAT
+    | (policy === 'private' ? fsConstants.O_CREAT : 0)
     | (fsConstants.O_NOFOLLOW ?? 0);
   let handle;
   try {
-    handle = await fsApi.open(lockDir, openFlags, 0o600);
-    await handle.chmod(0o600);
+    try {
+      handle = await fsApi.open(lockDir, openFlags, 0o600);
+    } catch (error) {
+      if (policy === 'shared' && error?.code === 'ENOENT') {
+        throw new Error(`shared deployment lock is not provisioned: ${lockDir}`);
+      }
+      throw error;
+    }
+    if (policy === 'private') {
+      await handle.chmod(0o600);
+    }
     const identity = await handle.stat();
-    assertTrustedDeploymentLock(lockDir, identity);
+    assertTrustedDeploymentLock(
+      lockDir,
+      identity,
+      policy,
+      lockParentStat,
+      rootUid,
+    );
+    if (provisionedLockStat && !sameFileIdentity(provisionedLockStat, identity)) {
+      throw new Error(`shared deployment lock changed before acquisition: ${lockDir}`);
+    }
     await acquireKernelFlock(handle, lockDir);
     const owner = {
       version: 1,
@@ -971,13 +1046,38 @@ async function acquireLock(lockDir, fsApi) {
       lock_kind: 'linux-flock',
     };
     await writeLockMetadata(handle, owner);
-    await syncDirectory(lockParent, fsApi);
+    if (policy === 'private') {
+      await syncDirectory(lockParent, fsApi);
+    }
+    const currentParentIdentity = await fsApi.lstat(lockParent);
+    assertTrustedDeploymentLockParent(
+      lockParent,
+      currentParentIdentity,
+      policy,
+      rootUid,
+    );
+    if (!sameFileIdentity(lockParentStat, currentParentIdentity)) {
+      throw new Error(`deployment lock parent changed during acquisition: ${lockParent}`);
+    }
     const currentIdentity = await fsApi.lstat(lockDir);
-    assertTrustedDeploymentLock(lockDir, currentIdentity);
+    assertTrustedDeploymentLock(
+      lockDir,
+      currentIdentity,
+      policy,
+      currentParentIdentity,
+      rootUid,
+    );
     if (!sameFileIdentity(identity, currentIdentity)) {
       throw new Error(`deployment lock path changed during acquisition: ${lockDir}`);
     }
-    return { owner, handle, identity };
+    return {
+      owner,
+      handle,
+      identity,
+      lockParentIdentity: currentParentIdentity,
+      policy,
+      rootUid,
+    };
   } catch (error) {
     await handle?.close().catch(() => {});
     throw error;
@@ -1039,7 +1139,25 @@ async function acquireKernelFlock(handle, lockFile) {
 }
 
 async function verifyLockForRelease(lockDir, lockState, fsApi) {
+  const lockParent = path.dirname(lockDir);
+  const currentParentIdentity = await fsApi.lstat(lockParent);
+  assertTrustedDeploymentLockParent(
+    lockParent,
+    currentParentIdentity,
+    lockState.policy,
+    lockState.rootUid,
+  );
+  if (!sameFileIdentity(lockState.lockParentIdentity, currentParentIdentity)) {
+    throw new Error(`deployment lock parent changed before cleanup: ${lockParent}`);
+  }
   const currentIdentity = await fsApi.lstat(lockDir);
+  assertTrustedDeploymentLock(
+    lockDir,
+    currentIdentity,
+    lockState.policy,
+    currentParentIdentity,
+    lockState.rootUid,
+  );
   if (!sameFileIdentity(lockState.identity, currentIdentity)) {
     throw new Error(`deployment lock path changed before cleanup: ${lockDir}`);
   }
@@ -2345,19 +2463,85 @@ function assertTrustedDeploymentDirectory(file, fileStat, label) {
   }
 }
 
-function assertTrustedDeploymentLock(file, fileStat) {
+function deploymentLockPolicy(lockDir) {
+  return path.resolve(lockDir) === SHARED_DEPLOYMENT_LOCK ? 'shared' : 'private';
+}
+
+function assertTrustedDeploymentLockParent(
+  file,
+  fileStat,
+  policy,
+  rootUid = null,
+  processApi = process,
+) {
+  if (!fileStat.isDirectory() || fileStat.isSymbolicLink()) {
+    throw new Error(`lock parent must be a real directory: ${file}`);
+  }
+  const mode = fileStat.mode & 0o7777;
+  const identity = deploymentProcessIdentity(processApi, fileStat);
+  if (policy === 'shared') {
+    if (fileStat.uid !== rootUid || !identityCanUseSharedGroup(identity, fileStat.gid, rootUid)) {
+      throw new Error(`shared lock parent ownership is not trusted: ${file}`);
+    }
+    if (mode !== 0o750) {
+      throw new Error(`shared lock parent mode is not trusted: ${file}`);
+    }
+    return;
+  }
+  if (fileStat.uid !== identity.uid || fileStat.gid !== identity.gid) {
+    throw new Error(`lock parent ownership is not trusted: ${file}`);
+  }
+  if ((mode & 0o700) !== 0o700 || (mode & 0o077) !== 0) {
+    throw new Error(`lock parent mode is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedDeploymentLock(
+  file,
+  fileStat,
+  policy,
+  lockParentStat,
+  rootUid = null,
+  processApi = process,
+) {
   if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
     throw new Error(`deployment lock must be a real file: ${file}`);
   }
   const mode = fileStat.mode & 0o7777;
-  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
-  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
-  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+  const identity = deploymentProcessIdentity(processApi, fileStat);
+  if (policy === 'shared') {
+    if (
+      fileStat.uid !== rootUid
+      || fileStat.gid !== lockParentStat.gid
+      || !identityCanUseSharedGroup(identity, fileStat.gid, rootUid)
+    ) {
+      throw new Error(`shared deployment lock ownership is not trusted: ${file}`);
+    }
+    if (mode !== 0o660) {
+      throw new Error(`shared deployment lock mode is not trusted: ${file}`);
+    }
+    return;
+  }
+  if (fileStat.uid !== identity.uid || fileStat.gid !== identity.gid) {
     throw new Error(`deployment lock ownership is not trusted: ${file}`);
   }
   if (mode !== 0o600) {
     throw new Error(`deployment lock mode is not trusted: ${file}`);
   }
+}
+
+function deploymentProcessIdentity(processApi, fallbackStat) {
+  const uid = typeof processApi.getuid === 'function' ? processApi.getuid() : fallbackStat.uid;
+  const gid = typeof processApi.getgid === 'function' ? processApi.getgid() : fallbackStat.gid;
+  const groups = new Set(
+    typeof processApi.getgroups === 'function' ? processApi.getgroups() : [gid],
+  );
+  groups.add(gid);
+  return { uid, gid, groups };
+}
+
+function identityCanUseSharedGroup(identity, sharedGid, rootUid) {
+  return identity.uid === rootUid || identity.groups.has(sharedGid);
 }
 
 function assertTrustedInstallTransaction(file, fileStat) {

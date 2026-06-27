@@ -20,9 +20,11 @@ superseded_by:
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
-  2b2 (separate-worker durable queue and `/config pull`), and PR 2b3
-  (recoverable activation plus `/config reload` and `/config sync`). Mutating
-  commands remain undeployable until their corresponding backend lands.
+  2b2a (separate-worker durable queue foundation), PRs 3 and 4 (runner
+  abstraction and ephemeral-user isolation), PR 2b2b (`/config pull`
+  enablement), and PR 2b3 (recoverable activation plus `/config reload` and
+  `/config sync`). Mutating commands remain undeployable until their security
+  dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
 - Bot PR #10 merged immutable staged preparation as
   `45d87b7d6fb59f7d751285a253b3cf7e21826563`.
@@ -99,14 +101,21 @@ superseded_by:
 - Do not treat the existing install-without-restart mode as pull: it replaces
   the live config and discards the cross-action rollback boundary.
 
-#### PR 2b2: Durable Pull Worker
+#### PR 2b2a: Durable Pull Worker Foundation
 - Run a stable, separate deployment identity behind a host-owned Unix socket.
   The bot may submit only an exact message ID and fixed action enum.
 - The worker must durably deduplicate and enqueue before acknowledging the bot,
   recover queued/running work after restart, and invoke the trusted prepare
   backend with fixed argv.
-- Enable `/config pull` only after socket authorization, queue durability,
-  duplicate-event, crash-recovery, fixed-argv, ownership, and symlink tests pass.
+- Keep bot socket-group access and deployable `/config pull` disabled because
+  current-user Codex children inherit the bot's supplementary groups.
+
+#### PR 2b2b: Pull Enablement After Runner Isolation
+- Merge PRs 3 and 4 first and prove prompt-controlled Codex subprocesses cannot
+  access the worker socket, bot/deployment secrets, or host `/run` paths.
+- Then grant the bot socket access and enable `/config pull` only after socket
+  authorization, queue durability, duplicate-event, crash-recovery, fixed-argv,
+  ownership, symlink, and isolated-child denial tests pass.
 
 #### PR 2b3: Recoverable Activation
 - Add activation of an already staged immutable revision without network fetch,

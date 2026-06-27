@@ -7609,9 +7609,16 @@ mod tests {
             room_id: ADMIN_ROOM_ID.to_owned(),
             allowed_person_ids: vec![SENDER_PERSON_ID.to_owned()],
             allowed_person_emails: vec![SENDER_EMAIL.to_owned()],
-            allowed_commands: vec![ConfigCommand::Status, ConfigCommand::Pull],
+            allowed_commands: vec![ConfigCommand::Status],
         });
         config.validate().unwrap();
+        // Exercise the dormant pull handoff without making it deployable.
+        config
+            .config_commands
+            .as_mut()
+            .unwrap()
+            .allowed_commands
+            .push(ConfigCommand::Pull);
         Arc::new(config)
     }
 

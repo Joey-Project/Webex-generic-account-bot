@@ -38,17 +38,23 @@ superseded_by:
 - Merged as bot PR #10 at
   `45d87b7d6fb59f7d751285a253b3cf7e21826563`.
 
-## PR 2b2
+## PR 2b2a
 - Add a separate-identity worker with a host-owned Unix socket and durable queue
   keyed by Webex message ID.
-- Enable `/config pull` only after enqueue durability, crash recovery,
-  duplicate-event, worker-restart, ownership, symlink, and fixed-argv tests pass.
 - Use a stable `webex-config-deploy` identity and a host-owned Unix socket. The
   bot request process receives no Git, deploy-key, checkout, or prepare-command
   access.
 - Bind the worker action ID into staged metadata so a crash after prepare commit
   recovers without resolving a different config revision.
 - Publish only a strict, non-secret action status projection for `/config status`.
+- Keep `/config pull` configuration-invalid and do not grant the bot the socket
+  group because current-user Codex children inherit its supplementary groups.
+
+## PR 2b2b
+- After the runner abstraction and `ephemeral-linux-user` launcher merge, prove
+  prompt-controlled children cannot access `/run/webex-config-pull`.
+- Then grant only the bot process the socket group, enable `/config pull`, and
+  add the reviewed admin Space/sender config in one bounded enablement sequence.
 
 ## PR 2b3
 - Add recoverable activation and persist the exact staged target revision before

@@ -16,6 +16,8 @@ export const DEFAULTS = Object.freeze({
   queueDir: '/var/lib/webex-generic-account-bot/config-actions/queue',
   stateDir: '/var/lib/webex-generic-account-bot/config-actions/state',
   publicStatusFile: '/var/lib/webex-generic-account-bot/config-actions/public-status.json',
+  stagedConfigFile:
+    '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged',
   stagedMetadataFile:
     '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged.json',
   requestTimeoutMs: 5_000,
@@ -49,16 +51,26 @@ export const MAX_MESSAGE_ID_BYTES = 256;
 
 const MAX_REQUEST_RECORD_BYTES = 1024;
 const MAX_STATE_RECORD_BYTES = 2048;
+const MAX_STAGED_CONFIG_BYTES = 4 * 1024 * 1024;
 const SOCKET_MODE = 0o660;
 const SHARED_DIRECTORY_MODE = 0o750;
+const PUBLIC_STATE_ROOT_MODE = 0o755;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const PUBLIC_FILE_MODE = 0o644;
 const ACTION_ID_PATTERN = /^[0-9a-f]{64}$/;
 const CONFIG_REVISION_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const REQUEST_TEMPORARY_PATTERN = new RegExp(
+  `^\\.request-([0-9a-f]{64})-([1-9][0-9]*)-(${UUID_PATTERN})\\.tmp$`,
+);
+const STATE_TEMPORARY_PATTERN = new RegExp(
+  `^\\.atomic-([0-9a-f]{64})\\.json-([1-9][0-9]*)-(${UUID_PATTERN})\\.tmp$`,
+);
 const TERMINAL_STATES = new Set(['succeeded', 'failed']);
 const ACTION_STATES = new Set(['queued', 'running', ...TERMINAL_STATES]);
+const STATE_PROGRESS = Object.freeze({ queued: 0, running: 1, failed: 2, succeeded: 2 });
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 const PREPARED_KEYS = [
   'bot_code_dir',
@@ -100,7 +112,7 @@ const PREPARED_POLICY = Object.freeze({
   configRef: 'main',
   botCodeDir: '/opt/webex-generic-account-bot/code',
   renderedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml',
-  stagedConfig: '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged',
+  stagedConfig: DEFAULTS.stagedConfigFile,
   service: 'webex-generic-account-bot',
 });
 
@@ -173,13 +185,62 @@ export async function readPreparedMetadataForAction({
   return preparedProjectionFromValue(metadata, actionId);
 }
 
+async function readDurablePreparedResultForAction({
+  stagedConfigFile,
+  stagedMetadataFile,
+  actionId,
+  fsApi,
+}) {
+  validateActionId(actionId);
+  const directories = [
+    ...new Set([path.dirname(stagedConfigFile), path.dirname(stagedMetadataFile)]),
+  ];
+  let configRecord = null;
+  let metadataRecord = null;
+
+  try {
+    for (const directory of directories) {
+      await assertTrustedDirectory(directory, PRIVATE_DIRECTORY_MODE, fsApi);
+    }
+    metadataRecord = await openBoundedRegularFile(
+      stagedMetadataFile,
+      DEFAULTS.outputLimitBytes,
+      PRIVATE_FILE_MODE,
+      fsApi,
+    );
+    const metadata = parseBoundedJson(metadataRecord.contents, stagedMetadataFile);
+    const prepared = preparedProjectionFromValue(metadata, actionId);
+
+    configRecord = await openBoundedRegularFile(
+      stagedConfigFile,
+      MAX_STAGED_CONFIG_BYTES,
+      PRIVATE_FILE_MODE,
+      fsApi,
+    );
+    const digest = createHash('sha256').update(configRecord.contents).digest('hex');
+    if (digest !== prepared.configSha256) {
+      throw new Error(`staged config digest mismatch: ${stagedConfigFile}`);
+    }
+
+    await configRecord.handle.sync();
+    await metadataRecord.handle.sync();
+    for (const directory of directories) await syncDirectory(directory, fsApi);
+    await assertPublishedFileIdentity(stagedConfigFile, configRecord, fsApi);
+    await assertPublishedFileIdentity(stagedMetadataFile, metadataRecord, fsApi);
+    return prepared;
+  } finally {
+    await configRecord?.handle.close().catch(() => {});
+    await metadataRecord?.handle.close().catch(() => {});
+  }
+}
+
 export async function prepareStorage({
   stateRoot,
   queueDir,
   stateDir,
   fsApi = fs,
 }) {
-  await ensureTrustedDirectory(stateRoot, SHARED_DIRECTORY_MODE, fsApi);
+  await ensureTrustedDirectory(stateRoot, PUBLIC_STATE_ROOT_MODE, fsApi);
   await ensureTrustedDirectory(queueDir, PRIVATE_DIRECTORY_MODE, fsApi);
   await ensureTrustedDirectory(stateDir, PRIVATE_DIRECTORY_MODE, fsApi);
 }
@@ -477,6 +538,8 @@ export class ConfigPullWorker {
     this.socketIdentity = null;
     this.connections = new Set();
     this.enqueueTail = Promise.resolve();
+    this.publicStatusTail = Promise.resolve();
+    this.latestPublicState = null;
     this.drainPromise = null;
     this.drainRequested = false;
     this.abortController = new AbortController();
@@ -509,6 +572,7 @@ export class ConfigPullWorker {
     }
     await this.enqueueTail.catch(() => {});
     await this.drainPromise?.catch(() => {});
+    await this.publicStatusTail.catch(() => {});
     await this.#removeOwnedSocket();
     this.started = false;
   }
@@ -597,11 +661,7 @@ export class ConfigPullWorker {
     if (!existingState) {
       await this.#persistState(this.#makeState(publication.actionId, 'queued'));
     } else {
-      await writePublicStatus({
-        publicStatusFile: this.options.publicStatusFile,
-        state: existingState,
-        fsApi: this.fsApi,
-      });
+      await this.#publishPublicStatus(existingState, { replay: true });
     }
     return publication;
   }
@@ -617,7 +677,8 @@ export class ConfigPullWorker {
       } else if (state.status === 'running') {
         let prepared = null;
         try {
-          prepared = await readPreparedMetadataForAction({
+          prepared = await readDurablePreparedResultForAction({
+            stagedConfigFile: this.options.stagedConfigFile,
             stagedMetadataFile: this.options.stagedMetadataFile,
             actionId: record.action_id,
             fsApi: this.fsApi,
@@ -631,11 +692,7 @@ export class ConfigPullWorker {
       if (!newestState || state.updated_at > newestState.updated_at) newestState = state;
     }
     if (newestState) {
-      await writePublicStatus({
-        publicStatusFile: this.options.publicStatusFile,
-        state: newestState,
-        fsApi: this.fsApi,
-      });
+      await this.#publishPublicStatus(newestState);
     }
   }
 
@@ -659,8 +716,15 @@ export class ConfigPullWorker {
     const records = await this.#listRequestRecords();
     for (const record of records) {
       if (this.stopping) return;
-      const state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
-      if (!state) throw new Error(`request state is missing: ${record.action_id}`);
+      let state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
+      if (!state) {
+        await this.enqueueTail;
+        state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
+      }
+      if (!state) {
+        state = this.#makeState(record.action_id, 'queued');
+        await this.#persistState(state);
+      }
       if (TERMINAL_STATES.has(state.status)) continue;
       if (state.status !== 'queued') {
         throw new Error(`request state cannot be drained: ${record.action_id}`);
@@ -689,11 +753,23 @@ export class ConfigPullWorker {
 
   async #persistState(state) {
     await writeActionState({ stateDir: this.options.stateDir, state, fsApi: this.fsApi });
-    await writePublicStatus({
-      publicStatusFile: this.options.publicStatusFile,
-      state,
-      fsApi: this.fsApi,
+    await this.#publishPublicStatus(state);
+  }
+
+  #publishPublicStatus(state, { replay = false } = {}) {
+    validateActionState(state);
+    const operation = this.publicStatusTail.then(async () => {
+      if (!shouldPublishPublicState(state, this.latestPublicState, replay)) return false;
+      await writePublicStatus({
+        publicStatusFile: this.options.publicStatusFile,
+        state,
+        fsApi: this.fsApi,
+      });
+      this.latestPublicState = state;
+      return true;
     });
+    this.publicStatusTail = operation.catch(() => {});
+    return operation;
   }
 
   #makeState(actionId, status, details = {}) {
@@ -719,6 +795,10 @@ export class ConfigPullWorker {
     const names = entries.map((entry) => entry.name).sort();
     const records = [];
     for (const name of names) {
+      if (REQUEST_TEMPORARY_PATTERN.test(name)) {
+        await this.#assertTrustedTemporaryFile(path.join(this.options.queueDir, name));
+        continue;
+      }
       if (!/^[0-9a-f]{64}\.json$/.test(name)) {
         throw new Error(`unexpected queue entry: ${name}`);
       }
@@ -729,11 +809,19 @@ export class ConfigPullWorker {
   }
 
   async #cleanStaleTemporaryFiles() {
-    for (const directory of [this.options.queueDir, this.options.stateDir]) {
+    for (const [directory, pattern] of [
+      [this.options.queueDir, REQUEST_TEMPORARY_PATTERN],
+      [this.options.stateDir, STATE_TEMPORARY_PATTERN],
+    ]) {
       const entries = await this.fsApi.readdir(directory, { withFileTypes: true });
       let changed = false;
       for (const entry of entries) {
-        if (!entry.name.startsWith('.request-') && !entry.name.startsWith('.atomic-')) continue;
+        const hasTemporaryPrefix = entry.name.startsWith('.request-')
+          || entry.name.startsWith('.atomic-');
+        if (!hasTemporaryPrefix) continue;
+        if (!pattern.test(entry.name)) {
+          throw new Error(`unexpected temporary entry: ${entry.name}`);
+        }
         const temporary = path.join(directory, entry.name);
         const stat = await this.fsApi.lstat(temporary);
         assertOwnedRegularFile(stat, temporary, PRIVATE_FILE_MODE);
@@ -741,6 +829,15 @@ export class ConfigPullWorker {
         changed = true;
       }
       if (changed) await syncDirectory(directory, this.fsApi);
+    }
+  }
+
+  async #assertTrustedTemporaryFile(temporary) {
+    try {
+      const stat = await this.fsApi.lstat(temporary);
+      assertOwnedRegularFile(stat, temporary, PRIVATE_FILE_MODE);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
     }
   }
 
@@ -883,6 +980,16 @@ async function readSocketRequest(socket, timeoutMs) {
 }
 
 async function readBoundedJsonFile(file, maxBytes, expectedMode, fsApi) {
+  let record = null;
+  try {
+    record = await openBoundedRegularFile(file, maxBytes, expectedMode, fsApi);
+    return parseBoundedJson(record.contents, file);
+  } finally {
+    await record?.handle.close().catch(() => {});
+  }
+}
+
+async function openBoundedRegularFile(file, maxBytes, expectedMode, fsApi) {
   const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
   let handle;
   try {
@@ -890,18 +997,46 @@ async function readBoundedJsonFile(file, maxBytes, expectedMode, fsApi) {
     const stat = await handle.stat();
     assertOwnedRegularFile(stat, file, expectedMode);
     if (stat.size <= 0 || stat.size > maxBytes) throw new Error(`record size is invalid: ${file}`);
-    const contents = await handle.readFile();
+    const contents = await readFileHandleBounded(handle, maxBytes);
     if (contents.length <= 0 || contents.length > maxBytes) {
       throw new Error(`record size is invalid: ${file}`);
     }
+    const finalStat = await handle.stat();
+    assertOwnedRegularFile(finalStat, file, expectedMode);
+    if (!sameFileIdentity(stat, finalStat) || finalStat.size !== contents.length) {
+      throw new Error(`record changed while reading: ${file}`);
+    }
+    return { handle, stat: finalStat, contents };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function readFileHandleBounded(handle, maxBytes) {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      offset,
+      buffer.length - offset,
+      offset,
+    );
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return buffer.subarray(0, offset);
+}
+
+function parseBoundedJson(contents, file) {
+  try {
     return JSON.parse(UTF8_DECODER.decode(contents));
   } catch (error) {
     if (error instanceof SyntaxError || error instanceof TypeError) {
       throw new Error(`record is corrupt: ${file}`);
     }
     throw error;
-  } finally {
-    await handle?.close().catch(() => {});
   }
 }
 
@@ -956,6 +1091,22 @@ async function ensureTrustedDirectory(directory, mode, fsApi) {
   }
 }
 
+async function assertTrustedDirectory(directory, mode, fsApi) {
+  if (!path.isAbsolute(directory)) throw new Error(`directory must be absolute: ${directory}`);
+  await assertNoSymlinkComponents(directory, fsApi);
+  const stat = await fsApi.lstat(directory);
+  const actualMode = stat.mode & 0o7777;
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || stat.uid !== currentUid(stat.uid)
+    || stat.gid !== currentGid(stat.gid)
+    || actualMode !== mode
+  ) {
+    throw new Error(`directory metadata is not trusted: ${directory}`);
+  }
+}
+
 async function assertNoSymlinkComponents(target, fsApi) {
   const resolved = path.resolve(target);
   const parts = resolved.split(path.sep).filter(Boolean);
@@ -991,6 +1142,7 @@ function resolveWorkerOptions(options) {
     publicStatusFile: path.resolve(
       options.publicStatusFile || path.join(stateRoot, 'public-status.json'),
     ),
+    stagedConfigFile: path.resolve(options.stagedConfigFile || DEFAULTS.stagedConfigFile),
     stagedMetadataFile: path.resolve(options.stagedMetadataFile || DEFAULTS.stagedMetadataFile),
     requestTimeoutMs: options.requestTimeoutMs || DEFAULTS.requestTimeoutMs,
     commandTimeoutMs: options.commandTimeoutMs || DEFAULTS.commandTimeoutMs,
@@ -1211,6 +1363,23 @@ function sameRequestRecord(left, right) {
 
 function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function assertPublishedFileIdentity(file, record, fsApi) {
+  const current = await fsApi.lstat(file);
+  assertOwnedRegularFile(current, file, PRIVATE_FILE_MODE);
+  if (!sameFileIdentity(current, record.stat) || current.size !== record.contents.length) {
+    throw new Error(`record changed before recovery commit: ${file}`);
+  }
+}
+
+function shouldPublishPublicState(candidate, current, replay) {
+  if (!current) return true;
+  const timestampOrder = candidate.updated_at.localeCompare(current.updated_at);
+  if (timestampOrder < 0) return false;
+  if (timestampOrder > 0) return true;
+  if (candidate.action_id !== current.action_id) return !replay;
+  return STATE_PROGRESS[candidate.status] >= STATE_PROGRESS[current.status];
 }
 
 function currentUid(fallback) {
