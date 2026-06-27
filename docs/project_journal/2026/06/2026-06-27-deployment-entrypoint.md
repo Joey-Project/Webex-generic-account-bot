@@ -122,6 +122,10 @@ superseded_by:
   the canonical Codex workspace. Existing symlink or non-directory ancestors
   fail closed, and runtime consumers use the canonical path returned by that
   check.
+- Concurrent artifact setup is serialized within the bot process, and each
+  attempt is registered as active before creation. Retention pruning therefore
+  cannot delete an in-flight attempt between directory creation and active-set
+  registration.
 - Structured Jenkins child URLs are passed back through the same controller,
   build-path, and URL-size validator as message URLs. Oversized or malformed
   child metadata is ignored without losing collected root evidence.

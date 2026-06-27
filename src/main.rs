@@ -62,6 +62,7 @@ const JENKINS_HELPER_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const JENKINS_HELPER_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
+static JENKINS_ARTIFACT_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -204,9 +205,22 @@ struct JenkinsArtifactCleanupGuard {
 
 impl JenkinsArtifactCleanupGuard {
     fn new(artifact_root: PathBuf) -> Self {
+        register_jenkins_artifact_dir(&artifact_root);
         Self {
             artifact_root: Some(artifact_root),
         }
+    }
+
+    fn artifact_root(&self) -> &Path {
+        self.artifact_root
+            .as_deref()
+            .expect("Jenkins artifact cleanup guard has already been consumed")
+    }
+
+    fn into_artifact_root(mut self) -> PathBuf {
+        self.artifact_root
+            .take()
+            .expect("Jenkins artifact cleanup guard has already been consumed")
     }
 
     async fn cleanup(mut self) -> Result<()> {
@@ -409,25 +423,10 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
-    let process_root = ensure_jenkins_artifact_base_root(&codex_config.cwd)
+    let artifact_cleanup = prepare_jenkins_artifact_root(&codex_config.cwd, &context.message_id)
         .await
         .with_context(|| "failed to prepare Jenkins diagnostics artifact root")?;
-    prune_jenkins_artifact_process_roots_in(
-        process_root
-            .parent()
-            .ok_or_else(|| anyhow!("Jenkins diagnostics process root has no parent"))?,
-        &process_root,
-    )
-    .await
-    .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
-
-    let artifact_root = create_private_subdirectory(
-        &process_root,
-        &jenkins_artifact_attempt_dir(&process_root, &context.message_id),
-    )
-    .await
-    .with_context(|| "failed to create Jenkins diagnostics artifact root")?;
-    register_jenkins_artifact_dir(&artifact_root);
+    let artifact_root = artifact_cleanup.artifact_root().to_path_buf();
 
     let mut sections = Vec::new();
     let mut console_urls = Vec::new();
@@ -473,12 +472,12 @@ async fn jenkins_context_prompt(
     match build_result {
         Ok(prompt) => Ok(Some(JenkinsPrefetchedContext {
             prompt,
-            artifact_root,
+            artifact_root: artifact_cleanup.into_artifact_root(),
             console_urls,
             evidence_logs,
         })),
         Err(error) => {
-            if let Err(cleanup_error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
+            if let Err(cleanup_error) = artifact_cleanup.cleanup().await {
                 warn!(
                     artifact_root = %artifact_root.display(),
                     error = %cleanup_error,
@@ -964,6 +963,33 @@ async fn ensure_jenkins_artifact_base_root(codex_cwd: &Path) -> Result<PathBuf> 
     create_private_subdirectory(codex_cwd, &process_root).await
 }
 
+async fn prepare_jenkins_artifact_root(
+    codex_cwd: &Path,
+    message_id: &str,
+) -> Result<JenkinsArtifactCleanupGuard> {
+    let _setup_guard = jenkins_artifact_setup_lock().lock().await;
+    let process_root = ensure_jenkins_artifact_base_root(codex_cwd).await?;
+    prune_jenkins_artifact_process_roots_in(
+        process_root
+            .parent()
+            .ok_or_else(|| anyhow!("Jenkins diagnostics process root has no parent"))?,
+        &process_root,
+    )
+    .await?;
+
+    let artifact_path = jenkins_artifact_attempt_dir(&process_root, message_id);
+    let cleanup = JenkinsArtifactCleanupGuard::new(artifact_path.clone());
+    let canonical_path = create_private_subdirectory(&process_root, &artifact_path).await?;
+    if canonical_path != artifact_path {
+        return Err(anyhow!(
+            "Jenkins artifact path changed during creation: {} != {}",
+            canonical_path.display(),
+            artifact_path.display()
+        ));
+    }
+    Ok(cleanup)
+}
+
 fn jenkins_artifact_base_root(codex_cwd: &Path) -> PathBuf {
     absolute_lexical(codex_cwd)
         .join(".codex-tmp")
@@ -1039,6 +1065,10 @@ fn jenkins_artifact_dir(attempt_root: &Path, index: usize) -> PathBuf {
 
 fn active_jenkins_artifact_dirs() -> &'static StdSyncMutex<HashSet<PathBuf>> {
     ACTIVE_JENKINS_ARTIFACT_DIRS.get_or_init(|| StdSyncMutex::new(HashSet::new()))
+}
+
+fn jenkins_artifact_setup_lock() -> &'static Mutex<()> {
+    JENKINS_ARTIFACT_SETUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn register_jenkins_artifact_dir(path: &Path) {
@@ -5563,6 +5593,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_jenkins_artifact_setup_preserves_active_roots() {
+        let codex_cwd = unique_state_path().with_extension("jenkins-concurrent-cwd");
+        fs::create_dir_all(&codex_cwd).unwrap();
+        let attempt_count = JENKINS_ARTIFACT_RETENTION_LIMIT + 8;
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..attempt_count {
+            let codex_cwd = codex_cwd.clone();
+            tasks.spawn(async move {
+                prepare_jenkins_artifact_root(&codex_cwd, &format!("message-{index}")).await
+            });
+        }
+
+        let mut guards = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            guards.push(result.unwrap().unwrap());
+        }
+
+        assert_eq!(guards.len(), attempt_count);
+        assert!(guards.iter().all(|guard| guard.artifact_root().is_dir()));
+        for guard in guards {
+            guard.cleanup().await.unwrap();
+        }
+        fs::remove_dir_all(codex_cwd).unwrap();
+    }
+
+    #[tokio::test]
     async fn prune_jenkins_artifact_dirs_skips_active_dirs() {
         let root = unique_state_path().with_extension("jenkins-active-root");
         for index in 0..(JENKINS_ARTIFACT_RETENTION_LIMIT + 3) {
@@ -5615,10 +5671,15 @@ mod tests {
         let dir = root.join("jenkins-drop-guard");
         fs::create_dir_all(&root).unwrap();
         create_private_subdirectory(&root, &dir).await.unwrap();
-        register_jenkins_artifact_dir(&dir);
 
         {
             let _guard = JenkinsArtifactCleanupGuard::new(dir.clone());
+            assert!(
+                active_jenkins_artifact_dirs()
+                    .lock()
+                    .unwrap()
+                    .contains(&dir)
+            );
         }
 
         for _ in 0..50 {
@@ -6122,6 +6183,7 @@ mod tests {
         webex: Arc<FakeWebex>,
         runner: Arc<FakeRunner>,
         state_path: PathBuf,
+        codex_cwd: PathBuf,
     }
 
     impl TestHarness {
@@ -6132,6 +6194,8 @@ mod tests {
 
         fn with_config(config: Arc<BotConfig>) -> Self {
             let state_path = config.state_file.clone();
+            let codex_cwd = config.codex.cwd.clone();
+            fs::create_dir_all(&codex_cwd).unwrap();
             let state = JsonlStateStore::load(config.state_file.clone()).unwrap();
             let webex = Arc::new(FakeWebex::default());
             let runner = Arc::new(FakeRunner::default());
@@ -6149,6 +6213,7 @@ mod tests {
                 webex,
                 runner,
                 state_path,
+                codex_cwd,
             }
         }
 
@@ -6164,6 +6229,7 @@ mod tests {
     impl Drop for TestHarness {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.state_path);
+            let _ = fs::remove_dir_all(&self.codex_cwd);
         }
     }
 
@@ -6341,6 +6407,8 @@ mod tests {
     }
 
     fn test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let codex_cwd = state_path.with_extension("codex-work");
+        let codex_home = state_path.with_extension("codex-home");
         let config = BotConfig {
             state_file: state_path,
             self_person_id: Some(SELF_PERSON_ID.to_owned()),
@@ -6350,8 +6418,8 @@ mod tests {
                 ..webex_generic_account_bot::ServerConfig::default()
             },
             codex: webex_generic_account_bot::CodexConfig {
-                cwd: PathBuf::from("/tmp/webex-generic-account-bot-work"),
-                codex_home: PathBuf::from("/tmp/webex-generic-account-bot-codex-home"),
+                cwd: codex_cwd,
+                codex_home,
                 timeout_secs: 30,
                 ..webex_generic_account_bot::CodexConfig::default()
             },
@@ -6369,6 +6437,8 @@ mod tests {
     }
 
     fn staging_test_config(state_path: PathBuf) -> Arc<BotConfig> {
+        let codex_cwd = state_path.with_extension("codex-work");
+        let codex_home = state_path.with_extension("codex-home");
         let config = BotConfig {
             state_file: state_path,
             self_person_id: Some(SELF_PERSON_ID.to_owned()),
@@ -6378,8 +6448,8 @@ mod tests {
                 ..webex_generic_account_bot::ServerConfig::default()
             },
             codex: webex_generic_account_bot::CodexConfig {
-                cwd: PathBuf::from("/tmp/webex-generic-account-bot-work"),
-                codex_home: PathBuf::from("/tmp/webex-generic-account-bot-codex-home"),
+                cwd: codex_cwd,
+                codex_home,
                 timeout_secs: 30,
                 ..webex_generic_account_bot::CodexConfig::default()
             },
