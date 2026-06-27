@@ -20,7 +20,7 @@ const DEFAULTS = Object.freeze({
   bashBin: '/usr/bin/bash',
   nodeBin: '/usr/bin/node',
   pythonBin: '/usr/bin/python3',
-  cargoBin: '/usr/bin/cargo',
+  botBin: '/opt/webex-generic-account-bot/bin/webex-generic-account-bot',
   systemctlBin: '/usr/bin/systemctl',
   sshBin: '/usr/bin/ssh',
   sshKey: '/var/lib/webex-generic-account-bot/deploy/id_ed25519',
@@ -79,7 +79,7 @@ const HOST_OVERRIDE_KEYS = new Set([
   'bashBin',
   'nodeBin',
   'pythonBin',
-  'cargoBin',
+  'botBin',
   'systemctlBin',
   'sshBin',
   'sshKey',
@@ -180,9 +180,9 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     } else if (arg === '--python-bin') {
       options.pythonBin = requiredValue(argv, (index += 1), arg);
       overrides.add('pythonBin');
-    } else if (arg === '--cargo-bin') {
-      options.cargoBin = requiredValue(argv, (index += 1), arg);
-      overrides.add('cargoBin');
+    } else if (arg === '--bot-bin') {
+      options.botBin = requiredValue(argv, (index += 1), arg);
+      overrides.add('botBin');
     } else if (arg === '--systemctl-bin') {
       options.systemctlBin = requiredValue(argv, (index += 1), arg);
       overrides.add('systemctlBin');
@@ -249,7 +249,7 @@ Options:
       --bash-bin <path>           Fixed Bash executable path.
       --node-bin <path>           Fixed Node.js executable path for trusted render policy.
       --python-bin <path>         Fixed Python executable path for trusted install policy.
-      --cargo-bin <path>          Fixed Cargo executable path for bot --check-config.
+      --bot-bin <path>            Installed bot executable used for --check-config.
       --systemctl-bin <path>      Fixed systemctl executable path.
       --ssh-bin <path>            Fixed SSH executable path for GitHub fetch.
       --ssh-key <path>            Host-owned deploy key for GitHub fetch.
@@ -355,7 +355,7 @@ export function buildDeployPlan(options) {
         WEBEX_BOT_CODE_DIR: botCodeDir,
         NODE_BIN: path.resolve(options.nodeBin),
         PYTHON_BIN: path.resolve(options.pythonBin),
-        CARGO_BIN: path.resolve(options.cargoBin),
+        BOT_BIN: path.resolve(options.botBin),
       },
       ...commandDefaults,
     }),
@@ -407,6 +407,7 @@ export function buildDeployPlan(options) {
     backupConfig,
     transactionFile,
     botCodeDir,
+    botBin: path.resolve(options.botBin),
     metadataFile,
     configRepo: options.configRepo,
     configRef: options.configRef,
@@ -1317,6 +1318,7 @@ function serialisablePlan(plan) {
     candidate_config: plan.candidateConfig,
     transaction_file: plan.transactionFile,
     bot_code_dir: plan.botCodeDir,
+    bot_bin: plan.botBin,
     service: plan.service,
     lock_dir: plan.lockDir,
     service_action: plan.serviceAction,
@@ -1342,7 +1344,7 @@ function validateOptions(options) {
     'bashBin',
     'nodeBin',
     'pythonBin',
-    'cargoBin',
+    'botBin',
     'systemctlBin',
     'sshBin',
     'sshKey',
@@ -1469,16 +1471,17 @@ async function prepareFreshCheckout(plan, fsApi) {
 
 async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
   const paths = [
-    ['checkout directory', plan.checkoutDir],
-    ['lock parent directory', path.dirname(plan.lockDir)],
-    ['rendered config directory', path.dirname(plan.renderedConfig)],
-    ['metadata directory', path.dirname(plan.metadataFile)],
-    ['bot code directory', plan.botCodeDir],
-    ['SSH key directory', path.dirname(plan.sshKey)],
-    ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts)],
+    ['checkout directory', plan.checkoutDir, false],
+    ['lock parent directory', path.dirname(plan.lockDir), false],
+    ['rendered config directory', path.dirname(plan.renderedConfig), false],
+    ['metadata directory', path.dirname(plan.metadataFile), false],
+    ['bot code directory', plan.botCodeDir, true],
+    ['bot binary directory', path.dirname(plan.botBin), true],
+    ['SSH key directory', path.dirname(plan.sshKey), true],
+    ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts), true],
   ];
   const seen = new Set();
-  for (const [label, candidate] of paths) {
+  for (const [label, candidate, includePath] of paths) {
     const resolved = path.resolve(candidate);
     if (seen.has(resolved)) {
       continue;
@@ -1488,7 +1491,9 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
     if (canonical !== resolved) {
       throw new Error(`${label} must not contain symlink ancestors: ${resolved}`);
     }
+    await assertTrustedPathAncestors(resolved, label, fsApi, { includePath });
   }
+  await assertTrustedExecutableFile(plan.botBin, 'bot binary', fsApi);
 }
 
 async function canonicalPathWithMissingSuffix(candidate, fsApi) {
@@ -1523,9 +1528,9 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
       continue;
     }
     seen.add(directory);
-    await assertTrustedOutputAncestors(directory, label, fsApi);
+    await assertTrustedPathAncestors(directory, label, fsApi);
     await createDirectoryDurably(directory, 0o755, fsApi);
-    await assertTrustedOutputAncestors(directory, label, fsApi);
+    await assertTrustedPathAncestors(directory, label, fsApi);
     const resolved = await fsApi.realpath(directory);
     if (resolved !== path.resolve(directory)) {
       throw new Error(`${label} must not contain symlinks: ${directory}`);
@@ -1535,9 +1540,15 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
   }
 }
 
-async function assertTrustedOutputAncestors(directory, label, fsApi) {
+async function assertTrustedPathAncestors(
+  directory,
+  label,
+  fsApi,
+  { includePath = false } = {},
+) {
   const candidates = [];
-  let current = path.dirname(path.resolve(directory));
+  const resolved = path.resolve(directory);
+  let current = includePath ? resolved : path.dirname(resolved);
   for (;;) {
     candidates.unshift(current);
     const parent = path.dirname(current);
@@ -1566,9 +1577,29 @@ async function assertTrustedOutputAncestors(directory, label, fsApi) {
       throw new Error(`${label} ancestor ownership is not trusted: ${candidate}`);
     }
     const mode = stat.mode & 0o7777;
-    if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+    const isIncludedPath = includePath && candidate === resolved;
+    if (
+      (mode & 0o022) !== 0
+      && (isIncludedPath || (mode & 0o1000) === 0)
+    ) {
       throw new Error(`${label} ancestor mode is not trusted: ${candidate}`);
     }
+  }
+}
+
+async function assertTrustedExecutableFile(file, label, fsApi) {
+  const stat = await fsApi.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real file: ${file}`);
+  }
+  const deploymentUid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+  const rootStat = await fsApi.lstat(path.parse(path.resolve(file)).root);
+  if (stat.uid !== deploymentUid && stat.uid !== rootStat.uid) {
+    throw new Error(`${label} ownership is not trusted: ${file}`);
+  }
+  const mode = stat.mode & 0o7777;
+  if ((mode & 0o022) !== 0 || (mode & 0o111) === 0) {
+    throw new Error(`${label} mode is not trusted: ${file}`);
   }
 }
 
@@ -2082,6 +2113,7 @@ function assertSafePlanPathTopology(plan) {
   const checkoutWork = path.resolve(plan.checkoutWorkDir);
   const lockDir = path.resolve(plan.lockDir);
   const botCodeDir = path.resolve(plan.botCodeDir);
+  const botBin = path.resolve(plan.botBin);
   const outputPaths = [
     ['rendered config', path.resolve(plan.renderedConfig)],
     ['candidate config', path.resolve(plan.candidateConfig)],
@@ -2096,6 +2128,7 @@ function assertSafePlanPathTopology(plan) {
   const protectedPaths = [
     ...outputPaths,
     ['bot code directory', botCodeDir],
+    ['bot binary', botBin],
     ...credentialPaths,
   ];
   for (const [label, protectedPath] of protectedPaths) {
@@ -2117,10 +2150,16 @@ function assertSafePlanPathTopology(plan) {
   if (pathsOverlap(checkoutRoot, botCodeDir)) {
     throw new UsageError('bot code directory must not overlap checkout directory');
   }
+  if (pathsOverlap(checkoutRoot, botBin)) {
+    throw new UsageError('bot binary must not overlap checkout directory');
+  }
   for (let index = 0; index < credentialPaths.length; index += 1) {
     const [credentialLabel, credentialPath] = credentialPaths[index];
     if (pathsOverlap(botCodeDir, credentialPath)) {
       throw new UsageError(`${credentialLabel} must not overlap bot code directory`);
+    }
+    if (pathsOverlap(botBin, credentialPath)) {
+      throw new UsageError(`${credentialLabel} must not overlap bot binary`);
     }
     for (const [otherLabel, otherPath] of credentialPaths.slice(index + 1)) {
       if (pathsOverlap(credentialPath, otherPath)) {
@@ -2132,6 +2171,9 @@ function assertSafePlanPathTopology(plan) {
     const [leftLabel, leftPath] = outputPaths[index];
     if (pathsOverlap(botCodeDir, leftPath)) {
       throw new UsageError(`${leftLabel} must not overlap bot code directory`);
+    }
+    if (pathsOverlap(botBin, leftPath)) {
+      throw new UsageError(`${leftLabel} must not overlap bot binary`);
     }
     for (const [credentialLabel, credentialPath] of credentialPaths) {
       if (pathsOverlap(leftPath, credentialPath)) {

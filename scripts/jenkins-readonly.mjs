@@ -1135,15 +1135,19 @@ function upstreamBuildUrl(build, baseUrl) {
 
 async function withRetries(operation, retries) {
   let lastError = null;
-  for (let attempt = 1; attempt <= retries; attempt += 1) {
+  const maxAttempts = retries + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       return await operation();
     } catch (error) {
       if (error instanceof JenkinsResponseBudgetError || error instanceof JenkinsBudgetStopError) {
         throw error;
       }
+      if (error instanceof JenkinsHttpError && !error.retryable) {
+        throw error;
+      }
       lastError = error;
-      if (attempt < retries) {
+      if (attempt < maxAttempts) {
         await sleep(250 * attempt);
       }
     }
@@ -1160,6 +1164,14 @@ class JenkinsResponseBudgetError extends Error {}
 class JenkinsLogBudgetError extends JenkinsResponseBudgetError {}
 
 class JenkinsApiBudgetError extends JenkinsResponseBudgetError {}
+
+class JenkinsHttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+    this.retryable = status === 408 || status === 429 || status >= 500;
+  }
+}
 
 async function getTextLimited(url, config, { maxBytes, timeoutMs, onBytesRead = () => {} }) {
   const response = await get(url, config, { timeoutMs });
@@ -1385,7 +1397,10 @@ async function get(url, config, options = {}) {
     signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
   });
   if (!response.ok) {
-    throw new Error(`GET ${url.pathname} failed status=${response.status}`);
+    throw new JenkinsHttpError(
+      `GET ${url.pathname} failed status=${response.status}`,
+      response.status,
+    );
   }
   return response;
 }

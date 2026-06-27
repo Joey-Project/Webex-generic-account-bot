@@ -55,6 +55,7 @@ const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
 const JENKINS_LOG_INDEX_MAX_BYTES: u64 = 1024 * 1024;
 const JENKINS_EVIDENCE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const JENKINS_EVIDENCE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const JENKINS_FETCH_RETRIES: u64 = 3;
 const JENKINS_FETCH_TIMEOUT_MAX_SECS: u64 = 60;
 const JENKINS_HELPER_COMPLETION_MARGIN_SECS: u64 = 30;
@@ -588,14 +589,40 @@ async fn load_jenkins_log_evidence(
 }
 
 async fn read_jenkins_evidence_log(path: &Path) -> Result<Vec<u8>> {
-    let file = fs::File::open(path)
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = timeout(JENKINS_EVIDENCE_READ_TIMEOUT, options.open(path))
         .await
+        .map_err(|_| anyhow!("timed out opening Jenkins evidence log {}", path.display()))?
         .with_context(|| format!("failed to open Jenkins evidence log {}", path.display()))?;
-    let mut contents = Vec::new();
-    file.take(JENKINS_EVIDENCE_LOG_MAX_BYTES + 1)
-        .read_to_end(&mut contents)
+    let metadata = timeout(JENKINS_EVIDENCE_READ_TIMEOUT, file.metadata())
         .await
-        .with_context(|| format!("failed to read Jenkins evidence log {}", path.display()))?;
+        .map_err(|_| anyhow!("timed out stating Jenkins evidence log {}", path.display()))?
+        .with_context(|| format!("failed to stat Jenkins evidence log {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "Jenkins evidence log must be a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > JENKINS_EVIDENCE_LOG_MAX_BYTES {
+        return Err(anyhow!(
+            "Jenkins evidence log exceeded {} bytes: {}",
+            JENKINS_EVIDENCE_LOG_MAX_BYTES,
+            path.display()
+        ));
+    }
+    let mut contents = Vec::new();
+    timeout(
+        JENKINS_EVIDENCE_READ_TIMEOUT,
+        file.take(JENKINS_EVIDENCE_LOG_MAX_BYTES + 1)
+            .read_to_end(&mut contents),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out reading Jenkins evidence log {}", path.display()))?
+    .with_context(|| format!("failed to read Jenkins evidence log {}", path.display()))?;
     if contents.len() as u64 > JENKINS_EVIDENCE_LOG_MAX_BYTES {
         return Err(anyhow!(
             "Jenkins evidence log exceeded {} bytes: {}",
@@ -892,7 +919,7 @@ async fn run_jenkins_context_helper(
 fn jenkins_fetch_timeout_seconds(helper_timeout_secs: u64) -> u64 {
     let margin = JENKINS_HELPER_COMPLETION_MARGIN_SECS.min(helper_timeout_secs.saturating_sub(1));
     let retry_budget = helper_timeout_secs.saturating_sub(margin);
-    let request_slots = JENKINS_FETCH_RETRIES * 2;
+    let request_slots = (JENKINS_FETCH_RETRIES + 1) * 2;
     (retry_budget / request_slots).clamp(1, JENKINS_FETCH_TIMEOUT_MAX_SECS)
 }
 
@@ -5583,6 +5610,45 @@ mod tests {
                 .as_deref(),
             Some("Exact failure evidence")
         );
+        #[cfg(unix)]
+        {
+            let replacement_path = log_path.with_extension("replacement.log");
+            fs::write(&replacement_path, "before\nExact failure evidence\nafter\n").unwrap();
+            fs::remove_file(&log_path).unwrap();
+            std::os::unix::fs::symlink(&replacement_path, &log_path).unwrap();
+            assert!(
+                verified_jenkins_excerpt(
+                    ReplyFormat::JenkinsDiagnosisJson,
+                    matching,
+                    &evidence_logs,
+                )
+                .await
+                .is_none()
+            );
+            fs::remove_file(&log_path).unwrap();
+            fs::remove_file(replacement_path).unwrap();
+
+            let fifo_status = std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&log_path)
+                .status()
+                .unwrap();
+            assert!(fifo_status.success());
+            assert!(
+                timeout(
+                    Duration::from_secs(1),
+                    verified_jenkins_excerpt(
+                        ReplyFormat::JenkinsDiagnosisJson,
+                        matching,
+                        &evidence_logs,
+                    ),
+                )
+                .await
+                .expect("FIFO evidence verification must not block")
+                .is_none()
+            );
+            fs::remove_file(log_path).unwrap();
+        }
+        #[cfg(not(unix))]
         fs::remove_file(log_path).unwrap();
     }
 
@@ -5995,7 +6061,7 @@ mod tests {
     #[test]
     fn jenkins_fetch_timeout_leaves_room_for_retries_and_helper_cleanup() {
         assert_eq!(jenkins_fetch_timeout_seconds(600), 60);
-        assert_eq!(jenkins_fetch_timeout_seconds(60), 5);
+        assert_eq!(jenkins_fetch_timeout_seconds(60), 3);
         assert_eq!(jenkins_fetch_timeout_seconds(5), 1);
         assert_eq!(jenkins_fetch_timeout_seconds(1), 1);
     }

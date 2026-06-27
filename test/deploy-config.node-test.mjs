@@ -52,7 +52,10 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.bashBin, '/usr/bin/bash');
     assert.equal(options.nodeBin, '/usr/bin/node');
     assert.equal(options.pythonBin, '/usr/bin/python3');
-    assert.equal(options.cargoBin, '/usr/bin/cargo');
+    assert.equal(
+      options.botBin,
+      '/opt/webex-generic-account-bot/bin/webex-generic-account-bot',
+    );
     assert.equal(options.systemctlBin, '/usr/bin/systemctl');
     assert.equal(options.sshBin, '/usr/bin/ssh');
     assert.equal(options.sshKey, '/var/lib/webex-generic-account-bot/deploy/id_ed25519');
@@ -72,7 +75,7 @@ describe('deploy-config argument parsing', () => {
     assert.throws(() => parseArgsAllow(['--git-bin', 'git']), /git-bin/);
     assert.throws(() => parseArgsAllow(['--node-bin', 'node']), /node-bin/);
     assert.throws(() => parseArgsAllow(['--python-bin', 'python3']), /python-bin/);
-    assert.throws(() => parseArgsAllow(['--cargo-bin', 'cargo']), /cargo-bin/);
+    assert.throws(() => parseArgsAllow(['--bot-bin', 'webex-bot']), /bot-bin/);
     assert.throws(() => parseArgsAllow(['--command-timeout-ms', '0']), /command-timeout-ms/);
     assert.throws(() => parseArgsAllow(['--command-timeout-ms', '3600001']), /at most 3600000/);
     assert.throws(() => parseArgsAllow(['--output-limit-bytes', 'many']), /output-limit-bytes/);
@@ -179,7 +182,10 @@ describe('deploy-config plan', () => {
     assert.equal(validate.env.WEBEX_BOT_CODE_DIR, plan.botCodeDir);
     assert.equal(validate.env.NODE_BIN, '/usr/bin/node');
     assert.equal(validate.env.PYTHON_BIN, '/usr/bin/python3');
-    assert.equal(validate.env.CARGO_BIN, '/usr/bin/cargo');
+    assert.equal(
+      validate.env.BOT_BIN,
+      '/opt/webex-generic-account-bot/bin/webex-generic-account-bot',
+    );
     assert(allGitCommands.every((command) => command.env.GIT_SSH_COMMAND.includes('/usr/bin/ssh')));
     assert(allGitCommands.every((command) => command.env.GIT_SSH_COMMAND.includes('/var/lib/webex-generic-account-bot/deploy/id_ed25519')));
     assert(allGitCommands.every((command) => command.env.GIT_SSH_COMMAND.includes('/etc/ssh/ssh_known_hosts')));
@@ -444,6 +450,18 @@ describe('trusted config policy', () => {
       'bin',
       'cargo',
     );
+    const build = spawnSync(
+      cargoBin,
+      ['build', '--locked', '--bin', 'webex-generic-account-bot'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 180_000,
+        env: process.env,
+      },
+    );
+    assert.equal(build.status, 0, `${build.stdout}\n${build.stderr}`);
+    const botBin = path.join(repoRoot, 'target', 'debug', 'webex-generic-account-bot');
     const result = spawnSync(
       '/usr/bin/bash',
       [
@@ -463,7 +481,7 @@ describe('trusted config policy', () => {
           WEBEX_BOT_CODE_DIR: repoRoot,
           NODE_BIN: process.execPath,
           PYTHON_BIN: '/usr/bin/python3',
-          CARGO_BIN: cargoBin,
+          BOT_BIN: botBin,
         }),
       },
     );
@@ -1157,6 +1175,43 @@ describe('trusted config policy', () => {
         assert.equal(fetchCallCount('/job/root/1/consoleText'), 2);
         assert.equal(bundle.graph.partial, true);
         assert.match(bundle.graph.stop_reason, /exceeded max_total_log_bytes=10/);
+      },
+    );
+  });
+
+  it('treats fetch_retries as retries after the initial Jenkins request', async () => {
+    let apiAttempts = 0;
+    await withMockedJenkinsFetch(
+      {
+        '/job/root/1/api/json': () => {
+          apiAttempts += 1;
+          if (apiAttempts <= 3) {
+            return new Response('temporary failure', { status: 503 });
+          }
+          return new Response(JSON.stringify({
+            fullDisplayName: 'root',
+            number: 1,
+            result: 'FAILURE',
+            artifacts: [],
+          }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        },
+        '/job/root/1/consoleText': 'eventual evidence',
+      },
+      async () => {
+        const report = await fetchBuildReport({
+          config: jenkinsConfig(),
+          url: 'https://jenkins.example/job/root/1/',
+          tailLines: 10,
+          maxLogBytes: 1000,
+          fetchTimeoutMs: 1000,
+          fetchRetries: 3,
+        });
+
+        assert.equal(report.fullDisplayName, 'root');
+        assert.equal(apiAttempts, 4);
       },
     );
   });
@@ -2071,7 +2126,84 @@ describe('deploy-config CLI and execution', () => {
 
     assert.equal(commandRan, false);
     await assert.rejects(() => fs.access(path.dirname(plan.renderedConfig)));
-    await assertLockReleased(plan.lockDir);
+    await assert.rejects(() => fs.access(plan.lockDir));
+  });
+
+  it('rejects an untrusted writable checkout ancestor before recursive cleanup', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const unsafeParent = path.join(temp, 'unsafe-checkout-parent');
+    await fs.mkdir(unsafeParent, { mode: 0o755 });
+    await fs.chmod(unsafeParent, 0o777);
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(unsafeParent, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /checkout directory ancestor mode is not trusted/,
+    );
+
+    assert.equal(commandRan, false);
+    await assert.rejects(() => fs.access(plan.checkoutDir));
+  });
+
+  it('rejects a symlinked host-installed bot binary before running commands', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const botBin = path.join(temp, 'webex-generic-account-bot');
+    await fs.symlink('/usr/bin/true', botBin);
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+        '--bot-bin',
+        botBin,
+      ]),
+    );
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /bot binary must be a real file/,
+    );
+
+    assert.equal(commandRan, false);
+    await assert.rejects(() => fs.access(plan.lockDir));
   });
 
   it('does not roll back a successful deployment when backup cleanup fails', async () => {
@@ -3569,7 +3701,10 @@ async function writeInstallTransactionFixture(
 }
 
 function parseArgsAllow(args) {
-  return parseArgs(args, { allowHostOverrides: true });
+  const withBotBin = args.includes('--bot-bin')
+    ? args
+    : [...args, '--bot-bin', '/usr/bin/true'];
+  return parseArgs(withBotBin, { allowHostOverrides: true });
 }
 
 function runStaticConfigPolicy(configPath) {

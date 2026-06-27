@@ -10,7 +10,7 @@ output_explicit=0
 skip_bot_check=0
 node_bin="${NODE_BIN:-node}"
 python_bin="${PYTHON_BIN:-python3}"
-cargo_bin="${CARGO_BIN:-cargo}"
+bot_bin="${BOT_BIN:-$bot_code_dir/target/debug/webex-generic-account-bot}"
 max_rendered_config_bytes="${MAX_RENDERED_CONFIG_BYTES:-4194304}"
 
 while [[ $# -gt 0 ]]; do
@@ -121,12 +121,12 @@ if [[ "$skip_bot_check" == 1 ]]; then
   exit 0
 fi
 
-if [[ ! -f "$bot_code_dir/Cargo.toml" ]]; then
-  echo "bot_check_failed=true reason=missing_code_dir path=$bot_code_dir" >&2
+if [[ ! -x "$bot_bin" ]]; then
+  echo "bot_check_failed=true reason=missing_bot_binary path=$bot_bin" >&2
   exit 1
 fi
 
-"$cargo_bin" run --quiet --manifest-path "$bot_code_dir/Cargo.toml" -- --config "$temp_output" --check-config
+"$bot_bin" --config "$temp_output" --check-config
 
 install_rendered_config "$temp_output" "$output"
 trap - EXIT

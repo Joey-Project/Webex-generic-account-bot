@@ -54,6 +54,9 @@ superseded_by:
   distinguishes skipped restarts, records generic apply and restart failure
   states, uses `failed_after_commit` for metadata failures after a successful
   restart, and rolls back the rendered config if restart fails.
+- Trusted config validation invokes a fixed host-installed bot binary for
+  `--check-config`; config deployment does not run Cargo, access registries, or
+  execute dependency build scripts.
 - Restart success requires both `systemctl is-active` and a retrying loopback
   `/healthz` probe. HTTP `200` and authenticated-endpoint `401` are ready;
   failed readiness rolls back through the same path.
@@ -155,8 +158,10 @@ superseded_by:
   deciding whether structured local evidence is required. The Node CI job also
   installs Rust explicitly before exercising the renderer-to-bot contract.
 - Local evidence gets a pre-run SHA-256 snapshot; post-run excerpt checks reject
-  any changed log before testing exact text. Helper stdout is represented as
-  fixed-prefix data lines rather than a model-closeable Markdown fence.
+  any changed log before testing exact text. Evidence reopens also require a
+  no-follow, non-blocking regular file and use bounded open/stat/read deadlines.
+  Helper stdout is represented as fixed-prefix data lines rather than a
+  model-closeable Markdown fence.
 - Jenkins env files accept the consistent `JENKINS_BASE_URL`,
   `JENKINS_USERNAME`, and `JENKINS_TOKEN` names while retaining compatibility
   with the legacy unprefixed names.

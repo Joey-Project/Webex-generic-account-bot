@@ -115,10 +115,13 @@ or token-shaped secrets. GitHub fetch uses fixed host policy:
 `/var/lib/webex-generic-account-bot/deploy/id_ed25519`, and
 `/etc/ssh/ssh_known_hosts`. The config checkout is recreated under a fresh
 `work` directory for each apply, and the trusted policy helper reads it only
-through `--source-root`. The default paths match the staging deployment layout:
+through `--source-root`. Final config validation invokes the fixed host-installed
+bot binary directly; deployment never runs Cargo, downloads crates, or executes
+dependency build scripts. The default paths match the staging deployment layout:
 
 - config checkout: `/var/lib/webex-generic-account-bot/config-checkout`
 - bot code: `/opt/webex-generic-account-bot/code`
+- bot binary: `/opt/webex-generic-account-bot/bin/webex-generic-account-bot`
 - Codex workspace: `/var/lib/webex-generic-account-bot/codex-workspace`
 - rendered config: `/var/lib/webex-generic-account-bot/rendered/production.toml`
 - service: `webex-generic-account-bot`
@@ -219,7 +222,9 @@ fail closed when prefetch produces no local evidence. Exact excerpts are
 rendered only when the model's own log URL matches that allowlist; a single-log
 fallback link never authenticates an excerpt. Before rendering, the bot also
 requires the sanitized excerpt text to occur verbatim in the local log mapped
-to that URL. The helper emits a
+to that URL. Post-run evidence reopens reject symlinks and non-regular files,
+use non-blocking reads, and enforce a short deadline so a replaced path cannot
+stall reply rendering. The helper emits a
 control-character-safe console URL
 block and keeps the complete structured URL allowlist separate from the prompt
 text truncation used for Codex context. Host policy pins the global Codex model
