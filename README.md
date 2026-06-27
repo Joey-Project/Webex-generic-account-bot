@@ -47,12 +47,14 @@ to create a Webex message in a configured read-only source room.
 For Jenkins triage rooms, `[rooms.jenkins_context]` can prefetch read-only
 diagnostics with a trusted helper script and append the result to the Codex
 prompt. Configure `script` as an absolute path outside any Codex workspace, for
-example `/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs`. The bot
+example `/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs`. The bot
 runs the helper from the helper script's directory, kills timed-out helpers, and
 requires `server.attempt_lease_secs` to cover the Codex timeout, Jenkins
 prefetch timeout budget, and Webex request margin. Codex then summarises the
 prefetched evidence without needing network access to Jenkins from inside its
 sandbox.
+Trusted deployment policy rejects Jenkins helper paths under the config checkout;
+the helper must be installed with the bot code.
 
 Jenkins triage rooms can set `reply_format = "jenkins-diagnosis-json"` so the
 bot renders deterministic Webex Markdown from compact Codex JSON:
@@ -93,6 +95,51 @@ Run the bot:
 ```bash
 cargo run -- --config config/example.toml
 ```
+
+Trusted config deployment entrypoint:
+
+```bash
+node scripts/deploy-config.mjs --dry-run
+node scripts/deploy-config.mjs --apply
+```
+
+The deployment entrypoint lives in this bot repository, not in the config
+repository checkout. It treats the config checkout as data, builds fixed argv
+calls for `git`, the bot repo's trusted `scripts/config-policy/validate-config.sh`,
+and `systemctl restart`, and runs children with a scrubbed environment that does
+not forward `SSH_AUTH_SOCK`, proxy variables, ambient `GIT_*` settings, `HOME`,
+or token-shaped secrets. GitHub fetch uses fixed host policy:
+`GIT_SSH_COMMAND` points at `/usr/bin/ssh`,
+`/var/lib/webex-generic-account-bot/deploy/id_ed25519`, and
+`/etc/ssh/ssh_known_hosts`. The config checkout is recreated under a fresh
+`work` directory for each apply, and the trusted policy helper reads it only
+through `--source-root`. The default paths match the staging deployment layout:
+
+- config checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- bot code: `/opt/webex-generic-account-bot/code`
+- Codex workspace: `/var/lib/webex-generic-account-bot/codex-workspace`
+- rendered config: `/var/lib/webex-generic-account-bot/rendered/production.toml`
+- service: `webex-generic-account-bot`
+
+Use `--skip-restart` when validating an install without restarting the service.
+That mode writes `status=installed_without_restart` instead of `status=deployed`.
+Normal apply renders and validates a candidate config first, installs it
+atomically, restarts the service, and restores the previous rendered config if
+`systemctl restart` fails. Failed fetch, validation, install, or restart paths
+write machine-readable failure metadata, so `--status` does not preserve an old
+success after a failed apply. If metadata writing fails after the new config has
+been installed and the service restart has succeeded, the entrypoint records
+`status=failed_after_commit` instead of implying the apply was rolled back.
+Child command stdout/stderr capture is bounded and each child has a deadline so
+a stuck fetch, validation, or restart cannot hold the deployment lock forever.
+Existing checkout and lock directories must be owned by the deployment user and
+mode `0700`. Path, repo, binary, timeout, and output-cap overrides are rejected
+unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
+entrypoint creates the lock parent directory when host permissions allow it and
+writes deployment metadata to
+`/var/lib/webex-generic-account-bot/rendered/deploy-status.json` after a
+successful apply. Fetch credentials must be provided by host policy without
+ambient agent, proxy, or token environment leakage.
 
 Point the `webex-headless-messenger` JS sidecar at the bot:
 
@@ -145,9 +192,10 @@ users.
 
 ## Development
 
-Generated Rust CI runs:
+Generated CI runs:
 
 ```bash
+node test/run-node-tests.mjs
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
@@ -156,6 +204,7 @@ cargo test --all-features
 Local tests:
 
 ```bash
+node test/run-node-tests.mjs
 cargo test --all-features
 ```
 

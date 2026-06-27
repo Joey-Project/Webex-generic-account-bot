@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: '24'
       - name: Run Node tests
-        run: node --test test/*.node-test.mjs
+        run: node test/run-node-tests.mjs
 
   rust:
     name: Rust

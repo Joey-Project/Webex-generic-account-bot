@@ -514,6 +514,12 @@ async fn run_jenkins_context_helper(
     url: &str,
     artifact_dir: &Path,
 ) -> Result<String> {
+    const SERVICE_MAX_JENKINS_NODES: &str = "32";
+    const SERVICE_MAX_TOTAL_LOG_BYTES: &str = "104857600";
+    const SERVICE_MAX_LOG_BYTES_PER_NODE: &str = "10485760";
+    const SERVICE_FETCH_RETRIES: &str = "3";
+    const SERVICE_MAX_PARALLEL_FETCHES: &str = "4";
+
     let mut command = Command::new(&config.node_bin);
     let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
     configure_jenkins_helper_process(&mut command);
@@ -527,6 +533,18 @@ async fn run_jenkins_context_helper(
         .arg("diagnose")
         .arg("--url")
         .arg(url)
+        .arg("--max-nodes")
+        .arg(SERVICE_MAX_JENKINS_NODES)
+        .arg("--max-total-log-bytes")
+        .arg(SERVICE_MAX_TOTAL_LOG_BYTES)
+        .arg("--max-log-bytes-per-node")
+        .arg(SERVICE_MAX_LOG_BYTES_PER_NODE)
+        .arg("--max-fetch-seconds")
+        .arg(config.timeout_secs.max(1).to_string())
+        .arg("--fetch-retries")
+        .arg(SERVICE_FETCH_RETRIES)
+        .arg("--max-parallel-fetches")
+        .arg(SERVICE_MAX_PARALLEL_FETCHES)
         .current_dir(script_dir)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -2834,7 +2852,12 @@ fn escape_markdown_plain_text(value: &str) -> String {
 fn extract_jenkins_console_urls(context: &str) -> Vec<String> {
     let mut urls = Vec::new();
     for line in context.lines() {
-        let Some((_, value)) = line.split_once("jenkins_console:") else {
+        let trimmed = line.trim_start();
+        let value = if let Some(value) = trimmed.strip_prefix("jenkins_console:") {
+            value
+        } else if let Some(value) = trimmed.strip_prefix("- jenkins_console:") {
+            value
+        } else {
             continue;
         };
         if let Some(url) = normalized_jenkins_console_url(value) {
@@ -4678,6 +4701,28 @@ mod tests {
     }
 
     #[test]
+    fn jenkins_console_url_allowlist_ignores_console_derived_markers() {
+        let context = "prefetched_jenkins_console_urls:\n- jenkins_console: https://jenkins.example/job/foo/1/console\n- jenkins_console: https://jenkins.example/job/bar/2/console\ninfra_signals:\n- checkout: fatal jenkins_console: https://evil.example/job/x/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "log_url": "https://evil.example/job/x/1/console"
+        }"#;
+
+        assert_eq!(
+            extract_jenkins_console_urls(context),
+            vec![
+                "https://jenkins.example/job/foo/1/console".to_owned(),
+                "https://jenkins.example/job/bar/2/console".to_owned(),
+            ]
+        );
+        assert_eq!(
+            render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context)),
+            "**Jenkins infra false alarm:** agent capacity failure"
+        );
+    }
+
+    #[test]
     fn jenkins_diagnosis_json_omits_fallback_when_multiple_logs_are_prefetched() {
         let context = "jenkins_console: https://jenkins.example/job/foo/1/console\njenkins_console: https://jenkins.example/job/bar/2/console\n";
         let output = r#"{
@@ -4978,7 +5023,11 @@ mod tests {
         let env_file = helper_dir.join("jenkins.env");
         let artifact_dir = helper_dir.join("artifacts");
         fs::create_dir_all(&artifact_dir).unwrap();
-        fs::write(&script, "printf 'pwd=%s\\n' \"$PWD\"\n").unwrap();
+        fs::write(
+            &script,
+            "printf 'pwd=%s\\n' \"$PWD\"\nprintf 'args=%s\\n' \"$*\"\n",
+        )
+        .unwrap();
         fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
         let config = webex_generic_account_bot::JenkinsContextConfig {
             node_bin: "/bin/sh".to_owned(),
@@ -4999,6 +5048,9 @@ mod tests {
         .unwrap();
 
         assert!(output.contains(&format!("pwd={}", helper_dir.display())));
+        assert!(output.contains("--max-total-log-bytes 104857600"));
+        assert!(output.contains("--max-log-bytes-per-node 10485760"));
+        assert!(output.contains("--max-nodes 32"));
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
