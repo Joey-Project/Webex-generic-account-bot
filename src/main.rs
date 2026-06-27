@@ -1525,7 +1525,7 @@ impl BotApp {
             .as_deref()
             .or(message.markdown.as_deref())
             .is_some_and(is_config_command_namespace);
-        if is_config_command && !is_config_command_room {
+        if self.config.config_commands.is_some() && is_config_command && !is_config_command_room {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
                 "config_command_wrong_room",
@@ -4034,6 +4034,29 @@ mod tests {
 
         assert!(harness.runner.calls().is_empty());
         assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_namespace_keeps_ordinary_room_behaviour_when_admin_is_disabled() {
+        let harness = TestHarness::new();
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-config-disabled")));
+        harness.runner.push_output("Ordinary reply");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "config-disabled",
+                "/config help",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("reply-config-disabled"));
+        assert_eq!(harness.runner.calls().len(), 1);
     }
 
     #[tokio::test]
