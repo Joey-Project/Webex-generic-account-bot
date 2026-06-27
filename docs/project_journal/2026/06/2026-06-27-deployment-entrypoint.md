@@ -138,6 +138,9 @@ superseded_by:
 - Local evidence gets a pre-run SHA-256 snapshot; post-run excerpt checks reject
   any changed log before testing exact text. Helper stdout is represented as
   fixed-prefix data lines rather than a model-closeable Markdown fence.
+- Jenkins env files accept the consistent `JENKINS_BASE_URL`,
+  `JENKINS_USERNAME`, and `JENKINS_TOKEN` names while retaining compatibility
+  with the legacy unprefixed names.
 
 ## Follow-Ups
 - Wire fixed Webex admin commands to this entrypoint in the next PR.

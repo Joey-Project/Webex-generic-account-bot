@@ -32,6 +32,7 @@ import {
   formatBundleStdout,
   formatBundleSummary,
   jenkinsLogFileName,
+  loadJenkinsConfig,
   redactedConsoleLinesFromText,
 } from '../scripts/jenkins-readonly.mjs';
 
@@ -317,6 +318,32 @@ describe('deploy-config environment and output hygiene', () => {
 });
 
 describe('trusted config policy', () => {
+  it('loads Jenkins-prefixed and legacy credentials from the helper env file', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jenkins-env-config-test-'));
+    const fixtures = [
+      [
+        'prefixed.env',
+        'JENKINS_BASE_URL=https://jenkins.example/jenkins/\nJENKINS_USERNAME=prefixed-user\nJENKINS_TOKEN=prefixed-token\n',
+        'prefixed-user',
+      ],
+      [
+        'legacy.env',
+        'BASE_URL=https://jenkins.example/jenkins/\nUSERNAME=legacy-user\nTOKEN=legacy-token\n',
+        'legacy-user',
+      ],
+    ];
+
+    for (const [fileName, contents, username] of fixtures) {
+      const envFile = path.join(temp, fileName);
+      await fs.writeFile(envFile, contents, 'utf8');
+      const config = await loadJenkinsConfig(envFile);
+      assert.equal(config.baseUrl.toString(), 'https://jenkins.example/jenkins/');
+      assert.equal(config.username, username);
+      assert.match(config.token, /-token$/);
+    }
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
   it('allowlists the bot-owned Jenkins helper path, not the config checkout path', async () => {
     const policy = await fs.readFile('scripts/config-policy/static-config-check.py', 'utf8');
     const example = await fs.readFile('config/example.toml', 'utf8');

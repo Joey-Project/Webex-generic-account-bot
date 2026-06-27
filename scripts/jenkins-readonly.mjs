@@ -1354,14 +1354,16 @@ export function jenkinsLogFileName(report, buildUrl) {
   return `${label}-${number}-${digest}.log`;
 }
 
-async function loadJenkinsConfig(envFile) {
+export async function loadJenkinsConfig(envFile) {
   const fileEnv = parseEnvFile(await fs.readFile(envFile, 'utf8'));
-  const baseUrl = fileEnv.BASE_URL || process.env.JENKINS_BASE_URL;
-  const username = fileEnv.USERNAME || fileEnv.JENKINS_USERNAME || process.env.JENKINS_USERNAME;
-  const token = fileEnv.TOKEN || fileEnv.JENKINS_TOKEN || process.env.JENKINS_TOKEN;
+  const baseUrl = fileEnv.JENKINS_BASE_URL || fileEnv.BASE_URL || process.env.JENKINS_BASE_URL;
+  const username = fileEnv.JENKINS_USERNAME || fileEnv.USERNAME || process.env.JENKINS_USERNAME;
+  const token = fileEnv.JENKINS_TOKEN || fileEnv.TOKEN || process.env.JENKINS_TOKEN;
 
   if (!baseUrl || !username || !token) {
-    throw new Error('jenkins env requires BASE_URL, USERNAME, and TOKEN');
+    throw new Error(
+      'jenkins env requires JENKINS_BASE_URL, JENKINS_USERNAME, and JENKINS_TOKEN (legacy unprefixed keys are also accepted)',
+    );
   }
 
   return {
