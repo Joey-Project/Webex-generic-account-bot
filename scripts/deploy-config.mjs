@@ -610,6 +610,7 @@ export async function executePlan({
             `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}`,
           );
         }
+        await recordFailure('failed_restart_rolled_back', error.message);
         try {
           await clearInstallTransaction(plan, fsApi);
           await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
@@ -622,7 +623,6 @@ export async function executePlan({
             `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
           );
         }
-        await recordFailure('failed_restart_rolled_back', error.message);
         throw error;
       }
     }

@@ -60,6 +60,8 @@ superseded_by:
 - Restart success requires both `systemctl is-active` and a retrying loopback
   `/healthz` probe. HTTP `200` and authenticated-endpoint `401` are ready;
   failed readiness rolls back through the same path.
+- Rollback failure metadata is made durable before clearing the transaction
+  journal and backup; a metadata failure preserves recovery-required status.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
   rename. Cleanup failures are merged into the reported error and lock-release
   verification failures are recorded without replacing an earlier specific

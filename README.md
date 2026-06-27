@@ -136,11 +136,14 @@ atomically, restarts the service, and restores the previous rendered config if
 endpoint does not become ready. A `200` response is ready; `401` also proves
 readiness when the endpoint requires the sidecar bearer token. Failed fetch,
 validation, install, restart, health, or cleanup paths
-write machine-readable failure metadata. Metadata is fsynced to a same-directory
-temporary file and atomically renamed, so existing links are replaced rather
-than followed and a failed write preserves the last complete status. If failure
-metadata cannot be written, the apply reports both the primary error and the
-metadata error; an existing status file must then be treated as stale. The
+write machine-readable failure metadata. A completed service rollback makes its
+failure metadata durable before removing the recovery journal, so a crash or
+metadata error cannot expose stale success status. Metadata is fsynced to a
+same-directory temporary file and atomically renamed, so existing links are
+replaced rather than followed and a failed write preserves the last complete
+status. If failure metadata cannot be written, the apply reports both the
+primary error and the metadata error; an existing status file must then be
+treated as stale. The
 candidate file and rendered-config directory are fsynced before success metadata
 is committed, so `status=deployed` cannot become more durable than the installed
 config. A post-rename durability failure restores the previous config before

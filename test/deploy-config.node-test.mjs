@@ -3216,6 +3216,109 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('keeps the recovery journal when rollback failure metadata cannot be persisted', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    await fs.writeFile(
+      plan.metadataFile,
+      `${JSON.stringify({
+        status: 'deployed',
+        config_repo: plan.configRepo,
+        config_ref: plan.configRef,
+        config_revision: 'b'.repeat(40),
+        bot_code_dir: plan.botCodeDir,
+        rendered_config: plan.renderedConfig,
+        service: plan.service,
+        service_action: 'restart',
+        service_restart_skipped: false,
+        deployed_at: '2026-06-27T00:00:00.000Z',
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (target === plan.metadataFile) {
+          throw new Error('rollback metadata write failed');
+        }
+        return await fs.rename(source, target);
+      },
+    };
+    let restartAttempts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+            if (restartAttempts === 1) {
+              throw new Error('restart failed');
+            }
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /restart failed; failed to write deployment failure metadata: rollback metadata write failed/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 2);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    assert.equal(transaction.config_revision, 'd'.repeat(40));
+    assert.equal(
+      JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).config_revision,
+      'b'.repeat(40),
+    );
+    let stdout = '';
+    const status = await runCli({
+      argv: [
+        '--status',
+        '--json',
+        '--rendered-config',
+        plan.renderedConfig,
+        '--metadata-file',
+        plan.metadataFile,
+      ],
+      parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+      stdout: writer((chunk) => {
+        stdout += chunk;
+      }),
+      stderr: writer(),
+    });
+    assert.equal(status, 1);
+    assert.deepEqual(JSON.parse(stdout), {
+      status: 'recovery_required',
+      transaction_phase: 'service_transition_started',
+      config_revision: 'd'.repeat(40),
+    });
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('stops the service when a first deployment restart fails without an old config', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
