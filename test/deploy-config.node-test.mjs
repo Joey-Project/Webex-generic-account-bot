@@ -71,6 +71,10 @@ describe('deploy-config argument parsing', () => {
     assert.throws(() => parseArgsAllow(['--config-repo', 'ssh://github.com/org/repo.git']), /config-repo/);
     assert.throws(() => parseArgsAllow(['--service', 'bad/unit']), /service/);
     assert.throws(() => parseArgsAllow(['--service', '-Hroot@example']), /service/);
+    assert.throws(
+      () => parseArgsAllow(['--service', 'webex-generic-account-bot.service']),
+      /fixed bot unit/,
+    );
     assert.throws(() => parseArgsAllow(['--checkout-dir', 'relative/path']), /checkout-dir/);
     assert.throws(() => parseArgsAllow(['--git-bin', 'git']), /git-bin/);
     assert.throws(() => parseArgsAllow(['--node-bin', 'node']), /node-bin/);
@@ -517,6 +521,34 @@ describe('trusted config policy', () => {
     const result = runStaticConfigPolicy(config);
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /room_id is not allowlisted by host policy: attacker-controlled-room/);
+  });
+
+  it('keeps config commands disabled until host policy pins the admin Space', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'config-commands.toml');
+    const rendered = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    const firstRoom = rendered.indexOf('[[rooms]]');
+    assert.notEqual(firstRoom, -1);
+    const configCommands = [
+      '[config_commands]',
+      'room_id = "unreviewed-admin-room"',
+      'allowed_person_ids = ["unreviewed-person"]',
+      'allowed_person_emails = []',
+      'allowed_commands = ["status"]',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      config,
+      `${rendered.slice(0, firstRoom)}${configCommands}${rendered.slice(firstRoom)}`,
+      'utf8',
+    );
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /config\.config_commands is not an allowed production config field/);
+    await fs.rm(temp, { recursive: true, force: true });
   });
 
   it('rejects appended instructions in host-pinned Jenkins prompts', async () => {
@@ -3023,7 +3055,11 @@ describe('deploy-config CLI and execution', () => {
         if (target === plan.metadataFile) {
           metadataRenames += 1;
           if (metadataRenames === 2) {
+            await fs.writeFile(plan.candidateConfig, 'stale candidate\n', 'utf8');
             throw new Error('recovered metadata update failed');
+          }
+          if (metadataRenames === 3) {
+            throw new Error('failure metadata write failed');
           }
         }
         return await fs.rename(source, target);
@@ -3031,6 +3067,9 @@ describe('deploy-config CLI and execution', () => {
       async rm(file, options) {
         if (file === plan.backupConfig) {
           throw new Error('backup cleanup failed');
+        }
+        if (file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
         }
         return await fs.rm(file, options);
       },
@@ -3055,7 +3094,9 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_after_commit');
     assert.equal(failureMetadata.config_revision, 'a'.repeat(40));
-    assert.equal(metadataRenames, 3);
+    assert.equal(failureMetadata.cleanup_failed, true);
+    assert.equal(failureMetadata.candidate_cleanup_failed, true);
+    assert.equal(metadataRenames, 4);
     await assertLockReleased(plan.lockDir);
   });
 

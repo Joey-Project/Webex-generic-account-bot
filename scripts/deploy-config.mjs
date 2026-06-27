@@ -534,16 +534,18 @@ export async function executePlan({
   let failureMetadataWritten = false;
   let failureMetadataError = null;
   let recordedFailureStatus = null;
+  let recordedFailureConfigRevision = null;
   let outputDirectoriesTrusted = false;
   const recordFailure = async (
     status,
     reason,
     configRevision = captures.configRevision || null,
   ) => {
+    recordedFailureStatus = status;
+    recordedFailureConfigRevision = configRevision;
     try {
       await writeFailureMetadata(plan, configRevision, status, reason, fsApi);
       failureMetadataWritten = true;
-      recordedFailureStatus = status;
     } catch (error) {
       failureMetadataError = error;
       throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
@@ -705,7 +707,7 @@ export async function executePlan({
         try {
           await writeFailureMetadata(
             plan,
-            captures.configRevision || null,
+            recordedFailureConfigRevision ?? captures.configRevision ?? null,
             recordedFailureStatus
               ?? (commitReached ? 'failed_after_commit_cleanup' : 'failed_cleanup'),
             combinedReason,
@@ -1434,8 +1436,8 @@ function validateRepo(value) {
 }
 
 function validateService(value) {
-  if (!/^[A-Za-z0-9_.@-]+$/.test(value) || value.startsWith('-')) {
-    throw new UsageError(`service must be a systemd unit name without path separators: ${value}`);
+  if (value !== DEFAULTS.service) {
+    throw new UsageError(`service must be the fixed bot unit ${DEFAULTS.service}`);
   }
 }
 

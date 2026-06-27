@@ -23,6 +23,11 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   reconciliation.
 - Bounds concurrent request processing with `server.max_concurrent_requests`.
 - Scrubs Webex token variables from the Codex subprocess environment.
+- Hydrates every sidecar message ID through Webex before making room, sender,
+  body, thread, Codex, or reply-routing decisions. Sidecar message fields are
+  hints only.
+- Supports an optional dedicated Configuration Space with explicit sender and
+  command allowlists. The current slice implements read-only `/config status`.
 
 The first implementation is synchronous per sidecar request: the HTTP request
 returns after Codex finishes and the Webex reply is accepted. For this slice,
@@ -37,6 +42,32 @@ environment variables or token files.
 Codex model settings can be configured globally under `[codex]` or overridden
 per room under `[rooms.codex]`, including `model` and
 `model_reasoning_effort`.
+
+The binary supports an optional `[config_commands]` table separate from
+ordinary room policy:
+
+```toml
+[config_commands]
+room_id = "ADMIN_WEBEX_ROOM_ID"
+allowed_person_ids = []
+allowed_person_emails = ["operator@example.com"]
+allowed_commands = ["status"]
+```
+
+The admin Space cannot overlap an input or output room, has no
+`allow_all_senders` mode, and accepts only exact `/config ...` commands after
+authoritative Webex hydration. `/config status` reads fixed host deployment
+metadata with no-follow and size checks, returns only allowlisted fields, and
+uses the normal idempotent Webex reply marker. `pull`, `reload`, and `sync` are
+reserved command names but remain undeployable until the durable external
+action worker is implemented; configuration validation rejects them.
+When a valid deployment transaction exists, status reports its allowlisted
+phase and in-progress revision; malformed journals fail closed to
+`recovery_required` without exposing their contents.
+The current production host policy also rejects the entire table until a
+companion config PR pins the exact admin Space and sender allowlist. The example
+above is therefore for local validation and the upcoming reviewed deployment,
+not yet for `scripts/deploy-config.mjs --apply`.
 
 For staging production Space behaviour, a room policy can set
 `output_room_id`, `forward_source_message = true`, and
