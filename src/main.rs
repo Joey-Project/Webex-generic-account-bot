@@ -409,6 +409,7 @@ fn parent_message_listing_is_empty(parent_id: Option<&str>, error: &WebexError) 
 
 async fn jenkins_context_prompt(
     policy: &webex_generic_account_bot::RoomPolicy,
+    reply_format: ReplyFormat,
     codex_config: &CodexConfig,
     context: &MessageContext,
 ) -> Result<Option<JenkinsPrefetchedContext>> {
@@ -432,7 +433,7 @@ async fn jenkins_context_prompt(
     let mut console_urls = Vec::new();
     let mut evidence_logs = HashMap::new();
     let evidence_required = matches!(
-        policy.reply_format,
+        reply_format,
         ReplyFormat::JenkinsDiagnosisJson | ReplyFormat::JenkinsFollowupJson
     );
     let build_result: Result<String> = async {
@@ -1602,7 +1603,14 @@ impl BotApp {
         );
         let mut jenkins_prefetch_failed = false;
         if let Some(jenkins_context) = jenkins_context {
-            match jenkins_context_prompt(policy, &codex_config, jenkins_context).await {
+            match jenkins_context_prompt(
+                policy,
+                request.reply_format,
+                &codex_config,
+                jenkins_context,
+            )
+            .await
+            {
                 Ok(Some(context_bundle)) => {
                     let JenkinsPrefetchedContext {
                         prompt,
@@ -4053,6 +4061,92 @@ mod tests {
                 .contains(&reply_marker("followup-1"))
         );
         assert!(harness.processed("followup-1").await);
+    }
+
+    #[tokio::test]
+    async fn jenkins_followup_override_loads_structured_evidence() {
+        let helper_dir = unique_state_path().with_extension("helper-followup-evidence-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(
+            &script,
+            "artifact_dir=\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             --artifact-dir) artifact_dir=\"$2\"; shift 2 ;;\n\
+             *) shift ;;\n\
+             esac\n\
+             done\n\
+             mkdir -p \"$artifact_dir/logs\"\n\
+             printf 'agent capacity failure\\n' > \"$artifact_dir/logs/foo.log\"\n\
+             printf '%s\\n' '{\"version\":1,\"jobs\":[{\"local_log_relative\":\"logs/foo.log\",\"jenkins_console\":\"https://jenkins.example/job/foo/1/console\"}]}' > \"$artifact_dir/logs/index.json\"\n\
+             printf 'jenkins_console: https://jenkins.example/job/foo/1/console\\n'\n",
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let state_path = unique_state_path();
+        let mut config = (*followup_test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::Markdown;
+        config.rooms[0].followup.reply_format = Some(ReplyFormat::JenkinsFollowupJson);
+        config.rooms[0].jenkins_context = Some(webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        });
+        config.validate().unwrap();
+        let harness = TestHarness::with_config(Arc::new(config));
+        let mut prior_reply = message_with_marker("bot-reply-1", ROOM_ID, &reply_marker("root-1"));
+        prior_reply.parent_id = Some("root-1".to_owned());
+        harness.webex.push_get_message(Ok(inbound_message(
+            "root-1",
+            "Jenkins failed: https://engci-private-sjc.cisco.com/jenkins/job/foo/1/",
+        )));
+        harness.webex.push_thread_messages(Ok(vec![prior_reply]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("followup-reply-1")));
+        harness.runner.push_output(
+            r#"{
+                "answer": "The task did not start because no agent was available.",
+                "include_evidence": true,
+                "log_url": "https://jenkins.example/job/foo/1/console"
+            }"#,
+        );
+
+        harness
+            .app
+            .process_event(message_event(inbound_thread_message(
+                "followup-1",
+                ROOM_ID,
+                "root-1",
+                "@miku.gen can you verify the evidence?",
+            )))
+            .await
+            .unwrap();
+
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("Prefetched Jenkins diagnostics"));
+        assert!(
+            calls[0]
+                .1
+                .contains("https://jenkins.example/job/foo/1/console")
+        );
+        let created = harness.webex.created_requests();
+        assert!(
+            created[0]
+                .markdown
+                .as_deref()
+                .unwrap()
+                .contains("The task did not start because no agent was available")
+        );
+        fs::remove_dir_all(helper_dir).unwrap();
     }
 
     #[test]

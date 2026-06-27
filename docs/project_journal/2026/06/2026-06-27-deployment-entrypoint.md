@@ -132,6 +132,9 @@ superseded_by:
 - Jenkins build URLs reject percent-decoded control characters in job
   segments. Decoded IDs, graph relationships, errors, and diagnostics are also
   single-line Markdown-escaped before entering the Codex-readable summary.
+- Jenkins prefetch uses the effective direct or follow-up reply format when
+  deciding whether structured local evidence is required. The Node CI job also
+  installs Rust explicitly before exercising the renderer-to-bot contract.
 
 ## Follow-Ups
 - Wire fixed Webex admin commands to this entrypoint in the next PR.
