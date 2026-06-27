@@ -63,6 +63,8 @@ superseded_by:
   failed readiness rolls back through the same path.
 - Rollback failure metadata is made durable before clearing the transaction
   journal and backup; a metadata failure preserves recovery-required status.
+- A live-path rollback whose final directory fsync fails still performs the
+  required service restart/stop, then retains the journal as durability evidence.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
   rename. Cleanup failures are merged into the reported error and lock-release
   verification failures are recorded without replacing an earlier specific
@@ -169,6 +171,9 @@ superseded_by:
   no-follow, non-blocking regular file and use bounded open/stat/read deadlines.
   Helper stdout is represented as fixed-prefix data lines rather than a
   model-closeable Markdown fence.
+- Config fragments use fixed code-unit filename ordering. Oversized Jenkins
+  `Content-Length` declarations debit the aggregate log budget before body
+  cancellation, matching streamed oversized-response accounting.
 - Jenkins env files accept the consistent `JENKINS_BASE_URL`,
   `JENKINS_USERNAME`, and `JENKINS_TOKEN` names while retaining compatibility
   with the legacy unprefixed names.

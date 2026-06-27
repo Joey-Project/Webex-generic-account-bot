@@ -1208,6 +1208,12 @@ async function readResponseBodyLimited(
 ) {
   const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    try {
+      onBytesRead(contentLength);
+    } catch (error) {
+      await response.body?.cancel?.().catch(() => {});
+      throw error;
+    }
     await response.body?.cancel?.().catch(() => {});
     throw new ErrorType(`GET ${url.pathname} exceeded ${budgetName}=${maxBytes}`);
   }

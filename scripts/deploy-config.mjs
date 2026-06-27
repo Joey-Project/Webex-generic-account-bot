@@ -585,8 +585,9 @@ export async function executePlan({
         const rollbackState = installState;
         installState = null;
         let rollbackError = null;
+        let rollbackDurabilityError = null;
         try {
-          await restoreCandidateConfig(plan, rollbackState, fsApi);
+          rollbackDurabilityError = await restoreCandidateConfig(plan, rollbackState, fsApi);
         } catch (restoreError) {
           rollbackError = restoreError;
         }
@@ -603,13 +604,21 @@ export async function executePlan({
           const rollbackAction = rollbackState.hadPrevious
             ? 'service restart'
             : 'service stop';
+          const durabilityFailure = rollbackDurabilityError
+            ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
+            : '';
           await recordFailure(
             'failed_restart_rollback_restart_failed',
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
           );
           throw new Error(
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
           );
+        }
+        if (rollbackDurabilityError) {
+          const reason = `${error.message}; restored previous config and service but failed to make config rollback durable: ${rollbackDurabilityError.message}`;
+          await recordFailure('failed_restart_rollback_failed', reason);
+          throw new Error(reason);
         }
         await recordFailure('failed_restart_rolled_back', error.message);
         try {
@@ -1698,15 +1707,30 @@ async function installCandidateConfig(plan, configRevision, fsApi) {
 }
 
 async function rollbackCandidateConfig(plan, installState, fsApi) {
-  await restoreCandidateConfig(plan, installState, fsApi);
+  const durabilityError = await restoreCandidateConfig(plan, installState, fsApi);
+  if (durabilityError) {
+    throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
+  }
   await clearInstallTransaction(plan, fsApi);
   await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
 }
 
 async function rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi) {
-  await restoreCandidateConfig(plan, installState, fsApi);
+  const durabilityError = await restoreCandidateConfig(plan, installState, fsApi);
   if (installState.phase === 'service_transition_started') {
-    await runServiceRollback(plan, installState, runner, parentEnv);
+    try {
+      await runServiceRollback(plan, installState, runner, parentEnv);
+    } catch (error) {
+      if (durabilityError) {
+        throw new Error(
+          `${error.message}; config rollback durability also failed: ${durabilityError.message}`,
+        );
+      }
+      throw error;
+    }
+  }
+  if (durabilityError) {
+    throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
   }
   await clearInstallTransaction(plan, fsApi);
   await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
@@ -1747,7 +1771,12 @@ async function restoreCandidateConfig(plan, installState, fsApi) {
   } else {
     await removeIfPresent(plan.renderedConfig, fsApi);
   }
-  await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+  try {
+    await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+    return null;
+  } catch (error) {
+    return error;
+  }
 }
 
 async function writeInstallTransaction(plan, installState, fsApi) {

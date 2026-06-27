@@ -584,6 +584,22 @@ describe('trusted config policy', () => {
     );
   });
 
+  it('renders space fragments in locale-independent code-unit order', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'render-config-test-'));
+    const spaces = path.join(temp, 'production', 'spaces');
+    await fs.mkdir(spaces, { recursive: true });
+    await fs.writeFile(path.join(temp, 'production', 'bot.toml'), 'base = true\n', 'utf8');
+    await fs.writeFile(path.join(spaces, 'a.toml'), 'room = "lower"\n', 'utf8');
+    await fs.writeFile(path.join(spaces, 'Z.toml'), 'room = "upper"\n', 'utf8');
+
+    const rendered = await renderEnvironment('production', temp);
+
+    assert(
+      rendered.indexOf('# Source: production/spaces/Z.toml')
+        < rendered.indexOf('# Source: production/spaces/a.toml'),
+    );
+  });
+
   it('redacts console-derived snippets before summaries or stdout can use them', () => {
     const lines = redactedConsoleLinesFromText(
       'ERROR password=secret-token\nAuthorization: Bearer abc.def\nfatal https://user:url-token@example.com/repo.git\nclone https://url-token@example.com/repo.git\ntoken="quoted-secret"\ncredential: \'single-secret\'\nnormal line',
@@ -1048,7 +1064,9 @@ describe('trusted config policy', () => {
           ],
           artifacts: [],
         },
-        '/job/root/1/consoleText': 'x'.repeat(20),
+        '/job/root/1/consoleText': () => new Response('x'.repeat(20), {
+          headers: { 'content-length': '20' },
+        }),
         '/job/child/2/api/json': {
           fullDisplayName: 'child #2',
           number: 2,
@@ -1094,7 +1112,9 @@ describe('trusted config policy', () => {
           ],
           artifacts: [],
         },
-        '/job/root/1/consoleText': 'x'.repeat(20),
+        '/job/root/1/consoleText': () => new Response('x'.repeat(20), {
+          headers: { 'content-length': '20' },
+        }),
         '/job/child-1/1/api/json': {
           fullDisplayName: 'child-1',
           number: 1,
@@ -2835,6 +2855,91 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('recovers the old service before reporting rollback durability failure', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: 'a'.repeat(40),
+      serviceRestartRequired: true,
+    });
+    let restoredLiveConfig = false;
+    let rollbackDirectorySyncFailed = false;
+    const calls = [];
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        await fs.rename(source, target);
+        if (source === plan.candidateConfig && target === plan.renderedConfig) {
+          restoredLiveConfig = true;
+        }
+      },
+      async open(file, ...args) {
+        const handle = await fs.open(file, ...args);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                if (
+                  String(file) === path.dirname(plan.renderedConfig)
+                  && restoredLiveConfig
+                  && !rollbackDirectorySyncFailed
+                ) {
+                  rollbackDirectorySyncFailed = true;
+                  throw new Error('recovery rollback directory fsync failed');
+                }
+                return await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          calls.push([command.bin, command.args[0]]);
+          return { stdout: command.bin === '/usr/bin/curl' ? '200' : '', stderr: '' };
+        },
+      }),
+      /failed to make config rollback durable: recovery rollback directory fsync failed/,
+    );
+
+    assert.deepEqual(calls, [
+      ['/usr/bin/systemctl', 'restart'],
+      ['/usr/bin/systemctl', 'is-active'],
+      ['/usr/bin/curl', '--disable'],
+    ]);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(rollbackDirectorySyncFailed, true);
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+    assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_apply');
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('finalises committed metadata without rolling back the live config', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
     const plan = buildDeployPlan(
@@ -3293,6 +3398,97 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
     assert.equal(failureMetadata.config_revision, 'c'.repeat(40));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores the old service when config rollback directory fsync fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let liveConfigRenames = 0;
+    let failRollbackDirectorySync = false;
+    let rollbackDirectorySyncFailed = false;
+    let restartAttempts = 0;
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        await fs.rename(source, target);
+        if (source === plan.candidateConfig && target === plan.renderedConfig) {
+          liveConfigRenames += 1;
+          if (liveConfigRenames === 2) {
+            failRollbackDirectorySync = true;
+          }
+        }
+      },
+      async open(file, ...args) {
+        const handle = await fs.open(file, ...args);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                if (
+                  String(file) === path.dirname(plan.renderedConfig)
+                  && failRollbackDirectorySync
+                  && !rollbackDirectorySyncFailed
+                ) {
+                  rollbackDirectorySyncFailed = true;
+                  throw new Error('rollback directory fsync failed');
+                }
+                return await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+            if (restartAttempts === 1) {
+              throw new Error('restart failed');
+            }
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'e'.repeat(40)}\n` : '200',
+            stderr: '',
+          };
+        },
+      }),
+      /restored previous config and service but failed to make config rollback durable: rollback directory fsync failed/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 2);
+    assert.equal(rollbackDirectorySyncFailed, true);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_restart_rollback_failed');
     await assertLockReleased(plan.lockDir);
   });
 

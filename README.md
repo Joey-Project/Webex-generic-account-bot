@@ -144,11 +144,13 @@ same-directory temporary file and atomically renamed, so existing links are
 replaced rather than followed and a failed write preserves the last complete
 status. If failure metadata cannot be written, the apply reports both the
 primary error and the metadata error; an existing status file must then be
-treated as stale. The
-candidate file and rendered-config directory are fsynced before success metadata
-is committed, so `status=deployed` cannot become more durable than the installed
-config. A post-rename durability failure restores the previous config before
-returning. Before replacing the live config, the entrypoint writes and fsyncs a
+treated as stale. The candidate file and rendered-config directory are fsynced
+before success metadata is committed, so `status=deployed` cannot become more
+durable than the installed config. A post-rename durability failure restores
+the previous config before returning. If rollback changes the live path but its
+final directory fsync fails, service restart/stop compensation still runs and
+the recovery journal is preserved. Before replacing the live config, the
+entrypoint writes and fsyncs a
 mode `0600` transaction journal beside it. The journal advances through
 `prepared`, `service_transition_started`, and `committed_pending_metadata`, and
 remains until success metadata is durable. After an unclean exit, the next apply
@@ -237,6 +239,11 @@ control-character-safe console URL
 block and keeps the complete structured URL allowlist separate from the prompt
 text truncation used for Codex context. Host policy pins the global Codex model
 and Jenkins prefetch fan-out/resource settings.
+
+Config fragment rendering uses fixed code-unit filename ordering rather than
+host locale. Jenkins log responses with an oversized declared `Content-Length`
+charge that declared size to the aggregate log budget before the body is
+cancelled.
 
 Point the `webex-headless-messenger` JS sidecar at the bot:
 

@@ -32,7 +32,7 @@ export async function renderEnvironment(environment, sourceRoot = REPO_ROOT, opt
   const base = await readRequiredFile(basePath, budget);
   const spaceFiles = (await fs.readdir(spacesDir))
     .filter((file) => file.endsWith('.toml'))
-    .sort((left, right) => left.localeCompare(right));
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 
   if (spaceFiles.length === 0) {
     throw new Error(`no space config files found in ${spacesDir}`);
