@@ -49,6 +49,7 @@ use webex_headless_messenger::{
 
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
 const EVENT_HYDRATION_NOT_FOUND_RETRY: Duration = Duration::from_secs(5);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
@@ -66,6 +67,17 @@ const JENKINS_HELPER_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 static JENKINS_ARTIFACT_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn event_hydration_not_found_retry() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        EVENT_HYDRATION_NOT_FOUND_RETRY
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -104,7 +116,6 @@ async fn main() -> Result<()> {
         state: Mutex::new(state_store),
         runner: Arc::new(ExecCodexRunner),
         config_status: Arc::new(FileConfigStatusProvider::default()),
-        hydration_not_found_once: Mutex::new(HashSet::new()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
     });
 
@@ -146,7 +157,6 @@ struct BotApp {
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
     config_status: Arc<dyn ConfigStatusProvider>,
-    hydration_not_found_once: Mutex<HashSet<String>>,
     request_slots: Arc<Semaphore>,
 }
 
@@ -1488,8 +1498,7 @@ impl BotApp {
         };
 
         let message = match self
-            .webex
-            .get_event_message(&message_id, &sidecar_message)
+            .get_event_message_with_not_found_retry(&message_id, &sidecar_message)
             .await
         {
             Ok(message) => message,
@@ -1499,10 +1508,6 @@ impl BotApp {
                     .await;
             }
         };
-        self.hydration_not_found_once
-            .lock()
-            .await
-            .remove(&message_id);
         if message.id.as_deref() != Some(message_id.as_str()) {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
@@ -2233,32 +2238,6 @@ impl BotApp {
         message_id: &str,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
-        if webex_call_is_not_found(&error) {
-            let first_not_found = self
-                .hydration_not_found_once
-                .lock()
-                .await
-                .insert(message_id.to_owned());
-            if first_not_found {
-                self.defer_attempt(attempt, EVENT_HYDRATION_NOT_FOUND_RETRY)
-                    .await?;
-                return Err(HttpError::retry_after(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("message {message_id} is not yet available from Webex"),
-                    EVENT_HYDRATION_NOT_FOUND_RETRY,
-                ));
-            }
-            self.hydration_not_found_once
-                .lock()
-                .await
-                .remove(message_id);
-            self.mark_processed(attempt).await?;
-            return Ok(BotAction::ignored(
-                "message_unavailable",
-                Some(message_id.to_owned()),
-                None,
-            ));
-        }
         match classify_webex_failure(&error, self.config.server.attempt_lease()) {
             WebexFailureAction::Stop => {
                 self.mark_processed(attempt).await?;
@@ -2277,6 +2256,19 @@ impl BotApp {
                 ))
             }
         }
+    }
+
+    async fn get_event_message_with_not_found_retry(
+        &self,
+        message_id: &str,
+        sidecar_hint: &Message,
+    ) -> Result<Message, WebexCallError> {
+        let first = self.webex.get_event_message(message_id, sidecar_hint).await;
+        if !first.as_ref().is_err_and(webex_call_is_not_found) {
+            return first;
+        }
+        tokio::time::sleep(event_hydration_not_found_retry()).await;
+        self.webex.get_event_message(message_id, sidecar_hint).await
     }
 
     async fn handle_reconciliation_failure(
@@ -3904,44 +3896,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_hydration_not_found_is_retryable() {
+    async fn initial_hydration_not_found_is_retried_once() {
         let harness = TestHarness::new();
         harness
             .webex
             .push_event_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
                 api_error(404, None),
             )))));
+        harness.webex.push_event_message(Ok(inbound_message(
+            "eventual-message",
+            "authoritative body",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("eventual-reply")));
+        harness.runner.push_output("Hydrated reply");
 
-        let error = harness
+        let action = harness
             .app
             .process_event(message_event(inbound_message(
                 "eventual-message",
                 "sidecar body",
             )))
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.retry_after, Some(EVENT_HYDRATION_NOT_FOUND_RETRY));
-        assert!(!harness.processed("eventual-message").await);
-        assert!(harness.runner.calls().is_empty());
-        assert!(harness.webex.created_requests().is_empty());
+        assert_eq!(action.action, "replied");
+        assert_eq!(
+            harness.webex.event_message_requests(),
+            vec!["eventual-message", "eventual-message"]
+        );
+        assert!(harness.processed("eventual-message").await);
     }
 
     #[tokio::test]
     async fn repeated_initial_hydration_not_found_stops_retrying() {
         let harness = TestHarness::new();
-        harness
-            .app
-            .hydration_not_found_once
-            .lock()
-            .await
-            .insert("missing-message".to_owned());
-        harness
-            .webex
-            .push_event_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
-                api_error(404, None),
-            )))));
+        for _ in 0..2 {
+            harness
+                .webex
+                .push_event_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                    api_error(404, None),
+                )))));
+        }
 
         let action = harness
             .app
@@ -3955,13 +3953,9 @@ mod tests {
         assert_eq!(action.action, "ignored");
         assert_eq!(action.reason.as_deref(), Some("message_unavailable"));
         assert!(harness.processed("missing-message").await);
-        assert!(
-            !harness
-                .app
-                .hydration_not_found_once
-                .lock()
-                .await
-                .contains("missing-message")
+        assert_eq!(
+            harness.webex.event_message_requests(),
+            vec!["missing-message", "missing-message"]
         );
     }
 
@@ -7034,7 +7028,6 @@ mod tests {
                 state: Mutex::new(state),
                 runner: runner.clone(),
                 config_status: config_status.clone(),
-                hydration_not_found_once: Mutex::new(HashSet::new()),
                 request_slots: Arc::new(Semaphore::new(4)),
             };
             Self {

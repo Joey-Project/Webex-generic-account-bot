@@ -1,29 +1,36 @@
-use std::{
-    io::{self, ErrorKind},
-    path::{Component, Path, PathBuf},
-    time::Duration,
-};
-
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::{
     ffi::CString,
+    io::{self, ErrorKind},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     },
+    path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
 use chrono::DateTime;
+#[cfg(target_os = "linux")]
 use serde_json::Value;
+#[cfg(target_os = "linux")]
 use tokio::{fs, io::AsyncReadExt, task, time::timeout};
 
+#[cfg(target_os = "linux")]
 const DEPLOY_STATUS_FILE: &str = "/var/lib/webex-generic-account-bot/rendered/deploy-status.json";
+#[cfg(target_os = "linux")]
 const DEPLOY_TRANSACTION_FILE: &str =
     "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
+#[cfg(target_os = "linux")]
 const STATUS_FILE_MAX_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const DEPLOYMENT_STATUSES: &[&str] = &[
     "deployed",
     "installed_without_restart",
@@ -35,11 +42,13 @@ const DEPLOYMENT_STATUSES: &[&str] = &[
     "failed_after_commit_cleanup",
     "failed_cleanup",
 ];
+#[cfg(target_os = "linux")]
 const TRANSACTION_PHASES: &[&str] = &[
     "prepared",
     "service_transition_started",
     "committed_pending_metadata",
 ];
+#[cfg(target_os = "linux")]
 const TRANSACTION_KEYS: &[&str] = &[
     "bot_code_dir",
     "committed_at",
@@ -68,10 +77,13 @@ impl ConfigStatusSnapshot {
     pub fn markdown(&self) -> String {
         let revision = self.config_revision.as_deref().unwrap_or("unknown");
         let service = self.service.as_deref().unwrap_or("unknown");
-        let revision_label = match self.status.as_str() {
-            "failed_after_commit" | "failed_after_commit_cleanup" => "Committed config revision",
-            status if status.starts_with("failed_") => "Attempted config revision",
-            "recovery_required" => "In-progress config revision",
+        let revision_label = match (self.status.as_str(), self.transaction_phase.as_deref()) {
+            ("failed_after_commit" | "failed_after_commit_cleanup", _)
+            | ("recovery_required", Some("committed_pending_metadata")) => {
+                "Committed config revision"
+            }
+            (status, _) if status.starts_with("failed_") => "Attempted config revision",
+            ("recovery_required", _) => "In-progress config revision",
             _ => "Config revision",
         };
         let transaction_phase = self
@@ -85,6 +97,7 @@ impl ConfigStatusSnapshot {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn unknown() -> Self {
         Self {
             status: "unknown".to_owned(),
@@ -94,6 +107,7 @@ impl ConfigStatusSnapshot {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn recovery_required() -> Self {
         Self {
             status: "recovery_required".to_owned(),
@@ -110,14 +124,18 @@ pub trait ConfigStatusProvider: Send + Sync {
 }
 
 pub struct FileConfigStatusProvider {
+    #[cfg(target_os = "linux")]
     status_file: PathBuf,
+    #[cfg(target_os = "linux")]
     transaction_file: PathBuf,
 }
 
 impl Default for FileConfigStatusProvider {
     fn default() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
             status_file: PathBuf::from(DEPLOY_STATUS_FILE),
+            #[cfg(target_os = "linux")]
             transaction_file: PathBuf::from(DEPLOY_TRANSACTION_FILE),
         }
     }
@@ -125,6 +143,7 @@ impl Default for FileConfigStatusProvider {
 
 #[async_trait]
 impl ConfigStatusProvider for FileConfigStatusProvider {
+    #[cfg(target_os = "linux")]
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
         match read_optional_bounded_file(&self.transaction_file).await {
             Ok(None) => {}
@@ -139,8 +158,16 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
         };
         parse_deployment_status(&contents)
     }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn status(&self) -> Result<ConfigStatusSnapshot> {
+        Err(anyhow!(
+            "secure config status file access is supported only on Linux"
+        ))
+    }
 }
 
+#[cfg(target_os = "linux")]
 async fn read_optional_bounded_file(path: &Path) -> Result<Option<Vec<u8>>> {
     let open_path = path.to_path_buf();
     let file = match timeout(
@@ -184,7 +211,7 @@ async fn read_optional_bounded_file(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(contents))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_no_symlink_components(path: &Path) -> io::Result<Option<std::fs::File>> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -248,14 +275,7 @@ fn open_no_symlink_components(path: &Path) -> io::Result<Option<std::fs::File>> 
     unreachable!("non-empty path components always return from the loop")
 }
 
-#[cfg(not(unix))]
-fn open_no_symlink_components(_path: &Path) -> io::Result<Option<std::fs::File>> {
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        "secure config status file access requires Unix openat semantics",
-    ))
-}
-
+#[cfg(target_os = "linux")]
 fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
     let value: Value =
         serde_json::from_slice(contents).context("invalid deployment status JSON")?;
@@ -326,6 +346,7 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
     let value: Value =
         serde_json::from_slice(contents).context("invalid deployment transaction JSON")?;
@@ -405,6 +426,7 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
     })
 }
 
+#[cfg(target_os = "linux")]
 fn required_nonempty_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     field: &str,
@@ -416,6 +438,7 @@ fn required_nonempty_string<'a>(
         .ok_or_else(|| anyhow!("deployment status contains an invalid {field}"))
 }
 
+#[cfg(target_os = "linux")]
 fn valid_revision(revision: &str) -> bool {
     matches!(revision.len(), 40 | 64)
         && revision
@@ -423,13 +446,18 @@ fn valid_revision(revision: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(target_os = "linux")]
 fn is_normal_absolute_path(path: &Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    let mut components = value.split('/');
     path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && components.next() == Some("")
+        && components.all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
+#[cfg(target_os = "linux")]
 fn valid_config_repo(value: &str) -> bool {
     let remainder = value
         .strip_prefix("git@github.com:")
@@ -448,10 +476,12 @@ fn valid_config_repo(value: &str) -> bool {
             .all(|part| part.bytes().all(is_repo_character))
 }
 
+#[cfg(target_os = "linux")]
 fn is_repo_character(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
 }
 
+#[cfg(target_os = "linux")]
 fn valid_config_ref(value: &str) -> bool {
     !value.is_empty()
         && !value.contains("..")
@@ -461,7 +491,7 @@ fn valid_config_ref(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
         fs as std_fs,
@@ -596,7 +626,10 @@ mod tests {
         invalid_ref["config_ref"] = Value::String("../main".to_owned());
         let mut invalid_time = deployment_transaction();
         invalid_time["started_at"] = Value::String("not-a-timestamp".to_owned());
-        for transaction in [invalid_repo, invalid_ref, invalid_time] {
+        let mut non_normal_path = deployment_transaction();
+        non_normal_path["bot_code_dir"] =
+            Value::String("/opt//webex-generic-account-bot/code".to_owned());
+        for transaction in [invalid_repo, invalid_ref, invalid_time, non_normal_path] {
             std_fs::write(
                 &provider.transaction_file,
                 serde_json::to_vec(&transaction).unwrap(),
@@ -640,6 +673,18 @@ mod tests {
                 .markdown()
                 .contains("Transaction phase: `service_transition_started`")
         );
+
+        let mut committed = deployment_transaction();
+        committed["phase"] = Value::String("committed_pending_metadata".to_owned());
+        committed["committed_at"] = Value::String("2026-06-27T00:01:00.000Z".to_owned());
+        std_fs::write(
+            &provider.transaction_file,
+            serde_json::to_vec(&committed).unwrap(),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert!(snapshot.markdown().contains("Committed config revision:"));
+        assert!(!snapshot.markdown().contains("In-progress config revision:"));
         std_fs::remove_dir_all(root).unwrap();
     }
 
