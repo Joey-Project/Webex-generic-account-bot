@@ -129,6 +129,9 @@ superseded_by:
 - Structured Jenkins child URLs are passed back through the same controller,
   build-path, and URL-size validator as message URLs. Oversized or malformed
   child metadata is ignored without losing collected root evidence.
+- Jenkins build URLs reject percent-decoded control characters in job
+  segments. Decoded IDs, graph relationships, errors, and diagnostics are also
+  single-line Markdown-escaped before entering the Codex-readable summary.
 
 ## Follow-Ups
 - Wire fixed Webex admin commands to this entrypoint in the next PR.

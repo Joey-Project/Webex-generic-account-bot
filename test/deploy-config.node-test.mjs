@@ -22,6 +22,7 @@ import {
   renderEnvironment,
 } from '../scripts/config-policy/render-config.mjs';
 import {
+  buildUrlFromJenkinsUrl,
   buildGraphSummary,
   collectBuildGraph,
   diagnoseBundle,
@@ -576,10 +577,52 @@ describe('trusted config policy', () => {
       graph,
     });
 
-    for (const payload of [JSON.stringify(graph), summary, stdout]) {
+    for (const payload of [JSON.stringify(graph), stdout]) {
       assert.doesNotMatch(payload, /url-token|abc\.def/);
       assert.match(payload, /\[REDACTED\]/);
     }
+    assert.doesNotMatch(summary, /url-token|abc\.def/);
+    assert.match(summary, /\\\[REDACTED\\\]/);
+  });
+
+  it('rejects encoded control characters and keeps summary IDs on one Markdown line', () => {
+    const baseUrl = new URL('https://jenkins.example/');
+    const maliciousUrl = 'https://jenkins.example/job/child%0A%5BInjected%5D(evil)/2/';
+    for (const url of [
+      maliciousUrl,
+      'https://jenkins.example/job/child%E2%80%A8Injected/2/',
+    ]) {
+      assert.throws(
+        () => buildUrlFromJenkinsUrl(url, baseUrl),
+        /control character in a job segment/,
+      );
+    }
+
+    const rootUrl = 'https://jenkins.example/job/root/1/';
+    const graph = buildGraphSummary({
+      initialUrl: rootUrl,
+      rootUrl,
+      limits: jenkinsLimits(),
+      nodes: [
+        {
+          buildUrl: maliciousUrl,
+          consoleUrl: `${maliciousUrl}console`,
+          consoleTextUrl: `${maliciousUrl}consoleText`,
+          parentUrls: new Set([rootUrl]),
+          childUrls: new Set(),
+          fullDisplayName: 'untrusted child',
+          number: '2',
+          result: 'FAILURE',
+          signalLines: [],
+          infraSignals: [],
+          logBytes: 0,
+        },
+      ],
+    });
+    const summary = formatBundleSummary(graph);
+
+    assert.doesNotMatch(summary, /\n\[Injected\]/);
+    assert(summary.includes('child \\[Injected\\](evil)#2'));
   });
 
   it('limits Jenkins downstream graph fetches to max_parallel_fetches', async () => {

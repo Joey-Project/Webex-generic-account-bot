@@ -84,6 +84,17 @@ export function buildUrlFromJenkinsUrl(value, baseUrl) {
   ) {
     throw new Error(`Jenkins URL must identify a build under /job/.../<build-number>/: ${url.pathname}`);
   }
+  for (const segment of jobParts.filter((_, index) => index % 2 === 1)) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch (_) {
+      throw new Error(`Jenkins URL contains an invalid encoded job segment: ${url.pathname}`);
+    }
+    if (containsUnsafeTextControl(decoded)) {
+      throw new Error(`Jenkins URL contains a control character in a job segment: ${url.pathname}`);
+    }
+  }
   url.pathname = `${base.pathname}${parts.join('/')}/`;
   url.search = '';
   return url;
@@ -917,7 +928,7 @@ export function formatBundleSummary(graph) {
     lines.push('- No failed jobs were identified.');
   } else {
     for (const item of graph.recommended_reading_order) {
-      lines.push(`${item.rank}. ${item.role}: ${item.id}`);
+      lines.push(`${item.rank}. ${item.role}: ${summaryScalar(item.id)}`);
       lines.push(`   - local_log: ${item.local_log ?? 'unavailable'}`);
       lines.push(`   - jenkins_console: ${item.jenkins_console}`);
       if (item.infra_signals.length === 0) {
@@ -925,7 +936,7 @@ export function formatBundleSummary(graph) {
       } else {
         lines.push('   - infra_signals:');
         for (const signal of item.infra_signals.slice(0, 5)) {
-          lines.push(`     - ${signal.kind}: ${redactLog(signal.line)}`);
+          lines.push(`     - ${summaryScalar(signal.kind)}: ${summaryScalar(redactLog(signal.line))}`);
         }
       }
     }
@@ -937,7 +948,7 @@ export function formatBundleSummary(graph) {
     lines.push('- No local log files were written.');
   } else {
     for (const node of nodesWithLogs) {
-      lines.push(`- ${node.id}`);
+      lines.push(`- ${summaryScalar(node.id)}`);
       lines.push(`  - role: ${node.role}`);
       lines.push(`  - result: ${node.result}`);
       lines.push(`  - local_log: ${node.local_log}`);
@@ -947,22 +958,22 @@ export function formatBundleSummary(graph) {
 
   lines.push('', '## Build Graph', '');
   for (const node of graph.nodes) {
-    lines.push(`- ${node.id}`);
+    lines.push(`- ${summaryScalar(node.id)}`);
     lines.push(`  - role: ${node.role}`);
     lines.push(`  - result: ${node.result}`);
     lines.push(`  - local_log: ${node.local_log ?? 'unavailable'}`);
     lines.push(`  - jenkins_console: ${node.jenkins_console}`);
     if (node.parent_ids.length > 0) {
-      lines.push(`  - parents: ${node.parent_ids.join(', ')}`);
+      lines.push(`  - parents: ${node.parent_ids.map(summaryScalar).join(', ')}`);
     }
     if (node.child_ids.length > 0) {
-      lines.push(`  - children: ${node.child_ids.join(', ')}`);
+      lines.push(`  - children: ${node.child_ids.map(summaryScalar).join(', ')}`);
     }
     if (node.failure_handler) {
       lines.push('  - failure_handler: true');
     }
     if (node.fetch_error) {
-      lines.push(`  - fetch_error: ${node.fetch_error}`);
+      lines.push(`  - fetch_error: ${summaryScalar(node.fetch_error)}`);
     }
   }
 
@@ -1022,7 +1033,15 @@ export function formatBundleStdout(bundle) {
 }
 
 function stdoutScalar(value) {
-  return String(value).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  return String(value).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+}
+
+function summaryScalar(value) {
+  return stdoutScalar(value).replace(/([\\`*_[\]<>])/g, '\\$1');
+}
+
+function containsUnsafeTextControl(value) {
+  return /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(String(value));
 }
 
 export function formatReport(report) {
