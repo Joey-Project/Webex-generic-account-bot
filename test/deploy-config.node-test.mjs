@@ -17,6 +17,7 @@ import {
   runCli,
   runCommand,
   scrubEnv,
+  usage,
   validateConfigTreeManifest,
   validateConfigTreePaths,
 } from '../scripts/deploy-config.mjs';
@@ -48,6 +49,7 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.dryRun, true);
     assert.equal(options.configRef, 'main');
     assert.equal(options.checkoutDir, '/var/lib/webex-generic-account-bot/config-checkout');
+    assert.equal(options.stagingDir, '/var/lib/webex-generic-account-bot/config-staging');
     assert.equal(options.renderedConfig, '/var/lib/webex-generic-account-bot/rendered/production.toml');
     assert.equal(options.botCodeDir, '/opt/webex-generic-account-bot/code');
     assert.equal(options.gitBin, '/usr/bin/git');
@@ -78,6 +80,7 @@ describe('deploy-config argument parsing', () => {
       /fixed bot unit/,
     );
     assert.throws(() => parseArgsAllow(['--checkout-dir', 'relative/path']), /checkout-dir/);
+    assert.throws(() => parseArgsAllow(['--staging-dir', 'relative/path']), /staging-dir/);
     assert.throws(() => parseArgsAllow(['--git-bin', 'git']), /git-bin/);
     assert.throws(() => parseArgsAllow(['--node-bin', 'node']), /node-bin/);
     assert.throws(() => parseArgsAllow(['--python-bin', 'python3']), /python-bin/);
@@ -93,10 +96,19 @@ describe('deploy-config argument parsing', () => {
       () => parseArgs(['--bot-code-dir', '/opt/evil']),
       /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
     );
+    assert.throws(
+      () => parseArgs(['--staging-dir', '/var/lib/webex-generic-account-bot/config-staging']),
+      /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
+    );
     assert.equal(
       parseArgsAllow(['--bot-code-dir', '/opt/webex-generic-account-bot/code']).botCodeDir,
       '/opt/webex-generic-account-bot/code',
     );
+    assert.equal(
+      parseArgsAllow(['--staging-dir', '/tmp/webex-config-staging']).stagingDir,
+      '/tmp/webex-config-staging',
+    );
+    assert.match(usage(), /--staging-dir <path>/);
   });
 
   it('requires execution modes to be unambiguous', () => {
@@ -146,9 +158,14 @@ describe('deploy-config plan', () => {
     const fetchCommands = allGitCommands.filter((command) => command.args.includes('fetch'));
 
     assert.equal(plan.checkoutWorkDir, path.join(plan.checkoutDir, 'work'));
+    assert.equal(plan.stagingDir, '/var/lib/webex-generic-account-bot/config-staging');
     assert.equal(plan.transactionFile, `${plan.renderedConfig}.transaction`);
-    assert.equal(plan.stagedConfig, `${plan.renderedConfig}.staged`);
-    assert.equal(plan.stagedMetadataFile, `${plan.renderedConfig}.staged.json`);
+    assert.equal(plan.candidateConfig, `${plan.renderedConfig}.candidate`);
+    assert.equal(plan.stagedConfig, path.join(plan.stagingDir, 'production.toml.staged'));
+    assert.equal(
+      plan.stagedMetadataFile,
+      path.join(plan.stagingDir, 'production.toml.staged.json'),
+    );
     assert.deepEqual(commands[0], ['/usr/bin/git', ['-c', 'advice.detachedHead=false', '-c', 'core.hooksPath=/dev/null', '-c', 'filter.lfs.required=false', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'init', plan.checkoutWorkDir]]);
     assert.deepEqual(commands[2], [
       '/usr/bin/git',
@@ -244,6 +261,7 @@ describe('deploy-config plan', () => {
     const plan = buildDeployPlan(parseArgs(['--prepare', '--request-id', requestId]));
 
     assert.equal(plan.requestId, requestId);
+    assert.equal(plan.candidateConfig, path.join(plan.stagingDir, 'production.toml.candidate'));
     assert.equal(buildDeployPlan(parseArgs(['--prepare'])).requestId, null);
   });
 
@@ -323,10 +341,12 @@ describe('deploy-config plan', () => {
         '--prepare',
         '--rendered-config',
         '/tmp/webex-output/production.toml',
+        '--staging-dir',
+        '/tmp/webex-staging',
         '--metadata-file',
-        '/tmp/webex-output/production.toml.staged',
+        '/tmp/webex-staging/deploy-status.json',
       ])),
-      /staged config must not overlap metadata file/,
+      /staging directory must not overlap metadata directory/,
     );
     assert.throws(
       () => buildDeployPlan(parseArgsAllow([
@@ -338,6 +358,108 @@ describe('deploy-config plan', () => {
       ])),
       /metadata file must not overlap checkout work directory/,
     );
+  });
+
+  it('rejects staging roots that overlap protected deployment paths', () => {
+    const renderedConfig = '/tmp/webex-topology/rendered/production.toml';
+    const cases = [
+      {
+        args: ['--checkout-dir', '/tmp/webex-topology/checkout', '--staging-dir', '/tmp/webex-topology/checkout/staging'],
+        expected: /staging directory must not overlap checkout directory/,
+      },
+      {
+        args: ['--lock-dir', '/tmp/webex-topology/run/deploy.lock', '--staging-dir', '/tmp/webex-topology/run'],
+        expected: /staging directory must not overlap deployment lock directory/,
+      },
+      {
+        args: ['--bot-code-dir', '/tmp/webex-topology/code', '--staging-dir', '/tmp/webex-topology/code/staging'],
+        expected: /staging directory must not overlap bot code directory/,
+      },
+      {
+        args: ['--bot-bin', '/tmp/webex-topology/bin/webex-bot', '--staging-dir', '/tmp/webex-topology/bin/webex-bot'],
+        expected: /staging directory must not overlap bot binary/,
+      },
+      {
+        args: ['--ssh-key', '/tmp/webex-topology/deploy/id_ed25519', '--staging-dir', '/tmp/webex-topology/deploy'],
+        expected: /staging directory must not overlap SSH key/,
+      },
+      {
+        args: ['--ssh-known-hosts', '/tmp/webex-topology/ssh/known_hosts', '--staging-dir', '/tmp/webex-topology/ssh'],
+        expected: /staging directory must not overlap SSH known-hosts file/,
+      },
+      {
+        args: ['--staging-dir', '/tmp/webex-topology/rendered'],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        args: ['--metadata-file', '/tmp/webex-topology/status/deploy.json', '--staging-dir', '/tmp/webex-topology/status'],
+        expected: /staging directory must not overlap metadata directory/,
+      },
+      {
+        args: ['--staging-dir', `${renderedConfig}.previous`],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        args: ['--staging-dir', `${renderedConfig}.transaction`],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+    ];
+
+    for (const { args, expected } of cases) {
+      assert.throws(
+        () => buildDeployPlan(parseArgsAllow([
+          '--apply',
+          '--rendered-config',
+          renderedConfig,
+          ...args,
+        ])),
+        expected,
+      );
+    }
+  });
+
+  it('rejects staging roots inside or containing live output directories', () => {
+    const cases = [
+      {
+        renderedConfig: '/tmp/webex-live-rendered/production.toml',
+        metadataFile: '/tmp/webex-live-metadata/deploy-status.json',
+        stagingDir: '/tmp/webex-live-rendered/staging',
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-live-root/rendered/production.toml',
+        metadataFile: '/tmp/webex-other-metadata/deploy-status.json',
+        stagingDir: '/tmp/webex-live-root',
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-other-rendered/production.toml',
+        metadataFile: '/tmp/webex-live-status/deploy-status.json',
+        stagingDir: '/tmp/webex-live-status/staging',
+        expected: /staging directory must not overlap metadata directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-separate-rendered/production.toml',
+        metadataFile: '/tmp/webex-status-root/live/deploy-status.json',
+        stagingDir: '/tmp/webex-status-root',
+        expected: /staging directory must not overlap metadata directory/,
+      },
+    ];
+
+    for (const { renderedConfig, metadataFile, stagingDir, expected } of cases) {
+      assert.throws(
+        () => buildDeployPlan(parseArgsAllow([
+          '--apply',
+          '--rendered-config',
+          renderedConfig,
+          '--metadata-file',
+          metadataFile,
+          '--staging-dir',
+          stagingDir,
+        ])),
+        expected,
+      );
+    }
   });
 });
 
@@ -1676,13 +1798,43 @@ describe('deploy-config CLI and execution', () => {
     assert.match(stdout, /checkout_work_dir=/);
     assert.match(
       stdout,
+      /staging_dir=\/var\/lib\/webex-generic-account-bot\/config-staging/,
+    );
+    assert.match(
+      stdout,
       /command_1=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
     );
+
+    let jsonStdout = '';
+    const jsonStatus = await runCli({
+      argv: ['--dry-run', '--json'],
+      stdout: writer((chunk) => {
+        jsonStdout += chunk;
+      }),
+      stderr: writer(),
+      runner: async () => {
+        executed = true;
+      },
+    });
+    const serialised = JSON.parse(jsonStdout);
+    assert.equal(jsonStatus, 0);
+    assert.equal(
+      serialised.plan.staging_dir,
+      '/var/lib/webex-generic-account-bot/config-staging',
+    );
+    assert.equal(
+      serialised.plan.candidate_config,
+      '/var/lib/webex-generic-account-bot/rendered/production.toml.candidate',
+    );
+    assert.equal(executed, false);
   });
 
   it('prepare CLI emits machine-readable staged metadata', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-cli-test-'));
-    const renderedConfig = path.join(temp, 'rendered', 'production.toml');
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const stagingDir = path.join(temp, 'staging');
+    await protectPrepareLiveDirectories(renderedConfig, metadataFile);
     let stdout = '';
     const requestId = 'd'.repeat(64);
     const status = await runCli({
@@ -1693,10 +1845,12 @@ describe('deploy-config CLI and execution', () => {
         '--json',
         '--checkout-dir',
         path.join(temp, 'checkout'),
+        '--staging-dir',
+        stagingDir,
         '--rendered-config',
         renderedConfig,
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        metadataFile,
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1711,7 +1865,11 @@ describe('deploy-config CLI and execution', () => {
       stderr: writer(),
       runner: async (command) => {
         if (command.bin === '/usr/bin/bash') {
-          await fs.writeFile(`${renderedConfig}.candidate`, 'prepared config\n', 'utf8');
+          await fs.writeFile(
+            path.join(stagingDir, 'production.toml.candidate'),
+            'prepared config\n',
+            'utf8',
+          );
         }
         return {
           stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
@@ -1724,7 +1882,7 @@ describe('deploy-config CLI and execution', () => {
     const metadata = JSON.parse(stdout);
     assert.equal(metadata.status, 'prepared');
     assert.equal(metadata.config_revision, 'd'.repeat(40));
-    assert.equal(metadata.staged_config, `${renderedConfig}.staged`);
+    assert.equal(metadata.staged_config, path.join(stagingDir, 'production.toml.staged'));
     assert.equal(metadata.request_id, requestId);
   });
 
@@ -1809,9 +1967,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'deploy.lock'),
         '--bot-code-dir',
@@ -1862,9 +2020,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1879,10 +2037,20 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.renderedConfig, liveConfig, { mode: 0o644 });
     await fs.writeFile(plan.metadataFile, deploymentStatus, { mode: 0o644 });
     await fs.writeFile(plan.backupConfig, backupConfig, { mode: 0o644 });
+    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     const calls = [];
+    let chownCalled = false;
+    const fsApi = {
+      ...fs,
+      async chown(...args) {
+        chownCalled = true;
+        return fs.chown(...args);
+      },
+    };
 
     const metadata = await executePreparePlan({
       plan,
+      fsApi,
       parentEnv: {
         PATH: '/bin',
         SSH_AUTH_SOCK: '/tmp/agent.sock',
@@ -1915,12 +2083,92 @@ describe('deploy-config CLI and execution', () => {
       JSON.parse(await fs.readFile(plan.stagedMetadataFile, 'utf8')),
       metadata,
     );
-    assert.equal((await fs.stat(plan.stagedConfig)).mode & 0o777, 0o644);
-    assert.equal((await fs.stat(plan.stagedMetadataFile)).mode & 0o777, 0o600);
+    const stagedStat = await fs.stat(plan.stagedConfig);
+    const stagedMetadataStat = await fs.stat(plan.stagedMetadataFile);
+    assert.equal(stagedStat.mode & 0o777, 0o600);
+    assert.equal(stagedStat.uid, process.getuid());
+    assert.equal(stagedStat.gid, process.getgid());
+    assert.equal(stagedMetadataStat.mode & 0o777, 0o600);
+    assert.equal(stagedMetadataStat.uid, process.getuid());
+    assert.equal(stagedMetadataStat.gid, process.getgid());
+    assert.equal(chownCalled, false);
+    assert.equal((await fs.stat(plan.stagingDir)).mode & 0o777, 0o700);
     assert.equal(calls.length, plan.commands.length);
     assert(calls.every((call) => call.command.bin !== '/usr/bin/systemctl'));
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when the live output directory is worker-writable', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-live-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /must not be writable by the prepare worker/,
+    );
+
+    assert.equal(executed, false);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when the live output parent is worker-writable', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-parent-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const liveDirectory = path.dirname(plan.renderedConfig);
+    await fs.mkdir(liveDirectory, { recursive: true, mode: 0o755 });
+    await fs.chmod(liveDirectory, 0o555);
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /must not be writable by the prepare worker/,
+    );
+
+    assert.equal(executed, false);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -1932,9 +2180,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1944,10 +2192,12 @@ describe('deploy-config CLI and execution', () => {
     const outsideConfig = path.join(temp, 'outside-config');
     const outsideMetadata = path.join(temp, 'outside-metadata');
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(plan.stagingDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(outsideConfig, 'outside config sentinel\n', 'utf8');
     await fs.writeFile(outsideMetadata, 'outside metadata sentinel\n', 'utf8');
     await fs.symlink(outsideConfig, plan.stagedConfig);
     await fs.symlink(outsideMetadata, plan.stagedMetadataFile);
+    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
 
     await executePreparePlan({
       plan,
@@ -1978,9 +2228,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1994,11 +2244,25 @@ describe('deploy-config CLI and execution', () => {
       configRevision: 'b'.repeat(40),
       serviceRestartRequired: true,
     });
+    await fs.chmod(plan.transactionFile, 0o000);
+    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     let executed = false;
+    let transactionRead = false;
+    const fsApi = {
+      ...fs,
+      async open(file, ...args) {
+        if (file === plan.transactionFile) {
+          transactionRead = true;
+          throw new Error('transaction contents must not be opened by prepare');
+        }
+        return fs.open(file, ...args);
+      },
+    };
 
     await assert.rejects(
       executePreparePlan({
         plan,
+        fsApi,
         runner: async () => {
           executed = true;
           return { stdout: '', stderr: '' };
@@ -2008,6 +2272,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.equal(executed, false);
+    assert.equal(transactionRead, false);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'live config\n');
     assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'rollback sentinel\n');
     assert.equal((await fs.stat(plan.transactionFile)).isFile(), true);
@@ -2022,9 +2287,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -2032,11 +2297,13 @@ describe('deploy-config CLI and execution', () => {
       ]),
     );
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(plan.stagingDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
     await fs.writeFile(plan.stagedConfig, 'old staged config\n', { mode: 0o644 });
     await fs.writeFile(plan.stagedMetadataFile, '{"status":"prepared","stale":true}\n', {
       mode: 0o600,
     });
+    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     const fsApi = {
       ...fs,
       async rename(source, destination) {
@@ -2080,18 +2347,19 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
         path.join(temp, 'bot-code'),
       ]),
     );
-    const renderedDirectory = path.dirname(plan.renderedConfig);
-    await fs.mkdir(renderedDirectory, { recursive: true, mode: 0o755 });
+    const stagingDirectory = plan.stagingDir;
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
     await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
+    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     let metadataRenamed = false;
     let metadataDirectorySyncFailed = false;
     const fsApi = {
@@ -2105,7 +2373,7 @@ describe('deploy-config CLI and execution', () => {
       async open(file, ...args) {
         const handle = await fs.open(file, ...args);
         if (
-          file === renderedDirectory
+          file === stagingDirectory
           && metadataRenamed
           && !metadataDirectorySyncFailed
         ) {
@@ -2198,6 +2466,8 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).config_revision, 'a'.repeat(40));
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'candidate config\n');
     assert.equal((await fs.stat(plan.renderedConfig)).mode & 0o777, 0o644);
+    assert.equal((await fs.stat(plan.stagingDir)).isDirectory(), true);
+    assert.equal((await fs.stat(path.dirname(plan.renderedConfig))).isDirectory(), true);
     assert.equal((await fs.stat(path.dirname(plan.lockDir))).isDirectory(), true);
     assert.equal(lockOwner.pid, process.pid);
     assert.match(lockOwner.process_start_ticks, /^[0-9]+$/);
@@ -2545,6 +2815,8 @@ describe('deploy-config CLI and execution', () => {
         '--skip-restart',
         '--checkout-dir',
         path.join(temp, 'checkout'),
+        '--staging-dir',
+        path.join(temp, 'staging'),
         '--rendered-config',
         path.join(unsafeParent, 'rendered', 'production.toml'),
         '--metadata-file',
@@ -4509,10 +4781,42 @@ async function writeInstallTransactionFixture(
   );
 }
 
+async function protectPrepareLiveDirectories(renderedConfig, metadataFile) {
+  const directories = new Set([
+    path.dirname(renderedConfig),
+    path.dirname(metadataFile),
+  ]);
+  const parents = new Set();
+  for (const directory of directories) {
+    await fs.mkdir(directory, { recursive: true, mode: 0o755 });
+    await fs.chmod(directory, 0o555);
+    parents.add(path.dirname(directory));
+  }
+  for (const parent of parents) {
+    await fs.chmod(parent, 0o555);
+  }
+}
+
 function parseArgsAllow(args) {
-  const withBotBin = args.includes('--bot-bin')
-    ? args
-    : [...args, '--bot-bin', '/usr/bin/true'];
+  let testArgs = args;
+  if (!testArgs.includes('--staging-dir')) {
+    const renderedConfigIndex = testArgs.indexOf('--rendered-config');
+    if (renderedConfigIndex !== -1) {
+      const renderedConfig = testArgs[renderedConfigIndex + 1];
+      const renderedDirectoryParent = path.dirname(path.dirname(renderedConfig));
+      const testRoot = path.basename(renderedDirectoryParent) === 'live-root'
+        ? path.dirname(renderedDirectoryParent)
+        : renderedDirectoryParent;
+      testArgs = [
+        ...testArgs,
+        '--staging-dir',
+        path.join(testRoot, 'config-staging'),
+      ];
+    }
+  }
+  const withBotBin = testArgs.includes('--bot-bin')
+    ? testArgs
+    : [...testArgs, '--bot-bin', '/usr/bin/true'];
   return parseArgs(withBotBin, { allowHostOverrides: true });
 }
 

@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 
 import {
   ConfigPullWorker,
+  DEFAULTS,
   MAX_REQUEST_BYTES,
   PREPARE_COMMAND,
   PREPARE_ENV,
@@ -22,6 +23,7 @@ import {
   writeActionState,
   writeSocketResponse,
 } from '../scripts/config-pull-worker.mjs';
+import { buildDeployPlan, parseArgs } from '../scripts/deploy-config.mjs';
 
 const CONFIG_REVISION = 'a'.repeat(40);
 const CONFIG_SHA256 = 'b'.repeat(64);
@@ -37,7 +39,7 @@ const PREPARED_RESULT = Object.freeze({
   request_id: PREPARE_ACTION_ID,
   bot_code_dir: '/opt/webex-generic-account-bot/code',
   rendered_config: '/var/lib/webex-generic-account-bot/rendered/production.toml',
-  staged_config: '/var/lib/webex-generic-account-bot/rendered/production.toml.staged',
+  staged_config: '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged',
   service: 'webex-generic-account-bot',
   prepared_at: PREPARED_AT,
 });
@@ -611,6 +613,12 @@ describe('config pull worker systemd boundary', () => {
       /^ExecStart=\/usr\/bin\/node \/opt\/webex-generic-account-bot\/code\/scripts\/config-pull-worker\.mjs$/m,
     );
     assert.match(unit, /^Restart=on-failure$/m);
+    assert.match(unit, /^RuntimeDirectoryMode=0700$/m);
+    assert.match(unit, /^RuntimeDirectoryPreserve=yes$/m);
+    assert.match(unit, /^ReadWritePaths=\/run\/webex-config-pull$/m);
+    assert.match(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/config-staging$/m);
+    assert.match(unit, /^ReadOnlyPaths=-\/var\/lib\/webex-generic-account-bot\/rendered$/m);
+    assert.doesNotMatch(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/rendered$/m);
     assert.match(unit, /^NoNewPrivileges=true$/m);
     assert.match(unit, /^ProtectSystem=strict$/m);
     assert.match(unit, /^ProtectHome=true$/m);
@@ -618,6 +626,13 @@ describe('config pull worker systemd boundary', () => {
     assert.match(unit, /^CapabilityBoundingSet=$/m);
     assert.doesNotMatch(unit, /^(?:PartOf|BindsTo)=/m);
     assert.doesNotMatch(unit, /^User=root$/m);
+
+    const plan = buildDeployPlan(parseArgs(['--prepare']));
+    assert.equal(path.dirname(plan.lockDir), '/run/webex-generic-account-bot');
+    assert.equal(path.dirname(DEFAULTS.socketPath), '/run/webex-config-pull');
+    assert.notEqual(path.dirname(plan.lockDir), path.dirname(DEFAULTS.socketPath));
+    assert.equal(plan.stagedConfig, PREPARED_RESULT.staged_config);
+    assert.equal(plan.stagedMetadataFile, DEFAULTS.stagedMetadataFile);
   });
 
   it('provisions only the worker identity and host-owned writable deployment roots', async () => {
@@ -646,12 +661,17 @@ describe('config pull worker systemd boundary', () => {
     assert.match(botDropIn, /^SupplementaryGroups=webex-config-pull$/m);
     assert.match(
       tmpfiles,
+      /^d \/run\/webex-config-pull 0750 webex-config-deploy webex-config-pull -$/m,
+    );
+    assert.match(
+      tmpfiles,
       /^d \/var\/lib\/webex-generic-account-bot\/config-checkout 0700 webex-config-deploy webex-config-pull -$/m,
     );
     assert.match(
       tmpfiles,
-      /^d \/var\/lib\/webex-generic-account-bot\/rendered 0755 webex-config-deploy webex-config-pull -$/m,
+      /^d \/var\/lib\/webex-generic-account-bot\/config-staging 0700 webex-config-deploy webex-config-pull -$/m,
     );
+    assert.doesNotMatch(tmpfiles, /\/rendered /);
     assert.doesNotMatch(tmpfiles, /codex-home|jenkins\.env|access-token/);
   });
 });

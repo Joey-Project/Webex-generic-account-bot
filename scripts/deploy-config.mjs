@@ -11,6 +11,7 @@ const DEFAULTS = Object.freeze({
   configRepo: 'git@github.com:WebexServices-staging/webex-generic-account-bot-config.git',
   configRef: 'main',
   checkoutDir: '/var/lib/webex-generic-account-bot/config-checkout',
+  stagingDir: '/var/lib/webex-generic-account-bot/config-staging',
   renderedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml',
   botCodeDir: '/opt/webex-generic-account-bot/code',
   service: 'webex-generic-account-bot',
@@ -70,6 +71,7 @@ const HOST_OVERRIDE_KEYS = new Set([
   'configRepo',
   'configRef',
   'checkoutDir',
+  'stagingDir',
   'renderedConfig',
   'botCodeDir',
   'service',
@@ -159,6 +161,9 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     } else if (arg === '--checkout-dir') {
       options.checkoutDir = requiredValue(argv, (index += 1), arg);
       overrides.add('checkoutDir');
+    } else if (arg === '--staging-dir') {
+      options.stagingDir = requiredValue(argv, (index += 1), arg);
+      overrides.add('stagingDir');
     } else if (arg === '--rendered-config') {
       options.renderedConfig = requiredValue(argv, (index += 1), arg);
       overrides.add('renderedConfig');
@@ -259,6 +264,7 @@ Options:
       --config-repo <url>         Expected config repo URL.
       --config-ref <name>         Expected config ref, default main.
       --checkout-dir <path>       Host-owned config checkout directory.
+      --staging-dir <path>        Worker-owned prepared config staging directory.
       --rendered-config <path>    Final rendered config path.
       --bot-code-dir <path>       Host-installed bot code directory.
       --service <name>            systemd service name.
@@ -283,10 +289,14 @@ Options:
 export function buildDeployPlan(options) {
   const checkoutDir = path.resolve(options.checkoutDir);
   const checkoutWorkDir = path.join(checkoutDir, 'work');
+  const stagingDir = path.resolve(options.stagingDir);
   const renderedConfig = path.resolve(options.renderedConfig);
-  const candidateConfig = `${renderedConfig}.candidate`;
-  const stagedConfig = `${renderedConfig}.staged`;
-  const stagedMetadataFile = `${renderedConfig}.staged.json`;
+  const stagingBase = path.join(stagingDir, path.basename(renderedConfig));
+  const candidateConfig = options.prepare
+    ? `${stagingBase}.candidate`
+    : `${renderedConfig}.candidate`;
+  const stagedConfig = `${stagingBase}.staged`;
+  const stagedMetadataFile = `${stagingBase}.staged.json`;
   const backupConfig = `${renderedConfig}.previous`;
   const transactionFile = `${renderedConfig}.transaction`;
   const botCodeDir = path.resolve(options.botCodeDir);
@@ -424,6 +434,7 @@ export function buildDeployPlan(options) {
   const plan = {
     checkoutDir,
     checkoutWorkDir,
+    stagingDir,
     renderedConfig,
     candidateConfig,
     stagedConfig,
@@ -565,15 +576,11 @@ export async function executePreparePlan({
   let primaryError = null;
   let outputDirectoriesTrusted = false;
   try {
-    await prepareTrustedOutputDirectories(plan, fsApi);
+    await prepareTrustedOutputDirectories(plan, fsApi, { includeLive: false });
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
-    const transaction = await readInstallTransaction(plan, fsApi);
-    if (transaction) {
-      throw new Error(
-        `deployment recovery is required before preparing a new config revision: ${transaction.phase}`,
-      );
-    }
+    await assertPrepareLiveDirectoriesReadOnly(plan, fsApi);
+    await assertNoInstallTransaction(plan, fsApi);
     await prepareFreshCheckout(plan, fsApi, { removeBackup: false });
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -1403,6 +1410,7 @@ function writePlan(stdout, plan, json) {
   stdout.write(`config_ref=${plan.configRef}\n`);
   stdout.write(`checkout_dir=${plan.checkoutDir}\n`);
   stdout.write(`checkout_work_dir=${plan.checkoutWorkDir}\n`);
+  stdout.write(`staging_dir=${plan.stagingDir}\n`);
   stdout.write(`rendered_config=${plan.renderedConfig}\n`);
   stdout.write(`candidate_config=${plan.candidateConfig}\n`);
   stdout.write(`staged_config=${plan.stagedConfig}\n`);
@@ -1442,6 +1450,7 @@ function serialisablePlan(plan) {
     config_ref: plan.configRef,
     checkout_dir: plan.checkoutDir,
     checkout_work_dir: plan.checkoutWorkDir,
+    staging_dir: plan.stagingDir,
     rendered_config: plan.renderedConfig,
     candidate_config: plan.candidateConfig,
     staged_config: plan.stagedConfig,
@@ -1467,6 +1476,7 @@ function validateOptions(options) {
   validateService(options.service);
   for (const key of [
     'checkoutDir',
+    'stagingDir',
     'renderedConfig',
     'botCodeDir',
     'lockDir',
@@ -1528,6 +1538,7 @@ async function writeMetadataAtomically(file, metadata, fsApi, { mode = 0o644 } =
   let handle = null;
   try {
     handle = await fsApi.open(temporary, 'wx', mode);
+    await handle.chmod(mode);
     await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
     await handle.sync();
     await handle.close();
@@ -1606,6 +1617,7 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
   const paths = [
     ['checkout directory', plan.checkoutDir, false],
     ['lock parent directory', path.dirname(plan.lockDir), false],
+    ['staging directory', plan.stagingDir, false],
     ['rendered config directory', path.dirname(plan.renderedConfig), false],
     ['metadata directory', path.dirname(plan.metadataFile), false],
     ['bot code directory', plan.botCodeDir, true],
@@ -1650,19 +1662,22 @@ async function canonicalPathWithMissingSuffix(candidate, fsApi) {
   }
 }
 
-async function prepareTrustedOutputDirectories(plan, fsApi) {
-  const directories = [
-    [path.dirname(plan.renderedConfig), 'rendered config directory'],
-    [path.dirname(plan.metadataFile), 'metadata directory'],
-  ];
+async function prepareTrustedOutputDirectories(plan, fsApi, { includeLive = true } = {}) {
+  const directories = [[plan.stagingDir, 'staging directory', 0o700]];
+  if (includeLive) {
+    directories.push(
+      [path.dirname(plan.renderedConfig), 'rendered config directory', 0o755],
+      [path.dirname(plan.metadataFile), 'metadata directory', 0o755],
+    );
+  }
   const seen = new Set();
-  for (const [directory, label] of directories) {
+  for (const [directory, label, createMode] of directories) {
     if (seen.has(directory)) {
       continue;
     }
     seen.add(directory);
     await assertTrustedPathAncestors(directory, label, fsApi);
-    await createDirectoryDurably(directory, 0o755, fsApi);
+    await createDirectoryDurably(directory, createMode, fsApi);
     await assertTrustedPathAncestors(directory, label, fsApi);
     const resolved = await fsApi.realpath(directory);
     if (resolved !== path.resolve(directory)) {
@@ -1670,6 +1685,9 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
     }
     const directoryStat = await fsApi.lstat(directory);
     assertTrustedOutputDirectory(directory, directoryStat, label);
+    if (label === 'staging directory' && (directoryStat.mode & 0o7777) !== 0o700) {
+      throw new Error(`staging directory mode is not trusted: ${directory}`);
+    }
   }
 }
 
@@ -1776,23 +1794,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     throw new Error(`candidate config must be a regular file: ${plan.candidateConfig}`);
   }
 
-  let mode = 0o644;
-  try {
-    const currentStat = await fsApi.lstat(plan.renderedConfig);
-    if (!currentStat.isFile() || currentStat.isSymbolicLink()) {
-      throw new Error(`rendered config must be a regular file when present: ${plan.renderedConfig}`);
-    }
-    assertSafeRenderedConfigMetadata(plan.renderedConfig, currentStat);
-    mode = currentStat.mode & 0o777;
-    if (candidateStat.uid !== currentStat.uid || candidateStat.gid !== currentStat.gid) {
-      await fsApi.chown(plan.candidateConfig, currentStat.uid, currentStat.gid);
-    }
-  } catch (error) {
-    if (!error || error.code !== 'ENOENT') {
-      throw error;
-    }
-  }
-  await fsApi.chmod(plan.candidateConfig, mode);
+  await fsApi.chmod(plan.candidateConfig, 0o600);
   await syncFile(plan.candidateConfig, fsApi);
   const contents = await fsApi.readFile(plan.candidateConfig);
   const configSha256 = createHash('sha256').update(contents).digest('hex');
@@ -1804,7 +1806,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
   if (!stagedStat.isFile() || stagedStat.isSymbolicLink()) {
     throw new Error(`staged config must be a regular file: ${plan.stagedConfig}`);
   }
-  assertSafeRenderedConfigMetadata(plan.stagedConfig, stagedStat);
+  assertWorkerOwnedPrivateFile(plan.stagedConfig, stagedStat, 'staged config');
 
   const metadata = {
     version: 1,
@@ -1822,6 +1824,12 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
   };
   try {
     await writeMetadataAtomically(plan.stagedMetadataFile, metadata, fsApi, { mode: 0o600 });
+    const metadataStat = await fsApi.lstat(plan.stagedMetadataFile);
+    assertWorkerOwnedPrivateFile(
+      plan.stagedMetadataFile,
+      metadataStat,
+      'staged metadata file',
+    );
   } catch (error) {
     try {
       await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
@@ -2082,6 +2090,79 @@ function deploymentMetadataFromInstallState(plan, installState) {
   };
 }
 
+async function assertNoInstallTransaction(plan, fsApi) {
+  try {
+    await fsApi.lstat(plan.transactionFile);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return;
+    }
+    throw new Error(
+      `cannot confirm that no deployment transaction exists: ${error.message}`,
+    );
+  }
+  throw new Error('deployment recovery is required before preparing a new config revision');
+}
+
+async function assertPrepareLiveDirectoriesReadOnly(plan, fsApi) {
+  const directories = [
+    [path.dirname(plan.renderedConfig), 'rendered config directory'],
+    [path.dirname(plan.metadataFile), 'metadata directory'],
+  ];
+  const seen = new Set();
+  for (const [directory, label] of directories) {
+    if (seen.has(directory)) continue;
+    seen.add(directory);
+    await assertPathNotWritableByCurrentProcess(directory, label, fsApi);
+  }
+}
+
+async function assertPathNotWritableByCurrentProcess(directory, label, fsApi) {
+  let current = path.resolve(directory);
+  let verified = 0;
+  for (;;) {
+    let stat;
+    try {
+      stat = await fsApi.lstat(current);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+      continue;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${label} must resolve through real directories: ${current}`);
+    }
+    const rootStat = await fsApi.lstat(path.parse(current).root);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+    if (stat.uid !== uid && stat.uid !== rootStat.uid) {
+      throw new Error(`${label} ownership is not trusted: ${current}`);
+    }
+    if (directoryWritableByCurrentProcess(stat)) {
+      throw new Error(`${label} must not be writable by the prepare worker: ${current}`);
+    }
+    verified += 1;
+    const parent = path.dirname(current);
+    if (verified >= 2 || parent === current) return;
+    current = parent;
+  }
+}
+
+function directoryWritableByCurrentProcess(stat) {
+  const mode = stat.mode & 0o7777;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+  if (uid === 0) return true;
+  if (stat.uid === uid) return (mode & 0o200) !== 0;
+  const groups = new Set(
+    typeof process.getgroups === 'function'
+      ? process.getgroups()
+      : [typeof process.getgid === 'function' ? process.getgid() : stat.gid],
+  );
+  if (groups.has(stat.gid)) return (mode & 0o020) !== 0;
+  return (mode & 0o002) !== 0;
+}
+
 async function readInstallTransaction(plan, fsApi) {
   const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
   let handle;
@@ -2309,6 +2390,20 @@ function assertTrustedOutputDirectory(file, fileStat, label) {
   }
 }
 
+function assertWorkerOwnedPrivateFile(file, fileStat, label) {
+  if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real file: ${file}`);
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
+  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+    throw new Error(`${label} ownership is not trusted: ${file}`);
+  }
+  if ((fileStat.mode & 0o7777) !== 0o600) {
+    throw new Error(`${label} mode is not trusted: ${file}`);
+  }
+}
+
 function assertConfigRevision(value) {
   if (!/^[0-9a-f]{40}$/i.test(value || '')) {
     throw new Error(`git rev-parse returned an invalid config revision: ${redact(value || '')}`);
@@ -2330,21 +2425,43 @@ function assertSafePlanPathTopology(plan) {
   const checkoutRoot = path.resolve(plan.checkoutDir);
   const checkoutWork = path.resolve(plan.checkoutWorkDir);
   const lockDir = path.resolve(plan.lockDir);
+  const stagingDir = path.resolve(plan.stagingDir);
   const botCodeDir = path.resolve(plan.botCodeDir);
   const botBin = path.resolve(plan.botBin);
-  const outputPaths = [
+  const liveOutputPaths = [
     ['rendered config', path.resolve(plan.renderedConfig)],
-    ['candidate config', path.resolve(plan.candidateConfig)],
-    ['staged config', path.resolve(plan.stagedConfig)],
-    ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
     ['backup config', path.resolve(plan.backupConfig)],
     ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
   ];
+  const stagingOutputPaths = [
+    ['candidate config', path.resolve(plan.candidateConfig)],
+    ['staged config', path.resolve(plan.stagedConfig)],
+    ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
+  ];
+  const outputPaths = [...liveOutputPaths, ...stagingOutputPaths];
   const credentialPaths = [
     ['SSH key', path.resolve(plan.sshKey)],
     ['SSH known-hosts file', path.resolve(plan.sshKnownHosts)],
   ];
+  const liveOutputDirectories = [
+    ['rendered config directory', path.dirname(path.resolve(plan.renderedConfig))],
+    ['metadata directory', path.dirname(path.resolve(plan.metadataFile))],
+  ];
+  const stagingConflicts = [
+    ['checkout directory', checkoutRoot],
+    ['deployment lock directory', lockDir],
+    ['bot code directory', botCodeDir],
+    ['bot binary', botBin],
+    ...liveOutputDirectories,
+    ...credentialPaths,
+    ...liveOutputPaths,
+  ];
+  for (const [label, protectedPath] of stagingConflicts) {
+    if (pathsOverlap(stagingDir, protectedPath)) {
+      throw new UsageError(`staging directory must not overlap ${label}`);
+    }
+  }
   const protectedPaths = [
     ...outputPaths,
     ['bot code directory', botCodeDir],

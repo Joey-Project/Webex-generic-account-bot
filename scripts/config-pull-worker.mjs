@@ -11,12 +11,13 @@ import { TextDecoder } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 export const DEFAULTS = Object.freeze({
-  socketPath: '/run/webex-generic-account-bot/config-pull.sock',
+  socketPath: '/run/webex-config-pull/config-pull.sock',
   stateRoot: '/var/lib/webex-generic-account-bot/config-actions',
   queueDir: '/var/lib/webex-generic-account-bot/config-actions/queue',
   stateDir: '/var/lib/webex-generic-account-bot/config-actions/state',
   publicStatusFile: '/var/lib/webex-generic-account-bot/config-actions/public-status.json',
-  stagedMetadataFile: '/var/lib/webex-generic-account-bot/rendered/production.toml.staged.json',
+  stagedMetadataFile:
+    '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged.json',
   requestTimeoutMs: 5_000,
   commandTimeoutMs: 900_000,
   outputLimitBytes: 64 * 1024,
@@ -99,7 +100,7 @@ const PREPARED_POLICY = Object.freeze({
   configRef: 'main',
   botCodeDir: '/opt/webex-generic-account-bot/code',
   renderedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml',
-  stagedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml.staged',
+  stagedConfig: '/var/lib/webex-generic-account-bot/config-staging/production.toml.staged',
   service: 'webex-generic-account-bot',
 });
 

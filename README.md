@@ -158,12 +158,15 @@ bot binary directly; deployment never runs Cargo, downloads crates, or executes
 dependency build scripts. The default paths match the staging deployment layout:
 
 - config checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- config staging: `/var/lib/webex-generic-account-bot/config-staging`
 - bot code: `/opt/webex-generic-account-bot/code`
 - bot binary: `/opt/webex-generic-account-bot/bin/webex-generic-account-bot`
 - Codex workspace: `/var/lib/webex-generic-account-bot/codex-workspace`
 - rendered config: `/var/lib/webex-generic-account-bot/rendered/production.toml`
-- staged config: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged`
-- staged metadata: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged.json`
+- staged config:
+  `/var/lib/webex-generic-account-bot/config-staging/production.toml.staged`
+- staged metadata:
+  `/var/lib/webex-generic-account-bot/config-staging/production.toml.staged.json`
 - service: `webex-generic-account-bot`
 
 Use `--prepare` to fetch the fixed config ref, render and validate it, and
@@ -194,7 +197,7 @@ The service runs as the stable `webex-config-deploy` user with the dedicated
 `webex-config-pull` primary group; it is not lifecycle-coupled to the bot unit.
 The bot unit receives only this secret-free supplementary group through the
 reviewed drop-in, for the mode `0660` socket at
-`/run/webex-generic-account-bot/config-pull.sock`. Queue and state subdirectories
+`/run/webex-config-pull/config-pull.sock`. Queue and state subdirectories
 remain mode `0700` and worker-owned. The only bot-readable worker artifact is
 mode `0644`
 `/var/lib/webex-generic-account-bot/config-actions/public-status.json`, whose
@@ -207,11 +210,26 @@ state, or Jenkins credentials. The service keeps `UMask=0077`; worker code
 explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
 public status file after creation.
 
+The socket parent and deployment lock parent are deliberately separate. The
+shared socket parent is mode `0750` at `/run/webex-config-pull`; the global
+deployment lock remains under the private mode `0700`
+`/run/webex-generic-account-bot`; systemd preserves that directory across worker
+stops so another trusted deployment process cannot lose the global lock path.
+Prepared candidate, staged config, and staged
+metadata files are confined to the worker-owned mode `0700` `config-staging`
+directory. The worker unit mounts the live `rendered` directory read-only and
+does not provision or own it, so preparation cannot overwrite the live config
+or deployment metadata. The read-only path is optional at unit startup so a
+fresh host can prepare before the first live install; `ProtectSystem=strict`
+still keeps an absent or later-created live path outside the worker's writable
+allowlist.
+
 Before enabling the unit, provision the sysusers and tmpfiles definitions, make
 the fixed deploy key readable only by `webex-config-deploy`, and migrate
-`config-checkout` and `rendered` to that identity. Keep `/opt/webex-generic-account-bot`
-root-owned and non-writable. The worker has no bot token, Codex home, Jenkins
-credential, `systemctl`, or live-config activation permission. It invokes only
+`config-checkout` and `config-staging` to that identity. Keep the live
+`rendered` directory and `/opt/webex-generic-account-bot` outside the worker's
+write boundary. The worker has no bot token, Codex home, Jenkins credential,
+`systemctl`, or live-config activation permission. It invokes only
 `/usr/bin/node /opt/webex-generic-account-bot/code/scripts/deploy-config.mjs
 --prepare --json --request-id <action-id>` with a scrubbed environment and no
 shell. A response is sent only after the immutable request, private queued
