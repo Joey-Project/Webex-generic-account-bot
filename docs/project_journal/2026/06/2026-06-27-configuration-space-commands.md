@@ -4,7 +4,7 @@ title: Configuration Space Commands
 status: active
 created: 2026-06-27
 updated: 2026-06-27
-branch: codex/config-space-commands
+branch: codex/config-prepare-backend
 pr:
 supersedes: []
 superseded_by:
@@ -27,12 +27,26 @@ superseded_by:
 - Keep `pull`, `reload`, and `sync` undeployable in this slice. Production host
   policy also rejects all config-command configuration until an exact admin
   room and sender policy are reviewed in the companion config PR.
+- Merged as bot PR #9 at
+  `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
 
-## PR 2b
-- Add a durable file-backed action queue keyed by Webex message ID, an external
-  systemd worker, staged config preparation/activation, and fixed argv mapping.
-- Enable `pull`, `reload`, and `sync` only after enqueue durability, crash
-  recovery, duplicate-event, and worker-restart tests pass.
+## PR 2b1
+- Add explicit immutable staged preparation. It may fetch, render, validate,
+  and persist a revision, but must not replace the live rendered config or
+  restart the service.
+- Keep all mutating Webex commands disabled.
+
+## PR 2b2
+- Add a separate-identity worker with a host-owned Unix socket and durable queue
+  keyed by Webex message ID.
+- Enable `/config pull` only after enqueue durability, crash recovery,
+  duplicate-event, worker-restart, ownership, symlink, and fixed-argv tests pass.
+
+## PR 2b3
+- Add recoverable activation and persist the exact staged target revision before
+  changing live config or service state.
+- Enable `/config reload` and `/config sync` only after activation rollback,
+  health, and in-flight work semantics are tested.
 
 ## Evidence
 - Deployment foundation: bot PR #8, merge commit
