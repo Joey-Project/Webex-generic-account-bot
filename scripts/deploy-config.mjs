@@ -293,6 +293,7 @@ export function buildDeployPlan(options) {
     gitCommand(options.gitBin, checkoutWorkDir, [
       'fetch',
       '--depth=1',
+      '--no-tags',
       '--filter=blob:limit=1048576',
       '--recurse-submodules=no',
       'origin',
@@ -681,13 +682,14 @@ export async function executePlan({
       }
     }
     try {
-      await releaseLock(plan.lockDir, lockOwner, fsApi);
+      await verifyLockForRelease(plan.lockDir, lockOwner, fsApi);
     } catch (error) {
       cleanupError ??= error;
       lockCleanupFailed = true;
     }
+    let combinedReason = null;
     if (cleanupError) {
-      let combinedReason = primaryError
+      combinedReason = primaryError
         ? `${primaryError.message}; deployment cleanup failed: ${cleanupError.message}`
         : `deployment cleanup failed: ${cleanupError.message}`;
       if (outputDirectoriesTrusted) {
@@ -710,6 +712,18 @@ export async function executePlan({
           combinedReason = `${combinedReason}; failed to record cleanup state: ${metadataError.message}`;
         }
       }
+    }
+    try {
+      await closeLock(lockOwner);
+    } catch (error) {
+      const closeReason = `deployment lock close failed: ${error.message}`;
+      combinedReason = combinedReason
+        ? `${combinedReason}; ${closeReason}`
+        : primaryError
+          ? `${primaryError.message}; ${closeReason}`
+          : closeReason;
+    }
+    if (combinedReason) {
       throw new Error(combinedReason);
     }
   }
@@ -904,27 +918,15 @@ async function acquireKernelFlock(handle, lockFile) {
   });
 }
 
-async function releaseLock(lockDir, lockState, fsApi) {
-  let verificationError = null;
-  try {
-    const currentIdentity = await fsApi.lstat(lockDir);
-    if (!sameFileIdentity(lockState.identity, currentIdentity)) {
-      verificationError = new Error(`deployment lock path changed before cleanup: ${lockDir}`);
-    }
-  } catch (error) {
-    verificationError = error;
+async function verifyLockForRelease(lockDir, lockState, fsApi) {
+  const currentIdentity = await fsApi.lstat(lockDir);
+  if (!sameFileIdentity(lockState.identity, currentIdentity)) {
+    throw new Error(`deployment lock path changed before cleanup: ${lockDir}`);
   }
-  let closeError = null;
-  try {
-    await lockState.handle.close();
-  } catch (error) {
-    closeError = error;
-  }
-  if (verificationError || closeError) {
-    throw new Error(
-      [verificationError?.message, closeError?.message].filter(Boolean).join('; '),
-    );
-  }
+}
+
+async function closeLock(lockState) {
+  await lockState.handle.close();
 }
 
 async function writeLockMetadata(handle, owner) {

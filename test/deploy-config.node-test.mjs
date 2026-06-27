@@ -111,6 +111,7 @@ describe('deploy-config plan', () => {
     const plan = buildDeployPlan(parseArgs(['--apply']));
     const commands = plan.commands.map((command) => [command.bin, command.args]);
     const allGitCommands = plan.commands.filter((command) => command.bin === '/usr/bin/git');
+    const fetchCommands = allGitCommands.filter((command) => command.args.includes('fetch'));
 
     assert.equal(plan.checkoutWorkDir, path.join(plan.checkoutDir, 'work'));
     assert.equal(plan.transactionFile, `${plan.renderedConfig}.transaction`);
@@ -122,6 +123,8 @@ describe('deploy-config plan', () => {
     assert(allGitCommands.every((command) => command.args.includes('core.hooksPath=/dev/null')));
     assert(allGitCommands.every((command) => command.args.includes('protocol.file.allow=never')));
     assert(allGitCommands.every((command) => command.args.includes('protocol.ext.allow=never')));
+    assert(fetchCommands.length > 0);
+    assert(fetchCommands.every((command) => command.args.includes('--no-tags')));
     assert(allGitCommands.every((command) => command.resourceLimits.includes('--fsize=33554432')));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--recurse-submodules=no')));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--filter=blob:limit=1048576')));
@@ -3165,6 +3168,83 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.status, 'failed_apply');
     assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('holds the deployment lock while persisting cleanup failure metadata', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    let candidateRemoveAttempts = 0;
+    let concurrentApplyBlocked = false;
+    const fsApi = {
+      ...fs,
+      async rm(file, options) {
+        if (file === plan.candidateConfig) {
+          candidateRemoveAttempts += 1;
+          if (candidateRemoveAttempts === 2) {
+            throw new Error('candidate cleanup failed');
+          }
+        }
+        return await fs.rm(file, options);
+      },
+      async rename(source, target) {
+        if (target === plan.metadataFile) {
+          const metadata = JSON.parse(await fs.readFile(source, 'utf8'));
+          if (metadata.cleanup_failed) {
+            await assert.rejects(
+              () => executePlan({
+                plan,
+                runner: async () => {
+                  throw new Error('concurrent apply reached command execution');
+                },
+              }),
+              /deployment already in progress/,
+            );
+            concurrentApplyBlocked = true;
+          }
+        }
+        return await fs.rename(source, target);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'candidate config\n', 'utf8');
+            throw new Error('validation failed');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'6'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /validation failed; deployment cleanup failed: candidate cleanup failed/,
+    );
+
+    assert.equal(concurrentApplyBlocked, true);
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_apply');
+    assert.equal(failureMetadata.cleanup_failed, true);
+    assert.equal(failureMetadata.candidate_cleanup_failed, true);
     await assertLockReleased(plan.lockDir);
   });
 

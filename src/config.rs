@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
-const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+pub const DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 3;
+const DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 2;
+const WEBEX_REQUESTS_PER_ATTEMPT: u64 =
+    DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + (DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES as u64 * 2);
 const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
 pub const WEBEX_LIST_PAGE_SIZE: usize = 100;
 pub const FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE;
@@ -1655,6 +1658,9 @@ output_limit_chars = 2048
     fn production_style_jenkins_context_keeps_helper_outside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [codex]
 cwd = "/var/lib/webex-generic-account-bot/codex-workspace"
 codex_home = "/var/lib/webex-generic-account-bot/codex-home"
@@ -1697,6 +1703,9 @@ env_file = "/etc/webex-generic-account-bot/jenkins.env"
     fn rejects_jenkins_script_inside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [codex]
 cwd = "/srv/webex-bot/workspace"
 codex_home = "/srv/webex-bot/codex-home"
@@ -1720,6 +1729,9 @@ env_file = "/etc/webex-generic-account-bot/jenkins.env"
     fn rejects_jenkins_env_file_inside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [codex]
 cwd = "/srv/webex-bot/workspace"
 codex_home = "/srv/webex-bot/codex-home"

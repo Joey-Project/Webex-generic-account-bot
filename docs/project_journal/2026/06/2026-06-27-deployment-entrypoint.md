@@ -27,9 +27,10 @@ superseded_by:
 - Git commands run through fixed `/usr/bin/prlimit` resource limits. Path shape
   and file count are checked before sparse checkout; file type, per-blob size,
   and total declared config bytes are checked before trusted rendering.
-- The initial fetch uses `blob:limit=1048576`; path and blob manifests run
-  before checkout, and sparse checkout materialises only `production/` under
-  Git resource limits. Manifest and checkout use `GIT_NO_LAZY_FETCH=1`, so
+- The initial fetch uses `blob:limit=1048576` and `--no-tags`; path and blob
+  manifests run before checkout, and sparse checkout materialises only
+  `production/` under Git resource limits. Manifest and checkout use
+  `GIT_NO_LAZY_FETCH=1`, so
   missing or oversized blobs fail closed before worktree materialisation and
   trusted rendering, including on Git 2.43 hosts.
 - Rendered-config and metadata parent directories are checked for symlink-free
@@ -89,8 +90,12 @@ superseded_by:
   lock through a file description inherited from Node, and the Node process
   retains that description for the full transaction. Process exit releases the
   lock automatically, so no pathname-based stale reclamation can race a new
-  owner. Lock-parent, checkout, and output directories must be
-  deployment-user-owned and non-writable by others.
+  owner. Cleanup-failure status is persisted while that lock is still held;
+  no metadata writes occur after closing it. Lock-parent, checkout, and output
+  directories must be deployment-user-owned and non-writable by others.
+- Direct reply marker scans and create-failure compensation are page-bounded;
+  follow-up compensation reuses its configured marker-page budget, and source
+  forward compensation is capped independently of historical replay scans.
 - Scoped `SIGINT` and `SIGTERM` handlers convert service-manager or operator
   interruption into the normal abort path, terminate an active child process
   group, and roll back an installed candidate before releasing the lock.

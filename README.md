@@ -19,7 +19,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 - Renders a per-room prompt template and runs `codex exec`.
 - Replies to the Webex message thread with the Codex result.
 - Reconciles ambiguous Webex reply creation failures with a stable reply marker
-  before retrying.
+  before retrying, using the same bounded marker-page budget as the initial
+  reconciliation.
 - Bounds concurrent request processing with `server.max_concurrent_requests`.
 - Scrubs Webex token variables from the Codex subprocess environment.
 
@@ -172,7 +173,9 @@ the owner's PID, process start time, and random token in a persistent mode
 `0600` file. `/usr/bin/flock` acquires the kernel lock on an inherited file
 description that the Node process retains for the whole transaction, so process
 exit releases the lock automatically and no pathname-based stale deletion is
-needed. `SIGINT` and `SIGTERM` are converted into controlled transaction
+needed. Cleanup-failure metadata is persisted before that description is
+closed, and no deployment status is written after lock release. `SIGINT` and
+`SIGTERM` are converted into controlled transaction
 aborts; active child process groups are terminated and an installed but
 uncommitted candidate follows the normal rollback and failure-metadata path.
 Existing checkout and lock-parent directories must be owned by the
@@ -189,7 +192,9 @@ ambient agent, proxy, or token environment leakage.
 
 The config checkout is sparse and data-only: only `production/bot.toml` and
 `production/spaces/*.toml` are accepted. Tree paths are allowlisted before
-checkout. The initial fetch uses Git's server-side `blob:limit=1048576` filter.
+checkout. The initial fetch uses Git's server-side `blob:limit=1048576` filter
+and `--no-tags`, preventing auto-followed tag refs from expanding the bounded
+checkout.
 A manifest check with `GIT_NO_LAZY_FETCH=1` rejects missing blobs, executable or
 symlink entries, more than 128 files, blobs over 1 MiB, or more than 8 MiB of
 declared config data before worktree materialisation. Small blobs outside

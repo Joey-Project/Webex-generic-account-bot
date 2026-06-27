@@ -35,10 +35,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexConfig, CodexRunner, ExecCodexRunner, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES,
-    FollowupTrigger, MessageContext, ReplyFormat, TriggerMode, WEBEX_LIST_PAGE_SIZE,
-    followup_reply_marker_search_max_pages, message_matches_prefix, render_prompt, should_trigger,
-    trim_to_chars, webex::build_webex_client,
+    BotConfig, CodexConfig, CodexRunner, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner,
+    FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FollowupTrigger, MessageContext, ReplyFormat, TriggerMode,
+    WEBEX_LIST_PAGE_SIZE, followup_reply_marker_search_max_pages, message_matches_prefix,
+    render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -149,6 +149,7 @@ struct ReplyCreateContext<'a> {
     room_id: &'a str,
     parent_id: &'a str,
     reply_marker: &'a str,
+    marker_search_max_pages: Option<usize>,
     reply_chars: usize,
 }
 
@@ -156,6 +157,7 @@ struct ForwardCreateContext<'a> {
     message_id: &'a str,
     output_room_id: &'a str,
     source_marker: &'a str,
+    marker_search_max_pages: Option<usize>,
 }
 
 struct ReplyThread {
@@ -1627,7 +1629,7 @@ impl BotApp {
             CodexReplyRequest {
                 message_id: &message_id,
                 reply_format: policy.reply_format,
-                reply_marker_search_max_pages: None,
+                reply_marker_search_max_pages: Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES),
                 reply_thread,
                 prompt,
             },
@@ -1779,6 +1781,7 @@ impl BotApp {
                             room_id: &reply_thread.room_id,
                             parent_id: reply_request.parent_id.as_deref().unwrap_or(message_id),
                             reply_marker: &reply_marker,
+                            marker_search_max_pages: reply_marker_search_max_pages,
                             reply_chars: reply_markdown.len(),
                         },
                         error,
@@ -2020,6 +2023,7 @@ impl BotApp {
                         message_id,
                         output_room_id,
                         source_marker: &source_marker,
+                        marker_search_max_pages: Some(SOURCE_MARKER_SEARCH_MAX_PAGES),
                     },
                     error,
                 )
@@ -2133,7 +2137,7 @@ impl BotApp {
                         context.output_room_id,
                         None,
                         context.source_marker,
-                        None,
+                        context.marker_search_max_pages,
                     )
                     .await
                 {
@@ -2184,7 +2188,7 @@ impl BotApp {
                         context.room_id,
                         Some(context.parent_id),
                         context.reply_marker,
-                        None,
+                        context.marker_search_max_pages,
                     )
                     .await
                 {
@@ -3973,7 +3977,54 @@ mod tests {
         assert_eq!(action.reply_id.as_deref(), Some("reply-after-timeout"));
         assert_eq!(harness.runner.calls().len(), 1);
         assert_eq!(harness.webex.created_requests().len(), 1);
-        assert_eq!(harness.webex.marker_searches().len(), 2);
+        let searches = harness.webex.marker_searches();
+        assert_eq!(searches.len(), 2);
+        assert!(
+            searches
+                .iter()
+                .all(|search| { search.4 == Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES) })
+        );
+        assert!(harness.processed("message-1").await);
+    }
+
+    #[tokio::test]
+    async fn forward_create_timeout_uses_bounded_reconciliation() {
+        let harness = TestHarness::with_config(staging_test_config(unique_state_path()));
+        let source_marker = source_marker("message-1");
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Err(WebexCallError::TimedOut));
+        harness.webex.push_reply_search(Ok(vec![message_with_marker(
+            "forward-after-timeout",
+            OUTPUT_ROOM_ID,
+            &source_marker,
+        )]));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("reply-1", OUTPUT_ROOM_ID)));
+        harness
+            .runner
+            .push_output("Recovered after uncertain forward create");
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "forward timeout path",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(action.reply_id.as_deref(), Some("reply-1"));
+        let searches = harness.webex.marker_searches();
+        assert_eq!(searches.len(), 3);
+        assert_eq!(searches[0].4, Some(SOURCE_MARKER_SEARCH_MAX_PAGES));
+        assert_eq!(searches[1].4, Some(SOURCE_MARKER_SEARCH_MAX_PAGES));
+        assert_eq!(searches[2].4, Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES));
+        assert_eq!(harness.webex.created_requests().len(), 2);
         assert!(harness.processed("message-1").await);
     }
 
@@ -4025,7 +4076,7 @@ mod tests {
                 Some("forward-1".to_owned()),
                 reply_marker.clone(),
                 Some(SELF_PERSON_ID.to_owned()),
-                None
+                Some(DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES)
             )
         );
 
@@ -4918,7 +4969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn followup_reply_reconciliation_uses_configured_marker_window() {
+    async fn followup_create_reconciliation_uses_configured_marker_window() {
         let state_path = unique_state_path();
         let mut config = (*followup_test_config(state_path)).clone();
         config.server.attempt_lease_secs = 900;
@@ -4938,7 +4989,11 @@ mod tests {
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
-            .push_create_result(Ok(reply_message("followup-reply-1")));
+            .push_create_result(Err(WebexCallError::TimedOut));
+        harness.webex.push_reply_search(Ok(vec![reply_with_marker(
+            "followup-reply-after-timeout",
+            &reply_marker("followup-1"),
+        )]));
         harness.runner.push_output("Follow-up answer");
 
         let action = harness
@@ -4955,13 +5010,22 @@ mod tests {
         assert_eq!(action.action, "replied");
         assert_eq!(
             harness.webex.marker_searches(),
-            vec![(
-                ROOM_ID.to_owned(),
-                Some("root-1".to_owned()),
-                reply_marker("followup-1"),
-                Some(SELF_PERSON_ID.to_owned()),
-                Some(followup_reply_marker_search_max_pages(350))
-            )]
+            vec![
+                (
+                    ROOM_ID.to_owned(),
+                    Some("root-1".to_owned()),
+                    reply_marker("followup-1"),
+                    Some(SELF_PERSON_ID.to_owned()),
+                    Some(followup_reply_marker_search_max_pages(350))
+                ),
+                (
+                    ROOM_ID.to_owned(),
+                    Some("root-1".to_owned()),
+                    reply_marker("followup-1"),
+                    Some(SELF_PERSON_ID.to_owned()),
+                    Some(followup_reply_marker_search_max_pages(350))
+                )
+            ]
         );
         assert_eq!(
             harness.webex.thread_requests(),
@@ -6741,6 +6805,7 @@ mod tests {
 
     fn staging_followup_test_config(state_path: PathBuf) -> Arc<BotConfig> {
         let mut config = (*staging_test_config(state_path)).clone();
+        config.server.attempt_lease_secs = 900;
         config.rooms[0].followup.enabled = true;
         config.rooms[0].followup.prompt_template =
             "Original {original_message_id}: {original_body}\nThread:\n{thread_context}\nFollow-up {message_id}: {body}".to_owned();
