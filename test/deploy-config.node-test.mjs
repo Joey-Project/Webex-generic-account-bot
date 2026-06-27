@@ -88,6 +88,14 @@ describe('deploy-config argument parsing', () => {
 
   it('requires apply or dry-run to be unambiguous', () => {
     assert.throws(() => parseArgs(['--apply', '--dry-run']), /either --apply or --dry-run/);
+    assert.throws(
+      () => parseArgs(['--apply', '--status']),
+      /--status cannot be combined/,
+    );
+    assert.throws(
+      () => parseArgs(['--status', '--skip-restart']),
+      /--status cannot be combined/,
+    );
   });
 });
 
@@ -177,6 +185,16 @@ describe('deploy-config plan', () => {
         '/tmp/webex-config-checkout/work/deploy-status.json',
       ])),
       /metadata file must not overlap checkout work directory/,
+    );
+    assert.throws(
+      () => buildDeployPlan(parseArgsAllow([
+        '--apply',
+        '--metadata-file',
+        '/tmp/webex-deploy-key',
+        '--ssh-key',
+        '/tmp/webex-deploy-key',
+      ])),
+      /metadata file must not overlap SSH key/,
     );
     assert.throws(
       () => buildDeployPlan(parseArgsAllow([
@@ -705,6 +723,36 @@ describe('trusted config policy', () => {
         .match(/jenkins_console:/g).length,
       5,
     );
+  });
+
+  it('does not allowlist Jenkins nodes without a local evidence log', () => {
+    const buildUrl = 'https://jenkins.example/job/root/1/';
+    const graph = buildGraphSummary({
+      initialUrl: buildUrl,
+      rootUrl: buildUrl,
+      limits: jenkinsLimits(),
+      nodes: [{
+        buildUrl,
+        consoleUrl: `${buildUrl}console`,
+        consoleTextUrl: `${buildUrl}consoleText`,
+        parentUrls: new Set(),
+        childUrls: new Set(),
+        fetchError: 'GET /job/root/1/api/json failed status=401',
+        localLog: '/tmp/jenkins-artifacts/logs/root.log',
+        localLogRelative: 'logs/root.log',
+        logBytes: 0,
+      }],
+    });
+    const stdout = formatBundleStdout({
+      artifactDir: '/tmp/jenkins-artifacts',
+      summaryPath: '/tmp/jenkins-artifacts/summary.md',
+      graphPath: '/tmp/jenkins-artifacts/graph.json',
+      logIndexPath: '/tmp/jenkins-artifacts/logs/index.json',
+      graph,
+    });
+    const allowlist = stdout.split('prefetched_jenkins_console_urls_end=true')[0];
+
+    assert.doesNotMatch(allowlist, /jenkins_console:/);
   });
 
   it('keeps Jenkins-derived control characters from injecting stdout records', () => {
@@ -1384,7 +1432,7 @@ describe('deploy-config CLI and execution', () => {
           throw new Error('tree validation failed');
         },
       }),
-      /rendered config directory must not contain symlinks/,
+      /rendered config directory must not contain symlink/,
     );
 
     assert.equal(commandRan, false);
@@ -1396,6 +1444,38 @@ describe('deploy-config CLI and execution', () => {
       JSON.parse(await fs.readFile(path.join(outside, 'deploy-status.json'), 'utf8')).status,
       'deployed',
     );
+    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
+  it('rejects checkout paths with symlink ancestors before recursive cleanup', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const outside = path.join(temp, 'outside');
+    const checkoutLink = path.join(temp, 'checkout-link');
+    await fs.mkdir(path.join(outside, 'work'), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(outside, 'work', 'sentinel'), 'keep\n', 'utf8');
+    await fs.symlink(outside, checkoutLink, 'dir');
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        checkoutLink,
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+
+    await assert.rejects(
+      () => executePlan({ plan }),
+      /checkout directory must not contain symlink ancestors/,
+    );
+    assert.equal(await fs.readFile(path.join(outside, 'work', 'sentinel'), 'utf8'), 'keep\n');
     await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
   });
 
@@ -1514,6 +1594,62 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(await fs.readFile(outside, 'utf8'), 'outside remains unchanged\n');
     assert.equal((await fs.lstat(plan.metadataFile)).isSymbolicLink(), false);
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status, 'installed_without_restart');
+  });
+
+  it('fsyncs the rendered config before committing success metadata', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const synced = [];
+    const fsApi = {
+      ...fs,
+      async open(file, ...args) {
+        const handle = await fs.open(file, ...args);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                synced.push(String(file));
+                return await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+
+    await executePlan({
+      plan,
+      fsApi,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+        }
+        return { stdout: command.capture === 'configRevision' ? `${'4'.repeat(40)}\n` : '', stderr: '' };
+      },
+    });
+
+    const candidateSync = synced.indexOf(plan.candidateConfig);
+    const metadataSync = synced.findIndex((file) => file.includes('.deploy-status.json.'));
+    assert(candidateSync >= 0);
+    assert(metadataSync > candidateSync);
+    assert(synced.includes(path.dirname(plan.renderedConfig)));
   });
 
   it('records post-commit metadata failures without implying apply rollback', async () => {

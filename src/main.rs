@@ -2792,16 +2792,22 @@ fn render_jenkins_diagnosis_reply(
     } else {
         escape_markdown_plain_text(&concise_reason(&reply.reason))
     };
-    let log_url = reply
+    let requested_log_url = reply
         .log_url
         .as_deref()
         .and_then(normalized_jenkins_console_url)
-        .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url))
-        .or_else(|| fallback_log_url.and_then(normalized_jenkins_console_url));
+        .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url));
+    let (log_url, excerpt) = match requested_log_url {
+        Some(url) => (Some(url), reply.excerpt.as_deref()),
+        None => (
+            fallback_log_url.and_then(normalized_jenkins_console_url),
+            None,
+        ),
+    };
     match log_url {
         Some(url) => append_jenkins_excerpt(
             format!("{prefix} {reason} [log](<{url}>)"),
-            reply.excerpt.as_deref(),
+            excerpt,
             reply.excerpt_format,
         ),
         None => format!("{prefix} {reason}"),
@@ -4939,6 +4945,25 @@ mod tests {
         assert_eq!(
             rendered,
             "**Jenkins infra false alarm:** agent capacity failure"
+        );
+        assert!(!rendered.contains("fabricated"));
+    }
+
+    #[test]
+    fn jenkins_diagnosis_fallback_link_drops_unverified_excerpt() {
+        let context = "jenkins_console: https://jenkins.example/job/foo/1/console\n";
+        let output = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "excerpt": "fabricated exact excerpt",
+            "excerpt_format": "inline_code",
+            "log_url": "https://evil.example/job/foo/1/console"
+        }"#;
+
+        let rendered = render_reply_text(ReplyFormat::JenkinsDiagnosisJson, output, Some(context));
+        assert_eq!(
+            rendered,
+            "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
         );
         assert!(!rendered.contains("fabricated"));
     }

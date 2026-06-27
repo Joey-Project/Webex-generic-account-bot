@@ -964,10 +964,13 @@ export function formatBundleSummary(graph) {
 
 export function formatBundleStdout(bundle) {
   const first = bundle.graph.recommended_reading_order[0];
+  const nodesWithLocalEvidence = bundle.graph.nodes.filter(
+    (node) => node.local_log && node.log_bytes > 0,
+  );
   const lines = [
     'jenkins_diagnostics_bundle=true',
     'prefetched_jenkins_console_urls:',
-    ...bundle.graph.nodes.map(
+    ...nodesWithLocalEvidence.map(
       (node) => `- jenkins_console: ${stdoutScalar(node.jenkins_console)}`,
     ),
     'prefetched_jenkins_console_urls_end=true',

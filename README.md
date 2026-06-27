@@ -123,6 +123,8 @@ through `--source-root`. The default paths match the staging deployment layout:
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
+`--status` is a separate read-only operation and cannot be combined with apply,
+dry-run, or restart flags.
 Normal apply renders and validates a candidate config first, installs it
 atomically, restarts the service, and restores the previous rendered config if
 `systemctl restart` fails or the service is not active after a fixed settle
@@ -131,10 +133,13 @@ write machine-readable failure metadata. Metadata is fsynced to a same-directory
 temporary file and atomically renamed, so existing links are replaced rather
 than followed and a failed write preserves the last complete status. If failure
 metadata cannot be written, the apply reports both the primary error and the
-metadata error; an existing status file must then be treated as stale. If
-metadata writing or cleanup fails after the new config has been installed and
-the service restart has succeeded, the entrypoint records a post-commit failure
-state when possible instead of implying the apply was rolled back.
+metadata error; an existing status file must then be treated as stale. The
+candidate file and rendered-config directory are fsynced before success metadata
+is committed, so `status=deployed` cannot become more durable than the installed
+config. If metadata writing or cleanup fails after the new config has been
+installed and the service restart has succeeded, the entrypoint records a
+post-commit failure state when possible instead of implying the apply was rolled
+back.
 Child command stdout/stderr capture is bounded and each child has a deadline so
 a stuck fetch, validation, or restart cannot hold the deployment lock forever.
 Existing checkout and lock directories must be owned by the deployment user and
@@ -158,7 +163,9 @@ output cap. Rendered-config and metadata parent directories are also rejected
 before cleanup or status writes if they contain symlinks, have unexpected
 ownership, or are group/world writable.
 Host path overrides are also rejected when checkout, lock, rendered config,
-metadata, bot code, or credential paths overlap a mutable deployment tree.
+metadata, bot code, or credential paths overlap a mutable deployment tree or
+one another. Existing path ancestors are canonicalised before any lock or
+recursive cleanup, and symlink ancestors are rejected.
 
 The host-owned static policy allowlists every deployable Webex room and pins its
 sender, routing, trigger, Codex, follow-up, and Jenkins policy. Jenkins prompts
@@ -169,9 +176,11 @@ helper uses fixed `/usr/bin/node` and `PATH=/usr/bin:/bin`, accepts only
 credentials, caps JSON API responses at 1 MiB, and charges every streamed log
 byte, including failed retries, against the aggregate budget. Derived evidence
 also caps retained line length and count, and redacts private-key blocks and
-common API-key assignments. Jenkins replies fail closed when prefetch produces
-no verifiable console URL; exact excerpts are rendered only beside an
-allowlisted log link. The helper emits a control-character-safe console URL
+common API-key assignments. Only nodes with a non-empty local log
+enter the renderer URL allowlist, so Jenkins replies fail closed when prefetch
+produces no local evidence. Exact excerpts are rendered only when the model's
+own log URL matches that allowlist; a single-log fallback link never authenticates
+an excerpt. The helper emits a control-character-safe console URL
 block and keeps the complete structured URL allowlist separate from the prompt
 text truncation used for Codex context. Host policy pins the global Codex model
 and Jenkins prefetch fan-out/resource settings.

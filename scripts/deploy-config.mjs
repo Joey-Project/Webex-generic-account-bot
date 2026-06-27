@@ -190,6 +190,9 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   if (options.apply && options.dryRun) {
     throw new UsageError('Use either --apply or --dry-run, not both.');
   }
+  if (options.status && (options.apply || options.dryRun || options.skipRestart)) {
+    throw new UsageError('--status cannot be combined with apply, dry-run, or restart options.');
+  }
   validateHostOverrides(overrides, allowHostOverrides);
   options.hostOverrides = Object.freeze([...overrides]);
   validateOptions(options);
@@ -425,6 +428,7 @@ export async function runCli({
 }
 
 export async function executePlan({ plan, parentEnv = process.env, runner = runCommand, fsApi = fs }) {
+  await assertPlanHasNoSymlinkAncestors(plan, fsApi);
   await acquireLock(plan.lockDir, fsApi);
   const captures = {};
   let installState = null;
@@ -1068,6 +1072,51 @@ async function prepareFreshCheckout(plan, fsApi) {
   await removeIfPresent(plan.backupConfig, fsApi);
 }
 
+async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
+  const paths = [
+    ['checkout directory', plan.checkoutDir],
+    ['lock parent directory', path.dirname(plan.lockDir)],
+    ['rendered config directory', path.dirname(plan.renderedConfig)],
+    ['metadata directory', path.dirname(plan.metadataFile)],
+    ['bot code directory', plan.botCodeDir],
+    ['SSH key directory', path.dirname(plan.sshKey)],
+    ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts)],
+  ];
+  const seen = new Set();
+  for (const [label, candidate] of paths) {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) {
+      continue;
+    }
+    seen.add(resolved);
+    const canonical = await canonicalPathWithMissingSuffix(resolved, fsApi);
+    if (canonical !== resolved) {
+      throw new Error(`${label} must not contain symlink ancestors: ${resolved}`);
+    }
+  }
+}
+
+async function canonicalPathWithMissingSuffix(candidate, fsApi) {
+  let current = path.resolve(candidate);
+  const missing = [];
+  for (;;) {
+    try {
+      const canonical = await fsApi.realpath(current);
+      return path.join(canonical, ...missing);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 async function prepareTrustedOutputDirectories(plan, fsApi) {
   const directories = [
     [path.dirname(plan.renderedConfig), 'rendered config directory'],
@@ -1104,6 +1153,7 @@ async function installCandidateConfig(plan, fsApi) {
     assertSafeRenderedConfigMetadata(plan.renderedConfig, currentStat);
     await fsApi.copyFile(plan.renderedConfig, plan.backupConfig);
     await fsApi.chmod(plan.backupConfig, currentStat.mode & 0o777);
+    await syncFile(plan.backupConfig, fsApi);
     if (candidateStat.uid !== currentStat.uid || candidateStat.gid !== currentStat.gid) {
       await fsApi.chown(plan.candidateConfig, currentStat.uid, currentStat.gid);
     }
@@ -1116,7 +1166,9 @@ async function installCandidateConfig(plan, fsApi) {
     await fsApi.chmod(plan.candidateConfig, 0o644);
   }
 
+  await syncFile(plan.candidateConfig, fsApi);
   await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
+  await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
   return { hadPrevious };
 }
 
@@ -1125,6 +1177,25 @@ async function rollbackCandidateConfig(plan, installState, fsApi) {
     await fsApi.rename(plan.backupConfig, plan.renderedConfig);
   } else {
     await removeIfPresent(plan.renderedConfig, fsApi);
+  }
+  await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+}
+
+async function syncFile(file, fsApi) {
+  const handle = await fsApi.open(file, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(directory, fsApi) {
+  const handle = await fsApi.open(directory, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 
@@ -1192,11 +1263,14 @@ function assertSafePlanPathTopology(plan) {
     ['backup config', path.resolve(plan.backupConfig)],
     ['metadata file', path.resolve(plan.metadataFile)],
   ];
+  const credentialPaths = [
+    ['SSH key', path.resolve(plan.sshKey)],
+    ['SSH known-hosts file', path.resolve(plan.sshKnownHosts)],
+  ];
   const protectedPaths = [
     ...outputPaths,
     ['bot code directory', botCodeDir],
-    ['SSH key', path.resolve(plan.sshKey)],
-    ['SSH known-hosts file', path.resolve(plan.sshKnownHosts)],
+    ...credentialPaths,
   ];
   for (const [label, protectedPath] of protectedPaths) {
     if (pathsOverlap(checkoutWork, protectedPath)) {
@@ -1216,6 +1290,11 @@ function assertSafePlanPathTopology(plan) {
     const [leftLabel, leftPath] = outputPaths[index];
     if (pathsOverlap(botCodeDir, leftPath)) {
       throw new UsageError(`${leftLabel} must not overlap bot code directory`);
+    }
+    for (const [credentialLabel, credentialPath] of credentialPaths) {
+      if (pathsOverlap(leftPath, credentialPath)) {
+        throw new UsageError(`${leftLabel} must not overlap ${credentialLabel}`);
+      }
     }
     for (const [rightLabel, rightPath] of outputPaths.slice(index + 1)) {
       if (pathsOverlap(leftPath, rightPath)) {

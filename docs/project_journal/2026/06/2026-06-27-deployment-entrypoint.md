@@ -34,10 +34,13 @@ superseded_by:
   canonical paths, trusted ownership, and non-writable group/world modes before
   candidate cleanup or failure-status writes.
 - Mutable checkout, lock, output, metadata, bot-code, and credential paths must
-  be topologically disjoint when host overrides are enabled.
+  be topologically disjoint when host overrides are enabled. Existing ancestors
+  are canonicalised and symlink ancestors are rejected before lock creation or
+  recursive cleanup.
 - Host policy overrides for executable paths, repo paths, timeouts, and output
   caps require `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`.
 - The entrypoint defaults to dry-run/status and requires `--apply` for mutation.
+- Status mode is mutually exclusive with apply, dry-run, and restart options.
 - Child processes run with a scrubbed environment that removes ambient Git,
   SSH-agent, proxy, home, and token-shaped variables.
 - Child processes run from a fixed host cwd (`/`) while all trusted inputs are
@@ -47,11 +50,13 @@ superseded_by:
   distinguishes skipped restarts, records generic apply and restart failure
   states, uses `failed_after_commit` for metadata failures after a successful
   restart, and rolls back the rendered config if restart fails.
-- Restart success is followed by a fixed settle period and `systemctl
-  is-active`; failed post-restart health rolls back through the same path.
+- Restart success is followed by a fixed settle period and `systemctl is-active`;
+  failed post-restart health rolls back through the same path.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
   rename. Cleanup failures are merged into the reported error and residual lock
   state is recorded when possible.
+- Candidate contents and the rendered-config directory are fsynced before
+  success metadata, preserving config-before-status durability ordering.
 - Child commands have per-command deadlines and bounded stdout/stderr capture;
   the lock parent and checkout directory must be deployment-user-owned `0700`
   directories.
@@ -82,8 +87,9 @@ superseded_by:
   template hashes; fragment-preserving instruction injection is rejected.
 - Host policy pins `/usr/bin/node`, the helper `PATH`, the global Codex model,
   and Jenkins timeout/fan-out/output values. Jenkins-format replies fail closed
-  without verifiable prefetched console URLs, and excerpts require a rendered
-  allowlisted log link.
+  unless at least one non-empty local log was written; only those nodes enter
+  the URL allowlist. Excerpts require the model's own log URL to match that
+  allowlist, and are dropped when the renderer uses a single-log fallback link.
 - Failure metadata write errors are surfaced together with the primary apply
   error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a
