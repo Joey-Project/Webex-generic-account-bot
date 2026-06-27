@@ -58,6 +58,8 @@ const JENKINS_EVIDENCE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const JENKINS_FETCH_RETRIES: u64 = 3;
 const JENKINS_FETCH_TIMEOUT_MAX_SECS: u64 = 60;
 const JENKINS_HELPER_COMPLETION_MARGIN_SECS: u64 = 30;
+const JENKINS_HELPER_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const JENKINS_HELPER_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -681,14 +683,12 @@ async fn run_jenkins_context_helper(
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             terminate_jenkins_helper(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            abort_helper_output(stdout_task, stderr_task).await;
             return Err(error).context("failed to run Jenkins diagnostics helper");
         }
         Err(_) => {
             terminate_jenkins_helper(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            abort_helper_output(stdout_task, stderr_task).await;
             return Err(anyhow!(
                 "Jenkins diagnostics helper timed out after {} seconds",
                 config.timeout_secs
@@ -697,18 +697,20 @@ async fn run_jenkins_context_helper(
     };
     #[cfg(unix)]
     terminate_jenkins_helper_process_group(process_group, SIGTERM);
-    let (stdout, stderr) =
-        match timeout_at(deadline, join_helper_output(stdout_task, stderr_task)).await {
-            Ok(output) => output?,
-            Err(_) => {
-                #[cfg(unix)]
-                terminate_jenkins_helper_process_group(process_group, SIGKILL);
-                return Err(anyhow!(
+    let (stdout, stderr) = match join_helper_output_until(deadline, stdout_task, stderr_task).await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            #[cfg(unix)]
+            terminate_jenkins_helper_process_group(process_group, SIGKILL);
+            return Err(error).with_context(|| {
+                format!(
                     "Jenkins diagnostics helper timed out after {} seconds",
                     config.timeout_secs
-                ));
-            }
-        };
+                )
+            });
+        }
+    };
 
     if status.success() {
         return Ok(compact_jenkins_helper_output(&stdout));
@@ -965,17 +967,42 @@ fn safe_path_fragment(value: &str) -> String {
     }
 }
 
-async fn join_helper_output(
+async fn join_helper_output_until(
+    deadline: Instant,
+    mut stdout_task: tokio::task::JoinHandle<Result<String>>,
+    mut stderr_task: tokio::task::JoinHandle<Result<String>>,
+) -> Result<(String, String)> {
+    let joined = async {
+        let stdout = (&mut stdout_task)
+            .await
+            .context("failed to join Jenkins stdout reader")??;
+        let stderr = (&mut stderr_task)
+            .await
+            .context("failed to join Jenkins stderr reader")??;
+        Ok((stdout, stderr))
+    };
+    match timeout_at(deadline, joined).await {
+        Ok(output) => output,
+        Err(_) => {
+            abort_helper_output(stdout_task, stderr_task).await;
+            Err(anyhow!(
+                "Jenkins diagnostics helper pipes did not close before deadline"
+            ))
+        }
+    }
+}
+
+async fn abort_helper_output(
     stdout_task: tokio::task::JoinHandle<Result<String>>,
     stderr_task: tokio::task::JoinHandle<Result<String>>,
-) -> Result<(String, String)> {
-    let stdout = stdout_task
-        .await
-        .context("failed to join Jenkins stdout reader")??;
-    let stderr = stderr_task
-        .await
-        .context("failed to join Jenkins stderr reader")??;
-    Ok((stdout, stderr))
+) {
+    stdout_task.abort();
+    stderr_task.abort();
+    let _ = timeout(JENKINS_HELPER_PIPE_CLOSE_GRACE, async {
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    })
+    .await;
 }
 
 fn apply_jenkins_helper_env(command: &mut Command) {
@@ -1006,8 +1033,8 @@ async fn terminate_jenkins_helper(child: &mut Child) {
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = timeout(JENKINS_HELPER_TERMINATION_GRACE, child.wait()).await;
     }
 }
 
@@ -1016,7 +1043,7 @@ async fn terminate_jenkins_helper_group(child: &mut Child) {
     if let Some(pid) = child.id() {
         let process_group = -(pid as i32);
         terminate_jenkins_helper_process_group(Some(process_group), SIGTERM);
-        if timeout(Duration::from_millis(250), child.wait())
+        if timeout(JENKINS_HELPER_TERMINATION_GRACE, child.wait())
             .await
             .is_ok()
         {
@@ -1024,8 +1051,8 @@ async fn terminate_jenkins_helper_group(child: &mut Child) {
         }
         terminate_jenkins_helper_process_group(Some(process_group), SIGKILL);
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    let _ = child.start_kill();
+    let _ = timeout(JENKINS_HELPER_TERMINATION_GRACE, child.wait()).await;
 }
 
 #[cfg(unix)]
@@ -5785,6 +5812,56 @@ mod tests {
 
         assert!(output.contains("parent_done"));
         fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jenkins_helper_timeout_aborts_pipes_held_by_escaped_descendant() {
+        let helper_dir = unique_state_path().with_extension("helper-escaped-pipe-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        let artifact_dir = helper_dir.join("artifacts");
+        let escaped_pid_file = helper_dir.join("escaped.pid");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        fs::write(
+            &script,
+            format!(
+                "/usr/bin/setsid /bin/sh -c 'echo $$ > {}; sleep 30' &\nwait\n",
+                escaped_pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let config = webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 1,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        };
+
+        let result = timeout(
+            Duration::from_secs(2),
+            run_jenkins_context_helper(
+                &config,
+                "https://engci-private-sjc.cisco.com/job/1",
+                &artifact_dir,
+            ),
+        )
+        .await
+        .expect("helper timeout path must remain bounded");
+
+        let error = result.unwrap_err();
+        if let Ok(value) = fs::read_to_string(&escaped_pid_file)
+            && let Ok(pid) = value.trim().parse::<i32>()
+        {
+            terminate_jenkins_helper_process_group(Some(-pid), SIGKILL);
+        }
+        fs::remove_dir_all(helper_dir).unwrap();
+        assert!(error.to_string().contains("timed out after 1 seconds"));
     }
 
     #[test]

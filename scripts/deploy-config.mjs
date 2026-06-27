@@ -48,7 +48,6 @@ const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
 const MAX_CONFIG_PATH_BYTES = 512;
 const SERVICE_READINESS_BIN = '/usr/bin/curl';
 const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
-const LOCK_OWNER_FILE = 'owner.json';
 const LOCK_OWNER_MAX_BYTES = 4096;
 const INCOMPLETE_LOCK_GRACE_MS = 60_000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
@@ -691,17 +690,19 @@ async function acquireLock(lockDir, fsApi) {
   await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
   const lockParentStat = await fsApi.lstat(lockParent);
   assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
-  const owner = {
-    version: 1,
-    token: randomUUID(),
-    pid: process.pid,
-    process_start_ticks: await readProcessStartTicks(process.pid, fsApi),
-    acquired_at: new Date().toISOString(),
-  };
+  const processStartTicks = await readProcessStartTicks(process.pid, fsApi);
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    const owner = {
+      version: 1,
+      token: randomUUID(),
+      pid: process.pid,
+      process_start_ticks: processStartTicks,
+      acquired_at: new Date().toISOString(),
+    };
+    let handle;
     try {
-      await fsApi.mkdir(lockDir, { recursive: false, mode: 0o700 });
+      handle = await fsApi.open(lockDir, 'wx', 0o600);
     } catch (error) {
       if (!error || error.code !== 'EEXIST') {
         throw error;
@@ -713,20 +714,36 @@ async function acquireLock(lockDir, fsApi) {
       throw new Error(`deployment already in progress: ${lockDir}`);
     }
 
+    let identity;
     try {
-      await writeLockOwner(lockDir, owner, fsApi);
-      return owner;
+      identity = await handle.stat();
+      await handle.chmod(0o600);
+      await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
+      await handle.sync();
     } catch (error) {
-      try {
-        await fsApi.rm(lockDir, { recursive: true, force: true });
-      } catch (cleanupError) {
-        throw new Error(
-          `failed to initialise deployment lock: ${error.message}; ` +
-            `failed to remove incomplete lock: ${cleanupError.message}`,
-        );
+      await handle.close().catch(() => {});
+      throw error;
+    }
+    await handle.close();
+    await syncDirectory(lockParent, fsApi);
+
+    let currentIdentity;
+    try {
+      currentIdentity = await fsApi.lstat(lockDir);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') {
+        continue;
       }
       throw error;
     }
+    if (!sameFileIdentity(identity, currentIdentity)) {
+      continue;
+    }
+    const persistedOwner = await readLockOwner(lockDir, fsApi, currentIdentity);
+    if (persistedOwner?.token !== owner.token) {
+      throw new Error(`deployment lock owner could not be verified: ${lockDir}`);
+    }
+    return owner;
   }
   throw new Error(`failed to acquire deployment lock after stale-lock recovery: ${lockDir}`);
 }
@@ -741,8 +758,8 @@ async function reclaimStaleLock(lockDir, fsApi) {
     }
     throw error;
   }
-  assertTrustedDeploymentDirectory(lockDir, lockStat, 'lock directory');
-  const owner = await readLockOwner(lockDir, fsApi);
+  assertTrustedDeploymentLock(lockDir, lockStat);
+  const owner = await readLockOwner(lockDir, fsApi, lockStat);
   if (owner && await lockOwnerIsActive(owner, fsApi)) {
     return false;
   }
@@ -750,16 +767,16 @@ async function reclaimStaleLock(lockDir, fsApi) {
     return false;
   }
 
-  const staleDir = `${lockDir}.stale-${randomUUID()}`;
+  const staleFile = `${lockDir}.stale-${randomUUID()}`;
   try {
-    await fsApi.rename(lockDir, staleDir);
+    await fsApi.rename(lockDir, staleFile);
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       return true;
     }
     throw error;
   }
-  await fsApi.rm(staleDir, { recursive: true, force: true });
+  await fsApi.rm(staleFile, { force: true });
   return true;
 }
 
@@ -768,37 +785,20 @@ async function releaseLock(lockDir, expectedOwner, fsApi) {
   if (!owner || owner.token !== expectedOwner.token) {
     throw new Error(`deployment lock ownership changed before cleanup: ${lockDir}`);
   }
-  await fsApi.rm(lockDir, { recursive: true, force: true });
+  await fsApi.rm(lockDir, { force: true });
 }
 
-async function writeLockOwner(lockDir, owner, fsApi) {
-  const ownerPath = path.join(lockDir, LOCK_OWNER_FILE);
-  const handle = await fsApi.open(ownerPath, 'wx', 0o600);
+async function readLockOwner(lockDir, fsApi, knownMetadata = null) {
+  let metadata = knownMetadata;
   try {
-    await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  const directoryHandle = await fsApi.open(lockDir, 'r');
-  try {
-    await directoryHandle.sync();
-  } finally {
-    await directoryHandle.close();
-  }
-}
-
-async function readLockOwner(lockDir, fsApi) {
-  const ownerPath = path.join(lockDir, LOCK_OWNER_FILE);
-  let metadata;
-  try {
-    metadata = await fsApi.lstat(ownerPath);
+    metadata ??= await fsApi.lstat(lockDir);
   } catch (error) {
     if (error && error.code === 'ENOENT') {
       return null;
     }
     throw error;
   }
+  assertTrustedDeploymentLock(lockDir, metadata);
   if (
     !metadata.isFile()
     || metadata.isSymbolicLink()
@@ -807,7 +807,7 @@ async function readLockOwner(lockDir, fsApi) {
     return null;
   }
   try {
-    const owner = JSON.parse(await fsApi.readFile(ownerPath, 'utf8'));
+    const owner = JSON.parse(await fsApi.readFile(lockDir, 'utf8'));
     if (
       owner?.version !== 1
       || typeof owner.token !== 'string'
@@ -823,6 +823,10 @@ async function readLockOwner(lockDir, fsApi) {
   } catch (_) {
     return null;
   }
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function lockOwnerIsActive(owner, fsApi) {
@@ -1499,6 +1503,21 @@ function assertTrustedDeploymentDirectory(file, fileStat, label) {
   }
   if ((mode & 0o700) !== 0o700 || (mode & 0o077) !== 0) {
     throw new Error(`${label} mode is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedDeploymentLock(file, fileStat) {
+  if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+    throw new Error(`deployment lock must be a real file: ${file}`);
+  }
+  const mode = fileStat.mode & 0o7777;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
+  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+    throw new Error(`deployment lock ownership is not trusted: ${file}`);
+  }
+  if (mode !== 0o600) {
+    throw new Error(`deployment lock mode is not trusted: ${file}`);
   }
 }
 

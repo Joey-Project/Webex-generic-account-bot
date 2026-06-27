@@ -1093,7 +1093,11 @@ describe('trusted config policy', () => {
           result: 'FAILURE',
           actions: [
             {
-              causes: [{ upstreamUrl: '/job/upstream/', upstreamBuild: 'N/A' }],
+              causes: [
+                { upstreamUrl: '/job/upstream/', upstreamBuild: 'N/A' },
+                { upstreamUrl: '/manage', upstreamBuild: 1 },
+                { upstreamUrl: 'https://evil.example/job/upstream/', upstreamBuild: 2 },
+              ],
               builds: [{ jobName: 'broken-child', buildNumberStr: 'N/A', result: 'FAILURE' }],
             },
           ],
@@ -1113,6 +1117,8 @@ describe('trusted config policy', () => {
         assert.equal(bundle.graph.counts.total_jobs_discovered, 1);
         assert.equal(fetchCallCount('/job/root/1/api/json'), 1);
         assert.equal(fetchCallCount('/job/upstream/N%2FA/api/json'), 0);
+        assert.equal(fetchCallCount('/manage/1/api/json'), 0);
+        assert.equal(fetchCallCount('/job/upstream/2/api/json'), 0);
         assert.equal(fetchCallCount('/job/broken-child/N%2FA/api/json'), 0);
       },
     );
@@ -1405,9 +1411,7 @@ describe('deploy-config CLI and execution', () => {
       },
       runner: async (command, env) => {
         calls.push({ command, env });
-        lockOwner ??= JSON.parse(
-          await fs.readFile(path.join(plan.lockDir, 'owner.json'), 'utf8'),
-        );
+        lockOwner ??= JSON.parse(await fs.readFile(plan.lockDir, 'utf8'));
         if (command.bin === '/usr/bin/bash') {
           await fs.mkdir(path.dirname(plan.candidateConfig), { recursive: true });
           await fs.writeFile(plan.candidateConfig, 'candidate config\n', 'utf8');
@@ -1453,9 +1457,8 @@ describe('deploy-config CLI and execution', () => {
         path.join(temp, 'bot-code'),
       ]),
     );
-    await fs.mkdir(plan.lockDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(
-      path.join(plan.lockDir, 'owner.json'),
+      plan.lockDir,
       `${JSON.stringify({
         version: 1,
         token: '00000000-0000-4000-8000-000000000000',
@@ -1503,9 +1506,8 @@ describe('deploy-config CLI and execution', () => {
     );
     const procStat = await fs.readFile(`/proc/${process.pid}/stat`, 'utf8');
     const startTicks = procStat.slice(procStat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
-    await fs.mkdir(plan.lockDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(
-      path.join(plan.lockDir, 'owner.json'),
+      plan.lockDir,
       `${JSON.stringify({
         version: 1,
         token: '00000000-0000-4000-8000-000000000001',
@@ -1521,8 +1523,103 @@ describe('deploy-config CLI and execution', () => {
       /deployment already in progress/,
     );
 
-    assert.equal((await fs.stat(plan.lockDir)).isDirectory(), true);
-    await fs.rm(plan.lockDir, { recursive: true, force: true });
+    assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
+    await fs.rm(plan.lockDir, { force: true });
+  });
+
+  it('does not let a reclaimed lock creator remove a newer active lock', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    let markFirstOpened;
+    const firstOpened = new Promise((resolve) => {
+      markFirstOpened = resolve;
+    });
+    let resumeFirstWrite;
+    const firstWriteCanResume = new Promise((resolve) => {
+      resumeFirstWrite = resolve;
+    });
+    let firstLockOpen = true;
+    const firstFsApi = {
+      ...fs,
+      async open(file, flags, mode) {
+        const handle = await fs.open(file, flags, mode);
+        if (file !== plan.lockDir || flags !== 'wx' || !firstLockOpen) {
+          return handle;
+        }
+        firstLockOpen = false;
+        markFirstOpened();
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'writeFile') {
+              return async (...args) => {
+                await firstWriteCanResume;
+                return await target.writeFile(...args);
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+    const firstApply = executePlan({ plan, fsApi: firstFsApi });
+    await firstOpened;
+    const staleTime = new Date(Date.now() - 120_000);
+    await fs.utimes(plan.lockDir, staleTime, staleTime);
+
+    let markSecondStarted;
+    const secondStarted = new Promise((resolve) => {
+      markSecondStarted = resolve;
+    });
+    let releaseSecond;
+    const secondCanRun = new Promise((resolve) => {
+      releaseSecond = resolve;
+    });
+    let secondRunnerBlocked = true;
+    const secondApply = executePlan({
+      plan,
+      runner: async (command) => {
+        if (secondRunnerBlocked) {
+          secondRunnerBlocked = false;
+          markSecondStarted();
+          await secondCanRun;
+        }
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+        }
+        return {
+          stdout: command.capture === 'configRevision' ? `${'2'.repeat(40)}\n` : '',
+          stderr: '',
+        };
+      },
+    });
+    await secondStarted;
+    const secondOwner = JSON.parse(await fs.readFile(plan.lockDir, 'utf8'));
+    resumeFirstWrite();
+
+    await assert.rejects(firstApply, /deployment already in progress/);
+    assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
+    assert.equal(JSON.parse(await fs.readFile(plan.lockDir, 'utf8')).token, secondOwner.token);
+
+    releaseSecond();
+    const metadata = await secondApply;
+    assert.equal(metadata.status, 'installed_without_restart');
+    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
   });
 
   it('preserves existing rendered config metadata while installing', async () => {
@@ -2156,8 +2253,8 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.status, 'failed_apply');
     assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
-    assert.equal((await fs.stat(plan.lockDir)).isDirectory(), true);
-    await fs.rm(plan.lockDir, { recursive: true, force: true });
+    assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
+    await fs.rm(plan.lockDir, { force: true });
   });
 
   it('rolls back the rendered config and records failure metadata if service restart fails', async () => {
@@ -2270,7 +2367,7 @@ describe('deploy-config CLI and execution', () => {
     assert.match(failureMetadata.reason, /failed post-restart health check/);
     assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
-    await fs.rm(plan.lockDir, { recursive: true, force: true });
+    await fs.rm(plan.lockDir, { force: true });
   });
 
   it('rolls back when systemd is active but the bot is not ready', async () => {

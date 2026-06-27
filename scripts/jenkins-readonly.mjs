@@ -1091,14 +1091,18 @@ function upstreamBuildUrl(build, baseUrl) {
     if (!/^\d+$/.test(upstreamBuild)) {
       continue;
     }
-    const upstreamJobUrl = new URL(cause.upstreamUrl, normalizeBaseUrl(baseUrl));
-    const pathname = upstreamJobUrl.pathname.endsWith('/')
-      ? upstreamJobUrl.pathname
-      : `${upstreamJobUrl.pathname}/`;
-    upstreamJobUrl.pathname = `${pathname}${upstreamBuild}/`;
-    upstreamJobUrl.search = '';
-    upstreamJobUrl.hash = '';
-    return normalizeJenkinsUrl(upstreamJobUrl.toString(), baseUrl).toString();
+    try {
+      const upstreamJobUrl = new URL(cause.upstreamUrl, normalizeBaseUrl(baseUrl));
+      const pathname = upstreamJobUrl.pathname.endsWith('/')
+        ? upstreamJobUrl.pathname
+        : `${upstreamJobUrl.pathname}/`;
+      upstreamJobUrl.pathname = `${pathname}${upstreamBuild}/`;
+      upstreamJobUrl.search = '';
+      upstreamJobUrl.hash = '';
+      return buildUrlFromJenkinsUrl(upstreamJobUrl.toString(), baseUrl).toString();
+    } catch (_) {
+      // Ignore malformed or non-build upstream metadata without discarding this build's evidence.
+    }
   }
   return null;
 }

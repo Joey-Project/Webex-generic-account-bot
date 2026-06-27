@@ -63,19 +63,25 @@ superseded_by:
   post-rename directory-fsync failure restores the previous config internally.
 - Child commands have per-command deadlines, process-group termination, a hard
   post-SIGKILL pipe-close deadline, and bounded stdout/stderr capture. The lock
-  records PID, process start time, and a random owner token so dead-process locks
-  can be reclaimed without stealing a live deployment. Lock, checkout, and
-  output directories must be deployment-user-owned and non-writable by others.
+  is an atomically created owner file containing PID, process start time, and a
+  random token; inode verification prevents a stale creator from touching a
+  replacement lock. Dead-process locks can be reclaimed without stealing a
+  live deployment. Lock-parent, checkout, and output directories must be
+  deployment-user-owned and non-writable by others; the lock file is mode
+  `0600`.
 - The trusted Jenkins helper is vendored into the bot repo with service-bounded
   graph fetch limits, redacted diagnostics snippets, explicit partial collection
   markers, and downstream traversal limited to structured Jenkins API metadata.
 - The helper process retains the configured overall timeout while each HTTP
   attempt uses a derived timeout capped at 60 seconds, leaving room for three
-  retries and output cleanup before the parent deadline.
+  retries and output cleanup before the parent deadline. Process termination and
+  pipe readers have separate hard deadlines for escaped descendants.
 - Jenkins API child and upstream build numbers must be decimal before they can
   affect graph traversal; malformed metadata is ignored without discarding
-  already collected root evidence. Markdown-only Jenkins rooms do not require
-  a structured evidence index, while deterministic JSON reply formats do.
+  already collected root evidence. Upstream URLs must also identify an in-base
+  Jenkins build; malformed or cross-controller causes are ignored.
+  Markdown-only Jenkins rooms do not require a structured evidence index,
+  while deterministic JSON reply formats do.
 - Jenkins JSON API responses have a separate 1 MiB streaming cap and omit
   unused build parameter values.
 - Jenkins inputs must identify `/job/.../<build-number>/`; authenticated fetches
