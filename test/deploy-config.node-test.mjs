@@ -1381,7 +1381,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(stdout).status, 'installed_without_restart');
   });
 
-  it('apply executes commands with scrubbed env, installs candidate metadata, and clears the lock', async () => {
+  it('apply executes commands with scrubbed env, installs metadata, and releases flock', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -1436,10 +1436,10 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(lockOwner.pid, process.pid);
     assert.match(lockOwner.process_start_ticks, /^[0-9]+$/);
     assert.equal(typeof lockOwner.token, 'string');
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
-  it('recovers a deployment lock owned by a dead process', async () => {
+  it('acquires an unlocked persistent lock file with stale owner metadata', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -1483,10 +1483,10 @@ describe('deploy-config CLI and execution', () => {
     });
 
     assert.equal(metadata.status, 'installed_without_restart');
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
-  it('does not reclaim a deployment lock owned by the active process', async () => {
+  it('serializes concurrent callers even when the lock file contains stale metadata', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -1504,100 +1504,33 @@ describe('deploy-config CLI and execution', () => {
         path.join(temp, 'bot-code'),
       ]),
     );
-    const procStat = await fs.readFile(`/proc/${process.pid}/stat`, 'utf8');
-    const startTicks = procStat.slice(procStat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
     await fs.writeFile(
       plan.lockDir,
       `${JSON.stringify({
         version: 1,
-        token: '00000000-0000-4000-8000-000000000001',
-        pid: process.pid,
-        process_start_ticks: startTicks,
-        acquired_at: new Date().toISOString(),
+        token: '00000000-0000-4000-8000-000000000000',
+        pid: 2_147_483_647,
+        process_start_ticks: '1',
+        acquired_at: new Date(0).toISOString(),
       })}\n`,
       { mode: 0o600 },
     );
-
-    await assert.rejects(
-      () => executePlan({ plan }),
-      /deployment already in progress/,
-    );
-
-    assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
-    await fs.rm(plan.lockDir, { force: true });
-  });
-
-  it('does not let a reclaimed lock creator remove a newer active lock', async () => {
-    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
-    const plan = buildDeployPlan(
-      parseArgsAllow([
-        '--apply',
-        '--skip-restart',
-        '--checkout-dir',
-        path.join(temp, 'checkout'),
-        '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
-        '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
-        '--lock-dir',
-        path.join(temp, 'deploy.lock'),
-        '--bot-code-dir',
-        path.join(temp, 'bot-code'),
-      ]),
-    );
-    let markFirstOpened;
-    const firstOpened = new Promise((resolve) => {
-      markFirstOpened = resolve;
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => {
+      markFirstStarted = resolve;
     });
-    let resumeFirstWrite;
-    const firstWriteCanResume = new Promise((resolve) => {
-      resumeFirstWrite = resolve;
+    let releaseFirst;
+    const firstCanRun = new Promise((resolve) => {
+      releaseFirst = resolve;
     });
-    let firstLockOpen = true;
-    const firstFsApi = {
-      ...fs,
-      async open(file, flags, mode) {
-        const handle = await fs.open(file, flags, mode);
-        if (file !== plan.lockDir || flags !== 'wx' || !firstLockOpen) {
-          return handle;
-        }
-        firstLockOpen = false;
-        markFirstOpened();
-        return new Proxy(handle, {
-          get(target, property) {
-            if (property === 'writeFile') {
-              return async (...args) => {
-                await firstWriteCanResume;
-                return await target.writeFile(...args);
-              };
-            }
-            const value = Reflect.get(target, property, target);
-            return typeof value === 'function' ? value.bind(target) : value;
-          },
-        });
-      },
-    };
-    const firstApply = executePlan({ plan, fsApi: firstFsApi });
-    await firstOpened;
-    const staleTime = new Date(Date.now() - 120_000);
-    await fs.utimes(plan.lockDir, staleTime, staleTime);
-
-    let markSecondStarted;
-    const secondStarted = new Promise((resolve) => {
-      markSecondStarted = resolve;
-    });
-    let releaseSecond;
-    const secondCanRun = new Promise((resolve) => {
-      releaseSecond = resolve;
-    });
-    let secondRunnerBlocked = true;
-    const secondApply = executePlan({
+    let firstRunnerBlocked = true;
+    const firstApply = executePlan({
       plan,
       runner: async (command) => {
-        if (secondRunnerBlocked) {
-          secondRunnerBlocked = false;
-          markSecondStarted();
-          await secondCanRun;
+        if (firstRunnerBlocked) {
+          firstRunnerBlocked = false;
+          markFirstStarted();
+          await firstCanRun;
         }
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
@@ -1608,18 +1541,20 @@ describe('deploy-config CLI and execution', () => {
         };
       },
     });
-    await secondStarted;
-    const secondOwner = JSON.parse(await fs.readFile(plan.lockDir, 'utf8'));
-    resumeFirstWrite();
+    await firstStarted;
+    const activeOwner = JSON.parse(await fs.readFile(plan.lockDir, 'utf8'));
 
-    await assert.rejects(firstApply, /deployment already in progress/);
+    await assert.rejects(
+      () => executePlan({ plan }),
+      /deployment already in progress/,
+    );
     assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
-    assert.equal(JSON.parse(await fs.readFile(plan.lockDir, 'utf8')).token, secondOwner.token);
+    assert.equal(JSON.parse(await fs.readFile(plan.lockDir, 'utf8')).token, activeOwner.token);
 
-    releaseSecond();
-    const metadata = await secondApply;
+    releaseFirst();
+    const metadata = await firstApply;
     assert.equal(metadata.status, 'installed_without_restart');
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('preserves existing rendered config metadata while installing', async () => {
@@ -1692,7 +1627,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.equal(commandRan, false);
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
 
     const lockParent = path.join(temp, 'unsafe-run');
     await fs.mkdir(lockParent, { recursive: true });
@@ -1830,7 +1765,7 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({ plan }),
       /rendered config directory mode is not trusted/,
     );
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('does not roll back a successful deployment when backup cleanup fails', async () => {
@@ -2044,7 +1979,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(restartAttempts, 0);
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_apply');
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('records post-commit metadata failures without implying apply rollback', async () => {
@@ -2149,7 +2084,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.config_revision, '7'.repeat(40));
     assert.match(failureMetadata.reason, /validation failed/);
     assert.doesNotMatch(failureMetadata.reason, /secret/);
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('surfaces failure metadata write errors instead of silently preserving old status', async () => {
@@ -2207,7 +2142,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status, 'deployed');
   });
 
-  it('reports lock cleanup failures and records the residual lock state', async () => {
+  it('reports lock release verification failures in cleanup metadata', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -2225,13 +2160,18 @@ describe('deploy-config CLI and execution', () => {
         path.join(temp, 'bot-code'),
       ]),
     );
+    let successfulLockStats = 0;
     const fsApi = {
       ...fs,
-      async rm(file, options) {
-        if (file === plan.lockDir) {
-          throw new Error('lock cleanup failed');
+      async lstat(file) {
+        const metadata = await fs.lstat(file);
+        if (file === plan.lockDir && metadata.isFile()) {
+          successfulLockStats += 1;
+          if (successfulLockStats === 2) {
+            throw new Error('lock cleanup failed');
+          }
         }
-        return await fs.rm(file, options);
+        return metadata;
       },
     };
 
@@ -2253,8 +2193,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.status, 'failed_apply');
     assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
-    assert.equal((await fs.stat(plan.lockDir)).isFile(), true);
-    await fs.rm(plan.lockDir, { force: true });
+    await assertLockReleased(plan.lockDir);
   });
 
   it('rolls back the rendered config and records failure metadata if service restart fails', async () => {
@@ -2302,7 +2241,7 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
     assert.equal(failureMetadata.config_revision, 'c'.repeat(40));
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('rolls back when restart returns success but the service is not active', async () => {
@@ -2326,13 +2265,18 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
     let restartAttempts = 0;
     let healthChecks = 0;
+    let successfulLockStats = 0;
     const fsApi = {
       ...fs,
-      async rm(file, options) {
-        if (file === plan.lockDir) {
-          throw new Error('lock cleanup failed');
+      async lstat(file) {
+        const metadata = await fs.lstat(file);
+        if (file === plan.lockDir && metadata.isFile()) {
+          successfulLockStats += 1;
+          if (successfulLockStats === 2) {
+            throw new Error('lock cleanup failed');
+          }
         }
-        return await fs.rm(file, options);
+        return metadata;
       },
     };
 
@@ -2367,7 +2311,7 @@ describe('deploy-config CLI and execution', () => {
     assert.match(failureMetadata.reason, /failed post-restart health check/);
     assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
-    await fs.rm(plan.lockDir, { force: true });
+    await assertLockReleased(plan.lockDir);
   });
 
   it('rolls back when systemd is active but the bot is not ready', async () => {
@@ -2427,7 +2371,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(readinessChecks, 2);
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('records failure metadata if rollback succeeds but service still cannot restart', async () => {
@@ -2475,7 +2419,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.config_revision, 'e'.repeat(40));
     assert.match(failureMetadata.reason, /restart failed 1/);
     assert.match(failureMetadata.reason, /restart failed 2/);
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
   });
 
   it('cleans candidate and lock even when rollback fails', async () => {
@@ -2529,7 +2473,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     await assert.rejects(() => fs.stat(plan.candidateConfig), /ENOENT/);
-    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
     assert.equal(rollbackRenameAttempts, 1);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new config\n');
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
@@ -2659,6 +2603,18 @@ describe('deploy-config CLI and execution', () => {
     }
   });
 });
+
+async function assertLockReleased(lockFile) {
+  const metadata = await fs.stat(lockFile);
+  assert.equal(metadata.isFile(), true);
+  assert.equal(metadata.mode & 0o777, 0o600);
+  const result = spawnSync(
+    '/usr/bin/flock',
+    ['--exclusive', '--nonblock', lockFile, '/usr/bin/true'],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
+}
 
 function parseArgsAllow(args) {
   return parseArgs(args, { allowHostOverrides: true });

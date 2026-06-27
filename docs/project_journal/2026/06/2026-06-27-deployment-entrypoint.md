@@ -55,20 +55,21 @@ superseded_by:
   `/healthz` probe. HTTP `200` and authenticated-endpoint `401` are ready;
   failed readiness rolls back through the same path.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
-  rename. Cleanup failures are merged into the reported error and residual lock
-  state is recorded when possible without replacing an earlier specific failure
-  status. Status mode validates the full metadata schema before returning it.
+  rename. Cleanup failures are merged into the reported error and lock-release
+  verification failures are recorded without replacing an earlier specific
+  failure status. Status mode validates the full metadata schema before
+  returning it.
 - Candidate contents and the rendered-config directory are fsynced before
   success metadata, preserving config-before-status durability ordering. A
   post-rename directory-fsync failure restores the previous config internally.
 - Child commands have per-command deadlines, process-group termination, a hard
   post-SIGKILL pipe-close deadline, and bounded stdout/stderr capture. The lock
-  is an atomically created owner file containing PID, process start time, and a
-  random token; inode verification prevents a stale creator from touching a
-  replacement lock. Dead-process locks can be reclaimed without stealing a
-  live deployment. Lock-parent, checkout, and output directories must be
-  deployment-user-owned and non-writable by others; the lock file is mode
-  `0600`.
+  is a persistent mode `0600` owner file. `/usr/bin/flock` acquires the kernel
+  lock through a file description inherited from Node, and the Node process
+  retains that description for the full transaction. Process exit releases the
+  lock automatically, so no pathname-based stale reclamation can race a new
+  owner. Lock-parent, checkout, and output directories must be
+  deployment-user-owned and non-writable by others.
 - The trusted Jenkins helper is vendored into the bot repo with service-bounded
   graph fetch limits, redacted diagnostics snippets, explicit partial collection
   markers, and downstream traversal limited to structured Jenkins API metadata.

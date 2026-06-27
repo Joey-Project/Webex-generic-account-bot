@@ -148,11 +148,12 @@ schema and rejects malformed or incomplete metadata.
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,
 validation, or restart cannot hold the deployment lock forever. The lock stores
-the owner's PID, process start time, and random token in an atomically created
-file; inode verification prevents a displaced creator from touching a newer
-lock. Locks from dead or reused PIDs are reclaimed without stealing an active
-deployment. Existing checkout and lock-parent directories must be owned by the
-deployment user and mode `0700`; the lock file is mode `0600`.
+the owner's PID, process start time, and random token in a persistent mode
+`0600` file. `/usr/bin/flock` acquires the kernel lock on an inherited file
+description that the Node process retains for the whole transaction, so process
+exit releases the lock automatically and no pathname-based stale deletion is
+needed. Existing checkout and lock-parent directories must be owned by the
+deployment user and mode `0700`.
 Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
 entrypoint creates the lock parent directory when host permissions allow it and

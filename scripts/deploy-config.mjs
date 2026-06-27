@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -48,8 +49,9 @@ const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
 const MAX_CONFIG_PATH_BYTES = 512;
 const SERVICE_READINESS_BIN = '/usr/bin/curl';
 const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
-const LOCK_OWNER_MAX_BYTES = 4096;
-const INCOMPLETE_LOCK_GRACE_MS = 60_000;
+const FLOCK_BIN = '/usr/bin/flock';
+const FLOCK_CHILD_FD = '3';
+const FLOCK_TIMEOUT_MS = 5000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
 const CHILD_CLOSE_GRACE_MS = 1000;
 const DEPLOYMENT_STATUSES = new Set([
@@ -690,154 +692,124 @@ async function acquireLock(lockDir, fsApi) {
   await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
   const lockParentStat = await fsApi.lstat(lockParent);
   assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
-  const processStartTicks = await readProcessStartTicks(process.pid, fsApi);
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  const openFlags = fsConstants.O_RDWR
+    | fsConstants.O_CREAT
+    | (fsConstants.O_NOFOLLOW ?? 0);
+  let handle;
+  try {
+    handle = await fsApi.open(lockDir, openFlags, 0o600);
+    await handle.chmod(0o600);
+    const identity = await handle.stat();
+    assertTrustedDeploymentLock(lockDir, identity);
+    await acquireKernelFlock(handle, lockDir);
     const owner = {
       version: 1,
       token: randomUUID(),
       pid: process.pid,
-      process_start_ticks: processStartTicks,
+      process_start_ticks: await readProcessStartTicks(process.pid, fsApi),
       acquired_at: new Date().toISOString(),
+      lock_kind: 'linux-flock',
     };
-    let handle;
-    try {
-      handle = await fsApi.open(lockDir, 'wx', 0o600);
-    } catch (error) {
-      if (!error || error.code !== 'EEXIST') {
-        throw error;
-      }
-      const reclaimed = await reclaimStaleLock(lockDir, fsApi);
-      if (reclaimed) {
-        continue;
-      }
-      throw new Error(`deployment already in progress: ${lockDir}`);
-    }
-
-    let identity;
-    try {
-      identity = await handle.stat();
-      await handle.chmod(0o600);
-      await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
-      await handle.sync();
-    } catch (error) {
-      await handle.close().catch(() => {});
-      throw error;
-    }
-    await handle.close();
+    await writeLockMetadata(handle, owner);
     await syncDirectory(lockParent, fsApi);
-
-    let currentIdentity;
-    try {
-      currentIdentity = await fsApi.lstat(lockDir);
-    } catch (error) {
-      if (error && error.code === 'ENOENT') {
-        continue;
-      }
-      throw error;
-    }
+    const currentIdentity = await fsApi.lstat(lockDir);
+    assertTrustedDeploymentLock(lockDir, currentIdentity);
     if (!sameFileIdentity(identity, currentIdentity)) {
-      continue;
+      throw new Error(`deployment lock path changed during acquisition: ${lockDir}`);
     }
-    const persistedOwner = await readLockOwner(lockDir, fsApi, currentIdentity);
-    if (persistedOwner?.token !== owner.token) {
-      throw new Error(`deployment lock owner could not be verified: ${lockDir}`);
-    }
-    return owner;
-  }
-  throw new Error(`failed to acquire deployment lock after stale-lock recovery: ${lockDir}`);
-}
-
-async function reclaimStaleLock(lockDir, fsApi) {
-  let lockStat;
-  try {
-    lockStat = await fsApi.lstat(lockDir);
+    return { owner, handle, identity };
   } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return true;
-    }
+    await handle?.close().catch(() => {});
     throw error;
   }
-  assertTrustedDeploymentLock(lockDir, lockStat);
-  const owner = await readLockOwner(lockDir, fsApi, lockStat);
-  if (owner && await lockOwnerIsActive(owner, fsApi)) {
-    return false;
-  }
-  if (!owner && Date.now() - lockStat.mtimeMs < INCOMPLETE_LOCK_GRACE_MS) {
-    return false;
-  }
-
-  const staleFile = `${lockDir}.stale-${randomUUID()}`;
-  try {
-    await fsApi.rename(lockDir, staleFile);
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return true;
-    }
-    throw error;
-  }
-  await fsApi.rm(staleFile, { force: true });
-  return true;
 }
 
-async function releaseLock(lockDir, expectedOwner, fsApi) {
-  const owner = await readLockOwner(lockDir, fsApi);
-  if (!owner || owner.token !== expectedOwner.token) {
-    throw new Error(`deployment lock ownership changed before cleanup: ${lockDir}`);
-  }
-  await fsApi.rm(lockDir, { force: true });
+async function acquireKernelFlock(handle, lockFile) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      FLOCK_BIN,
+      ['--exclusive', '--nonblock', FLOCK_CHILD_FD],
+      {
+        env: scrubEnv(),
+        shell: false,
+        stdio: ['ignore', 'ignore', 'pipe', handle.fd],
+      },
+    );
+    let stderr = '';
+    let settled = false;
+    let timer = null;
+    const finish = (error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(new Error(`timed out while acquiring deployment lock: ${lockFile}`));
+    }, FLOCK_TIMEOUT_MS);
+    timer.unref?.();
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < 2048) {
+        stderr += chunk;
+      }
+    });
+    child.once('error', finish);
+    child.once('close', (code) => {
+      if (code === 0) {
+        finish();
+      } else if (code === 1) {
+        finish(new Error(`deployment already in progress: ${lockFile}`));
+      } else {
+        finish(new Error(
+          `${FLOCK_BIN} failed with code ${code}: ${truncate(redact(stderr), 1000)}`,
+        ));
+      }
+    });
+  });
 }
 
-async function readLockOwner(lockDir, fsApi, knownMetadata = null) {
-  let metadata = knownMetadata;
+async function releaseLock(lockDir, lockState, fsApi) {
+  let verificationError = null;
   try {
-    metadata ??= await fsApi.lstat(lockDir);
+    const currentIdentity = await fsApi.lstat(lockDir);
+    if (!sameFileIdentity(lockState.identity, currentIdentity)) {
+      verificationError = new Error(`deployment lock path changed before cleanup: ${lockDir}`);
+    }
   } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return null;
-    }
-    throw error;
+    verificationError = error;
   }
-  assertTrustedDeploymentLock(lockDir, metadata);
-  if (
-    !metadata.isFile()
-    || metadata.isSymbolicLink()
-    || metadata.size > LOCK_OWNER_MAX_BYTES
-  ) {
-    return null;
-  }
+  let closeError = null;
   try {
-    const owner = JSON.parse(await fsApi.readFile(lockDir, 'utf8'));
-    if (
-      owner?.version !== 1
-      || typeof owner.token !== 'string'
-      || owner.token.length < 16
-      || !Number.isSafeInteger(owner.pid)
-      || owner.pid <= 0
-      || !/^[0-9]+$/.test(owner.process_start_ticks ?? '')
-      || typeof owner.acquired_at !== 'string'
-    ) {
-      return null;
-    }
-    return owner;
-  } catch (_) {
-    return null;
+    await lockState.handle.close();
+  } catch (error) {
+    closeError = error;
   }
+  if (verificationError || closeError) {
+    throw new Error(
+      [verificationError?.message, closeError?.message].filter(Boolean).join('; '),
+    );
+  }
+}
+
+async function writeLockMetadata(handle, owner) {
+  const payload = Buffer.from(`${JSON.stringify(owner)}\n`, 'utf8');
+  await handle.write(payload, 0, payload.length, 0);
+  await handle.truncate(payload.length);
+  await handle.sync();
 }
 
 function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
-}
-
-async function lockOwnerIsActive(owner, fsApi) {
-  try {
-    return await readProcessStartTicks(owner.pid, fsApi) === owner.process_start_ticks;
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return false;
-    }
-    throw error;
-  }
 }
 
 async function readProcessStartTicks(pid, fsApi) {
