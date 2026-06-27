@@ -61,6 +61,9 @@ metadata with no-follow and size checks, returns only allowlisted fields, and
 uses the normal idempotent Webex reply marker. `pull`, `reload`, and `sync` are
 reserved command names but remain undeployable until the durable external
 action worker is implemented; configuration validation rejects them.
+When a valid deployment transaction exists, status reports its allowlisted
+phase and in-progress revision; malformed journals fail closed to
+`recovery_required` without exposing their contents.
 The current production host policy also rejects the entire table until a
 companion config PR pins the exact admin Space and sender allowlist. The example
 above is therefore for local validation and the upcoming reviewed deployment,

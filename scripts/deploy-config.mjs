@@ -534,6 +534,7 @@ export async function executePlan({
   let failureMetadataWritten = false;
   let failureMetadataError = null;
   let recordedFailureStatus = null;
+  let recordedFailureConfigRevision = null;
   let outputDirectoriesTrusted = false;
   const recordFailure = async (
     status,
@@ -544,6 +545,7 @@ export async function executePlan({
       await writeFailureMetadata(plan, configRevision, status, reason, fsApi);
       failureMetadataWritten = true;
       recordedFailureStatus = status;
+      recordedFailureConfigRevision = configRevision;
     } catch (error) {
       failureMetadataError = error;
       throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
@@ -705,7 +707,7 @@ export async function executePlan({
         try {
           await writeFailureMetadata(
             plan,
-            captures.configRevision || null,
+            recordedFailureConfigRevision ?? captures.configRevision ?? null,
             recordedFailureStatus
               ?? (commitReached ? 'failed_after_commit_cleanup' : 'failed_cleanup'),
             combinedReason,

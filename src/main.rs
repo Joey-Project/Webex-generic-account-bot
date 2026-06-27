@@ -49,6 +49,7 @@ use webex_headless_messenger::{
 
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const EVENT_HYDRATION_NOT_FOUND_RETRY: Duration = Duration::from_secs(5);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
@@ -2226,6 +2227,15 @@ impl BotApp {
         message_id: &str,
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
+        if webex_call_is_not_found(&error) {
+            self.defer_attempt(attempt, EVENT_HYDRATION_NOT_FOUND_RETRY)
+                .await?;
+            return Err(HttpError::retry_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("message {message_id} is not yet available from Webex"),
+                EVENT_HYDRATION_NOT_FOUND_RETRY,
+            ));
+        }
         match classify_webex_failure(&error, self.config.server.attempt_lease()) {
             WebexFailureAction::Stop => {
                 self.mark_processed(attempt).await?;
@@ -3871,12 +3881,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_hydration_not_found_is_retryable() {
+        let harness = TestHarness::new();
+        harness
+            .webex
+            .push_event_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(404, None),
+            )))));
+
+        let error = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "eventual-message",
+                "sidecar body",
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(EVENT_HYDRATION_NOT_FOUND_RETRY));
+        assert!(!harness.processed("eventual-message").await);
+        assert!(harness.runner.calls().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn authorised_config_status_uses_fixed_provider_and_marked_reply() {
         let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
         harness.config_status.push_snapshot(ConfigStatusSnapshot {
             status: "deployed".to_owned(),
             config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             service: Some("webex-generic-account-bot".to_owned()),
+            transaction_phase: None,
         });
         harness.webex.push_event_message(Ok(admin_message(
             "config-status-1",
@@ -4164,6 +4200,7 @@ mod tests {
             status: "deployed".to_owned(),
             config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             service: Some("webex-generic-account-bot".to_owned()),
+            transaction_phase: None,
         });
         let mut authoritative = admin_message(
             "config-status-blank-text",
@@ -7206,6 +7243,7 @@ mod tests {
                         status: "unknown".to_owned(),
                         config_revision: None,
                         service: None,
+                        transaction_phase: None,
                     })
                 })
                 .map_err(|message| anyhow!(message))

@@ -1,6 +1,6 @@
 use std::{
     io::{self, ErrorKind},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -11,7 +11,6 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     },
-    path::Component,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -35,12 +34,33 @@ const DEPLOYMENT_STATUSES: &[&str] = &[
     "failed_after_commit_cleanup",
     "failed_cleanup",
 ];
+const TRANSACTION_PHASES: &[&str] = &[
+    "prepared",
+    "service_transition_started",
+    "committed_pending_metadata",
+];
+const TRANSACTION_KEYS: &[&str] = &[
+    "bot_code_dir",
+    "committed_at",
+    "config_ref",
+    "config_repo",
+    "config_revision",
+    "had_previous",
+    "metadata_file",
+    "phase",
+    "rendered_config",
+    "service",
+    "service_restart_required",
+    "started_at",
+    "version",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigStatusSnapshot {
     pub status: String,
     pub config_revision: Option<String>,
     pub service: Option<String>,
+    pub transaction_phase: Option<String>,
 }
 
 impl ConfigStatusSnapshot {
@@ -50,10 +70,16 @@ impl ConfigStatusSnapshot {
         let revision_label = match self.status.as_str() {
             "failed_after_commit" | "failed_after_commit_cleanup" => "Committed config revision",
             status if status.starts_with("failed_") => "Attempted config revision",
+            "recovery_required" => "In-progress config revision",
             _ => "Config revision",
         };
+        let transaction_phase = self
+            .transaction_phase
+            .as_deref()
+            .map(|phase| format!("\n- Transaction phase: `{phase}`"))
+            .unwrap_or_default();
         format!(
-            "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`\n- Service: `{service}`",
+            "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`{transaction_phase}\n- Service: `{service}`",
             self.status
         )
     }
@@ -63,6 +89,7 @@ impl ConfigStatusSnapshot {
             status: "unknown".to_owned(),
             config_revision: None,
             service: None,
+            transaction_phase: None,
         }
     }
 
@@ -71,6 +98,7 @@ impl ConfigStatusSnapshot {
             status: "recovery_required".to_owned(),
             config_revision: None,
             service: Some("webex-generic-account-bot".to_owned()),
+            transaction_phase: None,
         }
     }
 }
@@ -99,7 +127,11 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
         match read_optional_bounded_file(&self.transaction_file).await {
             Ok(None) => {}
-            Ok(Some(_)) | Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
+            Ok(Some(contents)) => {
+                return Ok(parse_deployment_transaction(&contents)
+                    .unwrap_or_else(|_| ConfigStatusSnapshot::recovery_required()));
+            }
+            Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
         }
         let Some(contents) = read_optional_bounded_file(&self.status_file).await? else {
             return Ok(ConfigStatusSnapshot::unknown());
@@ -275,6 +307,11 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
                 "installed_without_restart status metadata is inconsistent"
             ));
         }
+        "failed_after_commit" | "failed_after_commit_cleanup" if config_revision.is_none() => {
+            return Err(anyhow!(
+                "post-commit failure status metadata requires a revision"
+            ));
+        }
         _ => {}
     }
     if status.starts_with("failed_") && !object.get("reason").is_some_and(Value::is_string) {
@@ -284,6 +321,76 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
         status: status.to_owned(),
         config_revision,
         service: Some(service.to_owned()),
+        transaction_phase: None,
+    })
+}
+
+fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
+    let value: Value =
+        serde_json::from_slice(contents).context("invalid deployment transaction JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("deployment transaction must be a JSON object"))?;
+    if object.len() != TRANSACTION_KEYS.len()
+        || !TRANSACTION_KEYS
+            .iter()
+            .all(|field| object.contains_key(*field))
+    {
+        return Err(anyhow!("deployment transaction contains unexpected fields"));
+    }
+    if object.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(anyhow!("deployment transaction has an invalid version"));
+    }
+    let phase = required_nonempty_string(object, "phase")?;
+    if !TRANSACTION_PHASES.contains(&phase) {
+        return Err(anyhow!("deployment transaction has an invalid phase"));
+    }
+    let revision = required_nonempty_string(object, "config_revision")?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("deployment transaction has an invalid revision"));
+    }
+    let service = required_nonempty_string(object, "service")?;
+    if service != "webex-generic-account-bot" {
+        return Err(anyhow!("deployment transaction has an invalid service"));
+    }
+    let restart_required = object
+        .get("service_restart_required")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("deployment transaction has an invalid restart requirement"))?;
+    if phase == "service_transition_started" && !restart_required {
+        return Err(anyhow!("deployment transaction phase is inconsistent"));
+    }
+    if !object.get("had_previous").is_some_and(Value::is_boolean) {
+        return Err(anyhow!(
+            "deployment transaction has an invalid backup state"
+        ));
+    }
+    for field in ["config_repo", "config_ref", "started_at"] {
+        required_nonempty_string(object, field)?;
+    }
+    for field in ["bot_code_dir", "rendered_config", "metadata_file"] {
+        let path = required_nonempty_string(object, field)?;
+        if !is_normal_absolute_path(Path::new(path)) {
+            return Err(anyhow!("deployment transaction has an invalid {field}"));
+        }
+    }
+    match (phase, object.get("committed_at")) {
+        ("committed_pending_metadata", Some(Value::String(value))) if !value.is_empty() => {}
+        ("committed_pending_metadata", _) => {
+            return Err(anyhow!("deployment transaction has an invalid commit time"));
+        }
+        (_, Some(Value::Null)) => {}
+        _ => {
+            return Err(anyhow!(
+                "deployment transaction has an unexpected commit time"
+            ));
+        }
+    }
+    Ok(ConfigStatusSnapshot {
+        status: "recovery_required".to_owned(),
+        config_revision: Some(revision.to_ascii_lowercase()),
+        service: Some(service.to_owned()),
+        transaction_phase: Some(phase.to_owned()),
     })
 }
 
@@ -299,10 +406,17 @@ fn required_nonempty_string<'a>(
 }
 
 fn valid_revision(revision: &str) -> bool {
-    (40..=64).contains(&revision.len())
+    matches!(revision.len(), 40 | 64)
         && revision
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_normal_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
 #[cfg(all(test, unix))]
@@ -431,8 +545,42 @@ mod tests {
             std_fs::write(&provider.transaction_file, contents).unwrap();
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
+            assert_eq!(snapshot.config_revision, None);
+            assert_eq!(snapshot.transaction_phase, None);
         }
 
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn valid_transaction_reports_phase_and_in_progress_revision() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.transaction_file,
+            serde_json::to_vec(&deployment_transaction()).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "recovery_required");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            snapshot.transaction_phase.as_deref(),
+            Some("service_transition_started")
+        );
+        assert!(snapshot.markdown().contains("In-progress config revision:"));
+        assert!(
+            snapshot
+                .markdown()
+                .contains("Transaction phase: `service_transition_started`")
+        );
         std_fs::remove_dir_all(root).unwrap();
     }
 
@@ -473,6 +621,22 @@ mod tests {
         std_fs::write(
             &provider.status_file,
             serde_json::to_vec(&deployment_metadata("deployed", None)).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata("failed_after_commit", None)).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "failed_apply",
+                Some("0123456789abcdef0123456789abcdef012345678"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert!(provider.status().await.is_err());
@@ -580,9 +744,28 @@ mod tests {
         })
     }
 
+    fn deployment_transaction() -> Value {
+        serde_json::json!({
+            "version": 1,
+            "phase": "service_transition_started",
+            "had_previous": true,
+            "config_revision": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            "service_restart_required": true,
+            "service": "webex-generic-account-bot",
+            "config_repo": "git@github.com:example/config.git",
+            "config_ref": "main",
+            "bot_code_dir": "/opt/webex-generic-account-bot/code",
+            "rendered_config": "/var/lib/webex-generic-account-bot/rendered/production.toml",
+            "metadata_file": "/var/lib/webex-generic-account-bot/rendered/deploy-status.json",
+            "started_at": "2026-06-27T00:00:00.000Z",
+            "committed_at": null
+        })
+    }
+
     fn temp_root() -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
+        let temp_dir = std_fs::canonicalize(std::env::temp_dir()).unwrap();
+        temp_dir.join(format!(
             "webex-config-status-test-{}-{counter}",
             std::process::id()
         ))

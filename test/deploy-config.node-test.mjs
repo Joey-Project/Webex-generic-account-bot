@@ -3051,6 +3051,7 @@ describe('deploy-config CLI and execution', () => {
         if (target === plan.metadataFile) {
           metadataRenames += 1;
           if (metadataRenames === 2) {
+            await fs.writeFile(plan.candidateConfig, 'stale candidate\n', 'utf8');
             throw new Error('recovered metadata update failed');
           }
         }
@@ -3059,6 +3060,9 @@ describe('deploy-config CLI and execution', () => {
       async rm(file, options) {
         if (file === plan.backupConfig) {
           throw new Error('backup cleanup failed');
+        }
+        if (file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
         }
         return await fs.rm(file, options);
       },
@@ -3083,7 +3087,9 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_after_commit');
     assert.equal(failureMetadata.config_revision, 'a'.repeat(40));
-    assert.equal(metadataRenames, 3);
+    assert.equal(failureMetadata.cleanup_failed, true);
+    assert.equal(failureMetadata.candidate_cleanup_failed, true);
+    assert.equal(metadataRenames, 4);
     await assertLockReleased(plan.lockDir);
   });
 
