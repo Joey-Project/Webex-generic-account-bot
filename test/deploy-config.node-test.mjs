@@ -116,17 +116,16 @@ describe('deploy-config plan', () => {
     assert(allGitCommands.every((command) => command.args.includes('protocol.ext.allow=never')));
     assert(allGitCommands.every((command) => command.resourceLimits.includes('--fsize=33554432')));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--recurse-submodules=no')));
-    assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--filter=blob:limit=1048577')));
-    assert(
-      plan.commands
-        .filter((command) => ['config-tree-paths', 'config-tree-manifest'].includes(command.validation))
-        .every((command) => command.args.includes('--no-lazy-fetch')),
-    );
-    assert(
-      plan.commands.some(
-        (command) => command.args.includes('checkout') && command.args.includes('--no-lazy-fetch'),
-      ),
-    );
+    assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--filter=blob:none')));
+    assert(allGitCommands.every((command) => !command.args.includes('--no-lazy-fetch')));
+    const pathCheck = plan.commands.find((command) => command.validation === 'config-tree-paths');
+    const manifestCheck = plan.commands.find((command) => command.validation === 'config-tree-manifest');
+    const checkout = plan.commands.find((command) => command.args.includes('checkout'));
+    assert.equal(pathCheck.env.GIT_NO_LAZY_FETCH, '1');
+    assert.equal(manifestCheck.env.GIT_NO_LAZY_FETCH, '1');
+    assert.equal(checkout.env.GIT_NO_LAZY_FETCH, undefined);
+    assert(plan.commands.indexOf(pathCheck) < plan.commands.indexOf(checkout));
+    assert(plan.commands.indexOf(checkout) < plan.commands.indexOf(manifestCheck));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('sparse-checkout')));
     assert(plan.commands.some((command) => command.validation === 'config-tree-paths'));
     assert(plan.commands.some((command) => command.validation === 'config-tree-manifest'));
@@ -136,10 +135,34 @@ describe('deploy-config plan', () => {
     assert.deepEqual(
       plan.serviceVerificationCommands.map((command) => [command.bin, command.args]),
       [
-        ['/usr/bin/sleep', ['2']],
         ['/usr/bin/systemctl', ['is-active', '--quiet', '--', plan.service]],
+        [
+          '/usr/bin/curl',
+          [
+            '--silent',
+            '--show-error',
+            '--output',
+            '/dev/null',
+            '--write-out',
+            '%{http_code}',
+            '--connect-timeout',
+            '2',
+            '--max-time',
+            '5',
+            '--retry',
+            '10',
+            '--retry-delay',
+            '1',
+            '--retry-max-time',
+            '30',
+            '--retry-connrefused',
+            '--retry-all-errors',
+            'http://127.0.0.1:8787/healthz',
+          ],
+        ],
       ],
     );
+    assert.equal(plan.serviceVerificationCommands[1].validation, 'service-readiness');
 
     const validate = plan.commands.find((command) => command.bin === '/usr/bin/bash');
     assert.equal(validate.args[0], path.join(plan.botCodeDir, 'scripts/config-policy/validate-config.sh'));
@@ -220,7 +243,7 @@ describe('deploy-config plan', () => {
 });
 
 describe('deploy-config environment and output hygiene', () => {
-  it('bounds and allowlists the sparse production config tree before checkout', () => {
+  it('bounds and allowlists the sparse production config tree', () => {
     const paths = 'production/bot.toml\0production/spaces/room.toml\0';
     assert.deepEqual(validateConfigTreePaths(paths), [
       'production/bot.toml',
@@ -1060,6 +1083,42 @@ describe('trusted config policy', () => {
     );
   });
 
+  it('ignores malformed Jenkins API build numbers without losing root evidence', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jenkins-bundle-test-'));
+    await withMockedJenkinsFetch(
+      {
+        '/job/root/1/api/json': {
+          fullDisplayName: 'root',
+          number: 1,
+          result: 'FAILURE',
+          actions: [
+            {
+              causes: [{ upstreamUrl: '/job/upstream/', upstreamBuild: 'N/A' }],
+              builds: [{ jobName: 'broken-child', buildNumberStr: 'N/A', result: 'FAILURE' }],
+            },
+          ],
+          artifacts: [],
+        },
+        '/job/root/1/consoleText': 'root failure evidence',
+      },
+      async () => {
+        const bundle = await diagnoseBundle({
+          config: jenkinsConfig(),
+          url: 'https://jenkins.example/job/root/1/',
+          tailLines: 10,
+          artifactDir: temp,
+          limits: jenkinsLimits(),
+        });
+
+        assert.equal(bundle.graph.counts.total_jobs_discovered, 1);
+        assert.equal(fetchCallCount('/job/root/1/api/json'), 1);
+        assert.equal(fetchCallCount('/job/upstream/N%2FA/api/json'), 0);
+        assert.equal(fetchCallCount('/job/broken-child/N%2FA/api/json'), 0);
+      },
+    );
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
   it('bounds Jenkins API responses without retrying deterministic budget errors', async () => {
     await withMockedJenkinsFetch(
       {
@@ -1264,6 +1323,58 @@ describe('deploy-config CLI and execution', () => {
     assert.match(stderr, /status=unknown/);
   });
 
+  it('rejects schema-invalid deployment metadata in status mode', async () => {
+    let stderr = '';
+    const status = await runCli({
+      argv: ['--status', '--json'],
+      stdout: writer(),
+      stderr: writer((chunk) => {
+        stderr += chunk;
+      }),
+      fsApi: {
+        ...fs,
+        async readFile() {
+          return '{}';
+        },
+      },
+    });
+
+    assert.equal(status, 1);
+    assert.match(stderr, /status=unknown/);
+    assert.match(stderr, /invalid status/);
+  });
+
+  it('accepts complete install-only metadata in status mode', async () => {
+    let stdout = '';
+    const status = await runCli({
+      argv: ['--status', '--json'],
+      stdout: writer((chunk) => {
+        stdout += chunk;
+      }),
+      stderr: writer(),
+      fsApi: {
+        ...fs,
+        async readFile() {
+          return JSON.stringify({
+            status: 'installed_without_restart',
+            config_repo: 'git@github.com:WebexServices-staging/webex-generic-account-bot-config.git',
+            config_ref: 'main',
+            config_revision: '1'.repeat(40),
+            bot_code_dir: '/opt/webex-generic-account-bot/code',
+            rendered_config: '/var/lib/webex-generic-account-bot/rendered/production.toml',
+            service: 'webex-generic-account-bot',
+            service_action: null,
+            service_restart_skipped: true,
+            deployed_at: '2026-06-27T00:00:00.000Z',
+          });
+        },
+      },
+    });
+
+    assert.equal(status, 0);
+    assert.equal(JSON.parse(stdout).status, 'installed_without_restart');
+  });
+
   it('apply executes commands with scrubbed env, installs candidate metadata, and clears the lock', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -1283,6 +1394,7 @@ describe('deploy-config CLI and execution', () => {
       ]),
     );
     const calls = [];
+    let lockOwner = null;
 
     const metadata = await executePlan({
       plan,
@@ -1293,6 +1405,9 @@ describe('deploy-config CLI and execution', () => {
       },
       runner: async (command, env) => {
         calls.push({ command, env });
+        lockOwner ??= JSON.parse(
+          await fs.readFile(path.join(plan.lockDir, 'owner.json'), 'utf8'),
+        );
         if (command.bin === '/usr/bin/bash') {
           await fs.mkdir(path.dirname(plan.candidateConfig), { recursive: true });
           await fs.writeFile(plan.candidateConfig, 'candidate config\n', 'utf8');
@@ -1314,7 +1429,100 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'candidate config\n');
     assert.equal((await fs.stat(plan.renderedConfig)).mode & 0o777, 0o644);
     assert.equal((await fs.stat(path.dirname(plan.lockDir))).isDirectory(), true);
+    assert.equal(lockOwner.pid, process.pid);
+    assert.match(lockOwner.process_start_ticks, /^[0-9]+$/);
+    assert.equal(typeof lockOwner.token, 'string');
     await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
+  it('recovers a deployment lock owned by a dead process', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(plan.lockDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(plan.lockDir, 'owner.json'),
+      `${JSON.stringify({
+        version: 1,
+        token: '00000000-0000-4000-8000-000000000000',
+        pid: 2_147_483_647,
+        process_start_ticks: '1',
+        acquired_at: new Date(0).toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+        }
+        return {
+          stdout: command.capture === 'configRevision' ? `${'1'.repeat(40)}\n` : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'installed_without_restart');
+    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
+  it('does not reclaim a deployment lock owned by the active process', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const procStat = await fs.readFile(`/proc/${process.pid}/stat`, 'utf8');
+    const startTicks = procStat.slice(procStat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
+    await fs.mkdir(plan.lockDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(plan.lockDir, 'owner.json'),
+      `${JSON.stringify({
+        version: 1,
+        token: '00000000-0000-4000-8000-000000000001',
+        pid: process.pid,
+        process_start_ticks: startTicks,
+        acquired_at: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    await assert.rejects(
+      () => executePlan({ plan }),
+      /deployment already in progress/,
+    );
+
+    assert.equal((await fs.stat(plan.lockDir)).isDirectory(), true);
+    await fs.rm(plan.lockDir, { recursive: true, force: true });
   });
 
   it('preserves existing rendered config metadata while installing', async () => {
@@ -2065,6 +2273,66 @@ describe('deploy-config CLI and execution', () => {
     await fs.rm(plan.lockDir, { recursive: true, force: true });
   });
 
+  it('rolls back when systemd is active but the bot is not ready', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let restartAttempts = 0;
+    let activeChecks = 0;
+    let readinessChecks = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'is-active') {
+            activeChecks += 1;
+          }
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) {
+              throw new Error('service readiness endpoint returned HTTP none');
+            }
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '401',
+            stderr: '',
+          };
+        },
+      }),
+      /service readiness endpoint returned HTTP none/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 2);
+    assert.equal(activeChecks, 2);
+    assert.equal(readinessChecks, 2);
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
+    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
   it('records failure metadata if rollback succeeds but service still cannot restart', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2220,6 +2488,34 @@ describe('deploy-config CLI and execution', () => {
     );
   });
 
+  it('accepts only ready or authenticated bot health responses', async () => {
+    const ready = await runCommand(
+      {
+        bin: '/usr/bin/printf',
+        args: ['401'],
+        validation: 'service-readiness',
+        timeoutMs: 5_000,
+        outputLimitBytes: 100,
+      },
+      scrubEnv(),
+    );
+    assert.equal(ready.stdout, '401');
+
+    await assert.rejects(
+      () => runCommand(
+        {
+          bin: '/usr/bin/printf',
+          args: ['503'],
+          validation: 'service-readiness',
+          timeoutMs: 5_000,
+          outputLimitBytes: 100,
+        },
+        scrubEnv(),
+      ),
+      /readiness endpoint returned HTTP 503/,
+    );
+  });
+
   it('times out child processes', async () => {
     await assert.rejects(
       () => runCommand(
@@ -2236,6 +2532,34 @@ describe('deploy-config CLI and execution', () => {
       ),
       /timed out after 50ms/,
     );
+  });
+
+  it('hard-fails after SIGKILL when an escaped descendant holds command pipes', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const pidFile = path.join(temp, 'escaped.pid');
+    const script = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 30' &\nwait`;
+    try {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/bin/sh',
+            args: ['-c', script],
+            timeoutMs: 200,
+            terminationGraceMs: 50,
+            closeGraceMs: 50,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+        ),
+        /did not close after SIGKILL/,
+      );
+    } finally {
+      try {
+        const escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+        process.kill(-escapedPid, 'SIGKILL');
+      } catch (_) {}
+      await fs.rm(temp, { recursive: true, force: true });
+    }
   });
 });
 

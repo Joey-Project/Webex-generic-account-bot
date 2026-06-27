@@ -593,8 +593,11 @@ function structuredBuildUrl(candidate, baseUrl) {
 
 function structuredBuildNumber(candidate) {
   const raw = candidate.number ?? candidate.buildNumber ?? candidate.buildNumberStr;
-  if (raw !== undefined && raw !== null && String(raw).trim()) {
-    return String(raw).trim();
+  if (raw !== undefined && raw !== null) {
+    const value = String(raw).trim();
+    if (/^\d+$/.test(value)) {
+      return value;
+    }
   }
   for (const value of [
     candidate.fullDisplayName,
@@ -1077,14 +1080,22 @@ function guiConsoleUrl(buildUrl) {
 function upstreamBuildUrl(build, baseUrl) {
   const causes = (build.actions ?? []).flatMap((action) => action.causes ?? []);
   for (const cause of causes) {
-    if (!cause.upstreamUrl || !cause.upstreamBuild) {
+    if (
+      !cause.upstreamUrl
+      || cause.upstreamBuild === undefined
+      || cause.upstreamBuild === null
+    ) {
+      continue;
+    }
+    const upstreamBuild = String(cause.upstreamBuild).trim();
+    if (!/^\d+$/.test(upstreamBuild)) {
       continue;
     }
     const upstreamJobUrl = new URL(cause.upstreamUrl, normalizeBaseUrl(baseUrl));
     const pathname = upstreamJobUrl.pathname.endsWith('/')
       ? upstreamJobUrl.pathname
       : `${upstreamJobUrl.pathname}/`;
-    upstreamJobUrl.pathname = `${pathname}${cause.upstreamBuild}/`;
+    upstreamJobUrl.pathname = `${pathname}${upstreamBuild}/`;
     upstreamJobUrl.search = '';
     upstreamJobUrl.hash = '';
     return normalizeJenkinsUrl(upstreamJobUrl.toString(), baseUrl).toString();

@@ -127,8 +127,10 @@ That mode writes `status=installed_without_restart` instead of `status=deployed`
 dry-run, or restart flags.
 Normal apply renders and validates a candidate config first, installs it
 atomically, restarts the service, and restores the previous rendered config if
-`systemctl restart` fails or the service is not active after a fixed settle
-period. Failed fetch, validation, install, restart, health, or cleanup paths
+`systemctl restart` fails, the unit is not active, or the loopback `/healthz`
+endpoint does not become ready. A `200` response is ready; `401` also proves
+readiness when the endpoint requires the sidecar bearer token. Failed fetch,
+validation, install, restart, health, or cleanup paths
 write machine-readable failure metadata. Metadata is fsynced to a same-directory
 temporary file and atomically renamed, so existing links are replaced rather
 than followed and a failed write preserves the last complete status. If failure
@@ -141,12 +143,15 @@ returning. If metadata writing or cleanup fails after the new config has been
 installed and the service restart has succeeded, the entrypoint records a
 post-commit failure state when possible instead of implying the apply was rolled
 back. Cleanup details are added without replacing an earlier, more specific
-failure status. Status output, including `--status --json`, rejects malformed
-metadata rather than returning it as a successful result.
-Child command stdout/stderr capture is bounded and each child has a deadline so
-a stuck fetch, validation, or restart cannot hold the deployment lock forever.
-Existing checkout and lock directories must be owned by the deployment user and
-mode `0700`. Path, repo, binary, timeout, and output-cap overrides are rejected
+failure status. Status output, including `--status --json`, validates the status
+schema and rejects malformed or incomplete metadata.
+Child command stdout/stderr capture is bounded and each child has a deadline,
+process-group termination, and a final pipe-close deadline so a stuck fetch,
+validation, or restart cannot hold the deployment lock forever. The lock stores
+the owner's PID, process start time, and random token; locks from dead or reused
+PIDs are reclaimed without stealing an active deployment. Existing checkout
+and lock directories must be owned by the deployment user and mode `0700`.
+Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
 entrypoint creates the lock parent directory when host permissions allow it and
 writes deployment metadata to
@@ -155,16 +160,17 @@ successful apply. Fetch credentials must be provided by host policy without
 ambient agent, proxy, or token environment leakage.
 
 The config checkout is sparse and data-only: only `production/bot.toml` and
-`production/spaces/*.toml` are accepted. Before checkout, the entrypoint rejects
-unexpected paths, executable or symlink entries, more than 128 files, blobs
-over 1 MiB, or more than 8 MiB of declared config data. The bounded fetch uses
-Git's server-side `blob:limit` filter, and manifest validation plus checkout run
-with `--no-lazy-fetch`, so an omitted oversized blob cannot be fetched on
-demand. Git runs through fixed `/usr/bin/prlimit` CPU, address-space, file-size,
-process, and file-descriptor limits, in addition to the command deadline and
-output cap. Rendered-config and metadata parent directories are also rejected
-before cleanup or status writes if they contain symlinks, have unexpected
-ownership, or are group/world writable.
+`production/spaces/*.toml` are accepted. Tree paths are allowlisted before
+checkout. The initial fetch uses Git's server-side `blob:none` filter, so blobs
+outside `production/` are not downloaded; sparse checkout then materialises
+only the allowlisted tree under the Git process limits. Before trusted
+rendering, a manifest check with `GIT_NO_LAZY_FETCH=1` rejects missing blobs,
+executable or symlink entries, more than 128 files, blobs over 1 MiB, or more
+than 8 MiB of declared config data. Git runs through fixed `/usr/bin/prlimit`
+CPU, address-space, file-size, process, and file-descriptor limits, in addition
+to the command deadline and output cap. Rendered-config and metadata parent
+directories are also rejected before cleanup or status writes if they contain
+symlinks, have unexpected ownership, or are group/world writable.
 Host path overrides are also rejected when checkout, lock, rendered config,
 metadata, bot code, or credential paths overlap a mutable deployment tree or
 one another. Existing path ancestors are canonicalised before any lock or
@@ -179,12 +185,15 @@ helper uses fixed `/usr/bin/node` and `PATH=/usr/bin:/bin`, accepts only
 credentials, caps JSON API responses at 1 MiB, and charges every streamed log
 byte, including failed retries, against the aggregate budget. Derived evidence
 also caps retained line length and count, and redacts private-key blocks and
-common API-key assignments. Only nodes with a non-empty local log
-enter the renderer URL allowlist, so Jenkins replies fail closed when prefetch
-produces no local evidence. Exact excerpts are rendered only when the model's
-own log URL matches that allowlist; a single-log fallback link never authenticates
-an excerpt. Before rendering, the bot also requires the sanitized excerpt text
-to occur verbatim in the local log mapped to that URL. The helper emits a
+common API-key assignments. The configured Jenkins helper timeout remains the
+overall process deadline; each HTTP attempt uses a derived timeout capped at 60
+seconds, leaving budget for three retries and helper output cleanup. Only nodes
+with a non-empty local log enter the renderer URL allowlist, so Jenkins replies
+fail closed when prefetch produces no local evidence. Exact excerpts are
+rendered only when the model's own log URL matches that allowlist; a single-log
+fallback link never authenticates an excerpt. Before rendering, the bot also
+requires the sanitized excerpt text to occur verbatim in the local log mapped
+to that URL. The helper emits a
 control-character-safe console URL
 block and keeps the complete structured URL allowlist separate from the prompt
 text truncation used for Codex context. Host policy pins the global Codex model

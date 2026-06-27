@@ -24,12 +24,13 @@ superseded_by:
   apply and is passed to the trusted policy helper only as `--source-root`.
 - GitHub fetch uses fixed host SSH policy rather than ambient agent, home, or
   proxy state.
-- Git commands run through fixed `/usr/bin/prlimit` resource limits; the
-  checkout is sparse to `production/` and validates path shape, file count,
-  file type, per-blob size, and total declared config bytes before checkout.
-- The fetch uses a server-side `blob:limit`; manifest validation and checkout
-  disable lazy fetches, so omitted oversized blobs fail closed before worktree
-  materialisation.
+- Git commands run through fixed `/usr/bin/prlimit` resource limits. Path shape
+  and file count are checked before sparse checkout; file type, per-blob size,
+  and total declared config bytes are checked before trusted rendering.
+- The initial fetch uses `blob:none`, path validation runs before checkout, and
+  sparse checkout materialises only `production/` under Git resource limits.
+  The post-checkout manifest uses `GIT_NO_LAZY_FETCH=1` so missing blobs fail
+  closed before trusted rendering, including on Git 2.43 hosts.
 - Rendered-config and metadata parent directories are checked for symlink-free
   canonical paths, trusted ownership, and non-writable group/world modes before
   candidate cleanup or failure-status writes.
@@ -50,21 +51,31 @@ superseded_by:
   distinguishes skipped restarts, records generic apply and restart failure
   states, uses `failed_after_commit` for metadata failures after a successful
   restart, and rolls back the rendered config if restart fails.
-- Restart success is followed by a fixed settle period and `systemctl is-active`;
-  failed post-restart health rolls back through the same path.
+- Restart success requires both `systemctl is-active` and a retrying loopback
+  `/healthz` probe. HTTP `200` and authenticated-endpoint `401` are ready;
+  failed readiness rolls back through the same path.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
   rename. Cleanup failures are merged into the reported error and residual lock
   state is recorded when possible without replacing an earlier specific failure
-  status. JSON status mode parses and validates metadata before returning it.
+  status. Status mode validates the full metadata schema before returning it.
 - Candidate contents and the rendered-config directory are fsynced before
   success metadata, preserving config-before-status durability ordering. A
   post-rename directory-fsync failure restores the previous config internally.
-- Child commands have per-command deadlines and bounded stdout/stderr capture;
-  the lock parent and checkout directory must be deployment-user-owned `0700`
-  directories.
+- Child commands have per-command deadlines, process-group termination, a hard
+  post-SIGKILL pipe-close deadline, and bounded stdout/stderr capture. The lock
+  records PID, process start time, and a random owner token so dead-process locks
+  can be reclaimed without stealing a live deployment. Lock, checkout, and
+  output directories must be deployment-user-owned and non-writable by others.
 - The trusted Jenkins helper is vendored into the bot repo with service-bounded
   graph fetch limits, redacted diagnostics snippets, explicit partial collection
   markers, and downstream traversal limited to structured Jenkins API metadata.
+- The helper process retains the configured overall timeout while each HTTP
+  attempt uses a derived timeout capped at 60 seconds, leaving room for three
+  retries and output cleanup before the parent deadline.
+- Jenkins API child and upstream build numbers must be decimal before they can
+  affect graph traversal; malformed metadata is ignored without discarding
+  already collected root evidence. Markdown-only Jenkins rooms do not require
+  a structured evidence index, while deterministic JSON reply formats do.
 - Jenkins JSON API responses have a separate 1 MiB streaming cap and omit
   unused build parameter values.
 - Jenkins inputs must identify `/job/.../<build-number>/`; authenticated fetches

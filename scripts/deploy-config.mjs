@@ -46,8 +46,24 @@ const MAX_CONFIG_TREE_FILES = 128;
 const MAX_CONFIG_BLOB_BYTES = 1024 * 1024;
 const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
 const MAX_CONFIG_PATH_BYTES = 512;
-const SERVICE_HEALTH_SETTLE_BIN = '/usr/bin/sleep';
-const SERVICE_HEALTH_SETTLE_SECONDS = '2';
+const SERVICE_READINESS_BIN = '/usr/bin/curl';
+const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
+const LOCK_OWNER_FILE = 'owner.json';
+const LOCK_OWNER_MAX_BYTES = 4096;
+const INCOMPLETE_LOCK_GRACE_MS = 60_000;
+const CHILD_TERMINATION_GRACE_MS = 5000;
+const CHILD_CLOSE_GRACE_MS = 1000;
+const DEPLOYMENT_STATUSES = new Set([
+  'deployed',
+  'installed_without_restart',
+  'failed_apply',
+  'failed_restart_rollback_failed',
+  'failed_restart_rollback_restart_failed',
+  'failed_restart_rolled_back',
+  'failed_after_commit',
+  'failed_after_commit_cleanup',
+  'failed_cleanup',
+]);
 const HOST_OVERRIDE_KEYS = new Set([
   'configRepo',
   'configRef',
@@ -83,6 +99,7 @@ const GIT_SAFE_CONFIG = [
   '-c',
   'submodule.recurse=false',
 ];
+const GIT_NO_LAZY_FETCH_ENV = Object.freeze({ GIT_NO_LAZY_FETCH: '1' });
 
 class UsageError extends Error {
   constructor(message) {
@@ -244,6 +261,7 @@ export function buildDeployPlan(options) {
   const metadataFile = path.resolve(options.metadataFile);
   const trustedValidateScript = path.join(botCodeDir, 'scripts/config-policy/validate-config.sh');
   const gitEnv = gitEnvForRepo(options);
+  const noLazyGitEnv = { ...gitEnv, ...GIT_NO_LAZY_FETCH_ENV };
   const commandDefaults = {
     cwd: TRUSTED_CHILD_CWD,
     timeoutMs: options.commandTimeoutMs,
@@ -264,13 +282,12 @@ export function buildDeployPlan(options) {
     gitCommand(options.gitBin, checkoutWorkDir, [
       'fetch',
       '--depth=1',
-      `--filter=blob:limit=${MAX_CONFIG_BLOB_BYTES + 1}`,
+      '--filter=blob:none',
       '--recurse-submodules=no',
       'origin',
       options.configRef,
     ], { ...commandDefaults, env: gitEnv }),
     gitCommand(options.gitBin, checkoutWorkDir, [
-      '--no-lazy-fetch',
       'ls-tree',
       '-r',
       '-z',
@@ -279,18 +296,7 @@ export function buildDeployPlan(options) {
       'FETCH_HEAD',
       '--',
       CONFIG_TREE_ROOT,
-    ], { ...commandDefaults, env: gitEnv, validation: 'config-tree-paths' }),
-    gitCommand(options.gitBin, checkoutWorkDir, [
-      '--no-lazy-fetch',
-      'ls-tree',
-      '-r',
-      '-l',
-      '-z',
-      '--full-tree',
-      'FETCH_HEAD',
-      '--',
-      CONFIG_TREE_ROOT,
-    ], { ...commandDefaults, env: gitEnv, validation: 'config-tree-manifest' }),
+    ], { ...commandDefaults, env: noLazyGitEnv, validation: 'config-tree-paths' }),
     gitCommand(options.gitBin, checkoutWorkDir, ['sparse-checkout', 'init', '--no-cone'], {
       ...commandDefaults,
       env: gitEnv,
@@ -302,7 +308,6 @@ export function buildDeployPlan(options) {
       `/${CONFIG_TREE_ROOT}/`,
     ], { ...commandDefaults, env: gitEnv }),
     gitCommand(options.gitBin, checkoutWorkDir, [
-      '--no-lazy-fetch',
       'checkout',
       '--detach',
       '--force',
@@ -311,6 +316,16 @@ export function buildDeployPlan(options) {
       ...commandDefaults,
       env: gitEnv,
     }),
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      'ls-tree',
+      '-r',
+      '-l',
+      '-z',
+      '--full-tree',
+      'FETCH_HEAD',
+      '--',
+      CONFIG_TREE_ROOT,
+    ], { ...commandDefaults, env: noLazyGitEnv, validation: 'config-tree-manifest' }),
     gitCommand(options.gitBin, checkoutWorkDir, ['rev-parse', 'HEAD'], {
       ...commandDefaults,
       capture: 'configRevision',
@@ -341,12 +356,32 @@ export function buildDeployPlan(options) {
   const serviceVerificationCommands = options.skipRestart
     ? []
     : [
-        command(SERVICE_HEALTH_SETTLE_BIN, [SERVICE_HEALTH_SETTLE_SECONDS], commandDefaults),
         command(
           options.systemctlBin,
           ['is-active', '--quiet', '--', options.service],
           commandDefaults,
         ),
+        command(SERVICE_READINESS_BIN, [
+          '--silent',
+          '--show-error',
+          '--output',
+          '/dev/null',
+          '--write-out',
+          '%{http_code}',
+          '--connect-timeout',
+          '2',
+          '--max-time',
+          '5',
+          '--retry',
+          '10',
+          '--retry-delay',
+          '1',
+          '--retry-max-time',
+          '30',
+          '--retry-connrefused',
+          '--retry-all-errors',
+          SERVICE_READINESS_URL,
+        ], { ...commandDefaults, validation: 'service-readiness' }),
       ];
 
   const plan = {
@@ -429,7 +464,7 @@ export async function runCli({
 
 export async function executePlan({ plan, parentEnv = process.env, runner = runCommand, fsApi = fs }) {
   await assertPlanHasNoSymlinkAncestors(plan, fsApi);
-  await acquireLock(plan.lockDir, fsApi);
+  const lockOwner = await acquireLock(plan.lockDir, fsApi);
   const captures = {};
   let installState = null;
   let primaryError = null;
@@ -548,7 +583,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
       }
     }
     try {
-      await fsApi.rm(plan.lockDir, { recursive: true, force: true });
+      await releaseLock(plan.lockDir, lockOwner, fsApi);
     } catch (error) {
       cleanupError ??= error;
       lockCleanupFailed = true;
@@ -595,7 +630,7 @@ async function runServiceTransition(plan, runner, parentEnv) {
 async function printStatus({ options, stdout, stderr, fsApi }) {
   try {
     const contents = await fsApi.readFile(path.resolve(options.metadataFile), 'utf8');
-    const parsed = JSON.parse(contents);
+    const parsed = validateDeploymentMetadata(JSON.parse(contents));
     if (options.json) {
       stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
     } else {
@@ -611,19 +646,208 @@ async function printStatus({ options, stdout, stderr, fsApi }) {
   }
 }
 
+function validateDeploymentMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new Error('deployment metadata must be a JSON object');
+  }
+  if (!DEPLOYMENT_STATUSES.has(metadata.status)) {
+    throw new Error('deployment metadata contains an invalid status');
+  }
+  for (const key of [
+    'config_repo',
+    'config_ref',
+    'bot_code_dir',
+    'rendered_config',
+    'service',
+    'deployed_at',
+  ]) {
+    if (typeof metadata[key] !== 'string' || metadata[key].length === 0) {
+      throw new Error(`deployment metadata contains an invalid ${key}`);
+    }
+  }
+  if (typeof metadata.service_restart_skipped !== 'boolean') {
+    throw new Error('deployment metadata contains an invalid service_restart_skipped');
+  }
+  if (
+    (metadata.service_restart_skipped && metadata.service_action !== null)
+    || (!metadata.service_restart_skipped && metadata.service_action !== 'restart')
+  ) {
+    throw new Error('deployment metadata contains an invalid service_action');
+  }
+  if (
+    metadata.config_revision !== null
+    && !/^[0-9a-f]{40,64}$/.test(metadata.config_revision ?? '')
+  ) {
+    throw new Error('deployment metadata contains an invalid config_revision');
+  }
+  if (metadata.status.startsWith('failed_') && typeof metadata.reason !== 'string') {
+    throw new Error('failed deployment metadata must contain a reason');
+  }
+  return metadata;
+}
+
 async function acquireLock(lockDir, fsApi) {
-  try {
-    const lockParent = path.dirname(lockDir);
-    await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
-    const lockParentStat = await fsApi.lstat(lockParent);
-    assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
-    await fsApi.mkdir(lockDir, { recursive: false, mode: 0o700 });
-  } catch (error) {
-    if (error && error.code === 'EEXIST') {
+  const lockParent = path.dirname(lockDir);
+  await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
+  const lockParentStat = await fsApi.lstat(lockParent);
+  assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
+  const owner = {
+    version: 1,
+    token: randomUUID(),
+    pid: process.pid,
+    process_start_ticks: await readProcessStartTicks(process.pid, fsApi),
+    acquired_at: new Date().toISOString(),
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await fsApi.mkdir(lockDir, { recursive: false, mode: 0o700 });
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') {
+        throw error;
+      }
+      const reclaimed = await reclaimStaleLock(lockDir, fsApi);
+      if (reclaimed) {
+        continue;
+      }
       throw new Error(`deployment already in progress: ${lockDir}`);
+    }
+
+    try {
+      await writeLockOwner(lockDir, owner, fsApi);
+      return owner;
+    } catch (error) {
+      try {
+        await fsApi.rm(lockDir, { recursive: true, force: true });
+      } catch (cleanupError) {
+        throw new Error(
+          `failed to initialise deployment lock: ${error.message}; ` +
+            `failed to remove incomplete lock: ${cleanupError.message}`,
+        );
+      }
+      throw error;
+    }
+  }
+  throw new Error(`failed to acquire deployment lock after stale-lock recovery: ${lockDir}`);
+}
+
+async function reclaimStaleLock(lockDir, fsApi) {
+  let lockStat;
+  try {
+    lockStat = await fsApi.lstat(lockDir);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return true;
     }
     throw error;
   }
+  assertTrustedDeploymentDirectory(lockDir, lockStat, 'lock directory');
+  const owner = await readLockOwner(lockDir, fsApi);
+  if (owner && await lockOwnerIsActive(owner, fsApi)) {
+    return false;
+  }
+  if (!owner && Date.now() - lockStat.mtimeMs < INCOMPLETE_LOCK_GRACE_MS) {
+    return false;
+  }
+
+  const staleDir = `${lockDir}.stale-${randomUUID()}`;
+  try {
+    await fsApi.rename(lockDir, staleDir);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return true;
+    }
+    throw error;
+  }
+  await fsApi.rm(staleDir, { recursive: true, force: true });
+  return true;
+}
+
+async function releaseLock(lockDir, expectedOwner, fsApi) {
+  const owner = await readLockOwner(lockDir, fsApi);
+  if (!owner || owner.token !== expectedOwner.token) {
+    throw new Error(`deployment lock ownership changed before cleanup: ${lockDir}`);
+  }
+  await fsApi.rm(lockDir, { recursive: true, force: true });
+}
+
+async function writeLockOwner(lockDir, owner, fsApi) {
+  const ownerPath = path.join(lockDir, LOCK_OWNER_FILE);
+  const handle = await fsApi.open(ownerPath, 'wx', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const directoryHandle = await fsApi.open(lockDir, 'r');
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+async function readLockOwner(lockDir, fsApi) {
+  const ownerPath = path.join(lockDir, LOCK_OWNER_FILE);
+  let metadata;
+  try {
+    metadata = await fsApi.lstat(ownerPath);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  if (
+    !metadata.isFile()
+    || metadata.isSymbolicLink()
+    || metadata.size > LOCK_OWNER_MAX_BYTES
+  ) {
+    return null;
+  }
+  try {
+    const owner = JSON.parse(await fsApi.readFile(ownerPath, 'utf8'));
+    if (
+      owner?.version !== 1
+      || typeof owner.token !== 'string'
+      || owner.token.length < 16
+      || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0
+      || !/^[0-9]+$/.test(owner.process_start_ticks ?? '')
+      || typeof owner.acquired_at !== 'string'
+    ) {
+      return null;
+    }
+    return owner;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function lockOwnerIsActive(owner, fsApi) {
+  try {
+    return await readProcessStartTicks(owner.pid, fsApi) === owner.process_start_ticks;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function readProcessStartTicks(pid, fsApi) {
+  const stat = await fsApi.readFile(`/proc/${pid}/stat`, 'utf8');
+  const commandEnd = stat.lastIndexOf(')');
+  if (commandEnd < 0) {
+    throw new Error(`invalid /proc/${pid}/stat format`);
+  }
+  const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/);
+  const startTicks = fieldsAfterCommand[19];
+  if (!/^[0-9]+$/.test(startTicks ?? '')) {
+    throw new Error(`invalid /proc/${pid}/stat start time`);
+  }
+  return startTicks;
 }
 
 function command(bin, args, options = {}) {
@@ -638,6 +862,8 @@ function command(bin, args, options = {}) {
     timeoutMs: options.timeoutMs,
     outputLimitBytes: options.outputLimitBytes,
     resourceLimits: options.resourceLimits || null,
+    terminationGraceMs: options.terminationGraceMs,
+    closeGraceMs: options.closeGraceMs,
   };
 }
 
@@ -690,12 +916,49 @@ export async function runCommand(commandSpec, env) {
     const stderrCapture = outputCapture(commandSpec.outputLimitBytes);
     let timedOut = false;
     let killTimer = null;
+    let closeTimer = null;
+    let settled = false;
+    const clearTimers = () => {
+      clearTimeout(timeoutTimer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+      if (closeTimer) {
+        clearTimeout(closeTimer);
+      }
+    };
+    const rejectOnce = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimers();
+      reject(error);
+    };
+    const resolveOnce = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimers();
+      resolve(result);
+    };
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
       killChildProcess(child, detached, 'SIGTERM');
       killTimer = setTimeout(() => {
         killChildProcess(child, detached, 'SIGKILL');
-      }, 5000);
+        closeTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          child.unref();
+          rejectOnce(new Error(
+            `${commandSpec.bin} timed out after ` +
+              `${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms and did not close after SIGKILL`,
+          ));
+        }, commandSpec.closeGraceMs ?? CHILD_CLOSE_GRACE_MS);
+        closeTimer.unref?.();
+      }, commandSpec.terminationGraceMs ?? CHILD_TERMINATION_GRACE_MS);
       killTimer.unref?.();
     }, commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs);
     timeoutTimer.unref?.();
@@ -708,19 +971,11 @@ export async function runCommand(commandSpec, env) {
       stderr = stderrCapture.append(stderr, chunk);
     });
     child.on('error', (error) => {
-      clearTimeout(timeoutTimer);
-      if (killTimer) {
-        clearTimeout(killTimer);
-      }
-      reject(error);
+      rejectOnce(error);
     });
     child.on('close', (code) => {
-      clearTimeout(timeoutTimer);
-      if (killTimer) {
-        clearTimeout(killTimer);
-      }
       if (timedOut) {
-        reject(new Error(`${commandSpec.bin} timed out after ${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms`));
+        rejectOnce(new Error(`${commandSpec.bin} timed out after ${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms`));
         return;
       }
       if (code === 0 || commandSpec.optional) {
@@ -734,14 +989,14 @@ export async function runCommand(commandSpec, env) {
         try {
           validateCommandResult(commandSpec, result);
         } catch (error) {
-          reject(error);
+          rejectOnce(error);
           return;
         }
-        resolve(result);
+        resolveOnce(result);
         return;
       }
       const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
-      reject(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
+      rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
     });
   });
 }
@@ -769,6 +1024,13 @@ function validateCommandResult(commandSpec, result) {
   }
   if (commandSpec.validation === 'config-tree-manifest') {
     validateConfigTreeManifest(result.stdout);
+    return;
+  }
+  if (commandSpec.validation === 'service-readiness') {
+    const status = result.stdout.trim();
+    if (status !== '200' && status !== '401') {
+      throw new Error(`service readiness endpoint returned HTTP ${status || 'none'}`);
+    }
     return;
   }
   throw new Error(`unknown command output validation: ${commandSpec.validation}`);

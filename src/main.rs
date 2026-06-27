@@ -55,6 +55,9 @@ const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
 const JENKINS_LOG_INDEX_MAX_BYTES: u64 = 1024 * 1024;
 const JENKINS_EVIDENCE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const JENKINS_FETCH_RETRIES: u64 = 3;
+const JENKINS_FETCH_TIMEOUT_MAX_SECS: u64 = 60;
+const JENKINS_HELPER_COMPLETION_MARGIN_SECS: u64 = 30;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -423,6 +426,10 @@ async fn jenkins_context_prompt(
     let mut sections = Vec::new();
     let mut console_urls = Vec::new();
     let mut evidence_logs = HashMap::new();
+    let evidence_required = matches!(
+        policy.reply_format,
+        ReplyFormat::JenkinsDiagnosisJson | ReplyFormat::JenkinsFollowupJson
+    );
     let build_result: Result<String> = async {
         for (index, url) in urls.into_iter().enumerate() {
             let artifact_dir = jenkins_artifact_dir(&artifact_root, index + 1);
@@ -435,11 +442,13 @@ async fn jenkins_context_prompt(
                     )
                 })?;
             let output = run_jenkins_context_helper(config, &url, &artifact_dir).await?;
-            for (console_url, log_path) in load_jenkins_log_evidence(&artifact_dir).await? {
-                if !console_urls.contains(&console_url) {
-                    console_urls.push(console_url.clone());
+            if evidence_required {
+                for (console_url, log_path) in load_jenkins_log_evidence(&artifact_dir).await? {
+                    if !console_urls.contains(&console_url) {
+                        console_urls.push(console_url.clone());
+                    }
+                    evidence_logs.entry(console_url).or_insert(log_path);
                 }
-                evidence_logs.entry(console_url).or_insert(log_path);
             }
             sections.push(format!(
                 "URL: {url}\nDiagnostics artifact directory: `{}`\n```text\n{}\n```",
@@ -620,8 +629,8 @@ async fn run_jenkins_context_helper(
     const SERVICE_MAX_TOTAL_LOG_BYTES: &str = "104857600";
     const SERVICE_MAX_LOG_BYTES_PER_NODE: &str = "10485760";
     const SERVICE_MAX_API_RESPONSE_BYTES: &str = "1048576";
-    const SERVICE_FETCH_RETRIES: &str = "3";
     const SERVICE_MAX_PARALLEL_FETCHES: &str = "4";
+    let fetch_timeout_secs = jenkins_fetch_timeout_seconds(config.timeout_secs);
 
     let mut command = Command::new(&config.node_bin);
     let script_dir = config.script.parent().unwrap_or_else(|| Path::new("/"));
@@ -645,9 +654,9 @@ async fn run_jenkins_context_helper(
         .arg("--max-api-response-bytes")
         .arg(SERVICE_MAX_API_RESPONSE_BYTES)
         .arg("--max-fetch-seconds")
-        .arg(config.timeout_secs.max(1).to_string())
+        .arg(fetch_timeout_secs.to_string())
         .arg("--fetch-retries")
-        .arg(SERVICE_FETCH_RETRIES)
+        .arg(JENKINS_FETCH_RETRIES.to_string())
         .arg("--max-parallel-fetches")
         .arg(SERVICE_MAX_PARALLEL_FETCHES)
         .current_dir(script_dir)
@@ -711,6 +720,13 @@ async fn run_jenkins_context_helper(
         compact_jenkins_helper_output(&stdout),
         stderr
     ))
+}
+
+fn jenkins_fetch_timeout_seconds(helper_timeout_secs: u64) -> u64 {
+    let margin = JENKINS_HELPER_COMPLETION_MARGIN_SECS.min(helper_timeout_secs.saturating_sub(1));
+    let retry_budget = helper_timeout_secs.saturating_sub(margin);
+    let request_slots = JENKINS_FETCH_RETRIES * 2;
+    (retry_budget / request_slots).clamp(1, JENKINS_FETCH_TIMEOUT_MAX_SECS)
 }
 
 async fn prune_jenkins_artifact_dirs(codex_cwd: &Path) -> Result<()> {
@@ -3504,6 +3520,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_jenkins_prefetch_does_not_require_an_evidence_index() {
+        let helper_dir = unique_state_path().with_extension("helper-markdown-dir");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let script = helper_dir.join("helper.sh");
+        let env_file = helper_dir.join("jenkins.env");
+        fs::write(&script, "printf 'plain Jenkins diagnostics\\n'\n").unwrap();
+        fs::write(&env_file, "JENKINS_TOKEN=test\n").unwrap();
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.rooms[0].reply_format = ReplyFormat::Markdown;
+        config.rooms[0].jenkins_context = Some(webex_generic_account_bot::JenkinsContextConfig {
+            node_bin: "/bin/sh".to_owned(),
+            script,
+            env_file,
+            timeout_secs: 5,
+            max_urls: 1,
+            output_limit_chars: 1024,
+            enabled: true,
+        });
+        let harness = TestHarness::with_config(Arc::new(config));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-1")));
+        harness.runner.push_output("diagnosis complete");
+
+        harness
+            .app
+            .process_event(message_event(inbound_message(
+                "message-1",
+                "Jenkins failed: https://engci-private-sjc.cisco.com/jenkins/job/foo/1/",
+            )))
+            .await
+            .unwrap();
+
+        let calls = harness.runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("plain Jenkins diagnostics"));
+        fs::remove_dir_all(helper_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn process_event_removes_jenkins_artifacts_after_codex_run() {
         let helper_dir = unique_state_path().with_extension("helper-cleanup-dir");
         fs::create_dir_all(&helper_dir).unwrap();
@@ -5509,6 +5567,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jenkins_fetch_timeout_leaves_room_for_retries_and_helper_cleanup() {
+        assert_eq!(jenkins_fetch_timeout_seconds(600), 60);
+        assert_eq!(jenkins_fetch_timeout_seconds(60), 5);
+        assert_eq!(jenkins_fetch_timeout_seconds(5), 1);
+        assert_eq!(jenkins_fetch_timeout_seconds(1), 1);
+    }
+
     #[tokio::test]
     async fn jenkins_helper_runs_from_script_directory() {
         let helper_dir = unique_state_path().with_extension("helper-dir");
@@ -5546,6 +5612,8 @@ mod tests {
         assert!(output.contains("--max-log-bytes-per-node 10485760"));
         assert!(output.contains("--max-api-response-bytes 1048576"));
         assert!(output.contains("--max-nodes 32"));
+        assert!(output.contains("--max-fetch-seconds 1"));
+        assert!(output.contains("--fetch-retries 3"));
         fs::remove_dir_all(helper_dir).unwrap();
     }
 
