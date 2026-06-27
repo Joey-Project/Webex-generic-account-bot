@@ -27,6 +27,12 @@ superseded_by:
 - Git commands run through fixed `/usr/bin/prlimit` resource limits; the
   checkout is sparse to `production/` and validates path shape, file count,
   file type, per-blob size, and total declared config bytes before checkout.
+- The fetch uses a server-side `blob:limit`; manifest validation and checkout
+  disable lazy fetches, so omitted oversized blobs fail closed before worktree
+  materialisation.
+- Rendered-config and metadata parent directories are checked for symlink-free
+  canonical paths, trusted ownership, and non-writable group/world modes before
+  candidate cleanup or failure-status writes.
 - Host policy overrides for executable paths, repo paths, timeouts, and output
   caps require `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`.
 - The entrypoint defaults to dry-run/status and requires `--apply` for mutation.
@@ -47,6 +53,13 @@ superseded_by:
   markers, and downstream traversal limited to structured Jenkins API metadata.
 - Jenkins JSON API responses have a separate 1 MiB streaming cap and omit
   unused build parameter values.
+- Jenkins inputs must identify `/job/.../<build-number>/`; authenticated fetches
+  use manual redirect handling so credentials are never forwarded to a redirect
+  target.
+- Oversized per-node log attempts debit their reserved bytes from the aggregate
+  log budget, preventing repeated failed reads from bypassing the total cap.
+- Console lines retained in graph and summary artifacts are capped at 4 KiB
+  after redaction, preventing one log line from amplifying derived artifacts.
 - Jenkins helper stdout exposes every prefetched GUI console URL for reply
   rendering allowlists while keeping the recommended reading preview short;
   control characters are collapsed and Rust consumes only the explicit URL
@@ -55,6 +68,8 @@ superseded_by:
   truncation, so long 32-node graphs cannot silently lose valid log links.
 - Host policy rejects every room outside the pinned production, staging, and
   `miku bot test` room set.
+- Jenkins diagnosis and follow-up prompts must match full host-owned normalized
+  template hashes; fragment-preserving instruction injection is rejected.
 - Failure metadata write errors are surfaced together with the primary apply
   error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a

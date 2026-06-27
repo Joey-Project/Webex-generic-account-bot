@@ -258,12 +258,13 @@ export function buildDeployPlan(options) {
     gitCommand(options.gitBin, checkoutWorkDir, [
       'fetch',
       '--depth=1',
-      '--filter=blob:none',
+      `--filter=blob:limit=${MAX_CONFIG_BLOB_BYTES + 1}`,
       '--recurse-submodules=no',
       'origin',
       options.configRef,
     ], { ...commandDefaults, env: gitEnv }),
     gitCommand(options.gitBin, checkoutWorkDir, [
+      '--no-lazy-fetch',
       'ls-tree',
       '-r',
       '-z',
@@ -274,6 +275,7 @@ export function buildDeployPlan(options) {
       CONFIG_TREE_ROOT,
     ], { ...commandDefaults, env: gitEnv, validation: 'config-tree-paths' }),
     gitCommand(options.gitBin, checkoutWorkDir, [
+      '--no-lazy-fetch',
       'ls-tree',
       '-r',
       '-l',
@@ -293,7 +295,13 @@ export function buildDeployPlan(options) {
       '--no-cone',
       `/${CONFIG_TREE_ROOT}/`,
     ], { ...commandDefaults, env: gitEnv }),
-    gitCommand(options.gitBin, checkoutWorkDir, ['checkout', '--detach', '--force', 'FETCH_HEAD'], {
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      '--no-lazy-fetch',
+      'checkout',
+      '--detach',
+      '--force',
+      'FETCH_HEAD',
+    ], {
       ...commandDefaults,
       env: gitEnv,
     }),
@@ -409,6 +417,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
   let commitReached = false;
   let failureMetadataWritten = false;
   let failureMetadataError = null;
+  let outputDirectoriesTrusted = false;
   const recordFailure = async (status, reason) => {
     try {
       await writeFailureMetadata(plan, captures.configRevision || null, status, reason, fsApi);
@@ -419,6 +428,8 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     }
   };
   try {
+    await prepareTrustedOutputDirectories(plan, fsApi);
+    outputDirectoriesTrusted = true;
     await prepareFreshCheckout(plan, fsApi);
     for (const commandSpec of plan.commands) {
       const env = scrubEnv(parentEnv, commandSpec.env);
@@ -493,7 +504,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     return metadata;
   } catch (error) {
     primaryError = error;
-    if (!failureMetadataWritten && !failureMetadataError) {
+    if (outputDirectoriesTrusted && !failureMetadataWritten && !failureMetadataError) {
       await recordFailure(commitReached ? 'failed_after_commit' : 'failed_apply', error.message);
     }
     throw error;
@@ -506,10 +517,12 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
         cleanupError = error;
       }
     }
-    try {
-      await removeIfPresent(plan.candidateConfig, fsApi);
-    } catch (error) {
-      cleanupError ??= error;
+    if (outputDirectoriesTrusted) {
+      try {
+        await removeIfPresent(plan.candidateConfig, fsApi);
+      } catch (error) {
+        cleanupError ??= error;
+      }
     }
     try {
       await fsApi.rm(plan.lockDir, { recursive: true, force: true });
@@ -715,11 +728,14 @@ export function validateConfigTreeManifest(output) {
   const paths = [];
   let totalBytes = 0;
   for (const record of records) {
-    const match = /^(\d{6}) (\S+) ([0-9a-f]{40,64})\s+(\d+)\t(.+)$/.exec(record);
+    const match = /^(\d{6}) (\S+) ([0-9a-f]{40,64})\s+(\d+|BAD|-)\t(.+)$/.exec(record);
     if (!match) {
       throw new Error('config tree manifest contains an invalid entry');
     }
     const [, mode, objectType, , sizeText, file] = match;
+    if (sizeText === 'BAD' || sizeText === '-') {
+      throw new Error(`config tree blob is missing after bounded fetch: ${file}`);
+    }
     if (mode !== '100644' || objectType !== 'blob') {
       throw new Error(`config tree entry must be a non-executable regular file: ${file}`);
     }
@@ -970,6 +986,27 @@ async function prepareFreshCheckout(plan, fsApi) {
   await removeIfPresent(plan.backupConfig, fsApi);
 }
 
+async function prepareTrustedOutputDirectories(plan, fsApi) {
+  const directories = [
+    [path.dirname(plan.renderedConfig), 'rendered config directory'],
+    [path.dirname(plan.metadataFile), 'metadata directory'],
+  ];
+  const seen = new Set();
+  for (const [directory, label] of directories) {
+    if (seen.has(directory)) {
+      continue;
+    }
+    seen.add(directory);
+    await fsApi.mkdir(directory, { recursive: true, mode: 0o755 });
+    const resolved = await fsApi.realpath(directory);
+    if (resolved !== path.resolve(directory)) {
+      throw new Error(`${label} must not contain symlinks: ${directory}`);
+    }
+    const directoryStat = await fsApi.lstat(directory);
+    assertTrustedOutputDirectory(directory, directoryStat, label);
+  }
+}
+
 async function installCandidateConfig(plan, fsApi) {
   const candidateStat = await fsApi.lstat(plan.candidateConfig);
   if (!candidateStat.isFile() || candidateStat.isSymbolicLink()) {
@@ -1031,6 +1068,21 @@ function assertTrustedDeploymentDirectory(file, fileStat, label) {
     throw new Error(`${label} ownership is not trusted: ${file}`);
   }
   if ((mode & 0o700) !== 0o700 || (mode & 0o077) !== 0) {
+    throw new Error(`${label} mode is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedOutputDirectory(file, fileStat, label) {
+  if (!fileStat.isDirectory() || fileStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory: ${file}`);
+  }
+  const mode = fileStat.mode & 0o7777;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
+  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+    throw new Error(`${label} ownership is not trusted: ${file}`);
+  }
+  if ((mode & 0o700) !== 0o700 || (mode & 0o022) !== 0) {
     throw new Error(`${label} mode is not trusted: ${file}`);
   }
 }

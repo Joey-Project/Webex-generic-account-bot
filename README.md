@@ -146,14 +146,24 @@ ambient agent, proxy, or token environment leakage.
 The config checkout is sparse and data-only: only `production/bot.toml` and
 `production/spaces/*.toml` are accepted. Before checkout, the entrypoint rejects
 unexpected paths, executable or symlink entries, more than 128 files, blobs
-over 1 MiB, or more than 8 MiB of declared config data. Git runs through fixed
-`/usr/bin/prlimit` CPU, address-space, file-size, process, and file-descriptor
-limits, in addition to the command deadline and output cap.
+over 1 MiB, or more than 8 MiB of declared config data. The bounded fetch uses
+Git's server-side `blob:limit` filter, and manifest validation plus checkout run
+with `--no-lazy-fetch`, so an omitted oversized blob cannot be fetched on
+demand. Git runs through fixed `/usr/bin/prlimit` CPU, address-space, file-size,
+process, and file-descriptor limits, in addition to the command deadline and
+output cap. Rendered-config and metadata parent directories are also rejected
+before cleanup or status writes if they contain symlinks, have unexpected
+ownership, or are group/world writable.
 
 The host-owned static policy allowlists every deployable Webex room and pins its
-sender, routing, trigger, prompt, Codex, follow-up, and Jenkins policy. The
-Jenkins helper independently caps JSON API responses at 1 MiB, emits a
-control-character-safe console URL block, and keeps the complete structured URL
+sender, routing, trigger, Codex, follow-up, and Jenkins policy. Jenkins prompts
+must match host-owned full-template SHA-256 values; retaining a few guardrail
+phrases while appending conflicting instructions is rejected. The Jenkins
+helper accepts only `/job/.../<build-number>/` URLs, rejects HTTP redirects
+rather than forwarding credentials, caps JSON API responses at 1 MiB, charges
+oversized log attempts against the aggregate budget, and bounds retained
+console lines before graph or summary generation. It also emits a
+control-character-safe console URL block and keeps the complete structured URL
 allowlist separate from the prompt text truncation used for Codex context.
 
 Point the `webex-headless-messenger` JS sidecar at the bot:

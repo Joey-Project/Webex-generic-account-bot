@@ -1017,6 +1017,9 @@ fn extract_jenkins_urls(body: &str, max_urls: usize) -> Vec<String> {
             "https://engci-private-sjc.cisco.com/{}",
             rest.trim_end_matches([')', ']', '.', ',', ';', ':'])
         );
+        if !is_allowed_jenkins_build_url(&url) {
+            continue;
+        }
         if !urls.contains(&url) {
             urls.push(url);
         }
@@ -1025,6 +1028,45 @@ fn extract_jenkins_urls(body: &str, max_urls: usize) -> Vec<String> {
         }
     }
     urls
+}
+
+fn is_allowed_jenkins_build_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://engci-private-sjc.cisco.com/") else {
+        return false;
+    };
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    let lowercase_path = path.to_ascii_lowercase();
+    if ["%00", "%0a", "%0d"]
+        .iter()
+        .any(|encoded| lowercase_path.contains(encoded))
+    {
+        return false;
+    }
+    let mut parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.first() == Some(&"jenkins") {
+        parts.remove(0);
+    }
+    if parts
+        .last()
+        .is_some_and(|part| matches!(*part, "console" | "consoleText"))
+    {
+        parts.pop();
+    }
+    let Some(build_number) = parts.pop() else {
+        return false;
+    };
+    build_number
+        .chars()
+        .all(|character| character.is_ascii_digit())
+        && !build_number.is_empty()
+        && parts.len() >= 2
+        && parts.len() % 2 == 0
+        && parts
+            .chunks_exact(2)
+            .all(|pair| pair[0] == "job" && !pair[1].is_empty())
 }
 
 fn append_prefetched_context(prompt: &str, context: &str) -> String {
@@ -5065,6 +5107,22 @@ mod tests {
             vec![
                 "https://engci-private-sjc.cisco.com/jenkins/job/a/1/".to_owned(),
                 "https://engci-private-sjc.cisco.com/jenkins/job/b/2/".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_jenkins_urls_rejects_non_build_paths() {
+        let body = "root https://engci-private-sjc.cisco.com/jenkins/ \
+            admin https://engci-private-sjc.cisco.com/jenkins/manage \
+            job https://engci-private-sjc.cisco.com/jenkins/job/a/not-a-build/ \
+            control https://engci-private-sjc.cisco.com/jenkins/job/a%0Aevil/1/ \
+            valid https://engci-private-sjc.cisco.com/jenkins/job/folder/job/a/2/console";
+
+        assert_eq!(
+            extract_jenkins_urls(body, 3),
+            vec![
+                "https://engci-private-sjc.cisco.com/jenkins/job/folder/job/a/2/console".to_owned()
             ]
         );
     }

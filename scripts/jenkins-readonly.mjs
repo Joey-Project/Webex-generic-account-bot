@@ -16,6 +16,7 @@ const DEFAULT_MAX_FETCH_SECONDS = 600;
 const DEFAULT_FETCH_RETRIES = 3;
 const DEFAULT_MAX_PARALLEL_FETCHES = 6;
 const MAX_JENKINS_URL_CHARS = 4096;
+const MAX_RETAINED_LOG_LINE_BYTES = 4096;
 
 export function parseEnvFile(contents) {
   const env = {};
@@ -64,13 +65,25 @@ export function normalizeJenkinsUrl(value, baseUrl) {
 }
 
 export function buildUrlFromJenkinsUrl(value, baseUrl) {
+  const base = normalizeBaseUrl(baseUrl);
   const url = normalizeJenkinsUrl(value, baseUrl);
-  const parts = url.pathname.split('/').filter(Boolean);
+  const relativePath = url.pathname.slice(base.pathname.length);
+  const parts = relativePath.split('/').filter(Boolean);
   const terminalConsoleSegment = ['console', 'consoleText'].includes(parts.at(-1));
   if (terminalConsoleSegment) {
     parts.pop();
   }
-  url.pathname = `/${parts.join('/')}/`;
+  const buildNumber = parts.at(-1);
+  const jobParts = parts.slice(0, -1);
+  if (
+    !/^\d+$/.test(buildNumber ?? '')
+    || jobParts.length < 2
+    || jobParts.length % 2 !== 0
+    || jobParts.some((part, index) => (index % 2 === 0 ? part !== 'job' : !part))
+  ) {
+    throw new Error(`Jenkins URL must identify a build under /job/.../<build-number>/: ${url.pathname}`);
+  }
+  url.pathname = `${base.pathname}${parts.join('/')}/`;
   url.search = '';
   return url;
 }
@@ -240,7 +253,10 @@ class GraphFetcher {
         fetchTimeoutMs: this.limits.maxFetchSeconds * 1000,
         fetchRetries: this.limits.fetchRetries,
       });
-      this.totalLogBytes += report.logBytes;
+      const logBudgetExceeded = /exceeded max_log_bytes_per_node=/.test(
+        report.consoleFetchError ?? '',
+      );
+      this.totalLogBytes += logBudgetExceeded ? reservedLogBytes : report.logBytes;
       if (this.totalLogBytes > this.limits.maxTotalLogBytes) {
         throw new JenkinsBudgetStopError(
           `Jenkins diagnostics exceeded max_total_log_bytes=${this.limits.maxTotalLogBytes}`,
@@ -269,10 +285,8 @@ class GraphFetcher {
         logFetchError: report.consoleFetchError,
       });
       if (
-        report.consoleFetchError
-        && reservedLogBytes > 0
-        && reservedLogBytes < this.limits.maxLogBytesPerNode
-        && /exceeded max_log_bytes_per_node=/.test(report.consoleFetchError)
+        logBudgetExceeded
+        && this.totalLogBytes >= this.limits.maxTotalLogBytes
       ) {
         node.logFetchError = this.stop(
           `Jenkins diagnostics exceeded max_total_log_bytes=${this.limits.maxTotalLogBytes}`,
@@ -1153,7 +1167,26 @@ export function redactLog(text) {
 }
 
 export function redactedConsoleLinesFromText(text) {
-  return redactLog(text).split(/\r?\n/);
+  return redactLog(text).split(/\r?\n/).map(limitRetainedLogLine);
+}
+
+function limitRetainedLogLine(line) {
+  if (Buffer.byteLength(line, 'utf8') <= MAX_RETAINED_LOG_LINE_BYTES) {
+    return line;
+  }
+  const suffix = ' [line truncated]';
+  const byteBudget = MAX_RETAINED_LOG_LINE_BYTES - Buffer.byteLength(suffix, 'utf8');
+  let prefix = '';
+  let bytes = 0;
+  for (const character of line) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > byteBudget) {
+      break;
+    }
+    prefix += character;
+    bytes += characterBytes;
+  }
+  return `${prefix}${suffix}`;
 }
 
 function buildId(node) {
@@ -1237,6 +1270,7 @@ async function get(url, config, options = {}) {
   normalizeJenkinsUrl(url.toString(), config.baseUrl);
   const response = await fetch(url, {
     method: 'GET',
+    redirect: 'manual',
     headers: {
       Authorization: `Basic ${Buffer.from(`${config.username}:${config.token}`).toString('base64')}`,
       Accept: 'application/json,text/plain,*/*',

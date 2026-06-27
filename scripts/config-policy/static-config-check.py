@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from pathlib import PurePosixPath
@@ -105,41 +106,19 @@ JENKINS_CODEX_PINS = {
 JENKINS_STAGING_SOURCE_ROOM_ID = (
     "Y2lzY29zcGFyazovL3VzL1JPT00vZjY2Yzg5MDAtYzdiYi0xMWU4LTk2NmQtYzU3YTQxMzQxYjI4"
 )
-JENKINS_DIAGNOSIS_PROMPT_FRAGMENTS = [
-    "Use British English only",
-    "Use only the prefetched Jenkins diagnostics bundle",
-    "Do not use network commands",
-    "Jenkins APIs",
-    "write commands",
-    "credentials",
-    "token values",
-    "Output only compact JSON",
-    "Do not use consoleText links",
-    "Markdown, code fences",
-]
-JENKINS_STAGING_SOURCE_PROMPT_FRAGMENTS = [
-    "staging-only",
-    "read-only production Webex space",
-    "mirrored into the staging Webex space",
-    "do not suggest or imply any action in the production space",
-]
-JENKINS_FOLLOWUP_PROMPT_FRAGMENTS = [
-    "staging Webex thread",
-    "mirrored read-only production Jenkins alert",
-    "Use British English only",
-    "Do not suggest or imply any action in the production space",
-    "prefetched Jenkins diagnostics bundle",
-    "Do not use network commands",
-    "Jenkins APIs",
-    "write commands",
-    "credentials",
-    "token values",
-    "Output only compact JSON",
-    "Set `include_evidence` to false for ordinary follow-up answers",
-    "Set `include_evidence` to true only when the current follow-up explicitly asks",
-    "Do not use consoleText links",
-    "Markdown, code fences",
-]
+JENKINS_DIAGNOSIS_PROMPT_HASHES = {
+    "Y2lzY29zcGFyazovL3VzL1JPT00vNTMxMzQ4ZjAtNmJlZC0xMWYxLWFhNWUtZGY0YjBjYzc4YzY5": (
+        "331f872ee321192a3003bf0b4186d9ef92c9ae5d1901f2947530276ef11257d6"
+    ),
+    JENKINS_STAGING_SOURCE_ROOM_ID: (
+        "e4bb91bd2faaabcaba7231cb6a2a072697317dfa7825f4a1d21db287f1d369e1"
+    ),
+}
+JENKINS_FOLLOWUP_PROMPT_HASHES = {
+    JENKINS_STAGING_SOURCE_ROOM_ID: (
+        "310d7101ec50c81c7dc9f6481ee077095e12aba827a3783d398099189769a153"
+    ),
+}
 ALLOWED_SERVER_KEYS = {
     "bind",
     "event_path",
@@ -463,17 +442,11 @@ class Validator:
                     if forbidden_key in room:
                         self.error(f"{path}.{forbidden_key} is not allowed for this pinned room")
             if jenkins_room_pins is not None:
-                self.require_prompt_fragments(
+                self.require_prompt_hash(
                     room.get("prompt_template"),
                     f"{path}.prompt_template",
-                    JENKINS_DIAGNOSIS_PROMPT_FRAGMENTS,
+                    JENKINS_DIAGNOSIS_PROMPT_HASHES[room_id],
                 )
-                if room_id == JENKINS_STAGING_SOURCE_ROOM_ID:
-                    self.require_prompt_fragments(
-                        room.get("prompt_template"),
-                        f"{path}.prompt_template",
-                        JENKINS_STAGING_SOURCE_PROMPT_FRAGMENTS,
-                    )
             if "codex" in room:
                 self.validate_codex(
                     as_table(room["codex"], f"{path}.codex", self.errors),
@@ -496,10 +469,10 @@ class Validator:
                             self.expect_equal(followup, f"{path}.followup", key, expected)
                         else:
                             self.require_equal(followup, f"{path}.followup", key, expected)
-                    self.require_prompt_fragments(
+                    self.require_prompt_hash(
                         followup.get("prompt_template"),
                         f"{path}.followup.prompt_template",
-                        JENKINS_FOLLOWUP_PROMPT_FRAGMENTS,
+                        JENKINS_FOLLOWUP_PROMPT_HASHES[room_id],
                     )
                 if is_jenkins_reply_format(followup.get("reply_format")):
                     jenkins_context_required = True
@@ -631,14 +604,14 @@ class Validator:
             return
         self.expect_equal(table, path, key, expected)
 
-    def require_prompt_fragments(self, value: Any, path: str, fragments: list[str]) -> None:
+    def require_prompt_hash(self, value: Any, path: str, expected_hash: str) -> None:
         if not isinstance(value, str):
             self.error(f"{path} must be a string")
             return
         normalised_value = normalise_prompt_text(value)
-        for fragment in fragments:
-            if normalise_prompt_text(fragment) not in normalised_value:
-                self.error(f"{path} must include required Jenkins guardrail fragment: {fragment!r}")
+        actual_hash = hashlib.sha256(normalised_value.encode("utf-8")).hexdigest()
+        if actual_hash != expected_hash:
+            self.error(f"{path} must match the host-pinned prompt template")
 
     def require_prompt_equal(self, value: Any, path: str, expected: str) -> None:
         if not isinstance(value, str):
