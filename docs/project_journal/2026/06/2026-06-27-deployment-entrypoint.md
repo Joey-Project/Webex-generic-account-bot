@@ -27,10 +27,11 @@ superseded_by:
 - Git commands run through fixed `/usr/bin/prlimit` resource limits. Path shape
   and file count are checked before sparse checkout; file type, per-blob size,
   and total declared config bytes are checked before trusted rendering.
-- The initial fetch uses `blob:none`, path validation runs before checkout, and
-  sparse checkout materialises only `production/` under Git resource limits.
-  The post-checkout manifest uses `GIT_NO_LAZY_FETCH=1` so missing blobs fail
-  closed before trusted rendering, including on Git 2.43 hosts.
+- The initial fetch uses `blob:limit=1048576`; path and blob manifests run
+  before checkout, and sparse checkout materialises only `production/` under
+  Git resource limits. Manifest and checkout use `GIT_NO_LAZY_FETCH=1`, so
+  missing or oversized blobs fail closed before worktree materialisation and
+  trusted rendering, including on Git 2.43 hosts.
 - Rendered-config and metadata parent directories are checked for symlink-free
   canonical paths, trusted ownership, and non-writable group/world modes before
   candidate cleanup or failure-status writes.

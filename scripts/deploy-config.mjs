@@ -283,7 +283,7 @@ export function buildDeployPlan(options) {
     gitCommand(options.gitBin, checkoutWorkDir, [
       'fetch',
       '--depth=1',
-      '--filter=blob:none',
+      '--filter=blob:limit=1048576',
       '--recurse-submodules=no',
       'origin',
       options.configRef,
@@ -298,6 +298,16 @@ export function buildDeployPlan(options) {
       '--',
       CONFIG_TREE_ROOT,
     ], { ...commandDefaults, env: noLazyGitEnv, validation: 'config-tree-paths' }),
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      'ls-tree',
+      '-r',
+      '-l',
+      '-z',
+      '--full-tree',
+      'FETCH_HEAD',
+      '--',
+      CONFIG_TREE_ROOT,
+    ], { ...commandDefaults, env: noLazyGitEnv, validation: 'config-tree-manifest' }),
     gitCommand(options.gitBin, checkoutWorkDir, ['sparse-checkout', 'init', '--no-cone'], {
       ...commandDefaults,
       env: gitEnv,
@@ -315,18 +325,8 @@ export function buildDeployPlan(options) {
       'FETCH_HEAD',
     ], {
       ...commandDefaults,
-      env: gitEnv,
+      env: noLazyGitEnv,
     }),
-    gitCommand(options.gitBin, checkoutWorkDir, [
-      'ls-tree',
-      '-r',
-      '-l',
-      '-z',
-      '--full-tree',
-      'FETCH_HEAD',
-      '--',
-      CONFIG_TREE_ROOT,
-    ], { ...commandDefaults, env: noLazyGitEnv, validation: 'config-tree-manifest' }),
     gitCommand(options.gitBin, checkoutWorkDir, ['rev-parse', 'HEAD'], {
       ...commandDefaults,
       capture: 'configRevision',

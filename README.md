@@ -166,12 +166,13 @@ ambient agent, proxy, or token environment leakage.
 
 The config checkout is sparse and data-only: only `production/bot.toml` and
 `production/spaces/*.toml` are accepted. Tree paths are allowlisted before
-checkout. The initial fetch uses Git's server-side `blob:none` filter, so blobs
-outside `production/` are not downloaded; sparse checkout then materialises
-only the allowlisted tree under the Git process limits. Before trusted
-rendering, a manifest check with `GIT_NO_LAZY_FETCH=1` rejects missing blobs,
-executable or symlink entries, more than 128 files, blobs over 1 MiB, or more
-than 8 MiB of declared config data. Git runs through fixed `/usr/bin/prlimit`
+checkout. The initial fetch uses Git's server-side `blob:limit=1048576` filter.
+A manifest check with `GIT_NO_LAZY_FETCH=1` rejects missing blobs, executable or
+symlink entries, more than 128 files, blobs over 1 MiB, or more than 8 MiB of
+declared config data before worktree materialisation. Small blobs outside
+`production/` may enter the bounded object store, but sparse checkout
+materialises only the allowlisted tree; checkout also disables lazy fetch. Git
+runs through fixed `/usr/bin/prlimit`
 CPU, address-space, file-size, process, and file-descriptor limits, in addition
 to the command deadline and output cap. Rendered-config and metadata parent
 directories are also rejected before cleanup or status writes if they contain
