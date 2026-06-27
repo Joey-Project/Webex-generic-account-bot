@@ -50,7 +50,8 @@ use webex_headless_messenger::{
 const MAX_EVENT_BODY_BYTES: usize = 256 * 1024;
 const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
-const EVENT_HYDRATION_NOT_FOUND_RETRY: Duration = Duration::from_secs(5);
+const EVENT_HYDRATION_NOT_FOUND_RETRY: Duration =
+    Duration::from_secs(webex_generic_account_bot::EVENT_HYDRATION_NOT_FOUND_RETRY_SECS);
 const REPLY_LIMIT_CHARS: usize = 6_000;
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
@@ -7312,7 +7313,7 @@ mod tests {
             self_person_id: Some(SELF_PERSON_ID.to_owned()),
             server: webex_generic_account_bot::ServerConfig {
                 allow_unauthenticated: true,
-                attempt_lease_secs: 300,
+                attempt_lease_secs: 600,
                 ..webex_generic_account_bot::ServerConfig::default()
             },
             codex: webex_generic_account_bot::CodexConfig {

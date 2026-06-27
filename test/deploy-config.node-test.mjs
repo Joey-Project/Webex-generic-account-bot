@@ -71,6 +71,10 @@ describe('deploy-config argument parsing', () => {
     assert.throws(() => parseArgsAllow(['--config-repo', 'ssh://github.com/org/repo.git']), /config-repo/);
     assert.throws(() => parseArgsAllow(['--service', 'bad/unit']), /service/);
     assert.throws(() => parseArgsAllow(['--service', '-Hroot@example']), /service/);
+    assert.throws(
+      () => parseArgsAllow(['--service', 'webex-generic-account-bot.service']),
+      /fixed bot unit/,
+    );
     assert.throws(() => parseArgsAllow(['--checkout-dir', 'relative/path']), /checkout-dir/);
     assert.throws(() => parseArgsAllow(['--git-bin', 'git']), /git-bin/);
     assert.throws(() => parseArgsAllow(['--node-bin', 'node']), /node-bin/);

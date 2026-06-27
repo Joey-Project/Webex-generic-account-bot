@@ -4,7 +4,10 @@ use std::{
     io::{self, ErrorKind},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
     },
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -28,6 +31,8 @@ const DEPLOY_TRANSACTION_FILE: &str =
     "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
 #[cfg(target_os = "linux")]
 const STATUS_FILE_MAX_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const TRANSACTION_FILE_MAX_BYTES: u64 = 16 * 1024;
 #[cfg(target_os = "linux")]
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -145,7 +150,9 @@ impl Default for FileConfigStatusProvider {
 impl ConfigStatusProvider for FileConfigStatusProvider {
     #[cfg(target_os = "linux")]
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
-        match read_optional_bounded_file(&self.transaction_file).await {
+        match read_optional_bounded_file(&self.transaction_file, TRANSACTION_FILE_MAX_BYTES, true)
+            .await
+        {
             Ok(None) => {}
             Ok(Some(contents)) => {
                 return Ok(parse_deployment_transaction(&contents)
@@ -153,7 +160,9 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
             }
             Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
         }
-        let Some(contents) = read_optional_bounded_file(&self.status_file).await? else {
+        let Some(contents) =
+            read_optional_bounded_file(&self.status_file, STATUS_FILE_MAX_BYTES, false).await?
+        else {
             return Ok(ConfigStatusSnapshot::unknown());
         };
         parse_deployment_status(&contents)
@@ -168,7 +177,11 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
 }
 
 #[cfg(target_os = "linux")]
-async fn read_optional_bounded_file(path: &Path) -> Result<Option<Vec<u8>>> {
+async fn read_optional_bounded_file(
+    path: &Path,
+    max_bytes: u64,
+    require_trusted_owner: bool,
+) -> Result<Option<Vec<u8>>> {
     let open_path = path.to_path_buf();
     let file = match timeout(
         STATUS_READ_TIMEOUT,
@@ -193,19 +206,30 @@ async fn read_optional_bounded_file(path: &Path) -> Result<Option<Vec<u8>>> {
     if !metadata.is_file() {
         return Err(anyhow!("status input must be a regular file"));
     }
-    if metadata.len() == 0 || metadata.len() > STATUS_FILE_MAX_BYTES {
+    if require_trusted_owner {
+        // SAFETY: these libc calls take no pointers and return the process credentials.
+        let (effective_uid, effective_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if metadata.uid() != effective_uid
+            || metadata.gid() != effective_gid
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(anyhow!(
+                "deployment transaction ownership or mode is not trusted"
+            ));
+        }
+    }
+    if metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(anyhow!("status input size is invalid"));
     }
     let mut contents = Vec::new();
     timeout(
         STATUS_READ_TIMEOUT,
-        file.take(STATUS_FILE_MAX_BYTES + 1)
-            .read_to_end(&mut contents),
+        file.take(max_bytes + 1).read_to_end(&mut contents),
     )
     .await
     .map_err(|_| anyhow!("timed out reading {}", path.display()))?
     .with_context(|| format!("failed to read {}", path.display()))?;
-    if contents.len() as u64 > STATUS_FILE_MAX_BYTES {
+    if contents.len() as u64 > max_bytes {
         return Err(anyhow!("status input exceeded the size limit"));
     }
     Ok(Some(contents))
@@ -495,6 +519,7 @@ fn valid_config_ref(value: &str) -> bool {
 mod tests {
     use std::{
         fs as std_fs,
+        os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -593,7 +618,7 @@ mod tests {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
-        std_fs::write(&provider.transaction_file, "secret transaction details").unwrap();
+        write_transaction(&provider, b"secret transaction details", 0o600);
 
         let snapshot = provider.status().await.unwrap();
 
@@ -612,9 +637,9 @@ mod tests {
         for contents in [
             Vec::new(),
             b"{not valid json".to_vec(),
-            vec![b'x'; STATUS_FILE_MAX_BYTES as usize + 1],
+            vec![b'x'; TRANSACTION_FILE_MAX_BYTES as usize + 1],
         ] {
-            std_fs::write(&provider.transaction_file, contents).unwrap();
+            write_transaction(&provider, &contents, 0o600);
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -630,11 +655,7 @@ mod tests {
         non_normal_path["bot_code_dir"] =
             Value::String("/opt//webex-generic-account-bot/code".to_owned());
         for transaction in [invalid_repo, invalid_ref, invalid_time, non_normal_path] {
-            std_fs::write(
-                &provider.transaction_file,
-                serde_json::to_vec(&transaction).unwrap(),
-            )
-            .unwrap();
+            write_transaction(&provider, &serde_json::to_vec(&transaction).unwrap(), 0o600);
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -650,9 +671,14 @@ mod tests {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
-        std_fs::write(
+        let transaction = serde_json::to_vec(&deployment_transaction()).unwrap();
+        write_transaction(&provider, &transaction, 0o644);
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "recovery_required");
+        assert_eq!(snapshot.config_revision, None);
+        std_fs::set_permissions(
             &provider.transaction_file,
-            serde_json::to_vec(&deployment_transaction()).unwrap(),
+            std_fs::Permissions::from_mode(0o600),
         )
         .unwrap();
 
@@ -677,11 +703,7 @@ mod tests {
         let mut committed = deployment_transaction();
         committed["phase"] = Value::String("committed_pending_metadata".to_owned());
         committed["committed_at"] = Value::String("2026-06-27T00:01:00.000Z".to_owned());
-        std_fs::write(
-            &provider.transaction_file,
-            serde_json::to_vec(&committed).unwrap(),
-        )
-        .unwrap();
+        write_transaction(&provider, &serde_json::to_vec(&committed).unwrap(), 0o600);
         let snapshot = provider.status().await.unwrap();
         assert!(snapshot.markdown().contains("Committed config revision:"));
         assert!(!snapshot.markdown().contains("In-progress config revision:"));
@@ -830,6 +852,15 @@ mod tests {
             status_file: root.join("status.json"),
             transaction_file: root.join("transaction.json"),
         }
+    }
+
+    fn write_transaction(provider: &FileConfigStatusProvider, contents: &[u8], mode: u32) {
+        std_fs::write(&provider.transaction_file, contents).unwrap();
+        std_fs::set_permissions(
+            &provider.transaction_file,
+            std_fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
     }
 
     fn deployment_metadata(status: &str, config_revision: Option<&str>) -> Value {

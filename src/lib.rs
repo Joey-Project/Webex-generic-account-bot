@@ -7,9 +7,9 @@ pub mod webex;
 
 pub use config::{
     BotConfig, CodexConfig, CodexConfigPatch, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES,
-    FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FollowupConfig, FollowupTrigger, JenkinsContextConfig,
-    ReplyFormat, RoomPolicy, ServerConfig, TriggerMode, WEBEX_LIST_PAGE_SIZE,
-    followup_reply_marker_search_max_pages,
+    EVENT_HYDRATION_NOT_FOUND_RETRY_SECS, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FollowupConfig,
+    FollowupTrigger, JenkinsContextConfig, ReplyFormat, RoomPolicy, ServerConfig, TriggerMode,
+    WEBEX_LIST_PAGE_SIZE, followup_reply_marker_search_max_pages,
 };
 pub use config_commands::{
     ConfigCommand, ConfigCommandsConfig, ParseConfigCommandError, is_config_command_namespace,

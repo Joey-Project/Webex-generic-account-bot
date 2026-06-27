@@ -12,8 +12,9 @@ use serde::Deserialize;
 use crate::config_commands::ConfigCommandsConfig;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const EVENT_HYDRATION_NOT_FOUND_RETRY_SECS: u64 = 5;
 pub const DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 3;
-const DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 2;
+const DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
 const WEBEX_REQUESTS_PER_ATTEMPT: u64 =
     DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + (DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES as u64 * 2);
 const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
@@ -250,10 +251,11 @@ impl BotConfig {
         let minimum_lease = codex
             .timeout_secs
             .saturating_add(jenkins_prefetch_secs)
+            .saturating_add(EVENT_HYDRATION_NOT_FOUND_RETRY_SECS)
             .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(webex_requests));
         if minimum_lease >= self.server.attempt_lease_secs {
             return Err(anyhow!(
-                "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time and Webex request timeout margin for {name}"
+                "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time, hydration retry delay, and Webex request timeout margin for {name}"
             ));
         }
         Ok(())
@@ -1272,6 +1274,27 @@ allow_all_senders = true
     }
 
     #[test]
+    fn rejects_attempt_lease_without_hydration_retry_budget() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 305
+
+[codex]
+timeout_secs = 30
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("hydration retry delay"));
+    }
+
+    #[test]
     fn rejects_jenkins_prefetch_budget_that_exceeds_attempt_lease() {
         let config: BotConfig = toml::from_str(
             r#"
@@ -1726,6 +1749,9 @@ allow_all_senders = true
     fn parses_jenkins_context_config() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [[rooms]]
 room_id = "room-1"
 allow_all_senders = true

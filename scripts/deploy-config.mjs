@@ -1436,8 +1436,8 @@ function validateRepo(value) {
 }
 
 function validateService(value) {
-  if (!/^[A-Za-z0-9_.@-]+$/.test(value) || value.startsWith('-')) {
-    throw new UsageError(`service must be a systemd unit name without path separators: ${value}`);
+  if (value !== DEFAULTS.service) {
+    throw new UsageError(`service must be the fixed bot unit ${DEFAULTS.service}`);
   }
 }
 
