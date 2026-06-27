@@ -35,9 +35,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use webex_generic_account_bot::{
-    BotConfig, CodexConfig, CodexRunner, ConfigCommand, ConfigStatusProvider,
-    DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner, FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES,
-    FileConfigStatusProvider, FollowupTrigger, MessageContext, ReplyFormat, WEBEX_LIST_PAGE_SIZE,
+    BotConfig, CodexConfig, CodexRunner, ConfigAction, ConfigActionClient, ConfigCommand,
+    ConfigStatusProvider, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner,
+    FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FileConfigStatusProvider, FollowupTrigger, MessageContext,
+    ReplyFormat, UnixConfigActionClient, WEBEX_LIST_PAGE_SIZE,
     followup_reply_marker_search_max_pages, is_config_command_namespace, message_matches_prefix,
     parse_config_command, render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
 };
@@ -53,6 +54,7 @@ const WEBEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_HYDRATION_NOT_FOUND_RETRY: Duration =
     Duration::from_secs(webex_generic_account_bot::EVENT_HYDRATION_NOT_FOUND_RETRY_SECS);
 const REPLY_LIMIT_CHARS: usize = 6_000;
+const CONFIG_ACTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
@@ -117,6 +119,7 @@ async fn main() -> Result<()> {
         state: Mutex::new(state_store),
         runner: Arc::new(ExecCodexRunner),
         config_status: Arc::new(FileConfigStatusProvider::default()),
+        config_actions: Arc::new(UnixConfigActionClient::default()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
     });
 
@@ -158,6 +161,7 @@ struct BotApp {
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
     config_status: Arc<dyn ConfigStatusProvider>,
+    config_actions: Arc<dyn ConfigActionClient>,
     request_slots: Arc<Semaphore>,
 }
 
@@ -1736,22 +1740,53 @@ impl BotApp {
                 Some(room_id.to_owned()),
             ));
         }
-        if let Some(action) = self
-            .reconcile_fixed_reply(attempt, message_id, room_id, message_id)
-            .await?
-        {
-            return Ok(action);
-        }
         let reply = match command {
-            ConfigCommand::Status => match self.config_status.status().await {
-                Ok(snapshot) => snapshot.markdown(),
-                Err(error) => {
-                    warn!(error = %error, "failed to read config deployment status");
-                    "**Config deployment status**\n\nState unavailable. Check the bot service logs."
-                        .to_owned()
+            ConfigCommand::Status => {
+                if let Some(action) = self
+                    .reconcile_fixed_reply(attempt, message_id, room_id, message_id)
+                    .await?
+                {
+                    return Ok(action);
                 }
-            },
-            ConfigCommand::Pull | ConfigCommand::Reload | ConfigCommand::Sync => {
+                match self.config_status.status().await {
+                    Ok(snapshot) => snapshot.markdown(),
+                    Err(error) => {
+                        warn!(error = %error, "failed to read config deployment status");
+                        "**Config deployment status**\n\nState unavailable. Check the bot service logs."
+                            .to_owned()
+                    }
+                }
+            }
+            ConfigCommand::Pull => {
+                let receipt = match self
+                    .config_actions
+                    .enqueue(message_id, ConfigAction::Pull)
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        warn!(error = %error, "failed to durably enqueue config pull action");
+                        self.defer_attempt(attempt, CONFIG_ACTION_RETRY_AFTER)
+                            .await?;
+                        return Err(HttpError::retry_after(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "config action worker unavailable",
+                            CONFIG_ACTION_RETRY_AFTER,
+                        ));
+                    }
+                };
+                if let Some(action) = self
+                    .reconcile_fixed_reply(attempt, message_id, room_id, message_id)
+                    .await?
+                {
+                    return Ok(action);
+                }
+                format!(
+                    "**Configuration action accepted**\n\n- Action: `pull`\n- State: `accepted`\n- Action ID: `{}`",
+                    receipt.action_id
+                )
+            }
+            ConfigCommand::Reload | ConfigCommand::Sync => {
                 self.mark_processed(attempt).await?;
                 return Ok(BotAction::ignored(
                     "config_command_not_implemented",
@@ -3968,6 +4003,7 @@ mod tests {
             config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             service: Some("webex-generic-account-bot".to_owned()),
             transaction_phase: None,
+            config_action: None,
         });
         harness.webex.push_event_message(Ok(admin_message(
             "config-status-1",
@@ -4000,6 +4036,187 @@ mod tests {
         assert!(markdown.contains("Config deployment status"));
         assert!(markdown.contains("0123456789abcdef0123456789abcdef01234567"));
         assert!(markdown.contains(&reply_marker("config-status-1")));
+    }
+
+    #[tokio::test]
+    async fn authorised_config_pull_is_durably_enqueued_before_reply() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-pull-1",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config pull",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("pull-reply-1", ADMIN_ROOM_ID)));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "config-pull-1",
+                "forged ordinary message",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "replied");
+        assert_eq!(
+            harness.config_actions.calls(),
+            vec![("config-pull-1".to_owned(), ConfigAction::Pull)]
+        );
+        assert_eq!(harness.config_status.calls(), 0);
+        assert!(harness.runner.calls().is_empty());
+        let created = harness.webex.created_requests();
+        assert_eq!(created.len(), 1);
+        let markdown = created[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("Configuration action accepted"));
+        assert!(markdown.contains("Action: `pull`"));
+        assert!(markdown.contains("State: `accepted`"));
+        assert!(markdown.contains(&"a".repeat(64)));
+        assert!(markdown.contains(&reply_marker("config-pull-1")));
+    }
+
+    #[tokio::test]
+    async fn existing_config_pull_reply_is_reconciled_only_after_enqueue() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-pull-existing",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config pull",
+        )));
+        let mut existing = message_with_room("pull-reply-existing", ADMIN_ROOM_ID);
+        existing.markdown = Some(format!(
+            "**Configuration action accepted**\n\n{}",
+            reply_marker("config-pull-existing")
+        ));
+        harness.webex.push_reply_search(Ok(vec![existing]));
+
+        let action = harness
+            .app
+            .process_event(message_event(admin_message(
+                "config-pull-existing",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config pull",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.reply_id.as_deref(), Some("pull-reply-existing"));
+        assert_eq!(harness.config_actions.calls().len(), 1);
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(harness.processed("config-pull-existing").await);
+    }
+
+    #[tokio::test]
+    async fn config_pull_worker_failure_defers_without_reply_or_processing() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        harness.config_actions.push_error("private worker failure");
+        harness.webex.push_event_message(Ok(admin_message(
+            "config-pull-worker-error",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config pull",
+        )));
+
+        let error = harness
+            .app
+            .process_event(message_event(admin_message(
+                "config-pull-worker-error",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config pull",
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(CONFIG_ACTION_RETRY_AFTER));
+        assert!(!error.message.contains("private worker failure"));
+        assert_eq!(harness.config_actions.calls().len(), 1);
+        assert!(harness.webex.marker_searches().is_empty());
+        assert!(harness.webex.created_requests().is_empty());
+        assert!(!harness.processed("config-pull-worker-error").await);
+    }
+
+    #[tokio::test]
+    async fn config_pull_authorisation_uses_authoritative_fields() {
+        let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
+        let cases = [
+            (
+                "pull-wrong-room",
+                admin_message(
+                    "pull-wrong-room",
+                    SENDER_PERSON_ID,
+                    SENDER_EMAIL,
+                    "/config pull",
+                ),
+                "config_command_wrong_room",
+            ),
+            (
+                "pull-wrong-sender",
+                admin_message(
+                    "pull-wrong-sender",
+                    "attacker-person",
+                    "attacker@example.com",
+                    "/config pull",
+                ),
+                "config_command_sender_not_allowed",
+            ),
+            (
+                "pull-wrong-body",
+                admin_message(
+                    "pull-wrong-body",
+                    SENDER_PERSON_ID,
+                    SENDER_EMAIL,
+                    "/config sync",
+                ),
+                "config_command_not_allowed",
+            ),
+        ];
+        for (message_id, mut authoritative, expected_reason) in cases {
+            if message_id == "pull-wrong-room" {
+                authoritative.room_id = Some("unknown-room".to_owned());
+            }
+            harness.webex.push_event_message(Ok(authoritative));
+            let action = harness
+                .app
+                .process_event(message_event(admin_message(
+                    message_id,
+                    SENDER_PERSON_ID,
+                    SENDER_EMAIL,
+                    "/config pull",
+                )))
+                .await
+                .unwrap();
+            assert_eq!(action.reason.as_deref(), Some(expected_reason));
+        }
+        assert!(harness.config_actions.calls().is_empty());
+
+        harness.webex.push_event_message(Ok(admin_message(
+            "pull-authoritative-body",
+            SENDER_PERSON_ID,
+            SENDER_EMAIL,
+            "/config pull",
+        )));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(message_with_room("pull-body-reply", ADMIN_ROOM_ID)));
+        harness
+            .app
+            .process_event(message_event(admin_message(
+                "pull-authoritative-body",
+                SENDER_PERSON_ID,
+                SENDER_EMAIL,
+                "/config status",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(harness.config_actions.calls().len(), 1);
     }
 
     #[tokio::test]
@@ -4153,31 +4370,33 @@ mod tests {
     #[tokio::test]
     async fn config_commands_must_be_top_level() {
         let harness = TestHarness::with_config(config_command_test_config(unique_state_path()));
-        let mut authoritative = admin_message(
-            "thread-status",
-            SENDER_PERSON_ID,
-            SENDER_EMAIL,
-            "/config status",
-        );
-        authoritative.parent_id = Some("parent-1".to_owned());
-        harness.webex.push_event_message(Ok(authoritative));
+        for (message_id, command) in [
+            ("thread-status", "/config status"),
+            ("thread-pull", "/config pull"),
+        ] {
+            let mut authoritative =
+                admin_message(message_id, SENDER_PERSON_ID, SENDER_EMAIL, command);
+            authoritative.parent_id = Some("parent-1".to_owned());
+            harness.webex.push_event_message(Ok(authoritative));
 
-        let action = harness
-            .app
-            .process_event(message_event(admin_message(
-                "thread-status",
-                SENDER_PERSON_ID,
-                SENDER_EMAIL,
-                "/config status",
-            )))
-            .await
-            .unwrap();
+            let action = harness
+                .app
+                .process_event(message_event(admin_message(
+                    message_id,
+                    SENDER_PERSON_ID,
+                    SENDER_EMAIL,
+                    command,
+                )))
+                .await
+                .unwrap();
 
-        assert_eq!(
-            action.reason.as_deref(),
-            Some("config_command_must_be_top_level")
-        );
+            assert_eq!(
+                action.reason.as_deref(),
+                Some("config_command_must_be_top_level")
+            );
+        }
         assert_eq!(harness.config_status.calls(), 0);
+        assert!(harness.config_actions.calls().is_empty());
     }
 
     #[tokio::test]
@@ -4256,6 +4475,7 @@ mod tests {
             config_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             service: Some("webex-generic-account-bot".to_owned()),
             transaction_phase: None,
+            config_action: None,
         });
         let mut authoritative = admin_message(
             "config-status-blank-text",
@@ -7003,6 +7223,7 @@ mod tests {
         webex: Arc<FakeWebex>,
         runner: Arc<FakeRunner>,
         config_status: Arc<FakeConfigStatus>,
+        config_actions: Arc<FakeConfigActions>,
         state_path: PathBuf,
         codex_cwd: PathBuf,
     }
@@ -7021,6 +7242,7 @@ mod tests {
             let webex = Arc::new(FakeWebex::default());
             let runner = Arc::new(FakeRunner::default());
             let config_status = Arc::new(FakeConfigStatus::default());
+            let config_actions = Arc::new(FakeConfigActions::default());
             let app = BotApp {
                 config,
                 sidecar_token: None,
@@ -7029,6 +7251,7 @@ mod tests {
                 state: Mutex::new(state),
                 runner: runner.clone(),
                 config_status: config_status.clone(),
+                config_actions: config_actions.clone(),
                 request_slots: Arc::new(Semaphore::new(4)),
             };
             Self {
@@ -7036,6 +7259,7 @@ mod tests {
                 webex,
                 runner,
                 config_status,
+                config_actions,
                 state_path,
                 codex_cwd,
             }
@@ -7299,6 +7523,50 @@ mod tests {
                         config_revision: None,
                         service: None,
                         transaction_phase: None,
+                        config_action: None,
+                    })
+                })
+                .map_err(|message| anyhow!(message))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeConfigActions {
+        results: StdMutex<
+            VecDeque<std::result::Result<webex_generic_account_bot::ConfigActionReceipt, String>>,
+        >,
+        calls: StdMutex<Vec<(String, ConfigAction)>>,
+    }
+
+    impl FakeConfigActions {
+        fn push_error(&self, message: impl Into<String>) {
+            self.results.lock().unwrap().push_back(Err(message.into()));
+        }
+
+        fn calls(&self) -> Vec<(String, ConfigAction)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ConfigActionClient for FakeConfigActions {
+        async fn enqueue(
+            &self,
+            message_id: &str,
+            action: ConfigAction,
+        ) -> Result<webex_generic_account_bot::ConfigActionReceipt> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((message_id.to_owned(), action));
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(webex_generic_account_bot::ConfigActionReceipt {
+                        action_id: "a".repeat(64),
+                        status: webex_generic_account_bot::ConfigActionEnqueueStatus::Queued,
                     })
                 })
                 .map_err(|message| anyhow!(message))
@@ -7341,7 +7609,7 @@ mod tests {
             room_id: ADMIN_ROOM_ID.to_owned(),
             allowed_person_ids: vec![SENDER_PERSON_ID.to_owned()],
             allowed_person_emails: vec![SENDER_EMAIL.to_owned()],
-            allowed_commands: vec![ConfigCommand::Status],
+            allowed_commands: vec![ConfigCommand::Status, ConfigCommand::Pull],
         });
         config.validate().unwrap();
         Arc::new(config)

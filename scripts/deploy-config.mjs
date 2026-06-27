@@ -123,6 +123,7 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     ...DEFAULTS,
     apply: false,
     prepare: false,
+    requestId: null,
     dryRun: false,
     skipRestart: false,
     status: false,
@@ -139,6 +140,8 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
       options.apply = true;
     } else if (arg === '--prepare') {
       options.prepare = true;
+    } else if (arg === '--request-id') {
+      options.requestId = requiredValue(argv, (index += 1), arg);
     } else if (arg === '--dry-run') {
       options.dryRun = true;
     } else if (arg === '--skip-restart' || arg === '--skip-reload') {
@@ -225,6 +228,14 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   if ((options.prepare || options.status) && options.skipRestart) {
     throw new UsageError('--skip-restart cannot be used with --prepare or --status.');
   }
+  if (options.requestId !== null) {
+    if (!options.prepare) {
+      throw new UsageError('--request-id is valid only with --prepare.');
+    }
+    if (!/^[0-9a-f]{64}$/.test(options.requestId)) {
+      throw new UsageError('--request-id must be 64 lowercase hexadecimal characters.');
+    }
+  }
   validateHostOverrides(overrides, allowHostOverrides);
   options.hostOverrides = Object.freeze([...overrides]);
   validateOptions(options);
@@ -234,13 +245,14 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
 export function usage() {
   return `Usage:
   node scripts/deploy-config.mjs --dry-run
-  node scripts/deploy-config.mjs --prepare [--json]
+  node scripts/deploy-config.mjs --prepare [--request-id <id>] [--json]
   node scripts/deploy-config.mjs --apply [--skip-restart]
   node scripts/deploy-config.mjs --status [--json]
 
 Options:
       --apply                     Execute the fixed deployment plan.
       --prepare                   Fetch, render, and validate an immutable staged config only.
+      --request-id <id>           Bind prepared metadata to a 64-character worker action ID.
       --dry-run                   Print the fixed deployment plan without running it.
       --status                    Print the last deployment metadata file when present.
       --skip-restart              Install config but do not restart the service.
@@ -435,6 +447,7 @@ export function buildDeployPlan(options) {
     sshKnownHosts: path.resolve(options.sshKnownHosts),
     commandTimeoutMs: options.commandTimeoutMs,
     outputLimitBytes: options.outputLimitBytes,
+    requestId: options.requestId,
   };
   assertSafePlanPathTopology(plan);
   return plan;
@@ -1443,6 +1456,7 @@ function serialisablePlan(plan) {
     ssh_known_hosts: plan.sshKnownHosts,
     command_timeout_ms: plan.commandTimeoutMs,
     output_limit_bytes: plan.outputLimitBytes,
+    request_id: plan.requestId,
     commands: allPlanCommands(plan),
   };
 }
@@ -1799,6 +1813,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     config_ref: plan.configRef,
     config_revision: configRevision,
     config_sha256: configSha256,
+    request_id: plan.requestId,
     bot_code_dir: plan.botCodeDir,
     rendered_config: plan.renderedConfig,
     staged_config: plan.stagedConfig,

@@ -26,13 +26,14 @@ access_token_file_env = "WEBEX_ACCESS_TOKEN_FILE"
 # access_token_file = "/var/lib/webex-headless-access/access-token"
 
 # Optional administrative command Space. Keep this disabled until a dedicated
-# Space and explicit sender allowlist are provisioned. Only status is currently
-# deployable; pull, reload, and sync are reserved for a future durable worker.
+# Space, explicit sender allowlist, and the separate config pull worker are
+# provisioned. Status and pull are supported; reload and sync stay disabled
+# until recoverable activation and in-flight drain semantics are implemented.
 # [config_commands]
 # room_id = "ADMIN_WEBEX_ROOM_ID"
 # allowed_person_ids = []
 # allowed_person_emails = ["operator@example.com"]
-# allowed_commands = ["status"]
+# allowed_commands = ["status", "pull"]
 
 [codex]
 bin = "codex"

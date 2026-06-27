@@ -10,7 +10,11 @@
   every message through Webex before security decisions, and adds an optional
   explicit-sender admin Space with read-only `/config status`.
 - Configuration Space PR 2b1 adds immutable staged config preparation without
-  changing live config or service state; Webex mutation remains disabled.
+  changing live config or service state.
+- Configuration Space PR 2b2 adds a separate-identity, durable pull worker and
+  enables the bot-side `/config pull` path without granting deployment
+  execution to the Webex request process. Production remains disabled until a
+  companion config pins the admin Space and senders.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

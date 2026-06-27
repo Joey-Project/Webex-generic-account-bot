@@ -27,7 +27,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   body, thread, Codex, or reply-routing decisions. Sidecar message fields are
   hints only.
 - Supports an optional dedicated Configuration Space with explicit sender and
-  command allowlists. The current slice implements read-only `/config status`.
+  command allowlists. The current slice implements read-only `/config status`
+  and durable staged preparation through `/config pull`.
 
 The first implementation is synchronous per sidecar request: the HTTP request
 returns after Codex finishes and the Webex reply is accepted. For this slice,
@@ -51,19 +52,23 @@ ordinary room policy:
 room_id = "ADMIN_WEBEX_ROOM_ID"
 allowed_person_ids = []
 allowed_person_emails = ["operator@example.com"]
-allowed_commands = ["status"]
+allowed_commands = ["status", "pull"]
 ```
 
 The admin Space cannot overlap an input or output room, has no
 `allow_all_senders` mode, and accepts only exact `/config ...` commands after
 authoritative Webex hydration. `/config status` reads fixed host deployment
 metadata with no-follow and size checks, returns only allowlisted fields, and
-uses the normal idempotent Webex reply marker. `pull`, `reload`, and `sync` are
-reserved command names but remain undeployable until the durable external
-action worker is implemented; configuration validation rejects them.
+uses the normal idempotent Webex reply marker. `/config pull` durably submits a
+fixed action to a separate worker over a host-owned Unix socket before the bot
+acknowledges it. The worker runs immutable staged preparation only; it cannot
+reload the bot. `reload` and `sync` remain undeployable and configuration
+validation rejects them.
 When a valid deployment transaction exists, status reports its allowlisted
 phase and in-progress revision; malformed journals fail closed to
-`recovery_required` without exposing their contents.
+`recovery_required` without exposing their contents. A strict, bounded public
+worker status file adds the latest pull action state and prepared revision
+without exposing queue records, failure output, or the private transaction.
 The current production host policy also rejects the entire table until a
 companion config PR pins the exact admin Space and sender allowlist. The example
 above is therefore for local validation and the upcoming reviewed deployment,
@@ -172,6 +177,47 @@ metadata pointing at new config bytes. A pending or malformed install
 transaction makes prepare fail closed without attempting recovery or starting
 Git/render work. Preparation uses the same host-wide deployment lock and
 scrubbed fixed-argv execution as apply.
+An optional `--request-id` accepts only a 64-character lowercase hexadecimal
+worker action ID and records it in staged metadata. This lets the worker recover
+a prepare that committed before its private action state was updated, without
+fetching a newer revision for the same Webex request.
+
+The reviewed pull worker assets are:
+
+- `scripts/config-pull-worker.mjs`
+- `deploy/systemd/webex-config-pull-worker.service`
+- `deploy/systemd/webex-config-pull-worker.sysusers.conf`
+- `deploy/systemd/webex-config-pull-worker.tmpfiles.conf`
+- `deploy/systemd/webex-generic-account-bot.service.d/10-config-pull.conf`
+
+The service runs as the stable `webex-config-deploy` user with the dedicated
+`webex-config-pull` primary group; it is not lifecycle-coupled to the bot unit.
+The bot unit receives only this secret-free supplementary group through the
+reviewed drop-in, for the mode `0660` socket at
+`/run/webex-generic-account-bot/config-pull.sock`. Queue and state subdirectories
+remain mode `0700` and worker-owned. The only bot-readable worker artifact is
+mode `0644`
+`/var/lib/webex-generic-account-bot/config-actions/public-status.json`, whose
+schema excludes message text, stderr, paths, and failure details.
+Before connecting, the bot resolves the fixed system account and group names and
+requires both the socket and its mode `0750` parent to be owned by
+`webex-config-deploy:webex-config-pull`. The worker is never added to the bot's
+own group, so this channel does not grant it group-readable bot tokens, Codex
+state, or Jenkins credentials. The service keeps `UMask=0077`; worker code
+explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
+public status file after creation.
+
+Before enabling the unit, provision the sysusers and tmpfiles definitions, make
+the fixed deploy key readable only by `webex-config-deploy`, and migrate
+`config-checkout` and `rendered` to that identity. Keep `/opt/webex-generic-account-bot`
+root-owned and non-writable. The worker has no bot token, Codex home, Jenkins
+credential, `systemctl`, or live-config activation permission. It invokes only
+`/usr/bin/node /opt/webex-generic-account-bot/code/scripts/deploy-config.mjs
+--prepare --json --request-id <action-id>` with a scrubbed environment and no
+shell. A response is sent only after the immutable request, private queued
+state, and public status are durable. A lost response converges through the
+same message-derived action ID; running actions recover after restart, and
+terminal actions are not executed again.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.

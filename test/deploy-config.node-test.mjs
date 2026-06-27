@@ -122,6 +122,19 @@ describe('deploy-config argument parsing', () => {
       () => parseArgs(['--status', '--skip-restart']),
       /--skip-restart cannot be used with --prepare or --status/,
     );
+    const requestId = 'a'.repeat(64);
+    assert.equal(
+      parseArgs(['--prepare', '--request-id', requestId]).requestId,
+      requestId,
+    );
+    assert.throws(
+      () => parseArgs(['--apply', '--request-id', requestId]),
+      /--request-id is valid only with --prepare/,
+    );
+    assert.throws(
+      () => parseArgs(['--prepare', '--request-id', 'A'.repeat(64)]),
+      /64 lowercase hexadecimal/,
+    );
   });
 });
 
@@ -224,6 +237,14 @@ describe('deploy-config plan', () => {
 
     assert.equal(plan.serviceCommand, null);
     assert.deepEqual(plan.serviceVerificationCommands, []);
+  });
+
+  it('binds prepare plans to an optional validated worker request ID', () => {
+    const requestId = 'a'.repeat(64);
+    const plan = buildDeployPlan(parseArgs(['--prepare', '--request-id', requestId]));
+
+    assert.equal(plan.requestId, requestId);
+    assert.equal(buildDeployPlan(parseArgs(['--prepare'])).requestId, null);
   });
 
   it('rejects mutable deployment paths that overlap the checkout or lock', () => {
@@ -1663,9 +1684,12 @@ describe('deploy-config CLI and execution', () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-cli-test-'));
     const renderedConfig = path.join(temp, 'rendered', 'production.toml');
     let stdout = '';
+    const requestId = 'd'.repeat(64);
     const status = await runCli({
       argv: [
         '--prepare',
+        '--request-id',
+        requestId,
         '--json',
         '--checkout-dir',
         path.join(temp, 'checkout'),
@@ -1701,6 +1725,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(metadata.status, 'prepared');
     assert.equal(metadata.config_revision, 'd'.repeat(40));
     assert.equal(metadata.staged_config, `${renderedConfig}.staged`);
+    assert.equal(metadata.request_id, requestId);
   });
 
   it('rejects invalid JSON metadata in JSON status mode', async () => {

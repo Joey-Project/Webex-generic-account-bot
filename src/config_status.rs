@@ -30,9 +30,14 @@ const DEPLOY_STATUS_FILE: &str = "/var/lib/webex-generic-account-bot/rendered/de
 const DEPLOY_TRANSACTION_FILE: &str =
     "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
 #[cfg(target_os = "linux")]
+const CONFIG_ACTION_STATUS_FILE: &str =
+    "/var/lib/webex-generic-account-bot/config-actions/public-status.json";
+#[cfg(target_os = "linux")]
 const STATUS_FILE_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const TRANSACTION_FILE_MAX_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const CONFIG_ACTION_STATUS_MAX_BYTES: u64 = 16 * 1024;
 #[cfg(target_os = "linux")]
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -76,6 +81,14 @@ pub struct ConfigStatusSnapshot {
     pub config_revision: Option<String>,
     pub service: Option<String>,
     pub transaction_phase: Option<String>,
+    pub config_action: Option<ConfigActionStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigActionStatusSnapshot {
+    pub action_id: String,
+    pub state: String,
+    pub config_revision: Option<String>,
 }
 
 impl ConfigStatusSnapshot {
@@ -96,10 +109,15 @@ impl ConfigStatusSnapshot {
             .as_deref()
             .map(|phase| format!("\n- Transaction phase: `{phase}`"))
             .unwrap_or_default();
+        let config_action = self
+            .config_action
+            .as_ref()
+            .map(ConfigActionStatusSnapshot::markdown)
+            .unwrap_or_default();
         format!(
             "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`{transaction_phase}\n- Service: `{service}`",
             self.status
-        )
+        ) + &config_action
     }
 
     #[cfg(target_os = "linux")]
@@ -109,6 +127,7 @@ impl ConfigStatusSnapshot {
             config_revision: None,
             service: None,
             transaction_phase: None,
+            config_action: None,
         }
     }
 
@@ -119,7 +138,22 @@ impl ConfigStatusSnapshot {
             config_revision: None,
             service: Some("webex-generic-account-bot".to_owned()),
             transaction_phase: None,
+            config_action: None,
         }
+    }
+}
+
+impl ConfigActionStatusSnapshot {
+    fn markdown(&self) -> String {
+        let revision = self
+            .config_revision
+            .as_deref()
+            .map(|revision| format!("\n- Prepared config revision: `{revision}`"))
+            .unwrap_or_default();
+        format!(
+            "\n\n**Latest configuration action**\n\n- Action: `pull`\n- State: `{}`\n- Action ID: `{}`{revision}",
+            self.state, self.action_id
+        )
     }
 }
 
@@ -133,6 +167,8 @@ pub struct FileConfigStatusProvider {
     status_file: PathBuf,
     #[cfg(target_os = "linux")]
     transaction_file: PathBuf,
+    #[cfg(target_os = "linux")]
+    action_status_file: PathBuf,
 }
 
 impl Default for FileConfigStatusProvider {
@@ -142,6 +178,8 @@ impl Default for FileConfigStatusProvider {
             status_file: PathBuf::from(DEPLOY_STATUS_FILE),
             #[cfg(target_os = "linux")]
             transaction_file: PathBuf::from(DEPLOY_TRANSACTION_FILE),
+            #[cfg(target_os = "linux")]
+            action_status_file: PathBuf::from(CONFIG_ACTION_STATUS_FILE),
         }
     }
 }
@@ -150,22 +188,41 @@ impl Default for FileConfigStatusProvider {
 impl ConfigStatusProvider for FileConfigStatusProvider {
     #[cfg(target_os = "linux")]
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
-        match read_optional_bounded_file(&self.transaction_file, TRANSACTION_FILE_MAX_BYTES, true)
-            .await
+        let mut snapshot = match read_optional_bounded_file(
+            &self.transaction_file,
+            TRANSACTION_FILE_MAX_BYTES,
+            Some(0o600),
+            true,
+        )
+        .await
         {
-            Ok(None) => {}
-            Ok(Some(contents)) => {
-                return Ok(parse_deployment_transaction(&contents)
-                    .unwrap_or_else(|_| ConfigStatusSnapshot::recovery_required()));
-            }
-            Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
-        }
-        let Some(contents) =
-            read_optional_bounded_file(&self.status_file, STATUS_FILE_MAX_BYTES, false).await?
-        else {
-            return Ok(ConfigStatusSnapshot::unknown());
+            Ok(Some(contents)) => parse_deployment_transaction(&contents)
+                .unwrap_or_else(|_| ConfigStatusSnapshot::recovery_required()),
+            Err(_) => ConfigStatusSnapshot::recovery_required(),
+            Ok(None) => match read_optional_bounded_file(
+                &self.status_file,
+                STATUS_FILE_MAX_BYTES,
+                None,
+                false,
+            )
+            .await?
+            {
+                Some(contents) => parse_deployment_status(&contents)?,
+                None => ConfigStatusSnapshot::unknown(),
+            },
         };
-        parse_deployment_status(&contents)
+        snapshot.config_action = match read_optional_bounded_file(
+            &self.action_status_file,
+            CONFIG_ACTION_STATUS_MAX_BYTES,
+            Some(0o644),
+            false,
+        )
+        .await?
+        {
+            Some(contents) => Some(parse_config_action_status(&contents)?),
+            None => None,
+        };
+        Ok(snapshot)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -180,6 +237,7 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
 async fn read_optional_bounded_file(
     path: &Path,
     max_bytes: u64,
+    required_mode: Option<u32>,
     require_trusted_owner: bool,
 ) -> Result<Option<Vec<u8>>> {
     let open_path = path.to_path_buf();
@@ -205,6 +263,9 @@ async fn read_optional_bounded_file(
         .with_context(|| format!("failed to stat {}", path.display()))?;
     if !metadata.is_file() {
         return Err(anyhow!("status input must be a regular file"));
+    }
+    if required_mode.is_some_and(|mode| metadata.mode() & 0o7777 != mode) {
+        return Err(anyhow!("status input mode is invalid"));
     }
     if require_trusted_owner {
         // SAFETY: these libc calls take no pointers and return the process credentials.
@@ -367,6 +428,7 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
         config_revision,
         service: Some(service.to_owned()),
         transaction_phase: None,
+        config_action: None,
     })
 }
 
@@ -447,6 +509,69 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
         config_revision: Some(revision.to_ascii_lowercase()),
         service: Some(service.to_owned()),
         transaction_phase: Some(phase.to_owned()),
+        config_action: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_config_action_status(contents: &[u8]) -> Result<ConfigActionStatusSnapshot> {
+    let value: Value =
+        serde_json::from_slice(contents).context("invalid config action status JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config action status must be a JSON object"))?;
+    let expected = [
+        "action",
+        "action_id",
+        "config_revision",
+        "state",
+        "updated_at",
+        "version",
+    ];
+    if object.len() != expected.len() || !expected.iter().all(|field| object.contains_key(*field)) {
+        return Err(anyhow!("config action status contains unexpected fields"));
+    }
+    if object.get("version").and_then(Value::as_u64) != Some(1)
+        || object.get("action").and_then(Value::as_str) != Some("pull")
+    {
+        return Err(anyhow!("config action status identity is invalid"));
+    }
+    let action_id = object
+        .get("action_id")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| anyhow!("config action status action ID is invalid"))?;
+    let state = object
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|state| matches!(*state, "queued" | "running" | "succeeded" | "failed"))
+        .ok_or_else(|| anyhow!("config action status state is invalid"))?;
+    let config_revision = match object.get("config_revision") {
+        Some(Value::Null) => None,
+        Some(Value::String(revision)) if revision.len() == 40 && valid_revision(revision) => {
+            Some(revision.clone())
+        }
+        _ => return Err(anyhow!("config action status revision is invalid")),
+    };
+    if (state == "succeeded") != config_revision.is_some() {
+        return Err(anyhow!("config action status revision is inconsistent"));
+    }
+    let updated_at = object
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("config action status timestamp is invalid"))?;
+    if DateTime::parse_from_rfc3339(updated_at).is_err() {
+        return Err(anyhow!("config action status timestamp is invalid"));
+    }
+    Ok(ConfigActionStatusSnapshot {
+        action_id: action_id.to_owned(),
+        state: state.to_owned(),
+        config_revision,
     })
 }
 
@@ -818,6 +943,130 @@ mod tests {
         std_fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn reads_allowlisted_public_config_action_status() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status("queued", None)).unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        let action = snapshot.config_action.unwrap();
+        assert_eq!(action.action_id, "a".repeat(64));
+        assert_eq!(action.state, "queued");
+        assert_eq!(action.config_revision, None);
+        let markdown = provider.status().await.unwrap().markdown();
+        assert!(markdown.contains("Latest configuration action"));
+        assert!(markdown.contains("State: `queued`"));
+        assert!(!markdown.contains("Prepared config revision"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn succeeded_config_action_requires_a_revision() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status(
+                "succeeded",
+                Some("abcdef0123456789abcdef0123456789abcdef01"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "unknown");
+        assert!(
+            snapshot
+                .markdown()
+                .contains("Prepared config revision: `abcdef0123456789abcdef0123456789abcdef01`")
+        );
+        let mut invalid = action_status("succeeded", None);
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        invalid["state"] = Value::String("failed".to_owned());
+        invalid["config_revision"] =
+            Value::String("abcdef0123456789abcdef0123456789abcdef01".to_owned());
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_config_action_status_rejects_bad_mode_schema_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status("running", None)).unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
+
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
+        assert!(provider.status().await.is_err());
+
+        std_fs::remove_file(&provider.action_status_file).unwrap();
+        let target = root.join("target.json");
+        std_fs::write(
+            &target,
+            serde_json::to_vec(&action_status("running", None)).unwrap(),
+        )
+        .unwrap();
+        symlink(target, &provider.action_status_file).unwrap();
+        assert!(provider.status().await.is_err());
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlinked_parent_components() {
@@ -840,6 +1089,7 @@ mod tests {
         let provider = FileConfigStatusProvider {
             status_file: linked_root.join("status.json"),
             transaction_file: linked_root.join("transaction.json"),
+            action_status_file: root.join("action-status.json"),
         };
 
         let snapshot = provider.status().await.unwrap();
@@ -851,6 +1101,7 @@ mod tests {
         FileConfigStatusProvider {
             status_file: root.join("status.json"),
             transaction_file: root.join("transaction.json"),
+            action_status_file: root.join("action-status.json"),
         }
     }
 
@@ -876,6 +1127,17 @@ mod tests {
             "service_action": "restart",
             "service_restart_skipped": false,
             "deployed_at": "2026-06-27T00:00:00.000Z"
+        })
+    }
+
+    fn action_status(state: &str, config_revision: Option<&str>) -> Value {
+        serde_json::json!({
+            "version": 1,
+            "action": "pull",
+            "action_id": "a".repeat(64),
+            "state": state,
+            "config_revision": config_revision,
+            "updated_at": "2026-06-27T00:00:00.000Z",
         })
     }
 

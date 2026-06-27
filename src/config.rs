@@ -943,14 +943,14 @@ allow_all_senders = true
     }
 
     #[test]
-    fn parses_status_only_config_commands() {
+    fn parses_status_and_pull_config_commands() {
         let config: BotConfig = toml::from_str(
             r#"
 [config_commands]
 room_id = "admin-room"
 allowed_person_ids = []
 allowed_person_emails = ["operator@example.com"]
-allowed_commands = ["status"]
+allowed_commands = ["status", "pull"]
 
 [[rooms]]
 room_id = "room-1"
@@ -962,6 +962,7 @@ allow_all_senders = true
         config.validate().unwrap();
         let config_commands = config.config_commands.as_ref().unwrap();
         assert!(config_commands.command_allowed(crate::config_commands::ConfigCommand::Status));
+        assert!(config_commands.command_allowed(crate::config_commands::ConfigCommand::Pull));
         assert!(config_commands.sender_allowed(None, Some("operator@example.com")));
     }
 

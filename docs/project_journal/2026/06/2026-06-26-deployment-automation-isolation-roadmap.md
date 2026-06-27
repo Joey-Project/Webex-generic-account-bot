@@ -3,7 +3,7 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-06-26
+updated: 2026-06-27
 branch: codex/roadmap-deploy-isolation
 pr:
 supersedes: []
@@ -24,6 +24,8 @@ superseded_by:
   (recoverable activation plus `/config reload` and `/config sync`). Mutating
   commands remain undeployable until their corresponding backend lands.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
+- Bot PR #10 merged immutable staged preparation as
+  `45d87b7d6fb59f7d751285a253b3cf7e21826563`.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
