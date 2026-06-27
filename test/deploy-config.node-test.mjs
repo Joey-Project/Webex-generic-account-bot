@@ -1244,6 +1244,26 @@ describe('deploy-config CLI and execution', () => {
     );
   });
 
+  it('rejects invalid JSON metadata in JSON status mode', async () => {
+    let stderr = '';
+    const status = await runCli({
+      argv: ['--status', '--json'],
+      stdout: writer(),
+      stderr: writer((chunk) => {
+        stderr += chunk;
+      }),
+      fsApi: {
+        ...fs,
+        async readFile() {
+          return '{not valid json';
+        },
+      },
+    });
+
+    assert.equal(status, 1);
+    assert.match(stderr, /status=unknown/);
+  });
+
   it('apply executes commands with scrubbed env, installs candidate metadata, and clears the lock', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -1652,6 +1672,76 @@ describe('deploy-config CLI and execution', () => {
     assert(synced.includes(path.dirname(plan.renderedConfig)));
   });
 
+  it('rolls back if rendered directory fsync fails after install rename', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let failedRenderedDirectorySync = false;
+    let restartAttempts = 0;
+    const fsApi = {
+      ...fs,
+      async open(file, ...args) {
+        const handle = await fs.open(file, ...args);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                if (
+                  String(file) === path.dirname(plan.renderedConfig)
+                  && !failedRenderedDirectorySync
+                ) {
+                  failedRenderedDirectorySync = true;
+                  throw new Error('rendered directory fsync failed');
+                }
+                return await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl') {
+            restartAttempts += 1;
+          }
+          return { stdout: command.capture === 'configRevision' ? `${'3'.repeat(40)}\n` : '', stderr: '' };
+        },
+      }),
+      /rendered directory fsync failed/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(restartAttempts, 0);
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_apply');
+    await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
+  });
+
   it('records post-commit metadata failures without implying apply rollback', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -1855,7 +1945,8 @@ describe('deploy-config CLI and execution', () => {
     );
 
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
-    assert.equal(failureMetadata.status, 'failed_cleanup');
+    assert.equal(failureMetadata.status, 'failed_apply');
+    assert.equal(failureMetadata.cleanup_failed, true);
     assert.equal(failureMetadata.lock_cleanup_failed, true);
     assert.equal((await fs.stat(plan.lockDir)).isDirectory(), true);
     await fs.rm(plan.lockDir, { recursive: true, force: true });
@@ -1930,10 +2021,20 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
     let restartAttempts = 0;
     let healthChecks = 0;
+    const fsApi = {
+      ...fs,
+      async rm(file, options) {
+        if (file === plan.lockDir) {
+          throw new Error('lock cleanup failed');
+        }
+        return await fs.rm(file, options);
+      },
+    };
 
     await assert.rejects(
       () => executePlan({
         plan,
+        fsApi,
         runner: async (command) => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
@@ -1950,7 +2051,7 @@ describe('deploy-config CLI and execution', () => {
           return { stdout: command.capture === 'configRevision' ? `${'a'.repeat(40)}\n` : '', stderr: '' };
         },
       }),
-      /failed post-restart health check/,
+      /failed post-restart health check; deployment cleanup failed: lock cleanup failed/,
     );
 
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
@@ -1959,6 +2060,9 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
     assert.match(failureMetadata.reason, /failed post-restart health check/);
+    assert.equal(failureMetadata.cleanup_failed, true);
+    assert.equal(failureMetadata.lock_cleanup_failed, true);
+    await fs.rm(plan.lockDir, { recursive: true, force: true });
   });
 
   it('records failure metadata if rollback succeeds but service still cannot restart', async () => {

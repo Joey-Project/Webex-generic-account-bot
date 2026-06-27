@@ -54,9 +54,11 @@ superseded_by:
   failed post-restart health rolls back through the same path.
 - Deployment metadata uses a same-directory fsynced temporary file plus atomic
   rename. Cleanup failures are merged into the reported error and residual lock
-  state is recorded when possible.
+  state is recorded when possible without replacing an earlier specific failure
+  status. JSON status mode parses and validates metadata before returning it.
 - Candidate contents and the rendered-config directory are fsynced before
-  success metadata, preserving config-before-status durability ordering.
+  success metadata, preserving config-before-status durability ordering. A
+  post-rename directory-fsync failure restores the previous config internally.
 - Child commands have per-command deadlines and bounded stdout/stderr capture;
   the lock parent and checkout directory must be deployment-user-owned `0700`
   directories.
@@ -89,7 +91,8 @@ superseded_by:
   and Jenkins timeout/fan-out/output values. Jenkins-format replies fail closed
   unless at least one non-empty local log was written; only those nodes enter
   the URL allowlist. Excerpts require the model's own log URL to match that
-  allowlist, and are dropped when the renderer uses a single-log fallback link.
+  allowlist and the sanitized excerpt text to occur verbatim in the mapped local
+  log; they are dropped when the renderer uses a single-log fallback link.
 - Failure metadata write errors are surfaced together with the primary apply
   error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a

@@ -136,10 +136,13 @@ metadata cannot be written, the apply reports both the primary error and the
 metadata error; an existing status file must then be treated as stale. The
 candidate file and rendered-config directory are fsynced before success metadata
 is committed, so `status=deployed` cannot become more durable than the installed
-config. If metadata writing or cleanup fails after the new config has been
+config. A post-rename durability failure restores the previous config before
+returning. If metadata writing or cleanup fails after the new config has been
 installed and the service restart has succeeded, the entrypoint records a
 post-commit failure state when possible instead of implying the apply was rolled
-back.
+back. Cleanup details are added without replacing an earlier, more specific
+failure status. Status output, including `--status --json`, rejects malformed
+metadata rather than returning it as a successful result.
 Child command stdout/stderr capture is bounded and each child has a deadline so
 a stuck fetch, validation, or restart cannot hold the deployment lock forever.
 Existing checkout and lock directories must be owned by the deployment user and
@@ -180,7 +183,9 @@ common API-key assignments. Only nodes with a non-empty local log
 enter the renderer URL allowlist, so Jenkins replies fail closed when prefetch
 produces no local evidence. Exact excerpts are rendered only when the model's
 own log URL matches that allowlist; a single-log fallback link never authenticates
-an excerpt. The helper emits a control-character-safe console URL
+an excerpt. Before rendering, the bot also requires the sanitized excerpt text
+to occur verbatim in the local log mapped to that URL. The helper emits a
+control-character-safe console URL
 block and keeps the complete structured URL allowlist separate from the prompt
 text truncation used for Codex context. Host policy pins the global Codex model
 and Jenkins prefetch fan-out/resource settings.

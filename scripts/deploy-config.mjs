@@ -437,11 +437,13 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
   let commitReached = false;
   let failureMetadataWritten = false;
   let failureMetadataError = null;
+  let recordedFailureStatus = null;
   let outputDirectoriesTrusted = false;
   const recordFailure = async (status, reason) => {
     try {
       await writeFailureMetadata(plan, captures.configRevision || null, status, reason, fsApi);
       failureMetadataWritten = true;
+      recordedFailureStatus = status;
     } catch (error) {
       failureMetadataError = error;
       throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
@@ -560,10 +562,12 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
           await writeFailureMetadata(
             plan,
             captures.configRevision || null,
-            commitReached ? 'failed_after_commit_cleanup' : 'failed_cleanup',
+            recordedFailureStatus
+              ?? (commitReached ? 'failed_after_commit_cleanup' : 'failed_cleanup'),
             combinedReason,
             fsApi,
             {
+              cleanup_failed: true,
               rollback_cleanup_failed: rollbackCleanupFailed,
               candidate_cleanup_failed: candidateCleanupFailed,
               lock_cleanup_failed: lockCleanupFailed,
@@ -591,10 +595,10 @@ async function runServiceTransition(plan, runner, parentEnv) {
 async function printStatus({ options, stdout, stderr, fsApi }) {
   try {
     const contents = await fsApi.readFile(path.resolve(options.metadataFile), 'utf8');
+    const parsed = JSON.parse(contents);
     if (options.json) {
-      stdout.write(contents.endsWith('\n') ? contents : `${contents}\n`);
+      stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
     } else {
-      const parsed = JSON.parse(contents);
       stdout.write(
         `status=${parsed.status}\nconfig_revision=${parsed.config_revision || ''}\n` +
           `rendered_config=${parsed.rendered_config || ''}\nservice=${parsed.service || ''}\n`,
@@ -1168,7 +1172,18 @@ async function installCandidateConfig(plan, fsApi) {
 
   await syncFile(plan.candidateConfig, fsApi);
   await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
-  await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+  try {
+    await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+  } catch (error) {
+    try {
+      await rollbackCandidateConfig(plan, { hadPrevious }, fsApi);
+    } catch (rollbackError) {
+      throw new Error(
+        `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
+      );
+    }
+    throw error;
+  }
   return { hadPrevious };
 }
 

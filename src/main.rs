@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
+    ffi::OsStr,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -52,6 +53,8 @@ const FORWARD_MARKDOWN_LIMIT_BYTES: usize = 4_000;
 const SOURCE_MARKER_SEARCH_MAX_PAGES: usize = 3;
 const JENKINS_ARTIFACT_RETENTION_LIMIT: usize = 32;
 const JENKINS_DIAGNOSIS_EXCERPT_LIMIT: usize = 240;
+const JENKINS_LOG_INDEX_MAX_BYTES: u64 = 1024 * 1024;
+const JENKINS_EVIDENCE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -176,6 +179,18 @@ struct JenkinsPrefetchedContext {
     prompt: String,
     artifact_root: PathBuf,
     console_urls: Vec<String>,
+    evidence_logs: HashMap<String, PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct JenkinsLogIndex {
+    jobs: Vec<JenkinsLogIndexJob>,
+}
+
+#[derive(Deserialize)]
+struct JenkinsLogIndexJob {
+    local_log_relative: Option<PathBuf>,
+    jenkins_console: String,
 }
 
 struct JenkinsArtifactCleanupGuard {
@@ -407,6 +422,7 @@ async fn jenkins_context_prompt(
 
     let mut sections = Vec::new();
     let mut console_urls = Vec::new();
+    let mut evidence_logs = HashMap::new();
     let build_result: Result<String> = async {
         for (index, url) in urls.into_iter().enumerate() {
             let artifact_dir = jenkins_artifact_dir(&artifact_root, index + 1);
@@ -419,10 +435,11 @@ async fn jenkins_context_prompt(
                     )
                 })?;
             let output = run_jenkins_context_helper(config, &url, &artifact_dir).await?;
-            for console_url in extract_jenkins_console_urls(&output) {
+            for (console_url, log_path) in load_jenkins_log_evidence(&artifact_dir).await? {
                 if !console_urls.contains(&console_url) {
-                    console_urls.push(console_url);
+                    console_urls.push(console_url.clone());
                 }
+                evidence_logs.entry(console_url).or_insert(log_path);
             }
             sections.push(format!(
                 "URL: {url}\nDiagnostics artifact directory: `{}`\n```text\n{}\n```",
@@ -443,6 +460,7 @@ async fn jenkins_context_prompt(
             prompt,
             artifact_root,
             console_urls,
+            evidence_logs,
         })),
         Err(error) => {
             if let Err(cleanup_error) = cleanup_jenkins_artifact_dir(&artifact_root).await {
@@ -455,6 +473,82 @@ async fn jenkins_context_prompt(
             Err(error)
         }
     }
+}
+
+async fn load_jenkins_log_evidence(artifact_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let logs_root = artifact_dir.join("logs");
+    let index_path = logs_root.join("index.json");
+    let index_metadata = fs::symlink_metadata(&index_path)
+        .await
+        .with_context(|| format!("failed to stat Jenkins log index {}", index_path.display()))?;
+    if !index_metadata.is_file() || index_metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "Jenkins log index must be a regular file: {}",
+            index_path.display()
+        ));
+    }
+    if index_metadata.len() > JENKINS_LOG_INDEX_MAX_BYTES {
+        return Err(anyhow!(
+            "Jenkins log index exceeded {} bytes",
+            JENKINS_LOG_INDEX_MAX_BYTES
+        ));
+    }
+    let index: JenkinsLogIndex =
+        serde_json::from_slice(&fs::read(&index_path).await.with_context(|| {
+            format!("failed to read Jenkins log index {}", index_path.display())
+        })?)
+        .with_context(|| format!("failed to parse Jenkins log index {}", index_path.display()))?;
+    let canonical_logs_root = fs::canonicalize(&logs_root).await.with_context(|| {
+        format!(
+            "failed to resolve Jenkins logs directory {}",
+            logs_root.display()
+        )
+    })?;
+    let mut evidence = Vec::new();
+    for job in index.jobs {
+        let Some(relative_path) = job.local_log_relative else {
+            continue;
+        };
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || relative_path.components().next() != Some(Component::Normal(OsStr::new("logs")))
+        {
+            return Err(anyhow!(
+                "Jenkins log index contains an unsafe relative path: {}",
+                relative_path.display()
+            ));
+        }
+        let log_path = artifact_dir.join(&relative_path);
+        let canonical_log_path = fs::canonicalize(&log_path)
+            .await
+            .with_context(|| format!("failed to resolve Jenkins log {}", log_path.display()))?;
+        if !canonical_log_path.starts_with(&canonical_logs_root) {
+            return Err(anyhow!(
+                "Jenkins log escaped artifact directory: {}",
+                log_path.display()
+            ));
+        }
+        let log_metadata = fs::metadata(&canonical_log_path)
+            .await
+            .with_context(|| format!("failed to stat Jenkins log {}", log_path.display()))?;
+        if !log_metadata.is_file() || log_metadata.len() == 0 {
+            continue;
+        }
+        if log_metadata.len() > JENKINS_EVIDENCE_LOG_MAX_BYTES {
+            return Err(anyhow!(
+                "Jenkins evidence log exceeded {} bytes: {}",
+                JENKINS_EVIDENCE_LOG_MAX_BYTES,
+                log_path.display()
+            ));
+        }
+        let Some(console_url) = normalized_jenkins_console_url(&job.jenkins_console) else {
+            return Err(anyhow!("Jenkins log index contains an invalid console URL"));
+        };
+        evidence.push((console_url, canonical_log_path));
+    }
+    Ok(evidence)
 }
 
 async fn reset_jenkins_artifact_dir(path: &Path) -> Result<()> {
@@ -1320,6 +1414,7 @@ impl BotApp {
 
         let codex_config = self.config.codex_for_policy(policy);
         let mut prefetched_console_urls = Vec::new();
+        let mut jenkins_evidence_logs = HashMap::new();
         let mut jenkins_artifact_cleanup = None;
         let prefetch_required = matches!(
             request.reply_format,
@@ -1333,6 +1428,7 @@ impl BotApp {
                         prompt,
                         artifact_root,
                         console_urls,
+                        evidence_logs,
                     } = context_bundle;
                     jenkins_artifact_cleanup =
                         Some(JenkinsArtifactCleanupGuard::new(artifact_root));
@@ -1342,6 +1438,7 @@ impl BotApp {
                     } else {
                         request.prompt = append_prefetched_context(&request.prompt, &prompt);
                         prefetched_console_urls = console_urls;
+                        jenkins_evidence_logs = evidence_logs;
                     }
                 }
                 Ok(None) => {
@@ -1364,6 +1461,16 @@ impl BotApp {
                     .await,
             )
         };
+        let verified_excerpt = if let Some(Ok(output)) = &run_result {
+            verified_jenkins_excerpt(
+                request.reply_format,
+                &output.final_message,
+                &jenkins_evidence_logs,
+            )
+            .await
+        } else {
+            None
+        };
         if let Some(cleanup_guard) = jenkins_artifact_cleanup {
             if let Err(error) = cleanup_guard.cleanup().await {
                 warn!(
@@ -1375,10 +1482,11 @@ impl BotApp {
         }
         let reply_text = match run_result {
             None => "**Not enough evidence:** Jenkins diagnostics could not be fetched; check the bot service logs for details.".to_owned(),
-            Some(Ok(output)) => render_reply_text_with_allowed_urls(
+            Some(Ok(output)) => render_reply_text_with_verified_excerpt(
                 request.reply_format,
                 &output.final_message,
                 &prefetched_console_urls,
+                verified_excerpt.as_deref(),
             ),
             Some(Err(error)) => {
                 warn!(message_id = %message_id, error = %error, "codex run failed");
@@ -2646,6 +2754,33 @@ where
     })
 }
 
+async fn verified_jenkins_excerpt(
+    format: ReplyFormat,
+    output: &str,
+    evidence_logs: &HashMap<String, PathBuf>,
+) -> Option<String> {
+    let (log_url, excerpt) = match format {
+        ReplyFormat::JenkinsDiagnosisJson => {
+            let reply = parse_jenkins_diagnosis_json(output).ok()?;
+            (reply.log_url?, reply.excerpt?)
+        }
+        ReplyFormat::JenkinsFollowupJson => {
+            let reply = parse_jenkins_followup_json(output).ok()?;
+            if !reply.include_evidence {
+                return None;
+            }
+            (reply.log_url?, reply.excerpt?)
+        }
+        ReplyFormat::Markdown => return None,
+    };
+    let normalized_url = normalized_jenkins_console_url(&log_url)?;
+    let log_path = evidence_logs.get(&normalized_url)?;
+    let sanitized_excerpt = sanitize_jenkins_excerpt(&excerpt)?;
+    let log = fs::read_to_string(log_path).await.ok()?;
+    log.contains(&sanitized_excerpt)
+        .then_some(sanitized_excerpt)
+}
+
 #[cfg(test)]
 fn render_reply_text(
     format: ReplyFormat,
@@ -2655,28 +2790,60 @@ fn render_reply_text(
     let allowed_log_urls = prefetched_context
         .map(extract_jenkins_console_urls)
         .unwrap_or_default();
-    render_reply_text_with_allowed_urls(format, output, &allowed_log_urls)
+    let trusted_test_excerpt = match format {
+        ReplyFormat::JenkinsDiagnosisJson => parse_jenkins_diagnosis_json(output)
+            .ok()
+            .and_then(|reply| reply.excerpt)
+            .and_then(|excerpt| sanitize_jenkins_excerpt(&excerpt)),
+        ReplyFormat::JenkinsFollowupJson => parse_jenkins_followup_json(output)
+            .ok()
+            .filter(|reply| reply.include_evidence)
+            .and_then(|reply| reply.excerpt)
+            .and_then(|excerpt| sanitize_jenkins_excerpt(&excerpt)),
+        ReplyFormat::Markdown => None,
+    };
+    render_reply_text_with_verified_excerpt(
+        format,
+        output,
+        &allowed_log_urls,
+        trusted_test_excerpt.as_deref(),
+    )
 }
 
+#[cfg(test)]
 fn render_reply_text_with_allowed_urls(
     format: ReplyFormat,
     output: &str,
     allowed_log_urls: &[String],
 ) -> String {
+    render_reply_text_with_verified_excerpt(format, output, allowed_log_urls, None)
+}
+
+fn render_reply_text_with_verified_excerpt(
+    format: ReplyFormat,
+    output: &str,
+    allowed_log_urls: &[String],
+    verified_excerpt: Option<&str>,
+) -> String {
     match format {
         ReplyFormat::Markdown => output.to_owned(),
-        ReplyFormat::JenkinsDiagnosisJson => {
-            render_jenkins_diagnosis_json_with_allowed_urls(output, allowed_log_urls)
-        }
-        ReplyFormat::JenkinsFollowupJson => {
-            render_jenkins_followup_json_with_allowed_urls(output, allowed_log_urls)
-        }
+        ReplyFormat::JenkinsDiagnosisJson => render_jenkins_diagnosis_json_with_allowed_urls(
+            output,
+            allowed_log_urls,
+            verified_excerpt,
+        ),
+        ReplyFormat::JenkinsFollowupJson => render_jenkins_followup_json_with_allowed_urls(
+            output,
+            allowed_log_urls,
+            verified_excerpt,
+        ),
     }
 }
 
 fn render_jenkins_diagnosis_json_with_allowed_urls(
     output: &str,
     allowed_log_urls: &[String],
+    verified_excerpt: Option<&str>,
 ) -> String {
     let fallback_log_url = if allowed_log_urls.len() == 1 {
         allowed_log_urls.first().map(String::as_str)
@@ -2684,7 +2851,12 @@ fn render_jenkins_diagnosis_json_with_allowed_urls(
         None
     };
     match parse_jenkins_diagnosis_json(output) {
-        Ok(reply) => render_jenkins_diagnosis_reply(&reply, allowed_log_urls, fallback_log_url),
+        Ok(reply) => render_jenkins_diagnosis_reply(
+            &reply,
+            allowed_log_urls,
+            fallback_log_url,
+            verified_excerpt,
+        ),
         Err(_) => render_jenkins_diagnosis_reply(
             &JenkinsDiagnosisReply {
                 verdict: JenkinsDiagnosisVerdict::NotEnoughEvidence,
@@ -2695,6 +2867,7 @@ fn render_jenkins_diagnosis_json_with_allowed_urls(
             },
             allowed_log_urls,
             fallback_log_url,
+            None,
         ),
     }
 }
@@ -2708,9 +2881,10 @@ fn parse_jenkins_diagnosis_json(output: &str) -> Result<JenkinsDiagnosisReply> {
 fn render_jenkins_followup_json_with_allowed_urls(
     output: &str,
     allowed_log_urls: &[String],
+    verified_excerpt: Option<&str>,
 ) -> String {
     match parse_jenkins_followup_json(output) {
-        Ok(reply) => render_jenkins_followup_reply(&reply, allowed_log_urls),
+        Ok(reply) => render_jenkins_followup_reply(&reply, allowed_log_urls, verified_excerpt),
         Err(_) => render_jenkins_followup_reply(
             &JenkinsFollowupReply {
                 answer: "I could not parse the follow-up answer".to_owned(),
@@ -2720,6 +2894,7 @@ fn render_jenkins_followup_json_with_allowed_urls(
                 excerpt_format: JenkinsDiagnosisExcerptFormat::default(),
             },
             allowed_log_urls,
+            None,
         ),
     }
 }
@@ -2746,6 +2921,7 @@ fn extract_json_object(output: &str) -> Option<&str> {
 fn render_jenkins_followup_reply(
     reply: &JenkinsFollowupReply,
     allowed_log_urls: &[String],
+    verified_excerpt: Option<&str>,
 ) -> String {
     let answer = concise_followup_answer(&reply.answer);
     let answer = escape_markdown_plain_text(&answer);
@@ -2756,7 +2932,7 @@ fn render_jenkins_followup_reply(
                 .as_deref()
                 .and_then(normalized_jenkins_console_url)
                 .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url)),
-            reply.excerpt.as_deref(),
+            verified_excerpt,
         )
     } else {
         (None, None)
@@ -2775,6 +2951,7 @@ fn render_jenkins_diagnosis_reply(
     reply: &JenkinsDiagnosisReply,
     allowed_log_urls: &[String],
     fallback_log_url: Option<&str>,
+    verified_excerpt: Option<&str>,
 ) -> String {
     let reason_is_blank = reply.reason.split_whitespace().next().is_none();
     let verdict = if reason_is_blank {
@@ -2798,7 +2975,7 @@ fn render_jenkins_diagnosis_reply(
         .and_then(normalized_jenkins_console_url)
         .filter(|url| allowed_log_urls.iter().any(|allowed| allowed == url));
     let (log_url, excerpt) = match requested_log_url {
-        Some(url) => (Some(url), reply.excerpt.as_deref()),
+        Some(url) => (Some(url), verified_excerpt),
         None => (
             fallback_log_url.and_then(normalized_jenkins_console_url),
             None,
@@ -2938,6 +3115,7 @@ fn escape_markdown_plain_text(value: &str) -> String {
     escaped
 }
 
+#[cfg(test)]
 fn extract_jenkins_console_urls(context: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let has_explicit_block = context
@@ -3340,8 +3518,9 @@ mod tests {
              *) shift ;;\n\
              esac\n\
              done\n\
-             mkdir -p \"$artifact_dir\"\n\
-             printf evidence > \"$artifact_dir/evidence.txt\"\n\
+             mkdir -p \"$artifact_dir/logs\"\n\
+             printf 'agent capacity failure\\n' > \"$artifact_dir/logs/foo.log\"\n\
+             printf '%s\\n' '{\"version\":1,\"jobs\":[{\"local_log_relative\":\"logs/foo.log\",\"jenkins_console\":\"https://jenkins.example/job/foo/1/console\"}]}' > \"$artifact_dir/logs/index.json\"\n\
              printf 'jenkins_console: https://jenkins.example/job/foo/1/console\\n'\n",
         )
         .unwrap();
@@ -4966,6 +5145,72 @@ mod tests {
             "**Jenkins infra false alarm:** agent capacity failure [log](<https://jenkins.example/job/foo/1/console>)"
         );
         assert!(!rendered.contains("fabricated"));
+    }
+
+    #[tokio::test]
+    async fn jenkins_excerpt_must_exist_in_the_mapped_local_log() {
+        let log_path = unique_state_path().with_extension("jenkins-evidence.log");
+        fs::write(&log_path, "before\nExact failure evidence\nafter\n").unwrap();
+        let console_url = "https://jenkins.example/job/foo/1/console";
+        let evidence_logs = HashMap::from([(console_url.to_owned(), log_path.clone())]);
+        let matching = r#"{
+            "verdict": "infra_false_alarm",
+            "reason": "agent capacity failure",
+            "excerpt": "Exact failure evidence",
+            "excerpt_format": "inline_code",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+        let fabricated = matching.replace("Exact failure evidence", "Fabricated evidence");
+
+        assert_eq!(
+            verified_jenkins_excerpt(ReplyFormat::JenkinsDiagnosisJson, matching, &evidence_logs,)
+                .await
+                .as_deref(),
+            Some("Exact failure evidence")
+        );
+        assert!(
+            verified_jenkins_excerpt(
+                ReplyFormat::JenkinsDiagnosisJson,
+                &fabricated,
+                &evidence_logs,
+            )
+            .await
+            .is_none()
+        );
+        let followup = r#"{
+            "answer": "The task did not start.",
+            "include_evidence": true,
+            "excerpt": "Exact failure evidence",
+            "excerpt_format": "inline_code",
+            "log_url": "https://jenkins.example/job/foo/1/console"
+        }"#;
+        assert_eq!(
+            verified_jenkins_excerpt(ReplyFormat::JenkinsFollowupJson, followup, &evidence_logs,)
+                .await
+                .as_deref(),
+            Some("Exact failure evidence")
+        );
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jenkins_log_index_rejects_paths_outside_the_logs_directory() {
+        let artifact_dir = unique_state_path().with_extension("jenkins-index-dir");
+        fs::create_dir_all(artifact_dir.join("logs")).unwrap();
+        fs::write(
+            artifact_dir.join("logs/index.json"),
+            r#"{
+                "jobs": [{
+                    "local_log_relative": "../outside.log",
+                    "jenkins_console": "https://jenkins.example/job/foo/1/console"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_jenkins_log_evidence(&artifact_dir).await.unwrap_err();
+        assert!(error.to_string().contains("unsafe relative path"));
+        fs::remove_dir_all(artifact_dir).unwrap();
     }
 
     #[test]
