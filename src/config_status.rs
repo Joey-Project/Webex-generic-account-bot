@@ -47,8 +47,13 @@ impl ConfigStatusSnapshot {
     pub fn markdown(&self) -> String {
         let revision = self.config_revision.as_deref().unwrap_or("unknown");
         let service = self.service.as_deref().unwrap_or("unknown");
+        let revision_label = if self.status.starts_with("failed_") {
+            "Attempted config revision"
+        } else {
+            "Config revision"
+        };
         format!(
-            "**Config deployment status**\n\n- State: `{}`\n- Config revision: `{revision}`\n- Service: `{service}`",
+            "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`\n- Service: `{service}`",
             self.status
         )
     }
@@ -334,6 +339,8 @@ mod tests {
             snapshot.config_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert!(snapshot.markdown().contains("Config revision:"));
+        assert!(!snapshot.markdown().contains("Attempted config revision:"));
         assert!(!snapshot.markdown().contains("must not leak"));
 
         let mut installed_without_restart = deployment_metadata(
@@ -360,14 +367,23 @@ mod tests {
         let provider = provider_in(&root);
         std_fs::write(
             &provider.status_file,
-            serde_json::to_vec(&deployment_metadata("failed_apply", None)).unwrap(),
+            serde_json::to_vec(&deployment_metadata(
+                "failed_apply",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
         )
         .unwrap();
 
         let snapshot = provider.status().await.unwrap();
 
         assert_eq!(snapshot.status, "failed_apply");
-        assert_eq!(snapshot.config_revision, None);
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(snapshot.markdown().contains("Attempted config revision:"));
+        assert!(!snapshot.markdown().contains("\n- Config revision:"));
         assert!(!snapshot.markdown().contains("must not leak"));
         std_fs::remove_dir_all(root).unwrap();
     }
