@@ -232,20 +232,56 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
         .filter(|status| DEPLOYMENT_STATUSES.contains(status))
         .ok_or_else(|| anyhow!("deployment status contains an invalid state"))?;
     let config_revision = match object.get("config_revision") {
-        None | Some(Value::Null) => None,
+        Some(Value::Null) => None,
         Some(Value::String(revision)) if valid_revision(revision) => Some(revision.clone()),
         _ => return Err(anyhow!("deployment status contains an invalid revision")),
     };
-    let service = object
-        .get("service")
-        .and_then(Value::as_str)
-        .filter(|service| *service == "webex-generic-account-bot")
-        .ok_or_else(|| anyhow!("deployment status contains an invalid service"))?;
+    for field in [
+        "config_repo",
+        "config_ref",
+        "bot_code_dir",
+        "rendered_config",
+        "deployed_at",
+    ] {
+        required_nonempty_string(object, field)?;
+    }
+    let service = required_nonempty_string(object, "service")?;
+    if service != "webex-generic-account-bot" {
+        return Err(anyhow!("deployment status contains an invalid service"));
+    }
+    let restart_skipped = object
+        .get("service_restart_skipped")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("deployment status contains an invalid service_restart_skipped"))?;
+    let valid_service_action = match (restart_skipped, object.get("service_action")) {
+        (true, Some(Value::Null)) => true,
+        (false, Some(Value::String(action))) if action == "restart" => true,
+        _ => false,
+    };
+    if !valid_service_action {
+        return Err(anyhow!(
+            "deployment status contains an invalid service_action"
+        ));
+    }
+    if status.starts_with("failed_") && !object.get("reason").is_some_and(Value::is_string) {
+        return Err(anyhow!("failed deployment status must contain a reason"));
+    }
     Ok(ConfigStatusSnapshot {
         status: status.to_owned(),
         config_revision,
         service: Some(service.to_owned()),
     })
+}
+
+fn required_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("deployment status contains an invalid {field}"))
 }
 
 fn valid_revision(revision: &str) -> bool {
@@ -274,7 +310,11 @@ mod tests {
         let provider = provider_in(&root);
         std_fs::write(
             &provider.status_file,
-            r#"{"status":"deployed","config_revision":"0123456789abcdef0123456789abcdef01234567","service":"webex-generic-account-bot","reason":"must not leak"}"#,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
         )
         .unwrap();
 
@@ -285,6 +325,26 @@ mod tests {
             snapshot.config_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert!(!snapshot.markdown().contains("must not leak"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepts_complete_failure_metadata_without_exposing_reason() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata("failed_apply", None)).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "failed_apply");
+        assert_eq!(snapshot.config_revision, None);
         assert!(!snapshot.markdown().contains("must not leak"));
         std_fs::remove_dir_all(root).unwrap();
     }
@@ -320,11 +380,21 @@ mod tests {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            r#"{"status":"deployed","service":"webex-generic-account-bot"}"#,
+        )
+        .unwrap();
+        assert!(provider.status().await.is_err());
         std_fs::write(&provider.status_file, r#"{"status":"unexpected"}"#).unwrap();
         assert!(provider.status().await.is_err());
         std_fs::write(
             &provider.status_file,
-            r#"{"status":"deployed","config_revision":"ABCDEF0123456789ABCDEF0123456789ABCDEF01","service":"webex-generic-account-bot"}"#,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert!(provider.status().await.is_err());
@@ -385,6 +455,22 @@ mod tests {
             status_file: root.join("status.json"),
             transaction_file: root.join("transaction.json"),
         }
+    }
+
+    fn deployment_metadata(status: &str, config_revision: Option<&str>) -> Value {
+        serde_json::json!({
+            "status": status,
+            "reason": "must not leak",
+            "config_repo": "git@github.com:example/config.git",
+            "config_ref": "main",
+            "config_revision": config_revision,
+            "bot_code_dir": "/opt/webex-generic-account-bot/code",
+            "rendered_config": "/var/lib/webex-generic-account-bot/rendered/production.toml",
+            "service": "webex-generic-account-bot",
+            "service_action": "restart",
+            "service_restart_skipped": false,
+            "deployed_at": "2026-06-27T00:00:00.000Z"
+        })
     }
 
     fn temp_root() -> PathBuf {
