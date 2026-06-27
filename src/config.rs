@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
-const WEBEX_REQUESTS_PER_ATTEMPT: u64 = 4;
+pub const DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES: usize = 3;
+const DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 2;
+const WEBEX_REQUESTS_PER_ATTEMPT: u64 =
+    DIRECT_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT + (DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES as u64 * 2);
 const FOLLOWUP_NON_PAGED_WEBEX_REQUESTS_PER_ATTEMPT: u64 = 3;
 pub const WEBEX_LIST_PAGE_SIZE: usize = 100;
 pub const FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES: usize = WEBEX_LIST_PAGE_SIZE;
@@ -1187,7 +1190,7 @@ room_id = "room-1"
 allow_all_senders = true
 
 [rooms.jenkins_context]
-script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+script = "/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 30
 max_urls = 3
@@ -1632,7 +1635,7 @@ room_id = "room-1"
 allow_all_senders = true
 
 [rooms.jenkins_context]
-script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+script = "/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs"
 env_file = "/etc/webex-generic-account-bot/jenkins.env"
 timeout_secs = 15
 max_urls = 2
@@ -1644,10 +1647,37 @@ output_limit_chars = 2048
         config.validate().unwrap();
         let jenkins_context = config.rooms[0].jenkins_context.as_ref().unwrap();
         assert!(jenkins_context.enabled);
+        assert_eq!(jenkins_context.node_bin, "node");
         assert!(jenkins_context.script.is_absolute());
         assert_eq!(jenkins_context.timeout_secs, 15);
         assert_eq!(jenkins_context.max_urls, 2);
         assert_eq!(jenkins_context.output_limit_chars, 2048);
+    }
+
+    #[test]
+    fn production_style_jenkins_context_keeps_helper_outside_codex_cwd() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 1200
+
+[codex]
+cwd = "/var/lib/webex-generic-account-bot/codex-workspace"
+codex_home = "/var/lib/webex-generic-account-bot/codex-home"
+skip_git_repo_check = true
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.jenkins_context]
+script = "/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs"
+env_file = "/etc/webex-generic-account-bot/jenkins.env"
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1673,6 +1703,9 @@ env_file = "/etc/webex-generic-account-bot/jenkins.env"
     fn rejects_jenkins_script_inside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [codex]
 cwd = "/srv/webex-bot/workspace"
 codex_home = "/srv/webex-bot/codex-home"
@@ -1696,6 +1729,9 @@ env_file = "/etc/webex-generic-account-bot/jenkins.env"
     fn rejects_jenkins_env_file_inside_codex_cwd() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 1200
+
 [codex]
 cwd = "/srv/webex-bot/workspace"
 codex_home = "/srv/webex-bot/codex-home"
@@ -1705,7 +1741,7 @@ room_id = "room-1"
 allow_all_senders = true
 
 [rooms.jenkins_context]
-script = "/opt/webex-generic-account-bot/scripts/jenkins-readonly.mjs"
+script = "/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs"
 env_file = "/srv/webex-bot/workspace/jenkins.env"
 "#,
         )

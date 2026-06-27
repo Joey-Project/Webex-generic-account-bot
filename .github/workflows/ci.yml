@@ -26,8 +26,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '24'
+      - name: Set up Rust for config contract tests
+        uses: dtolnay/rust-toolchain@stable
       - name: Run Node tests
-        run: node --test test/*.node-test.mjs
+        run: node test/run-node-tests.mjs
 
   rust:
     name: Rust
