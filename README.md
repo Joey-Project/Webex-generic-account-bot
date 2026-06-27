@@ -134,6 +134,7 @@ Trusted config deployment entrypoint:
 
 ```bash
 node scripts/deploy-config.mjs --dry-run
+node scripts/deploy-config.mjs --prepare
 node scripts/deploy-config.mjs --apply
 ```
 
@@ -156,12 +157,28 @@ dependency build scripts. The default paths match the staging deployment layout:
 - bot binary: `/opt/webex-generic-account-bot/bin/webex-generic-account-bot`
 - Codex workspace: `/var/lib/webex-generic-account-bot/codex-workspace`
 - rendered config: `/var/lib/webex-generic-account-bot/rendered/production.toml`
+- staged config: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged`
+- staged metadata: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged.json`
 - service: `webex-generic-account-bot`
+
+Use `--prepare` to fetch the fixed config ref, render and validate it, and
+durably publish an immutable staged artifact without replacing the live
+rendered config or invoking `systemctl`. The staged metadata binds the config
+revision, SHA-256 digest, fixed repo/ref, bot code path, live target path, and
+service. Its mode is `0600`; it is published only after the staged config is
+durable. Before replacing an older staged artifact, prepare removes and fsyncs
+the older metadata, so a crash or metadata commit failure cannot leave old
+metadata pointing at new config bytes. A pending or malformed install
+transaction makes prepare fail closed without attempting recovery or starting
+Git/render work. Preparation uses the same host-wide deployment lock and
+scrubbed fixed-argv execution as apply.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
+It still replaces the live rendered config and therefore is not equivalent to
+`--prepare` or `/config pull`.
 `--status` is a separate read-only operation and cannot be combined with apply,
-dry-run, or restart flags.
+prepare, dry-run, or restart flags.
 Normal apply renders and validates a candidate config first, installs it
 atomically, restarts the service, and restores the previous rendered config if
 `systemctl restart` fails, the unit is not active, or the loopback `/healthz`

@@ -19,8 +19,11 @@ superseded_by:
 - Trusted deployment entrypoint merged in bot PR #8.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
-  admin schema, read-only status) and PR 2b (durable external action worker for
-  pull/reload/sync). Mutating commands remain undeployable until PR 2b lands.
+  admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
+  2b2 (separate-worker durable queue and `/config pull`), and PR 2b3
+  (recoverable activation plus `/config reload` and `/config sync`). Mutating
+  commands remain undeployable until their corresponding backend lands.
+- Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -85,6 +88,30 @@ superseded_by:
 - Use the PR 1b deployment entrypoint as the backend, but do not synchronously reload the current bot from inside a Webex request handler.
 - Mutating commands must durably create or successfully hand off a status-tracked deployment action before acknowledging acceptance; if that cannot be guaranteed, they must remain status/dry-run only.
 - Include handoff failure, process-crash recovery, duplicate Webex event, and in-progress status tests so an accepted config command cannot be lost.
+
+#### PR 2b1: Immutable Staged Preparation
+- Add an explicit trusted prepare mode that fetches, renders, validates, and
+  durably records one immutable config revision without replacing the live
+  rendered config or touching the bot service.
+- Keep all mutating Webex commands undeployable in this slice.
+- Do not treat the existing install-without-restart mode as pull: it replaces
+  the live config and discards the cross-action rollback boundary.
+
+#### PR 2b2: Durable Pull Worker
+- Run a stable, separate deployment identity behind a host-owned Unix socket.
+  The bot may submit only an exact message ID and fixed action enum.
+- The worker must durably deduplicate and enqueue before acknowledging the bot,
+  recover queued/running work after restart, and invoke the trusted prepare
+  backend with fixed argv.
+- Enable `/config pull` only after socket authorization, queue durability,
+  duplicate-event, crash-recovery, fixed-argv, ownership, and symlink tests pass.
+
+#### PR 2b3: Recoverable Activation
+- Add activation of an already staged immutable revision without network fetch,
+  including deployment transaction recovery, health verification, rollback,
+  and explicit in-flight attempt/Codex-run drain or handoff semantics.
+- Enable `/config reload` and `/config sync` only after those guarantees and the
+  worker's target-revision persistence are tested.
 
 ### PR 3: Runner Backend Abstraction for Existing Isolation Config
 - Repository: `Joey-Project/Webex-generic-account-bot`.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -122,6 +122,7 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   const options = {
     ...DEFAULTS,
     apply: false,
+    prepare: false,
     dryRun: false,
     skipRestart: false,
     status: false,
@@ -136,6 +137,8 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
       options.help = true;
     } else if (arg === '--apply') {
       options.apply = true;
+    } else if (arg === '--prepare') {
+      options.prepare = true;
     } else if (arg === '--dry-run') {
       options.dryRun = true;
     } else if (arg === '--skip-restart' || arg === '--skip-reload') {
@@ -214,11 +217,13 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     }
   }
 
-  if (options.apply && options.dryRun) {
-    throw new UsageError('Use either --apply or --dry-run, not both.');
+  const executionModes = [options.apply, options.prepare, options.dryRun, options.status]
+    .filter(Boolean).length;
+  if (executionModes > 1) {
+    throw new UsageError('Use only one of --apply, --prepare, --dry-run, or --status.');
   }
-  if (options.status && (options.apply || options.dryRun || options.skipRestart)) {
-    throw new UsageError('--status cannot be combined with apply, dry-run, or restart options.');
+  if ((options.prepare || options.status) && options.skipRestart) {
+    throw new UsageError('--skip-restart cannot be used with --prepare or --status.');
   }
   validateHostOverrides(overrides, allowHostOverrides);
   options.hostOverrides = Object.freeze([...overrides]);
@@ -229,11 +234,13 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
 export function usage() {
   return `Usage:
   node scripts/deploy-config.mjs --dry-run
+  node scripts/deploy-config.mjs --prepare [--json]
   node scripts/deploy-config.mjs --apply [--skip-restart]
   node scripts/deploy-config.mjs --status [--json]
 
 Options:
       --apply                     Execute the fixed deployment plan.
+      --prepare                   Fetch, render, and validate an immutable staged config only.
       --dry-run                   Print the fixed deployment plan without running it.
       --status                    Print the last deployment metadata file when present.
       --skip-restart              Install config but do not restart the service.
@@ -266,6 +273,8 @@ export function buildDeployPlan(options) {
   const checkoutWorkDir = path.join(checkoutDir, 'work');
   const renderedConfig = path.resolve(options.renderedConfig);
   const candidateConfig = `${renderedConfig}.candidate`;
+  const stagedConfig = `${renderedConfig}.staged`;
+  const stagedMetadataFile = `${renderedConfig}.staged.json`;
   const backupConfig = `${renderedConfig}.previous`;
   const transactionFile = `${renderedConfig}.transaction`;
   const botCodeDir = path.resolve(options.botCodeDir);
@@ -405,6 +414,8 @@ export function buildDeployPlan(options) {
     checkoutWorkDir,
     renderedConfig,
     candidateConfig,
+    stagedConfig,
+    stagedMetadataFile,
     backupConfig,
     transactionFile,
     botCodeDir,
@@ -466,6 +477,17 @@ export async function runCli({
     }
 
     const plan = buildDeployPlan(options);
+    if (options.prepare) {
+      const result = await executePreparePlan({
+        plan,
+        parentEnv,
+        runner,
+        fsApi,
+        signal: deploymentSignal,
+      });
+      writePreparedStatus(stdout, result, options.json);
+      return 0;
+    }
     if (!options.apply || options.dryRun) {
       writePlan(stdout, plan, options.json);
       return 0;
@@ -513,6 +535,73 @@ export function installProcessSignalHandlers(processApi = process) {
       }
     },
   };
+}
+
+export async function executePreparePlan({
+  plan,
+  parentEnv = process.env,
+  runner = runCommand,
+  fsApi = fs,
+  signal = null,
+}) {
+  throwIfAborted(signal);
+  await assertPlanHasNoSymlinkAncestors(plan, fsApi);
+  throwIfAborted(signal);
+  const lockOwner = await acquireLock(plan.lockDir, fsApi);
+  const captures = {};
+  let primaryError = null;
+  let outputDirectoriesTrusted = false;
+  try {
+    await prepareTrustedOutputDirectories(plan, fsApi);
+    outputDirectoriesTrusted = true;
+    throwIfAborted(signal);
+    const transaction = await readInstallTransaction(plan, fsApi);
+    if (transaction) {
+      throw new Error(
+        `deployment recovery is required before preparing a new config revision: ${transaction.phase}`,
+      );
+    }
+    await prepareFreshCheckout(plan, fsApi, { removeBackup: false });
+    throwIfAborted(signal);
+    for (const commandSpec of plan.commands) {
+      const env = scrubEnv(parentEnv, commandSpec.env);
+      const result = await runner(commandSpec, env, signal);
+      throwIfAborted(signal);
+      if (commandSpec.capture) {
+        captures[commandSpec.capture] = result.stdout.trim();
+      }
+    }
+    assertConfigRevision(captures.configRevision);
+    return await storePreparedConfig(plan, captures.configRevision, fsApi);
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    let cleanupError = null;
+    if (outputDirectoriesTrusted) {
+      try {
+        await removeIfPresent(plan.candidateConfig, fsApi);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    try {
+      await verifyLockForRelease(plan.lockDir, lockOwner, fsApi);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      await closeLock(lockOwner);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (cleanupError) {
+      const reason = primaryError
+        ? `${primaryError.message}; prepare cleanup failed: ${cleanupError.message}`
+        : `prepare cleanup failed: ${cleanupError.message}`;
+      throw new Error(reason);
+    }
+  }
 }
 
 export async function executePlan({
@@ -1303,6 +1392,8 @@ function writePlan(stdout, plan, json) {
   stdout.write(`checkout_work_dir=${plan.checkoutWorkDir}\n`);
   stdout.write(`rendered_config=${plan.renderedConfig}\n`);
   stdout.write(`candidate_config=${plan.candidateConfig}\n`);
+  stdout.write(`staged_config=${plan.stagedConfig}\n`);
+  stdout.write(`staged_metadata_file=${plan.stagedMetadataFile}\n`);
   stdout.write(`transaction_file=${plan.transactionFile}\n`);
   for (const [index, commandSpec] of allPlanCommands(plan).entries()) {
     const invocation = commandInvocation(commandSpec);
@@ -1321,6 +1412,17 @@ function writeStatus(stdout, metadata, json) {
   stdout.write(`service=${metadata.service}\n`);
 }
 
+function writePreparedStatus(stdout, metadata, json) {
+  if (json) {
+    stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
+    return;
+  }
+  stdout.write(`status=${metadata.status}\n`);
+  stdout.write(`config_revision=${metadata.config_revision}\n`);
+  stdout.write(`staged_config=${metadata.staged_config}\n`);
+  stdout.write(`config_sha256=${metadata.config_sha256}\n`);
+}
+
 function serialisablePlan(plan) {
   return {
     config_repo: plan.configRepo,
@@ -1329,6 +1431,8 @@ function serialisablePlan(plan) {
     checkout_work_dir: plan.checkoutWorkDir,
     rendered_config: plan.renderedConfig,
     candidate_config: plan.candidateConfig,
+    staged_config: plan.stagedConfig,
+    staged_metadata_file: plan.stagedMetadataFile,
     transaction_file: plan.transactionFile,
     bot_code_dir: plan.botCodeDir,
     bot_bin: plan.botBin,
@@ -1471,7 +1575,7 @@ function hostOverridesAllowed(parentEnv) {
   return parentEnv?.[HOST_OVERRIDE_ENV] === '1';
 }
 
-async function prepareFreshCheckout(plan, fsApi) {
+async function prepareFreshCheckout(plan, fsApi, { removeBackup = true } = {}) {
   assertManagedSubpath(plan.checkoutWorkDir, plan.checkoutDir, 'checkout work directory');
   await fsApi.mkdir(plan.checkoutDir, { recursive: true, mode: 0o700 });
   const checkoutStat = await fsApi.lstat(plan.checkoutDir);
@@ -1479,7 +1583,9 @@ async function prepareFreshCheckout(plan, fsApi) {
   await fsApi.rm(plan.checkoutWorkDir, { recursive: true, force: true });
   await fsApi.mkdir(plan.checkoutWorkDir, { recursive: true, mode: 0o700 });
   await removeIfPresent(plan.candidateConfig, fsApi);
-  await removeIfPresent(plan.backupConfig, fsApi);
+  if (removeBackup) {
+    await removeIfPresent(plan.backupConfig, fsApi);
+  }
 }
 
 async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
@@ -1648,6 +1754,70 @@ async function createDirectoryDurably(directory, mode, fsApi) {
     await syncDirectory(current, fsApi);
     current = child;
   }
+}
+
+async function storePreparedConfig(plan, configRevision, fsApi) {
+  const candidateStat = await fsApi.lstat(plan.candidateConfig);
+  if (!candidateStat.isFile() || candidateStat.isSymbolicLink()) {
+    throw new Error(`candidate config must be a regular file: ${plan.candidateConfig}`);
+  }
+
+  let mode = 0o644;
+  try {
+    const currentStat = await fsApi.lstat(plan.renderedConfig);
+    if (!currentStat.isFile() || currentStat.isSymbolicLink()) {
+      throw new Error(`rendered config must be a regular file when present: ${plan.renderedConfig}`);
+    }
+    assertSafeRenderedConfigMetadata(plan.renderedConfig, currentStat);
+    mode = currentStat.mode & 0o777;
+    if (candidateStat.uid !== currentStat.uid || candidateStat.gid !== currentStat.gid) {
+      await fsApi.chown(plan.candidateConfig, currentStat.uid, currentStat.gid);
+    }
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+  await fsApi.chmod(plan.candidateConfig, mode);
+  await syncFile(plan.candidateConfig, fsApi);
+  const contents = await fsApi.readFile(plan.candidateConfig);
+  const configSha256 = createHash('sha256').update(contents).digest('hex');
+
+  await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
+  await fsApi.rename(plan.candidateConfig, plan.stagedConfig);
+  await syncDirectory(path.dirname(plan.stagedConfig), fsApi);
+  const stagedStat = await fsApi.lstat(plan.stagedConfig);
+  if (!stagedStat.isFile() || stagedStat.isSymbolicLink()) {
+    throw new Error(`staged config must be a regular file: ${plan.stagedConfig}`);
+  }
+  assertSafeRenderedConfigMetadata(plan.stagedConfig, stagedStat);
+
+  const metadata = {
+    version: 1,
+    status: 'prepared',
+    config_repo: plan.configRepo,
+    config_ref: plan.configRef,
+    config_revision: configRevision,
+    config_sha256: configSha256,
+    bot_code_dir: plan.botCodeDir,
+    rendered_config: plan.renderedConfig,
+    staged_config: plan.stagedConfig,
+    service: plan.service,
+    prepared_at: new Date().toISOString(),
+  };
+  try {
+    await writeMetadataAtomically(plan.stagedMetadataFile, metadata, fsApi, { mode: 0o600 });
+  } catch (error) {
+    try {
+      await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
+    } catch (cleanupError) {
+      throw new Error(
+        `${error.message}; failed to remove incomplete staged metadata: ${cleanupError.message}`,
+      );
+    }
+    throw error;
+  }
+  return metadata;
 }
 
 async function installCandidateConfig(plan, configRevision, fsApi) {
@@ -2150,6 +2320,8 @@ function assertSafePlanPathTopology(plan) {
   const outputPaths = [
     ['rendered config', path.resolve(plan.renderedConfig)],
     ['candidate config', path.resolve(plan.candidateConfig)],
+    ['staged config', path.resolve(plan.stagedConfig)],
+    ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
     ['backup config', path.resolve(plan.backupConfig)],
     ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
