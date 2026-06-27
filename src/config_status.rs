@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::DateTime;
 use serde_json::Value;
 use tokio::{fs, io::AsyncReadExt, task, time::timeout};
 
@@ -365,8 +366,13 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
             "deployment transaction has an invalid backup state"
         ));
     }
-    for field in ["config_repo", "config_ref", "started_at"] {
-        required_nonempty_string(object, field)?;
+    let config_repo = required_nonempty_string(object, "config_repo")?;
+    if !valid_config_repo(config_repo) {
+        return Err(anyhow!("deployment transaction has an invalid config_repo"));
+    }
+    let config_ref = required_nonempty_string(object, "config_ref")?;
+    if !valid_config_ref(config_ref) {
+        return Err(anyhow!("deployment transaction has an invalid config_ref"));
     }
     for field in ["bot_code_dir", "rendered_config", "metadata_file"] {
         let path = required_nonempty_string(object, field)?;
@@ -374,8 +380,13 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
             return Err(anyhow!("deployment transaction has an invalid {field}"));
         }
     }
+    let started_at = required_nonempty_string(object, "started_at")?;
+    if DateTime::parse_from_rfc3339(started_at).is_err() {
+        return Err(anyhow!("deployment transaction has an invalid start time"));
+    }
     match (phase, object.get("committed_at")) {
-        ("committed_pending_metadata", Some(Value::String(value))) if !value.is_empty() => {}
+        ("committed_pending_metadata", Some(Value::String(value)))
+            if DateTime::parse_from_rfc3339(value).is_ok() => {}
         ("committed_pending_metadata", _) => {
             return Err(anyhow!("deployment transaction has an invalid commit time"));
         }
@@ -417,6 +428,37 @@ fn is_normal_absolute_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+fn valid_config_repo(value: &str) -> bool {
+    let remainder = value
+        .strip_prefix("git@github.com:")
+        .or_else(|| value.strip_prefix("https://github.com/"));
+    let Some(path) = remainder.and_then(|value| value.strip_suffix(".git")) else {
+        return false;
+    };
+    let Some((owner, repository)) = path.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !repository.is_empty()
+        && !repository.contains('/')
+        && [owner, repository]
+            .into_iter()
+            .all(|part| part.bytes().all(is_repo_character))
+}
+
+fn is_repo_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+fn valid_config_ref(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains("..")
+        && !value.starts_with(['/', '-'])
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
 }
 
 #[cfg(all(test, unix))]
@@ -543,6 +585,23 @@ mod tests {
             vec![b'x'; STATUS_FILE_MAX_BYTES as usize + 1],
         ] {
             std_fs::write(&provider.transaction_file, contents).unwrap();
+            let snapshot = provider.status().await.unwrap();
+            assert_eq!(snapshot.status, "recovery_required");
+            assert_eq!(snapshot.config_revision, None);
+            assert_eq!(snapshot.transaction_phase, None);
+        }
+        let mut invalid_repo = deployment_transaction();
+        invalid_repo["config_repo"] = Value::String("https://example.com/config.git".to_owned());
+        let mut invalid_ref = deployment_transaction();
+        invalid_ref["config_ref"] = Value::String("../main".to_owned());
+        let mut invalid_time = deployment_transaction();
+        invalid_time["started_at"] = Value::String("not-a-timestamp".to_owned());
+        for transaction in [invalid_repo, invalid_ref, invalid_time] {
+            std_fs::write(
+                &provider.transaction_file,
+                serde_json::to_vec(&transaction).unwrap(),
+            )
+            .unwrap();
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);

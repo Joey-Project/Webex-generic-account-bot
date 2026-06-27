@@ -541,11 +541,11 @@ export async function executePlan({
     reason,
     configRevision = captures.configRevision || null,
   ) => {
+    recordedFailureStatus = status;
+    recordedFailureConfigRevision = configRevision;
     try {
       await writeFailureMetadata(plan, configRevision, status, reason, fsApi);
       failureMetadataWritten = true;
-      recordedFailureStatus = status;
-      recordedFailureConfigRevision = configRevision;
     } catch (error) {
       failureMetadataError = error;
       throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);

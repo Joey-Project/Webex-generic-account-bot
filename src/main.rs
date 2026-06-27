@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
         state: Mutex::new(state_store),
         runner: Arc::new(ExecCodexRunner),
         config_status: Arc::new(FileConfigStatusProvider::default()),
+        hydration_not_found_once: Mutex::new(HashSet::new()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
     });
 
@@ -145,6 +146,7 @@ struct BotApp {
     state: Mutex<JsonlStateStore>,
     runner: Arc<dyn CodexRunner>,
     config_status: Arc<dyn ConfigStatusProvider>,
+    hydration_not_found_once: Mutex<HashSet<String>>,
     request_slots: Arc<Semaphore>,
 }
 
@@ -1497,6 +1499,10 @@ impl BotApp {
                     .await;
             }
         };
+        self.hydration_not_found_once
+            .lock()
+            .await
+            .remove(&message_id);
         if message.id.as_deref() != Some(message_id.as_str()) {
             self.mark_processed(&attempt).await?;
             return Ok(BotAction::ignored(
@@ -2228,12 +2234,29 @@ impl BotApp {
         error: WebexCallError,
     ) -> Result<BotAction, HttpError> {
         if webex_call_is_not_found(&error) {
-            self.defer_attempt(attempt, EVENT_HYDRATION_NOT_FOUND_RETRY)
-                .await?;
-            return Err(HttpError::retry_after(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("message {message_id} is not yet available from Webex"),
-                EVENT_HYDRATION_NOT_FOUND_RETRY,
+            let first_not_found = self
+                .hydration_not_found_once
+                .lock()
+                .await
+                .insert(message_id.to_owned());
+            if first_not_found {
+                self.defer_attempt(attempt, EVENT_HYDRATION_NOT_FOUND_RETRY)
+                    .await?;
+                return Err(HttpError::retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("message {message_id} is not yet available from Webex"),
+                    EVENT_HYDRATION_NOT_FOUND_RETRY,
+                ));
+            }
+            self.hydration_not_found_once
+                .lock()
+                .await
+                .remove(message_id);
+            self.mark_processed(attempt).await?;
+            return Ok(BotAction::ignored(
+                "message_unavailable",
+                Some(message_id.to_owned()),
+                None,
             ));
         }
         match classify_webex_failure(&error, self.config.server.attempt_lease()) {
@@ -3903,6 +3926,43 @@ mod tests {
         assert!(!harness.processed("eventual-message").await);
         assert!(harness.runner.calls().is_empty());
         assert!(harness.webex.created_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_initial_hydration_not_found_stops_retrying() {
+        let harness = TestHarness::new();
+        harness
+            .app
+            .hydration_not_found_once
+            .lock()
+            .await
+            .insert("missing-message".to_owned());
+        harness
+            .webex
+            .push_event_message(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(404, None),
+            )))));
+
+        let action = harness
+            .app
+            .process_event(message_event(inbound_message(
+                "missing-message",
+                "sidecar body",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(action.action, "ignored");
+        assert_eq!(action.reason.as_deref(), Some("message_unavailable"));
+        assert!(harness.processed("missing-message").await);
+        assert!(
+            !harness
+                .app
+                .hydration_not_found_once
+                .lock()
+                .await
+                .contains("missing-message")
+        );
     }
 
     #[tokio::test]
@@ -6974,6 +7034,7 @@ mod tests {
                 state: Mutex::new(state),
                 runner: runner.clone(),
                 config_status: config_status.clone(),
+                hydration_not_found_once: Mutex::new(HashSet::new()),
                 request_slots: Arc::new(Semaphore::new(4)),
             };
             Self {

@@ -3054,6 +3054,9 @@ describe('deploy-config CLI and execution', () => {
             await fs.writeFile(plan.candidateConfig, 'stale candidate\n', 'utf8');
             throw new Error('recovered metadata update failed');
           }
+          if (metadataRenames === 3) {
+            throw new Error('failure metadata write failed');
+          }
         }
         return await fs.rename(source, target);
       },
