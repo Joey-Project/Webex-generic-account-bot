@@ -353,6 +353,62 @@ describe('trusted config policy', () => {
     }
   });
 
+  it('validates the rendered production policy with the bot config checker', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'validate-config-contract-test-'));
+    const sourceRoot = path.join(temp, 'source');
+    const output = path.join(temp, 'rendered', 'production.toml');
+    const rendered = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    const firstRoom = rendered.indexOf('[[rooms]]');
+    assert.notEqual(firstRoom, -1);
+    await fs.mkdir(path.join(sourceRoot, 'production', 'spaces'), { recursive: true });
+    await fs.writeFile(
+      path.join(sourceRoot, 'production', 'bot.toml'),
+      rendered.slice(0, firstRoom),
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(sourceRoot, 'production', 'spaces', 'rooms.toml'),
+      rendered.slice(firstRoom),
+      'utf8',
+    );
+
+    const result = spawnSync(
+      '/usr/bin/bash',
+      [
+        'scripts/config-policy/validate-config.sh',
+        '--source-root',
+        sourceRoot,
+        '--env',
+        'production',
+        '--out',
+        output,
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        timeout: 180_000,
+        env: {
+          ...process.env,
+          WEBEX_BOT_CODE_DIR: process.cwd(),
+          NODE_BIN: process.execPath,
+          PYTHON_BIN: '/usr/bin/python3',
+          CARGO_BIN: process.env.CARGO_BIN || path.join(
+            process.env.CARGO_HOME || path.join(os.homedir(), '.cargo'),
+            'bin',
+            'cargo',
+          ),
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /rendered_config=/);
+    assert.match(await fs.readFile(output, 'utf8'), /attempt_lease_secs = 3600/);
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
   it('rejects rooms that are not explicitly allowlisted by host policy', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
     const config = path.join(temp, 'unexpected-room.toml');
@@ -1083,7 +1139,7 @@ describe('trusted config policy', () => {
     );
   });
 
-  it('ignores malformed Jenkins API build numbers without losing root evidence', async () => {
+  it('ignores malformed Jenkins API graph metadata without losing root evidence', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jenkins-bundle-test-'));
     await withMockedJenkinsFetch(
       {
@@ -1098,7 +1154,10 @@ describe('trusted config policy', () => {
                 { upstreamUrl: '/manage', upstreamBuild: 1 },
                 { upstreamUrl: 'https://evil.example/job/upstream/', upstreamBuild: 2 },
               ],
-              builds: [{ jobName: 'broken-child', buildNumberStr: 'N/A', result: 'FAILURE' }],
+              builds: [
+                { jobName: 'broken-child', buildNumberStr: 'N/A', result: 'FAILURE' },
+                { jobName: `oversized-${'x'.repeat(5000)}`, buildNumber: 2, result: 'FAILURE' },
+              ],
             },
           ],
           artifacts: [],
@@ -2648,7 +2707,7 @@ health_path = "/healthz"
 sidecar_token_env = "WEBEX_SIDECAR_TOKEN"
 allow_unauthenticated = false
 max_concurrent_requests = 4
-attempt_lease_secs = 1200
+attempt_lease_secs = 3600
 
 [webex]
 access_token_file = "/var/lib/webex-headless-access/access-token"

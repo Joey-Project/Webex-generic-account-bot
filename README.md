@@ -53,6 +53,8 @@ requires `server.attempt_lease_secs` to cover the Codex timeout, Jenkins
 prefetch timeout budget, and Webex request margin. Codex then summarises the
 prefetched evidence without needing network access to Jenkins from inside its
 sandbox.
+Production host policy pins this lease to 3600 seconds and validates the
+rendered policy with the bot's `--check-config` contract before installation.
 Trusted deployment policy rejects Jenkins helper paths under the config checkout;
 the helper must be installed with the bot code.
 

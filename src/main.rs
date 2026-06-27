@@ -409,20 +409,24 @@ async fn jenkins_context_prompt(
         return Ok(None);
     }
 
-    ensure_jenkins_artifact_base_root(&codex_config.cwd)
+    let process_root = ensure_jenkins_artifact_base_root(&codex_config.cwd)
         .await
         .with_context(|| "failed to prepare Jenkins diagnostics artifact root")?;
-    prune_jenkins_artifact_dirs(&codex_config.cwd)
-        .await
-        .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
+    prune_jenkins_artifact_process_roots_in(
+        process_root
+            .parent()
+            .ok_or_else(|| anyhow!("Jenkins diagnostics process root has no parent"))?,
+        &process_root,
+    )
+    .await
+    .with_context(|| "failed to prune old Jenkins diagnostics artifact dirs")?;
 
-    let artifact_root = jenkins_artifact_attempt_dir(&codex_config.cwd, &context.message_id);
-    create_private_dir(&artifact_root).await.with_context(|| {
-        format!(
-            "failed to create Jenkins diagnostics artifact root {}",
-            artifact_root.display()
-        )
-    })?;
+    let artifact_root = create_private_subdirectory(
+        &process_root,
+        &jenkins_artifact_attempt_dir(&process_root, &context.message_id),
+    )
+    .await
+    .with_context(|| "failed to create Jenkins diagnostics artifact root")?;
     register_jenkins_artifact_dir(&artifact_root);
 
     let mut sections = Vec::new();
@@ -434,13 +438,13 @@ async fn jenkins_context_prompt(
     );
     let build_result: Result<String> = async {
         for (index, url) in urls.into_iter().enumerate() {
-            let artifact_dir = jenkins_artifact_dir(&artifact_root, index + 1);
-            reset_jenkins_artifact_dir(&artifact_dir)
+            let artifact_path = jenkins_artifact_dir(&artifact_root, index + 1);
+            let artifact_dir = reset_jenkins_artifact_dir(&artifact_root, &artifact_path)
                 .await
                 .with_context(|| {
                     format!(
                         "failed to reset Jenkins diagnostics artifact dir {}",
-                        artifact_dir.display()
+                        artifact_path.display()
                     )
                 })?;
             let output = run_jenkins_context_helper(config, &url, &artifact_dir).await?;
@@ -562,33 +566,140 @@ async fn load_jenkins_log_evidence(artifact_dir: &Path) -> Result<Vec<(String, P
     Ok(evidence)
 }
 
-async fn reset_jenkins_artifact_dir(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
+async fn reset_jenkins_artifact_dir(root: &Path, path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!(
+                "Jenkins artifact directory must not be a symlink: {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(path).await.with_context(|| {
                 format!(
                     "failed to remove existing Jenkins artifact dir {}",
                     path.display()
                 )
-            });
+            })?;
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "Jenkins artifact path must be a directory: {}",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
         }
     }
-    create_private_dir(path).await.with_context(|| {
-        format!(
-            "failed to create Jenkins diagnostics artifact dir {}",
-            path.display()
-        )
-    })?;
-    Ok(())
+    create_private_subdirectory(root, path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create Jenkins diagnostics artifact dir {}",
+                path.display()
+            )
+        })
 }
 
-async fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
+async fn create_private_subdirectory(root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = absolute_lexical(root);
+    let path = absolute_lexical(path);
+    let relative = path.strip_prefix(&root).with_context(|| {
+        format!(
+            "private directory {} must remain under {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(anyhow!(
+            "private directory must be a normal descendant of {}: {}",
+            root.display(),
+            path.display()
+        ));
+    }
+
+    let root_metadata = fs::symlink_metadata(&root)
         .await
-        .with_context(|| format!("failed to create directory {}", path.display()))?;
-    set_private_dir_permissions(path).await
+        .with_context(|| format!("failed to stat private directory root {}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(anyhow!(
+            "private directory root must be a real directory: {}",
+            root.display()
+        ));
+    }
+    let canonical_root = fs::canonicalize(&root).await.with_context(|| {
+        format!(
+            "failed to resolve private directory root {}",
+            root.display()
+        )
+    })?;
+
+    let mut current = root;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            unreachable!("relative path components were validated above");
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "private directory path must not contain symlinks: {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(anyhow!(
+                    "private directory path component is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to create directory {}", current.display())
+                        });
+                    }
+                }
+                let metadata = fs::symlink_metadata(&current).await.with_context(|| {
+                    format!("failed to verify created directory {}", current.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(anyhow!(
+                        "created private path is not a real directory: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat directory {}", current.display()));
+            }
+        }
+        set_private_dir_permissions(&current).await?;
+    }
+
+    let canonical_path = fs::canonicalize(&current)
+        .await
+        .with_context(|| format!("failed to resolve private directory {}", current.display()))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(anyhow!(
+            "private directory escaped {}: {}",
+            canonical_root.display(),
+            canonical_path.display()
+        ));
+    }
+    Ok(canonical_path)
 }
 
 async fn set_private_dir_permissions(path: &Path) -> Result<()> {
@@ -731,6 +842,7 @@ fn jenkins_fetch_timeout_seconds(helper_timeout_secs: u64) -> u64 {
     (retry_budget / request_slots).clamp(1, JENKINS_FETCH_TIMEOUT_MAX_SECS)
 }
 
+#[cfg(test)]
 async fn prune_jenkins_artifact_dirs(codex_cwd: &Path) -> Result<()> {
     prune_jenkins_artifact_process_roots_in(
         &jenkins_artifact_base_root(codex_cwd),
@@ -848,13 +960,8 @@ async fn prune_jenkins_artifact_dirs_in(root: &Path) -> Result<()> {
 }
 
 async fn ensure_jenkins_artifact_base_root(codex_cwd: &Path) -> Result<PathBuf> {
-    let codex_tmp_root = absolute_lexical(codex_cwd).join(".codex-tmp");
-    let base_root = jenkins_artifact_base_root(codex_cwd);
     let process_root = jenkins_artifact_process_root(codex_cwd);
-    create_private_dir(&codex_tmp_root).await?;
-    create_private_dir(&base_root).await?;
-    create_private_dir(&process_root).await?;
-    Ok(process_root)
+    create_private_subdirectory(codex_cwd, &process_root).await
 }
 
 fn jenkins_artifact_base_root(codex_cwd: &Path) -> PathBuf {
@@ -913,13 +1020,13 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     }
 }
 
-fn jenkins_artifact_attempt_dir(codex_cwd: &Path, message_id: &str) -> PathBuf {
+fn jenkins_artifact_attempt_dir(process_root: &Path, message_id: &str) -> PathBuf {
     let counter = JENKINS_ARTIFACT_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_nanos();
-    jenkins_artifact_process_root(codex_cwd).join(format!(
+    process_root.join(format!(
         "{}-{nanos}-{counter}-{}",
         std::process::id(),
         safe_path_fragment(message_id)
@@ -5349,9 +5456,9 @@ mod tests {
     #[test]
     fn jenkins_artifact_attempt_dirs_are_unique_workspace_paths() {
         let codex_cwd = unique_state_path().with_extension("codex-cwd");
-        let first = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
-        let second = jenkins_artifact_attempt_dir(&codex_cwd, "message-1");
         let process_root = jenkins_artifact_process_root(&codex_cwd);
+        let first = jenkins_artifact_attempt_dir(&process_root, "message-1");
+        let second = jenkins_artifact_attempt_dir(&process_root, "message-1");
 
         assert_ne!(first, second);
         assert!(first.is_absolute());
@@ -5387,13 +5494,15 @@ mod tests {
     async fn create_private_jenkins_artifact_dirs_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = unique_state_path().with_extension("jenkins-private-dir");
+        let root = unique_state_path().with_extension("jenkins-private-root");
+        let dir = root.join("nested/private");
+        fs::create_dir_all(&root).unwrap();
 
-        create_private_dir(&dir).await.unwrap();
+        let canonical = create_private_subdirectory(&root, &dir).await.unwrap();
 
-        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(&canonical).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
-        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -5402,6 +5511,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let codex_cwd = unique_state_path().with_extension("codex-cwd");
+        fs::create_dir_all(&codex_cwd).unwrap();
         let codex_tmp_root = absolute_lexical(&codex_cwd).join(".codex-tmp");
         let base_root = jenkins_artifact_base_root(&codex_cwd);
         let process_root = ensure_jenkins_artifact_base_root(&codex_cwd).await.unwrap();
@@ -5411,6 +5521,45 @@ mod tests {
             assert_eq!(mode, 0o700, "unexpected mode for {}", path.display());
         }
         fs::remove_dir_all(codex_cwd).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_jenkins_artifact_root_rejects_symlinked_tmp_ancestor() {
+        let root = unique_state_path().with_extension("jenkins-symlink-root");
+        let codex_cwd = root.join("codex-cwd");
+        let outside = root.join("outside");
+        fs::create_dir_all(&codex_cwd).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, codex_cwd.join(".codex-tmp")).unwrap();
+
+        let error = ensure_jenkins_artifact_base_root(&codex_cwd)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not contain symlinks"));
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_jenkins_artifact_root_rejects_nested_symlink_ancestor() {
+        let root = unique_state_path().with_extension("jenkins-nested-symlink-root");
+        let codex_cwd = root.join("codex-cwd");
+        let codex_tmp = codex_cwd.join(".codex-tmp");
+        let outside = root.join("outside");
+        fs::create_dir_all(&codex_tmp).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, codex_tmp.join("jenkins-diagnostics")).unwrap();
+
+        let error = ensure_jenkins_artifact_base_root(&codex_cwd)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not contain symlinks"));
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -5462,8 +5611,10 @@ mod tests {
 
     #[tokio::test]
     async fn jenkins_artifact_cleanup_guard_removes_artifacts_on_drop() {
-        let dir = unique_state_path().with_extension("jenkins-drop-guard");
-        create_private_dir(&dir).await.unwrap();
+        let root = unique_state_path().with_extension("jenkins-drop-root");
+        let dir = root.join("jenkins-drop-guard");
+        fs::create_dir_all(&root).unwrap();
+        create_private_subdirectory(&root, &dir).await.unwrap();
         register_jenkins_artifact_dir(&dir);
 
         {
@@ -5483,6 +5634,7 @@ mod tests {
                 .unwrap()
                 .contains(&dir)
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5737,7 +5889,9 @@ mod tests {
         let script = helper_dir.join("helper.sh");
         let env_file = helper_dir.join("jenkins.env");
         let artifact_dir = helper_dir.join("artifacts");
-        create_private_dir(&artifact_dir).await.unwrap();
+        create_private_subdirectory(&helper_dir, &artifact_dir)
+            .await
+            .unwrap();
         fs::write(
             &script,
             "artifact_dir=\n\

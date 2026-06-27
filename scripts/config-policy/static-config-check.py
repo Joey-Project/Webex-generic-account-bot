@@ -250,7 +250,7 @@ class Validator:
         self.require_equal(server, "server", "sidecar_token_env", "WEBEX_SIDECAR_TOKEN")
         self.require_equal(server, "server", "allow_unauthenticated", False)
         self.expect_int_range(server, "server", "max_concurrent_requests", 1, 8, required=True)
-        self.expect_int_range(server, "server", "attempt_lease_secs", 900, 7200, required=True)
+        self.require_equal(server, "server", "attempt_lease_secs", 3600)
 
     def validate_webex(self, webex: dict[str, Any]) -> None:
         self.expect_keys(webex, "webex", ALLOWED_WEBEX_KEYS)

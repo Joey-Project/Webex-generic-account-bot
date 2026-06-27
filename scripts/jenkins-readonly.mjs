@@ -588,7 +588,11 @@ function structuredBuildUrl(candidate, baseUrl) {
   url.pathname = `/${[...baseParts, ...jobParts, encodeURIComponent(number)].join('/')}/`;
   url.search = '';
   url.hash = '';
-  return url.toString();
+  try {
+    return buildUrlFromJenkinsUrl(url.toString(), baseUrl).toString();
+  } catch (_) {
+    return null;
+  }
 }
 
 function structuredBuildNumber(candidate) {

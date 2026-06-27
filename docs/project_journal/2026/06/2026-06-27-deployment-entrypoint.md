@@ -106,15 +106,25 @@ superseded_by:
 - Jenkins diagnosis and follow-up prompts must match full host-owned normalized
   template hashes; fragment-preserving instruction injection is rejected.
 - Host policy pins `/usr/bin/node`, the helper `PATH`, the global Codex model,
-  and Jenkins timeout/fan-out/output values. Jenkins-format replies fail closed
-  unless at least one non-empty local log was written; only those nodes enter
-  the URL allowlist. Excerpts require the model's own log URL to match that
-  allowlist and the sanitized excerpt text to occur verbatim in the mapped local
-  log; they are dropped when the renderer uses a single-log fallback link.
+  a 3600-second attempt lease, and Jenkins timeout/fan-out/output values. The
+  complete rendered production fixture is also exercised through the trusted
+  validation script and the bot's `--check-config` contract. Jenkins-format
+  replies fail closed unless at least one non-empty local log was written; only
+  those nodes enter the URL allowlist. Excerpts require the model's own log URL
+  to match that allowlist and the sanitized excerpt text to occur verbatim in
+  the mapped local log; they are dropped when the renderer uses a single-log
+  fallback link.
 - Failure metadata write errors are surfaced together with the primary apply
   error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a
   missing or oversized root log does not prevent traversal to downstream jobs.
+- Jenkins artifact directories are created one path component at a time under
+  the canonical Codex workspace. Existing symlink or non-directory ancestors
+  fail closed, and runtime consumers use the canonical path returned by that
+  check.
+- Structured Jenkins child URLs are passed back through the same controller,
+  build-path, and URL-size validator as message URLs. Oversized or malformed
+  child metadata is ignored without losing collected root evidence.
 
 ## Follow-Ups
 - Wire fixed Webex admin commands to this entrypoint in the next PR.
