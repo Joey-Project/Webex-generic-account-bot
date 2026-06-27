@@ -141,12 +141,24 @@ metadata error; an existing status file must then be treated as stale. The
 candidate file and rendered-config directory are fsynced before success metadata
 is committed, so `status=deployed` cannot become more durable than the installed
 config. A post-rename durability failure restores the previous config before
-returning. If metadata writing or cleanup fails after the new config has been
-installed and the service restart has succeeded, the entrypoint records a
-post-commit failure state when possible instead of implying the apply was rolled
-back. Cleanup details are added without replacing an earlier, more specific
-failure status. Status output, including `--status --json`, validates the status
-schema and rejects malformed or incomplete metadata.
+returning. Before replacing the live config, the entrypoint writes and fsyncs a
+mode `0600` transaction journal beside it. The journal advances through
+`prepared`, `service_transition_started`, and `committed_pending_metadata`, and
+remains until success metadata is durable. After an unclean exit, the next apply
+either restores the preserved backup without consuming it or finalises metadata
+for an already committed service. Required rollback restarts and verifies an old
+service; a failed first deployment is restored by stopping the service after its
+config is removed. Journal removal is fsynced before deleting the backup or
+starting a new checkout. A malformed journal fails closed and preserves the live
+config, backup, and journal for inspection; `--skip-restart` cannot bypass a
+pending service recovery. If metadata writing or cleanup fails after the new
+config has been installed and the service restart has succeeded, the entrypoint
+records a post-commit failure state when possible instead of implying the apply
+was rolled back. While any journal remains, `--status` returns
+`recovery_required` instead of stale deployment metadata. Cleanup details are
+added without replacing an earlier, more specific failure status. Status output,
+including `--status --json`, validates the status schema and rejects malformed or
+incomplete metadata.
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,
 validation, or restart cannot hold the deployment lock forever. The lock stores

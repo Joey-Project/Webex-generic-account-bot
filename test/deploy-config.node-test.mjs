@@ -110,6 +110,7 @@ describe('deploy-config plan', () => {
     const allGitCommands = plan.commands.filter((command) => command.bin === '/usr/bin/git');
 
     assert.equal(plan.checkoutWorkDir, path.join(plan.checkoutDir, 'work'));
+    assert.equal(plan.transactionFile, `${plan.renderedConfig}.transaction`);
     assert.deepEqual(commands[0], ['/usr/bin/git', ['-c', 'advice.detachedHead=false', '-c', 'core.hooksPath=/dev/null', '-c', 'filter.lfs.required=false', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'init', plan.checkoutWorkDir]]);
     assert.deepEqual(commands[2], [
       '/usr/bin/git',
@@ -136,6 +137,8 @@ describe('deploy-config plan', () => {
     assert(commands.some(([bin, args]) => bin === '/usr/bin/bash' && args.includes('--source-root')));
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
+    assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
+    assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
     assert.deepEqual(
       plan.serviceVerificationCommands.map((command) => [command.bin, command.args]),
       [
@@ -1559,6 +1562,60 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(stdout).status, 'installed_without_restart');
   });
 
+  it('reports recovery_required instead of stale metadata while a transaction exists', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-status-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '9'.repeat(40),
+      serviceRestartRequired: false,
+    });
+    await fs.writeFile(
+      plan.metadataFile,
+      `${JSON.stringify({ status: 'deployed', config_revision: 'old' })}\n`,
+      'utf8',
+    );
+    let stdout = '';
+
+    const status = await runCli({
+      argv: [
+        '--status',
+        '--json',
+        '--rendered-config',
+        plan.renderedConfig,
+        '--metadata-file',
+        plan.metadataFile,
+      ],
+      parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+      stdout: writer((chunk) => {
+        stdout += chunk;
+      }),
+      stderr: writer(),
+    });
+
+    assert.equal(status, 1);
+    assert.deepEqual(JSON.parse(stdout), {
+      status: 'recovery_required',
+      transaction_phase: 'prepared',
+      config_revision: '9'.repeat(40),
+    });
+  });
+
   it('apply executes commands with scrubbed env, installs metadata, and releases flock', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2109,7 +2166,7 @@ describe('deploy-config CLI and execution', () => {
     );
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
     await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
-    let failedRenderedDirectorySync = false;
+    let renderedDirectorySyncs = 0;
     let restartAttempts = 0;
     const fsApi = {
       ...fs,
@@ -2121,10 +2178,11 @@ describe('deploy-config CLI and execution', () => {
               return async () => {
                 if (
                   String(file) === path.dirname(plan.renderedConfig)
-                  && !failedRenderedDirectorySync
                 ) {
-                  failedRenderedDirectorySync = true;
-                  throw new Error('rendered directory fsync failed');
+                  renderedDirectorySyncs += 1;
+                  if (renderedDirectorySyncs === 2) {
+                    throw new Error('rendered directory fsync failed');
+                  }
                 }
                 return await target.sync();
               };
@@ -2217,6 +2275,339 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('recovers an interrupted install before checkout cleanup can delete its backup', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '1'.repeat(40),
+      serviceRestartRequired: false,
+    });
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+          await assert.rejects(() => fs.access(plan.transactionFile));
+          await assert.rejects(() => fs.access(plan.backupConfig));
+          throw new Error('stop after recovery');
+        },
+      }),
+      /stop after recovery/,
+    );
+
+    assert.equal(commandRan, true);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rolls back a prepared first install without stopping or restarting the service', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted first config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '5'.repeat(40),
+      serviceRestartRequired: true,
+      hadPrevious: false,
+      phase: 'prepared',
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command.bin);
+          await assert.rejects(() => fs.access(plan.renderedConfig));
+          throw new Error('stop after prepared recovery');
+        },
+      }),
+      /stop after prepared recovery/,
+    );
+
+    assert.deepEqual(calls, ['/usr/bin/git']);
+    await assert.rejects(() => fs.access(plan.transactionFile));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('keeps interrupted-install recovery repeatable when transaction cleanup fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '2'.repeat(40),
+      serviceRestartRequired: false,
+    });
+    let failTransactionRemoval = true;
+    const fsApi = {
+      ...fs,
+      async rm(file, options) {
+        if (file === plan.transactionFile && failTransactionRemoval) {
+          failTransactionRemoval = false;
+          throw new Error('transaction cleanup failed');
+        }
+        return await fs.rm(file, options);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({ plan, fsApi }),
+      /transaction cleanup failed/,
+    );
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+          await assert.rejects(() => fs.access(plan.transactionFile));
+          await assert.rejects(() => fs.access(plan.backupConfig));
+          throw new Error('stop after repeated recovery');
+        },
+      }),
+      /stop after repeated recovery/,
+    );
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('fails closed on a malformed install transaction without deleting recovery evidence', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await fs.writeFile(plan.transactionFile, '{not valid json\n', { mode: 0o600 });
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /deployment transaction is not valid JSON/,
+    );
+
+    assert.equal(commandRan, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'uncommitted config\n');
+    assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
+    assert.equal(await fs.readFile(plan.transactionFile, 'utf8'), '{not valid json\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('does not let skip-restart bypass required interrupted service recovery', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '3'.repeat(40),
+      serviceRestartRequired: true,
+    });
+
+    await assert.rejects(
+      () => executePlan({ plan }),
+      /requires service recovery; rerun without --skip-restart/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'uncommitted config\n');
+    assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores and verifies the old service before starting a new apply', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '4'.repeat(40),
+      serviceRestartRequired: true,
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push([command.bin, command.args[0]]);
+          assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+          if (command.bin === '/usr/bin/git') {
+            await assert.rejects(() => fs.access(plan.transactionFile));
+            await assert.rejects(() => fs.access(plan.backupConfig));
+            throw new Error('stop after service recovery');
+          }
+          return { stdout: command.bin === '/usr/bin/curl' ? '200' : '', stderr: '' };
+        },
+      }),
+      /stop after service recovery/,
+    );
+
+    assert.deepEqual(calls.slice(0, 4), [
+      ['/usr/bin/systemctl', 'restart'],
+      ['/usr/bin/systemctl', 'is-active'],
+      ['/usr/bin/curl', '--silent'],
+      ['/usr/bin/git', '-c'],
+    ]);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('finalises committed metadata without rolling back the live config', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'committed config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: '6'.repeat(40),
+      serviceRestartRequired: true,
+      phase: 'committed_pending_metadata',
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command.bin);
+          assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
+          const recoveredMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+          assert.equal(recoveredMetadata.status, 'deployed');
+          assert.equal(recoveredMetadata.config_revision, '6'.repeat(40));
+          assert.equal(recoveredMetadata.deployed_at, '2026-06-27T00:01:00.000Z');
+          await assert.rejects(() => fs.access(plan.transactionFile));
+          await assert.rejects(() => fs.access(plan.backupConfig));
+          throw new Error('stop after committed recovery');
+        },
+      }),
+      /stop after committed recovery/,
+    );
+
+    assert.deepEqual(calls, ['/usr/bin/git']);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('records post-commit metadata failures without implying apply rollback', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2272,6 +2663,9 @@ describe('deploy-config CLI and execution', () => {
     const metadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(metadata.status, 'failed_after_commit');
     assert.equal(metadata.config_revision, '8'.repeat(40));
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'committed_pending_metadata');
+    assert.equal(transaction.config_revision, '8'.repeat(40));
   });
 
   it('records failure metadata when validation fails before install', async () => {
@@ -2479,6 +2873,60 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('stops the service when a first deployment restart fails without an old config', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    let restartAttempts = 0;
+    let stopAttempts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'first config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartAttempts += 1;
+            throw new Error('first restart failed');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'stop') {
+            stopAttempts += 1;
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'f'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /first restart failed/,
+    );
+
+    assert.equal(restartAttempts, 1);
+    assert.equal(stopAttempts, 1);
+    await assert.rejects(() => fs.access(plan.renderedConfig));
+    await assert.rejects(() => fs.access(plan.transactionFile));
+    assert.equal(
+      JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status,
+      'failed_restart_rolled_back',
+    );
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('rolls back when restart returns success but the service is not active', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2681,7 +3129,7 @@ describe('deploy-config CLI and execution', () => {
     const fsApi = {
       ...fs,
       async rename(source, target) {
-        if (failRollback && source === plan.backupConfig && target === plan.renderedConfig) {
+        if (failRollback && source === plan.candidateConfig && target === plan.renderedConfig) {
           rollbackRenameAttempts += 1;
           throw new Error('rollback rename failed');
         }
@@ -2874,6 +3322,39 @@ async function assertLockReleased(lockFile) {
     { encoding: 'utf8' },
   );
   assert.equal(result.status, 0, result.stderr);
+}
+
+async function writeInstallTransactionFixture(
+  plan,
+  {
+    configRevision,
+    serviceRestartRequired,
+    hadPrevious = true,
+    phase = serviceRestartRequired ? 'service_transition_started' : 'prepared',
+    committedAt = phase === 'committed_pending_metadata'
+      ? '2026-06-27T00:01:00.000Z'
+      : null,
+  },
+) {
+  await fs.writeFile(
+    plan.transactionFile,
+    `${JSON.stringify({
+      version: 1,
+      phase,
+      had_previous: hadPrevious,
+      config_revision: configRevision,
+      service_restart_required: serviceRestartRequired,
+      service: plan.service,
+      config_repo: plan.configRepo,
+      config_ref: plan.configRef,
+      bot_code_dir: plan.botCodeDir,
+      rendered_config: plan.renderedConfig,
+      metadata_file: plan.metadataFile,
+      started_at: '2026-06-27T00:00:00.000Z',
+      committed_at: committedAt,
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
 }
 
 function parseArgsAllow(args) {

@@ -54,6 +54,7 @@ const FLOCK_CHILD_FD = '3';
 const FLOCK_TIMEOUT_MS = 5000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
 const CHILD_CLOSE_GRACE_MS = 1000;
+const MAX_INSTALL_TRANSACTION_BYTES = 16 * 1024;
 const DEPLOYMENT_STATUSES = new Set([
   'deployed',
   'installed_without_restart',
@@ -258,6 +259,7 @@ export function buildDeployPlan(options) {
   const renderedConfig = path.resolve(options.renderedConfig);
   const candidateConfig = `${renderedConfig}.candidate`;
   const backupConfig = `${renderedConfig}.previous`;
+  const transactionFile = `${renderedConfig}.transaction`;
   const botCodeDir = path.resolve(options.botCodeDir);
   const metadataFile = path.resolve(options.metadataFile);
   const trustedValidateScript = path.join(botCodeDir, 'scripts/config-policy/validate-config.sh');
@@ -354,6 +356,9 @@ export function buildDeployPlan(options) {
   const serviceCommand = options.skipRestart
     ? null
     : command(options.systemctlBin, ['restart', '--', options.service], commandDefaults);
+  const serviceStopCommand = options.skipRestart
+    ? null
+    : command(options.systemctlBin, ['stop', '--', options.service], commandDefaults);
   const serviceVerificationCommands = options.skipRestart
     ? []
     : [
@@ -391,6 +396,7 @@ export function buildDeployPlan(options) {
     renderedConfig,
     candidateConfig,
     backupConfig,
+    transactionFile,
     botCodeDir,
     metadataFile,
     configRepo: options.configRepo,
@@ -399,6 +405,7 @@ export function buildDeployPlan(options) {
     lockDir: path.resolve(options.lockDir),
     commands,
     serviceCommand,
+    serviceStopCommand,
     serviceVerificationCommands,
     skipRestart: options.skipRestart,
     serviceAction: options.skipRestart ? null : 'restart',
@@ -531,6 +538,8 @@ export async function executePlan({
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
+    await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
+    throwIfAborted(signal);
     await prepareFreshCheckout(plan, fsApi);
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -542,19 +551,29 @@ export async function executePlan({
       }
     }
     assertConfigRevision(captures.configRevision);
-    installState = await installCandidateConfig(plan, fsApi);
+    installState = await installCandidateConfig(
+      plan,
+      captures.configRevision,
+      fsApi,
+    );
     throwIfAborted(signal);
     if (plan.serviceCommand) {
+      installState = await updateInstallTransactionPhase(
+        plan,
+        installState,
+        'service_transition_started',
+        fsApi,
+      );
       try {
         await runServiceTransition(plan, runner, parentEnv, signal);
       } catch (error) {
+        const rollbackState = installState;
+        installState = null;
         let rollbackError = null;
         try {
-          await rollbackCandidateConfig(plan, installState, fsApi);
-          installState = null;
+          await restoreCandidateConfig(plan, rollbackState, fsApi);
         } catch (restoreError) {
           rollbackError = restoreError;
-          installState = null;
         }
         if (rollbackError) {
           await recordFailure(
@@ -564,14 +583,29 @@ export async function executePlan({
           throw new Error(`${error.message}; failed to restore previous config: ${rollbackError.message}`);
         }
         try {
-          await runServiceTransition(plan, runner, parentEnv);
+          await runServiceRollback(plan, rollbackState, runner, parentEnv);
         } catch (restoreError) {
+          const rollbackAction = rollbackState.hadPrevious
+            ? 'service restart'
+            : 'service stop';
           await recordFailure(
             'failed_restart_rollback_restart_failed',
-            `${error.message}; restored previous config but service restart also failed: ${restoreError.message}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}`,
           );
           throw new Error(
-            `${error.message}; restored previous config but service restart also failed: ${restoreError.message}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}`,
+          );
+        }
+        try {
+          await clearInstallTransaction(plan, fsApi);
+          await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+        } catch (restoreError) {
+          await recordFailure(
+            'failed_restart_rollback_failed',
+            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
+          );
+          throw new Error(
+            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
           );
         }
         await recordFailure('failed_restart_rolled_back', error.message);
@@ -579,29 +613,26 @@ export async function executePlan({
       }
     }
     throwIfAborted(signal);
-    commitReached = true;
+    installState = await updateInstallTransactionPhase(
+      plan,
+      installState,
+      'committed_pending_metadata',
+      fsApi,
+    );
+    const metadata = deploymentMetadataFromInstallState(plan, installState);
     installState = null;
+    commitReached = true;
+    await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+    await clearInstallTransaction(plan, fsApi);
     try {
-      await removeIfPresent(plan.backupConfig, fsApi);
+      await removeDurablyIfPresent(plan.backupConfig, fsApi);
     } catch (error) {
       backupCleanupError = error;
     }
-    const metadata = {
-      status: plan.skipRestart ? 'installed_without_restart' : 'deployed',
-      config_repo: plan.configRepo,
-      config_ref: plan.configRef,
-      config_revision: captures.configRevision || null,
-      bot_code_dir: plan.botCodeDir,
-      rendered_config: plan.renderedConfig,
-      service: plan.service,
-      service_action: plan.serviceAction,
-      service_restart_skipped: plan.skipRestart,
-      deployed_at: new Date().toISOString(),
-    };
     if (backupCleanupError) {
       metadata.backup_cleanup_error = redact(backupCleanupError.message);
+      await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
     }
-    await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
     return metadata;
   } catch (error) {
     primaryError = error;
@@ -616,7 +647,7 @@ export async function executePlan({
     let lockCleanupFailed = false;
     if (installState) {
       try {
-        await rollbackCandidateConfig(plan, installState, fsApi);
+        await rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi);
       } catch (error) {
         cleanupError = error;
         rollbackCleanupFailed = true;
@@ -684,6 +715,27 @@ async function runServiceTransition(plan, runner, parentEnv, signal = null) {
 }
 
 async function printStatus({ options, stdout, stderr, fsApi }) {
+  const transactionFile = `${path.resolve(options.renderedConfig)}.transaction`;
+  try {
+    const transaction = await readInstallTransaction({ transactionFile }, fsApi);
+    if (transaction) {
+      if (options.json) {
+        stdout.write(`${JSON.stringify({
+          status: 'recovery_required',
+          transaction_phase: transaction.phase,
+          config_revision: transaction.config_revision,
+        }, null, 2)}\n`);
+      } else {
+        stderr.write(
+          `status=recovery_required phase=${transaction.phase} config_revision=${transaction.config_revision}\n`,
+        );
+      }
+      return 1;
+    }
+  } catch (error) {
+    stderr.write(`status=recovery_required reason=${redact(error.code || error.message)}\n`);
+    return 1;
+  }
   try {
     const contents = await fsApi.readFile(path.resolve(options.metadataFile), 'utf8');
     const parsed = validateDeploymentMetadata(JSON.parse(contents));
@@ -1219,6 +1271,7 @@ function writePlan(stdout, plan, json) {
   stdout.write(`checkout_work_dir=${plan.checkoutWorkDir}\n`);
   stdout.write(`rendered_config=${plan.renderedConfig}\n`);
   stdout.write(`candidate_config=${plan.candidateConfig}\n`);
+  stdout.write(`transaction_file=${plan.transactionFile}\n`);
   for (const [index, commandSpec] of allPlanCommands(plan).entries()) {
     const invocation = commandInvocation(commandSpec);
     stdout.write(`command_${index + 1}=${invocation.bin} ${invocation.args.map(shellQuoteForDisplay).join(' ')}\n`);
@@ -1244,6 +1297,7 @@ function serialisablePlan(plan) {
     checkout_work_dir: plan.checkoutWorkDir,
     rendered_config: plan.renderedConfig,
     candidate_config: plan.candidateConfig,
+    transaction_file: plan.transactionFile,
     bot_code_dir: plan.botCodeDir,
     service: plan.service,
     lock_dir: plan.lockDir,
@@ -1313,7 +1367,7 @@ async function writeFailureMetadata(
   await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
 }
 
-async function writeMetadataAtomically(file, metadata, fsApi) {
+async function writeMetadataAtomically(file, metadata, fsApi, { mode = 0o644 } = {}) {
   const directory = path.dirname(file);
   const temporary = path.join(
     directory,
@@ -1322,7 +1376,7 @@ async function writeMetadataAtomically(file, metadata, fsApi) {
   await fsApi.mkdir(directory, { recursive: true, mode: 0o755 });
   let handle = null;
   try {
-    handle = await fsApi.open(temporary, 'wx', 0o644);
+    handle = await fsApi.open(temporary, 'wx', mode);
     await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
     await handle.sync();
     await handle.close();
@@ -1461,7 +1515,7 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
   }
 }
 
-async function installCandidateConfig(plan, fsApi) {
+async function installCandidateConfig(plan, configRevision, fsApi) {
   const candidateStat = await fsApi.lstat(plan.candidateConfig);
   if (!candidateStat.isFile() || candidateStat.isSymbolicLink()) {
     throw new Error(`candidate config must be a regular file: ${plan.candidateConfig}`);
@@ -1490,29 +1544,336 @@ async function installCandidateConfig(plan, fsApi) {
   }
 
   await syncFile(plan.candidateConfig, fsApi);
-  await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
+  const installState = {
+    hadPrevious,
+    configRevision,
+    serviceRestartRequired: Boolean(plan.serviceCommand),
+    phase: 'prepared',
+    startedAt: new Date().toISOString(),
+    committedAt: null,
+  };
+  let transactionWritten = false;
   try {
+    await writeInstallTransaction(plan, installState, fsApi);
+    transactionWritten = true;
+    await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
     await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
   } catch (error) {
-    try {
-      await rollbackCandidateConfig(plan, { hadPrevious }, fsApi);
-    } catch (rollbackError) {
-      throw new Error(
-        `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
-      );
+    if (transactionWritten) {
+      try {
+        await rollbackCandidateConfig(plan, installState, fsApi);
+      } catch (rollbackError) {
+        throw new Error(
+          `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
+        );
+      }
     }
     throw error;
   }
-  return { hadPrevious };
+  return installState;
 }
 
 async function rollbackCandidateConfig(plan, installState, fsApi) {
+  await restoreCandidateConfig(plan, installState, fsApi);
+  await clearInstallTransaction(plan, fsApi);
+  await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+}
+
+async function rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi) {
+  await restoreCandidateConfig(plan, installState, fsApi);
+  if (installState.phase === 'service_transition_started') {
+    await runServiceRollback(plan, installState, runner, parentEnv);
+  }
+  await clearInstallTransaction(plan, fsApi);
+  await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+}
+
+async function runServiceRollback(plan, installState, runner, parentEnv) {
+  if (!installState.serviceRestartRequired) {
+    return;
+  }
+  if (installState.hadPrevious) {
+    if (!plan.serviceCommand) {
+      throw new Error('cannot restore service state without a configured restart command');
+    }
+    await runServiceTransition(plan, runner, parentEnv);
+    return;
+  }
+  if (!plan.serviceStopCommand) {
+    throw new Error('cannot restore an absent initial config without a configured stop command');
+  }
+  await runner(
+    plan.serviceStopCommand,
+    scrubEnv(parentEnv, plan.serviceStopCommand.env),
+  );
+}
+
+async function restoreCandidateConfig(plan, installState, fsApi) {
   if (installState?.hadPrevious) {
-    await fsApi.rename(plan.backupConfig, plan.renderedConfig);
+    const backupStat = await fsApi.lstat(plan.backupConfig);
+    if (!backupStat.isFile() || backupStat.isSymbolicLink()) {
+      throw new Error(`backup config must be a regular file: ${plan.backupConfig}`);
+    }
+    assertSafeRenderedConfigMetadata(plan.backupConfig, backupStat);
+    await removeIfPresent(plan.candidateConfig, fsApi);
+    await fsApi.copyFile(plan.backupConfig, plan.candidateConfig);
+    await fsApi.chmod(plan.candidateConfig, backupStat.mode & 0o777);
+    await syncFile(plan.candidateConfig, fsApi);
+    await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
   } else {
     await removeIfPresent(plan.renderedConfig, fsApi);
   }
   await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+}
+
+async function writeInstallTransaction(plan, installState, fsApi) {
+  const transaction = {
+    version: 1,
+    phase: installState.phase,
+    had_previous: installState.hadPrevious,
+    config_revision: installState.configRevision,
+    service_restart_required: installState.serviceRestartRequired,
+    service: plan.service,
+    config_repo: plan.configRepo,
+    config_ref: plan.configRef,
+    bot_code_dir: plan.botCodeDir,
+    rendered_config: plan.renderedConfig,
+    metadata_file: plan.metadataFile,
+    started_at: installState.startedAt,
+    committed_at: installState.committedAt,
+  };
+  await writeMetadataAtomically(
+    plan.transactionFile,
+    transaction,
+    fsApi,
+    { mode: 0o600 },
+  );
+}
+
+async function updateInstallTransactionPhase(plan, installState, phase, fsApi) {
+  const nextState = {
+    ...installState,
+    phase,
+    committedAt: phase === 'committed_pending_metadata'
+      ? new Date().toISOString()
+      : installState.committedAt,
+  };
+  await writeInstallTransaction(plan, nextState, fsApi);
+  return nextState;
+}
+
+async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
+  const transaction = await readInstallTransaction(plan, fsApi);
+  if (!transaction) {
+    return;
+  }
+  if (transaction.service !== plan.service) {
+    throw new Error(
+      `interrupted deployment targets service ${transaction.service}; current plan targets ${plan.service}`,
+    );
+  }
+  if (
+    transaction.phase === 'service_transition_started'
+    && transaction.service_restart_required
+    && !plan.serviceCommand
+  ) {
+    throw new Error(
+      'interrupted deployment requires service recovery; rerun without --skip-restart',
+    );
+  }
+  if (transaction.rendered_config !== plan.renderedConfig) {
+    throw new Error('interrupted deployment rendered-config path does not match the current plan');
+  }
+  if (transaction.metadata_file !== plan.metadataFile) {
+    throw new Error('interrupted deployment metadata path does not match the current plan');
+  }
+  const installState = {
+    hadPrevious: transaction.had_previous,
+    configRevision: transaction.config_revision,
+    serviceRestartRequired: transaction.service_restart_required,
+    phase: transaction.phase,
+    startedAt: transaction.started_at,
+    committedAt: transaction.committed_at,
+  };
+  if (transaction.phase === 'committed_pending_metadata') {
+    const metadata = deploymentMetadataFromInstallState(
+      {
+        ...plan,
+        configRepo: transaction.config_repo,
+        configRef: transaction.config_ref,
+        botCodeDir: transaction.bot_code_dir,
+        renderedConfig: transaction.rendered_config,
+        metadataFile: transaction.metadata_file,
+        service: transaction.service,
+        skipRestart: !transaction.service_restart_required,
+        serviceAction: transaction.service_restart_required ? 'restart' : null,
+      },
+      installState,
+    );
+    await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+    await clearInstallTransaction(plan, fsApi);
+    try {
+      await removeDurablyIfPresent(plan.backupConfig, fsApi);
+    } catch (error) {
+      metadata.backup_cleanup_error = redact(error.message);
+      await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
+    }
+    return;
+  }
+  await rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi);
+}
+
+function deploymentMetadataFromInstallState(plan, installState) {
+  return {
+    status: plan.skipRestart ? 'installed_without_restart' : 'deployed',
+    config_repo: plan.configRepo,
+    config_ref: plan.configRef,
+    config_revision: installState.configRevision,
+    bot_code_dir: plan.botCodeDir,
+    rendered_config: plan.renderedConfig,
+    service: plan.service,
+    service_action: plan.serviceAction,
+    service_restart_skipped: plan.skipRestart,
+    deployed_at: installState.committedAt,
+  };
+}
+
+async function readInstallTransaction(plan, fsApi) {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+  let handle;
+  try {
+    handle = await fsApi.open(plan.transactionFile, flags);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    assertTrustedInstallTransaction(plan.transactionFile, stat);
+    if (stat.size <= 0 || stat.size > MAX_INSTALL_TRANSACTION_BYTES) {
+      throw new Error(
+        `deployment transaction size is invalid: ${plan.transactionFile}`,
+      );
+    }
+    const payload = Buffer.alloc(stat.size + 1);
+    const { bytesRead } = await handle.read(payload, 0, payload.length, 0);
+    if (bytesRead !== stat.size) {
+      throw new Error(
+        `deployment transaction changed while being read: ${plan.transactionFile}`,
+      );
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(payload.subarray(0, bytesRead).toString('utf8'));
+    } catch (error) {
+      throw new Error(`deployment transaction is not valid JSON: ${error.message}`);
+    }
+    return validateInstallTransaction(parsed);
+  } finally {
+    await handle.close();
+  }
+}
+
+function validateInstallTransaction(transaction) {
+  if (!transaction || typeof transaction !== 'object' || Array.isArray(transaction)) {
+    throw new Error('deployment transaction must be a JSON object');
+  }
+  const expectedKeys = [
+    'bot_code_dir',
+    'committed_at',
+    'config_ref',
+    'config_repo',
+    'config_revision',
+    'had_previous',
+    'metadata_file',
+    'phase',
+    'rendered_config',
+    'service',
+    'service_restart_required',
+    'started_at',
+    'version',
+  ];
+  const actualKeys = Object.keys(transaction).sort();
+  if (
+    actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error('deployment transaction contains unexpected fields');
+  }
+  if (
+    transaction.version !== 1
+    || ![
+      'prepared',
+      'service_transition_started',
+      'committed_pending_metadata',
+    ].includes(transaction.phase)
+  ) {
+    throw new Error('deployment transaction has an unsupported state');
+  }
+  if (typeof transaction.had_previous !== 'boolean') {
+    throw new Error('deployment transaction has an invalid had_previous value');
+  }
+  if (!/^[0-9a-f]{40}$/i.test(transaction.config_revision ?? '')) {
+    throw new Error('deployment transaction has an invalid config_revision');
+  }
+  if (typeof transaction.service_restart_required !== 'boolean') {
+    throw new Error('deployment transaction has an invalid service_restart_required value');
+  }
+  if (
+    transaction.phase === 'service_transition_started'
+    && !transaction.service_restart_required
+  ) {
+    throw new Error('deployment transaction service phase does not require a restart');
+  }
+  try {
+    validateService(transaction.service);
+    validateRepo(transaction.config_repo);
+    validateRef(transaction.config_ref);
+  } catch (error) {
+    throw new Error(`deployment transaction contains invalid deployment identity: ${error.message}`);
+  }
+  for (const key of [
+    'bot_code_dir',
+    'rendered_config',
+    'metadata_file',
+  ]) {
+    if (
+      typeof transaction[key] !== 'string'
+      || !path.isAbsolute(transaction[key])
+      || path.resolve(transaction[key]) !== transaction[key]
+    ) {
+      throw new Error(`deployment transaction has an invalid ${key}`);
+    }
+  }
+  if (
+    typeof transaction.started_at !== 'string'
+    || !Number.isFinite(Date.parse(transaction.started_at))
+  ) {
+    throw new Error('deployment transaction has an invalid started_at value');
+  }
+  if (transaction.phase === 'committed_pending_metadata') {
+    if (
+      typeof transaction.committed_at !== 'string'
+      || !Number.isFinite(Date.parse(transaction.committed_at))
+    ) {
+      throw new Error('deployment transaction has an invalid committed_at value');
+    }
+  } else if (transaction.committed_at !== null) {
+    throw new Error('deployment transaction has an unexpected committed_at value');
+  }
+  return transaction;
+}
+
+async function clearInstallTransaction(plan, fsApi) {
+  await removeIfPresent(plan.transactionFile, fsApi);
+  await syncDirectory(path.dirname(plan.transactionFile), fsApi);
+}
+
+async function removeDurablyIfPresent(file, fsApi) {
+  await removeIfPresent(file, fsApi);
+  await syncDirectory(path.dirname(file), fsApi);
 }
 
 async function syncFile(file, fsApi) {
@@ -1574,6 +1935,21 @@ function assertTrustedDeploymentLock(file, fileStat) {
   }
 }
 
+function assertTrustedInstallTransaction(file, fileStat) {
+  if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+    throw new Error(`deployment transaction must be a real file: ${file}`);
+  }
+  const mode = fileStat.mode & 0o7777;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
+  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+    throw new Error(`deployment transaction ownership is not trusted: ${file}`);
+  }
+  if (mode !== 0o600) {
+    throw new Error(`deployment transaction mode is not trusted: ${file}`);
+  }
+}
+
 function assertTrustedOutputDirectory(file, fileStat, label) {
   if (!fileStat.isDirectory() || fileStat.isSymbolicLink()) {
     throw new Error(`${label} must be a real directory: ${file}`);
@@ -1597,7 +1973,12 @@ function assertConfigRevision(value) {
 
 function allPlanCommands(plan) {
   return plan.serviceCommand
-    ? [...plan.commands, plan.serviceCommand, ...plan.serviceVerificationCommands]
+    ? [
+        ...plan.commands,
+        plan.serviceCommand,
+        ...plan.serviceVerificationCommands,
+        plan.serviceStopCommand,
+      ]
     : plan.commands;
 }
 
@@ -1610,6 +1991,7 @@ function assertSafePlanPathTopology(plan) {
     ['rendered config', path.resolve(plan.renderedConfig)],
     ['candidate config', path.resolve(plan.candidateConfig)],
     ['backup config', path.resolve(plan.backupConfig)],
+    ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
   ];
   const credentialPaths = [

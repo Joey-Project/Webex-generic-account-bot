@@ -63,6 +63,19 @@ superseded_by:
 - Candidate contents and the rendered-config directory are fsynced before
   success metadata, preserving config-before-status durability ordering. A
   post-rename directory-fsync failure restores the previous config internally.
+- A same-directory mode `0600` transaction journal is atomically written and
+  fsynced after the candidate and backup are durable but before the live-config
+  rename. It advances through prepared, service-transition-started, and
+  committed-pending-metadata states, remains through success metadata, and is
+  then fsynced away before backup cleanup.
+- An apply holding the deployment lock recovers any interrupted transaction
+  before deleting checkout, candidate, or backup state. Recovery restores from
+  a non-consuming backup copy, restarts and verifies the old service when the
+  journal requires it, stops a failed first-deployment service when no old
+  config exists, or finalises metadata for an already committed deployment.
+  Recovery remains repeatable if cleanup itself is interrupted. Malformed
+  journals fail closed, install-only mode cannot bypass a pending service
+  recovery, and status mode reports `recovery_required` while a journal exists.
 - Child commands have per-command deadlines, process-group termination, a hard
   post-SIGKILL pipe-close deadline, and bounded stdout/stderr capture. The lock
   is a persistent mode `0600` owner file. `/usr/bin/flock` acquires the kernel
