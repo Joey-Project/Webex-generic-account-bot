@@ -432,7 +432,11 @@ export async function runCli({
   parentEnv = process.env,
   runner = runCommand,
   fsApi = fs,
+  signal = null,
+  processApi = process,
 } = {}) {
+  const signalScope = signal ? null : installProcessSignalHandlers(processApi);
+  const deploymentSignal = signal || signalScope.signal;
   try {
     const options = parseArgs(argv, { allowHostOverrides: hostOverridesAllowed(parentEnv) });
     if (options.help) {
@@ -449,7 +453,13 @@ export async function runCli({
       return 0;
     }
 
-    const result = await executePlan({ plan, parentEnv, runner, fsApi });
+    const result = await executePlan({
+      plan,
+      parentEnv,
+      runner,
+      fsApi,
+      signal: deploymentSignal,
+    });
     writeStatus(stdout, result, options.json);
     return 0;
   } catch (error) {
@@ -460,11 +470,43 @@ export async function runCli({
       stderr.write(usage());
     }
     return status;
+  } finally {
+    signalScope?.cleanup();
   }
 }
 
-export async function executePlan({ plan, parentEnv = process.env, runner = runCommand, fsApi = fs }) {
+export function installProcessSignalHandlers(processApi = process) {
+  const controller = new AbortController();
+  const handlers = new Map();
+  for (const signalName of ['SIGINT', 'SIGTERM']) {
+    const handler = () => {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error(`deployment interrupted by ${signalName}`));
+      }
+    };
+    handlers.set(signalName, handler);
+    processApi.on(signalName, handler);
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      for (const [signalName, handler] of handlers) {
+        processApi.off(signalName, handler);
+      }
+    },
+  };
+}
+
+export async function executePlan({
+  plan,
+  parentEnv = process.env,
+  runner = runCommand,
+  fsApi = fs,
+  signal = null,
+}) {
+  throwIfAborted(signal);
   await assertPlanHasNoSymlinkAncestors(plan, fsApi);
+  throwIfAborted(signal);
   const lockOwner = await acquireLock(plan.lockDir, fsApi);
   const captures = {};
   let installState = null;
@@ -488,19 +530,23 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
   try {
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
+    throwIfAborted(signal);
     await prepareFreshCheckout(plan, fsApi);
+    throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
       const env = scrubEnv(parentEnv, commandSpec.env);
-      const result = await runner(commandSpec, env);
+      const result = await runner(commandSpec, env, signal);
+      throwIfAborted(signal);
       if (commandSpec.capture) {
         captures[commandSpec.capture] = result.stdout.trim();
       }
     }
     assertConfigRevision(captures.configRevision);
     installState = await installCandidateConfig(plan, fsApi);
+    throwIfAborted(signal);
     if (plan.serviceCommand) {
       try {
-        await runServiceTransition(plan, runner, parentEnv);
+        await runServiceTransition(plan, runner, parentEnv, signal);
       } catch (error) {
         let rollbackError = null;
         try {
@@ -532,6 +578,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
         throw error;
       }
     }
+    throwIfAborted(signal);
     commitReached = true;
     installState = null;
     try {
@@ -618,13 +665,21 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
   }
 }
 
-async function runServiceTransition(plan, runner, parentEnv) {
-  await runner(plan.serviceCommand, scrubEnv(parentEnv, plan.serviceCommand.env));
+async function runServiceTransition(plan, runner, parentEnv, signal = null) {
+  throwIfAborted(signal);
+  await runner(
+    plan.serviceCommand,
+    scrubEnv(parentEnv, plan.serviceCommand.env),
+    signal,
+  );
+  throwIfAborted(signal);
   for (const verificationCommand of plan.serviceVerificationCommands) {
     await runner(
       verificationCommand,
       scrubEnv(parentEnv, verificationCommand.env),
+      signal,
     );
+    throwIfAborted(signal);
   }
 }
 
@@ -875,7 +930,8 @@ function gitEnvForRepo(options) {
   };
 }
 
-export async function runCommand(commandSpec, env) {
+export async function runCommand(commandSpec, env, signal = null) {
+  throwIfAborted(signal);
   return await new Promise((resolve, reject) => {
     const detached = process.platform !== 'win32';
     const invocation = commandInvocation(commandSpec);
@@ -890,12 +946,13 @@ export async function runCommand(commandSpec, env) {
     let stderr = '';
     const stdoutCapture = outputCapture(commandSpec.outputLimitBytes);
     const stderrCapture = outputCapture(commandSpec.outputLimitBytes);
-    let timedOut = false;
+    let terminationError = null;
     let killTimer = null;
     let closeTimer = null;
     let settled = false;
     const clearTimers = () => {
       clearTimeout(timeoutTimer);
+      signal?.removeEventListener('abort', onAbort);
       if (killTimer) {
         clearTimeout(killTimer);
       }
@@ -919,8 +976,11 @@ export async function runCommand(commandSpec, env) {
       clearTimers();
       resolve(result);
     };
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
+    const beginTermination = (error) => {
+      if (settled || terminationError) {
+        return;
+      }
+      terminationError = error;
       killChildProcess(child, detached, 'SIGTERM');
       killTimer = setTimeout(() => {
         killChildProcess(child, detached, 'SIGKILL');
@@ -929,15 +989,24 @@ export async function runCommand(commandSpec, env) {
           child.stderr.destroy();
           child.unref();
           rejectOnce(new Error(
-            `${commandSpec.bin} timed out after ` +
-              `${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms and did not close after SIGKILL`,
+            `${terminationError.message}; child did not close after SIGKILL`,
           ));
         }, commandSpec.closeGraceMs ?? CHILD_CLOSE_GRACE_MS);
         closeTimer.unref?.();
       }, commandSpec.terminationGraceMs ?? CHILD_TERMINATION_GRACE_MS);
       killTimer.unref?.();
+    };
+    const timeoutTimer = setTimeout(() => {
+      beginTermination(new Error(
+        `${commandSpec.bin} timed out after ${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms`,
+      ));
     }, commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs);
     timeoutTimer.unref?.();
+    const onAbort = () => beginTermination(abortError(signal));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -950,8 +1019,8 @@ export async function runCommand(commandSpec, env) {
       rejectOnce(error);
     });
     child.on('close', (code) => {
-      if (timedOut) {
-        rejectOnce(new Error(`${commandSpec.bin} timed out after ${commandSpec.timeoutMs || DEFAULTS.commandTimeoutMs}ms`));
+      if (terminationError) {
+        rejectOnce(terminationError);
         return;
       }
       if (code === 0 || commandSpec.optional) {
@@ -975,6 +1044,18 @@ export async function runCommand(commandSpec, env) {
       rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
     });
   });
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
+}
+
+function abortError(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new Error('deployment interrupted');
 }
 
 function commandInvocation(commandSpec) {

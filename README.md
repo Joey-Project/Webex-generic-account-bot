@@ -154,7 +154,10 @@ the owner's PID, process start time, and random token in a persistent mode
 `0600` file. `/usr/bin/flock` acquires the kernel lock on an inherited file
 description that the Node process retains for the whole transaction, so process
 exit releases the lock automatically and no pathname-based stale deletion is
-needed. Existing checkout and lock-parent directories must be owned by the
+needed. `SIGINT` and `SIGTERM` are converted into controlled transaction
+aborts; active child process groups are terminated and an installed but
+uncommitted candidate follows the normal rollback and failure-metadata path.
+Existing checkout and lock-parent directories must be owned by the
 deployment user and mode `0700`.
 Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The

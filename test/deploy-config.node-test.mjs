@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import { describe, it } from 'node:test';
 import {
   buildDeployPlan,
   executePlan,
+  installProcessSignalHandlers,
   parseArgs,
   redact,
   runCli,
@@ -1446,6 +1448,21 @@ describe('trusted config policy', () => {
 });
 
 describe('deploy-config CLI and execution', () => {
+  it('installs scoped SIGINT and SIGTERM abort handlers', () => {
+    const processApi = new EventEmitter();
+    const scope = installProcessSignalHandlers(processApi);
+
+    assert.equal(processApi.listenerCount('SIGINT'), 1);
+    assert.equal(processApi.listenerCount('SIGTERM'), 1);
+    processApi.emit('SIGTERM');
+    assert.equal(scope.signal.aborted, true);
+    assert.match(scope.signal.reason.message, /interrupted by SIGTERM/);
+
+    scope.cleanup();
+    assert.equal(processApi.listenerCount('SIGINT'), 0);
+    assert.equal(processApi.listenerCount('SIGTERM'), 0);
+  });
+
   it('dry-run prints a plan without executing commands', async () => {
     let stdout = '';
     let executed = false;
@@ -2143,6 +2160,63 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('rolls back an installed candidate when deployment is interrupted', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-signal-test-'));
+    const controller = new AbortController();
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        await fs.rename(source, target);
+        if (source === plan.candidateConfig && target === plan.renderedConfig) {
+          controller.abort(new Error('deployment interrupted by SIGTERM'));
+        }
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        signal: controller.signal,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'a'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /interrupted by SIGTERM/,
+    );
+
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_apply');
+    assert.match(failureMetadata.reason, /interrupted by SIGTERM/);
+    await assert.rejects(() => fs.access(plan.backupConfig));
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('records post-commit metadata failures without implying apply rollback', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2734,6 +2808,31 @@ describe('deploy-config CLI and execution', () => {
       ),
       /timed out after 50ms/,
     );
+  });
+
+  it('terminates child processes when the deployment signal aborts', async () => {
+    const controller = new AbortController();
+    const abortTimer = setTimeout(
+      () => controller.abort(new Error('deployment interrupted by SIGTERM')),
+      30,
+    );
+    try {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/usr/bin/python3',
+            args: ['-c', 'import time; time.sleep(30)'],
+            timeoutMs: 5_000,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+          controller.signal,
+        ),
+        /interrupted by SIGTERM/,
+      );
+    } finally {
+      clearTimeout(abortTimer);
+    }
   });
 
   it('hard-fails after SIGKILL when an escaped descendant holds command pipes', async () => {

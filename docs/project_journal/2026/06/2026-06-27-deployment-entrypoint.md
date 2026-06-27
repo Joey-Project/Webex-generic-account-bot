@@ -71,6 +71,9 @@ superseded_by:
   lock automatically, so no pathname-based stale reclamation can race a new
   owner. Lock-parent, checkout, and output directories must be
   deployment-user-owned and non-writable by others.
+- Scoped `SIGINT` and `SIGTERM` handlers convert service-manager or operator
+  interruption into the normal abort path, terminate an active child process
+  group, and roll back an installed candidate before releasing the lock.
 - The trusted Jenkins helper is vendored into the bot repo with service-bounded
   graph fetch limits, redacted diagnostics snippets, explicit partial collection
   markers, and downstream traversal limited to structured Jenkins API metadata.
