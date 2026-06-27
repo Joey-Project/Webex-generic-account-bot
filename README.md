@@ -151,13 +151,15 @@ not forward `SSH_AUTH_SOCK`, proxy variables, ambient `GIT_*` settings, `HOME`,
 or token-shaped secrets. GitHub fetch uses fixed host policy:
 `GIT_SSH_COMMAND` points at `/usr/bin/ssh`,
 `/var/lib/webex-generic-account-bot/deploy/id_ed25519`, and
-`/etc/ssh/ssh_known_hosts`. The config checkout is recreated under a fresh
-`work` directory for each apply, and the trusted policy helper reads it only
-through `--source-root`. Final config validation invokes the fixed host-installed
+`/etc/ssh/ssh_known_hosts`. Each mode recreates its own config checkout under a
+fresh `work` directory, and the trusted policy helper reads it only through
+`--source-root`. Final config validation invokes the fixed host-installed
 bot binary directly; deployment never runs Cargo, downloads crates, or executes
 dependency build scripts. The default paths match the staging deployment layout:
 
-- config checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- apply checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- prepare checkout:
+  `/var/lib/webex-generic-account-bot/config-prepare-checkout`
 - config staging: `/var/lib/webex-generic-account-bot/config-staging`
 - bot code: `/opt/webex-generic-account-bot/code`
 - bot binary: `/opt/webex-generic-account-bot/bin/webex-generic-account-bot`
@@ -179,7 +181,8 @@ the older metadata, so a crash or metadata commit failure cannot leave old
 metadata pointing at new config bytes. A pending or malformed install
 transaction makes prepare fail closed without attempting recovery or starting
 Git/render work. Preparation uses the same host-wide deployment lock and
-scrubbed fixed-argv execution as apply.
+scrubbed fixed-argv execution as apply. Apply does not inspect, create, clean,
+or validate ownership of the prepare checkout or config staging directory.
 An optional `--request-id` accepts only a 64-character lowercase hexadecimal
 worker action ID and records it in staged metadata. This lets the worker recover
 a prepare that committed before its private action state was updated, without
@@ -217,20 +220,27 @@ deployment lock is the preprovisioned root-owned
 `/run/webex-config-deploy/deploy-config.lock`, shared by non-root prepare and a
 future root activation through one kernel flock without giving the worker write
 access to the lock parent.
-Prepared candidate, staged config, and staged
-metadata files are confined to the worker-owned mode `0700` `config-staging`
-directory. The worker unit mounts the live `rendered` directory read-only and
-does not provision or own it, so preparation cannot overwrite the live config
-or deployment metadata. The read-only path is optional at unit startup so a
-fresh host can prepare before the first live install; `ProtectSystem=strict`
-still keeps an absent or later-created live path outside the worker's writable
-allowlist.
+The prepare checkout and prepared candidate, staged config, and staged metadata
+files are confined to worker-owned mode `0700` directories. The worker unit
+mounts the live `rendered` directory read-only and does not provision or own it,
+so preparation cannot overwrite the live config or deployment metadata. The
+read-only path is optional at unit startup so a fresh host can prepare before
+the first live install; `ProtectSystem=strict` still keeps an absent or
+later-created live path outside the worker's writable allowlist. Prepare also
+rejects a live directory or checked existing parent owned by its own UID even
+when mode `0555`, because that owner could restore write permission.
 
-Before enabling the unit, provision the sysusers and tmpfiles definitions, make
-the fixed deploy key readable only by `webex-config-deploy`, and migrate
-`config-checkout` and `config-staging` to that identity. Keep the live
-`rendered` directory and `/opt/webex-generic-account-bot` outside the worker's
-write boundary. The worker has no bot token, Codex home, Jenkins credential,
+Before enabling the unit, provision the sysusers and tmpfiles definitions and
+make the fixed deploy key readable only by `webex-config-deploy`. Tmpfiles
+creates worker-owned `config-prepare-checkout` and `config-staging`; it does not
+create or change the existing root/apply
+`/var/lib/webex-generic-account-bot/config-checkout`. On hosts deployed from an
+older worker definition, stop the worker before migration, provision the new
+prepare checkout, and restore `config-checkout` to the root/apply identity if
+the old definition assigned it to `webex-config-deploy`. Do not grant the worker
+write access to that apply checkout. Keep the live `rendered` directory and
+`/opt/webex-generic-account-bot` outside the worker's write boundary. The worker
+has no bot token, Codex home, Jenkins credential,
 `systemctl`, or live-config activation permission. It invokes only
 `/usr/bin/node /opt/webex-generic-account-bot/code/scripts/deploy-config.mjs
 --prepare --json --request-id <action-id>` with a scrubbed environment and no
@@ -299,14 +309,20 @@ closed, and no deployment status is written after lock release. `SIGINT` and
 `SIGTERM` are converted into controlled transaction
 aborts; active child process groups are terminated and an installed but
 uncommitted candidate follows the normal rollback and failure-metadata path.
-Existing checkout and lock-parent directories must be owned by the
-deployment user and mode `0700`.
+Each mode's existing checkout must be owned by that mode's deployment identity
+and group with mode `0700`. A custom private lock uses a current-deployment-user
+owned parent with mode `0700` and a mode `0600` lock file. The default shared
+lock is different: `/run/webex-config-deploy` is preprovisioned as
+`root:webex-config-pull` mode `0750`, and `deploy-config.lock` is root-owned with
+group `webex-config-pull` and mode `0660` so root apply and non-root prepare use
+the same kernel flock.
 Missing rendered-config and metadata directories are created one component at
 a time, and each new directory entry is made durable by fsyncing its parent.
 Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
-entrypoint creates the lock parent directory when host permissions allow it and
-writes deployment metadata to
+entrypoint creates a custom private lock parent when host permissions allow it;
+the default shared lock parent and file must already be provisioned. It writes
+deployment metadata to
 `/var/lib/webex-generic-account-bot/rendered/deploy-status.json` after a
 successful apply. Fetch credentials must be provided by host policy without
 ambient agent, proxy, or token environment leakage.

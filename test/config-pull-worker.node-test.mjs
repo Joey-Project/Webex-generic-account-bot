@@ -83,6 +83,7 @@ describe('config pull worker socket protocol', () => {
         version: 1,
         action_id: actionId,
         action: 'pull',
+        enqueue_sequence: 1,
         message_id: 'webex-message-1',
       },
     );
@@ -107,12 +108,82 @@ describe('config pull worker socket protocol', () => {
     await fixture.worker.waitForIdle();
     const second = await sendRequest(fixture.socketPath, request);
     await fixture.worker.waitForIdle();
+    const third = await sendRequest(fixture.socketPath, {
+      version: 1,
+      message_id: 'after-duplicate',
+      action: 'pull',
+    });
+    await fixture.worker.waitForIdle();
+
+    const firstRecord = JSON.parse(
+      await fs.readFile(path.join(fixture.queueDir, `${first.action_id}.json`), 'utf8'),
+    );
+    const thirdRecord = JSON.parse(
+      await fs.readFile(path.join(fixture.queueDir, `${third.action_id}.json`), 'utf8'),
+    );
 
     assert.equal(first.status, 'queued');
     assert.equal(second.status, 'existing');
     assert.equal(second.action_id, first.action_id);
-    assert.equal(executions, 1);
-    assert.deepEqual(await fs.readdir(fixture.queueDir), [`${first.action_id}.json`]);
+    assert.equal(firstRecord.enqueue_sequence, 1);
+    assert.equal(thirdRecord.enqueue_sequence, 2);
+    assert.equal(executions, 2);
+    assert.deepEqual(
+      (await fs.readdir(fixture.queueDir)).sort(),
+      [`${first.action_id}.json`, `${third.action_id}.json`].sort(),
+    );
+  });
+
+  it('drains live requests in acceptance order while the first runner is blocked', async (context) => {
+    const layout = await createLayout(context);
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const requests = ['accepted-first', 'accepted-second', 'accepted-third'].map((messageId) => ({
+      version: 1,
+      message_id: messageId,
+      action: 'pull',
+    }));
+    const actionIds = requests.map((request) => actionIdForMessageId(request.message_id));
+    const executionOrder = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async ({ actionId }) => {
+        executionOrder.push(actionId);
+        if (actionId === actionIds[0]) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        await stagePreparedResult(layout, actionId);
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => {
+      releaseFirst.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+
+    const responses = [await sendRequest(layout.socketPath, requests[0])];
+    await firstStarted.promise;
+    responses.push(await sendRequest(layout.socketPath, requests[1]));
+    responses.push(await sendRequest(layout.socketPath, requests[2]));
+
+    const records = await Promise.all(actionIds.map(async (actionId) => JSON.parse(
+      await fs.readFile(path.join(layout.queueDir, `${actionId}.json`), 'utf8'),
+    )));
+    assert.notDeepEqual([...actionIds].sort(), actionIds);
+    assert.deepEqual(responses.map((response) => response.action_id), actionIds);
+    assert.deepEqual(records.map((record) => record.enqueue_sequence), [1, 2, 3]);
+
+    releaseFirst.resolve();
+    await worker.waitForIdle();
+
+    const publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
+    const stagedMetadata = JSON.parse(await fs.readFile(layout.stagedMetadataFile, 'utf8'));
+    assert.deepEqual(executionOrder, actionIds);
+    assert.equal(publicStatus.action_id, actionIds.at(-1));
+    assert.equal(publicStatus.state, 'succeeded');
+    assert.equal(stagedMetadata.request_id, actionIds.at(-1));
   });
 
   it('ignores a trusted request temporary file exposed during a live drain', async (context) => {
@@ -390,7 +461,11 @@ describe('config pull worker recovery', () => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
     const request = { version: 1, message_id: 'crash-before-request-state', action: 'pull' };
-    const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request,
+      enqueueSequence: 1,
+    });
     const staleTemporary = path.join(
       layout.queueDir,
       `.request-${publication.actionId}-1234-12345678-1234-4123-8123-123456789abc.tmp`,
@@ -414,11 +489,72 @@ describe('config pull worker recovery', () => {
     assert.equal((await readActionState(layout.stateDir, publication.actionId)).status, 'succeeded');
   });
 
+  it('recovers pending requests in acceptance order and resumes at durable max plus one', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const requests = ['restart-first', 'restart-second', 'restart-third'].map((messageId) => ({
+      version: 1,
+      message_id: messageId,
+      action: 'pull',
+    }));
+    const publications = [];
+    for (const [index, request] of requests.entries()) {
+      publications.push(await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request,
+        enqueueSequence: 40 + index,
+      }));
+    }
+    const actionIds = publications.map((publication) => publication.actionId);
+    const executionOrder = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async ({ actionId }) => {
+        executionOrder.push(actionId);
+        await stagePreparedResult(layout, actionId);
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => worker.stop());
+
+    assert.notDeepEqual([...actionIds].sort(), actionIds);
+    await worker.start();
+    await worker.waitForIdle();
+
+    let publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
+    let stagedMetadata = JSON.parse(await fs.readFile(layout.stagedMetadataFile, 'utf8'));
+    assert.deepEqual(executionOrder, actionIds);
+    assert.equal(publicStatus.action_id, actionIds.at(-1));
+    assert.equal(stagedMetadata.request_id, actionIds.at(-1));
+
+    const afterRestart = await sendRequest(layout.socketPath, {
+      version: 1,
+      message_id: 'restart-after-durable-publication',
+      action: 'pull',
+    });
+    await worker.waitForIdle();
+
+    const afterRestartRecord = JSON.parse(
+      await fs.readFile(path.join(layout.queueDir, `${afterRestart.action_id}.json`), 'utf8'),
+    );
+    publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
+    stagedMetadata = JSON.parse(await fs.readFile(layout.stagedMetadataFile, 'utf8'));
+    assert.equal(afterRestartRecord.enqueue_sequence, 43);
+    assert.deepEqual(executionOrder, [...actionIds, afterRestart.action_id]);
+    assert.equal(publicStatus.action_id, afterRestart.action_id);
+    assert.equal(publicStatus.state, 'succeeded');
+    assert.equal(stagedMetadata.request_id, afterRestart.action_id);
+  });
+
   it('replays a running request after restart', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
     const request = { version: 1, message_id: 'restart-running', action: 'pull' };
-    const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request,
+      enqueueSequence: 1,
+    });
     await writeActionState({
       stateDir: layout.stateDir,
       state: actionState(publication.actionId, 'running', '2026-06-27T12:01:00.000Z'),
@@ -446,7 +582,11 @@ describe('config pull worker recovery', () => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
     const request = { version: 1, message_id: 'prepared-before-crash', action: 'pull' };
-    const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request,
+      enqueueSequence: 1,
+    });
     await writeActionState({
       stateDir: layout.stateDir,
       state: actionState(publication.actionId, 'running', '2026-06-27T12:01:30.000Z'),
@@ -512,7 +652,11 @@ describe('config pull worker recovery', () => {
           message_id: `staged-${scenario.name.replaceAll(' ', '-')}`,
           action: 'pull',
         };
-        const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+        const publication = await publishRequestRecord({
+          queueDir: layout.queueDir,
+          request,
+          enqueueSequence: 1,
+        });
         await writeActionState({
           stateDir: layout.stateDir,
           state: actionState(publication.actionId, 'running', '2026-06-27T12:01:35.000Z'),
@@ -555,7 +699,11 @@ describe('config pull worker recovery', () => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
     const request = { version: 1, message_id: 'mismatched-staged-result', action: 'pull' };
-    const publication = await publishRequestRecord({ queueDir: layout.queueDir, request });
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request,
+      enqueueSequence: 1,
+    });
     await writeActionState({
       stateDir: layout.stateDir,
       state: actionState(publication.actionId, 'running', '2026-06-27T12:01:45.000Z'),
@@ -588,10 +736,12 @@ describe('config pull worker recovery', () => {
     const succeeded = await publishRequestRecord({
       queueDir: layout.queueDir,
       request: { version: 1, message_id: 'already-succeeded', action: 'pull' },
+      enqueueSequence: 1,
     });
     const failed = await publishRequestRecord({
       queueDir: layout.queueDir,
       request: { version: 1, message_id: 'already-failed', action: 'pull' },
+      enqueueSequence: 2,
     });
     await writeActionState({
       stateDir: layout.stateDir,
@@ -686,7 +836,7 @@ describe('config pull worker recovery', () => {
     assert.equal(publicStatus.action_id, response.action_id);
   });
 
-  it('fails closed on symlink and corrupt immutable records', async (context) => {
+  it('fails closed on untrusted or invalid immutable records', async (context) => {
     await context.test('unexpected temporary record', async (subcontext) => {
       const layout = await createLayout(subcontext);
       await prepareStorage(layout);
@@ -697,6 +847,61 @@ describe('config pull worker recovery', () => {
       subcontext.after(async () => worker.stop());
 
       await assert.rejects(worker.start(), /unexpected temporary entry/);
+    });
+
+    await context.test('invalid enqueue sequence', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      const messageId = 'invalid-enqueue-sequence';
+      const actionId = actionIdForMessageId(messageId);
+      await fs.writeFile(
+        path.join(layout.queueDir, `${actionId}.json`),
+        `${JSON.stringify({
+          version: 1,
+          action_id: actionId,
+          action: 'pull',
+          enqueue_sequence: 0,
+          message_id: messageId,
+        })}\n`,
+        { mode: 0o600 },
+      );
+      const worker = new ConfigPullWorker({ ...layout, prepareRunner: async () => PREPARED_PROJECTION });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /enqueue sequence is invalid/);
+    });
+
+    await context.test('duplicate enqueue sequence', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: 'duplicate-sequence-first', action: 'pull' },
+        enqueueSequence: 1,
+      });
+      await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: 'duplicate-sequence-second', action: 'pull' },
+        enqueueSequence: 1,
+      });
+      const worker = new ConfigPullWorker({ ...layout, prepareRunner: async () => PREPARED_PROJECTION });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /duplicate enqueue sequence: 1/);
+    });
+
+    await context.test('enqueue sequence overflow', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: 'sequence-overflow', action: 'pull' },
+        enqueueSequence: Number.MAX_SAFE_INTEGER,
+      });
+      const worker = new ConfigPullWorker({ ...layout, prepareRunner: async () => PREPARED_PROJECTION });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /enqueue sequence overflow/);
     });
 
     await context.test('symlink record', async (subcontext) => {
@@ -857,6 +1062,7 @@ describe('config pull worker durable files', () => {
       publishRequestRecord({
         queueDir: layout.queueDir,
         request: { version: 1, message_id: 'fsync-failure', action: 'pull' },
+        enqueueSequence: 1,
         fsApi,
       }),
       /injected directory fsync failure/,
@@ -963,8 +1169,9 @@ describe('config pull worker systemd boundary', () => {
     );
     assert.match(
       tmpfiles,
-      /^d \/var\/lib\/webex-generic-account-bot\/config-checkout 0700 webex-config-deploy webex-config-pull -$/m,
+      /^d \/var\/lib\/webex-generic-account-bot\/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -$/m,
     );
+    assert.doesNotMatch(tmpfiles, /\/config-checkout /);
     assert.match(
       tmpfiles,
       /^d \/var\/lib\/webex-generic-account-bot\/config-staging 0700 webex-config-deploy webex-config-pull -$/m,
@@ -1010,6 +1217,15 @@ function deferred() {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+async function stagePreparedResult(layout, actionId) {
+  await fs.writeFile(layout.stagedConfigFile, STAGED_CONFIG, { mode: 0o600 });
+  await fs.writeFile(
+    layout.stagedMetadataFile,
+    `${JSON.stringify({ ...PREPARED_RESULT, request_id: actionId })}\n`,
+    { mode: 0o600 },
+  );
 }
 
 function durabilityRecordingFsApi(

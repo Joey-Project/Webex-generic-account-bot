@@ -8,6 +8,7 @@ import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 const SHARED_DEPLOYMENT_LOCK = '/run/webex-config-deploy/deploy-config.lock';
+const PREPARE_CHECKOUT_DIR = '/var/lib/webex-generic-account-bot/config-prepare-checkout';
 
 const DEFAULTS = Object.freeze({
   configRepo: 'git@github.com:WebexServices-staging/webex-generic-account-bot-config.git',
@@ -243,6 +244,9 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
       throw new UsageError('--request-id must be 64 lowercase hexadecimal characters.');
     }
   }
+  if (options.prepare && !overrides.has('checkoutDir')) {
+    options.checkoutDir = PREPARE_CHECKOUT_DIR;
+  }
   validateHostOverrides(overrides, allowHostOverrides);
   options.hostOverrides = Object.freeze([...overrides]);
   validateOptions(options);
@@ -265,7 +269,7 @@ Options:
       --skip-restart              Install config but do not restart the service.
       --config-repo <url>         Expected config repo URL.
       --config-ref <name>         Expected config ref, default main.
-      --checkout-dir <path>       Host-owned config checkout directory.
+      --checkout-dir <path>       Mode-specific config checkout directory.
       --staging-dir <path>        Worker-owned prepared config staging directory.
       --rendered-config <path>    Final rendered config path.
       --bot-code-dir <path>       Host-installed bot code directory.
@@ -461,6 +465,7 @@ export function buildDeployPlan(options) {
     commandTimeoutMs: options.commandTimeoutMs,
     outputLimitBytes: options.outputLimitBytes,
     requestId: options.requestId,
+    prepare: options.prepare,
   };
   assertSafePlanPathTopology(plan);
   return plan;
@@ -578,7 +583,10 @@ export async function executePreparePlan({
   let primaryError = null;
   let outputDirectoriesTrusted = false;
   try {
-    await prepareTrustedOutputDirectories(plan, fsApi, { includeLive: false });
+    await prepareTrustedOutputDirectories(plan, fsApi, {
+      includeStaging: true,
+      includeLive: false,
+    });
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
     await assertPrepareLiveDirectoriesReadOnly(plan, fsApi);
@@ -1735,7 +1743,6 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
   const paths = [
     ['checkout directory', plan.checkoutDir, false],
     ['lock parent directory', path.dirname(plan.lockDir), false],
-    ['staging directory', plan.stagingDir, false],
     ['rendered config directory', path.dirname(plan.renderedConfig), false],
     ['metadata directory', path.dirname(plan.metadataFile), false],
     ['bot code directory', plan.botCodeDir, true],
@@ -1743,6 +1750,9 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
     ['SSH key directory', path.dirname(plan.sshKey), true],
     ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts), true],
   ];
+  if (plan.prepare) {
+    paths.splice(2, 0, ['staging directory', plan.stagingDir, false]);
+  }
   const seen = new Set();
   for (const [label, candidate, includePath] of paths) {
     const resolved = path.resolve(candidate);
@@ -1780,8 +1790,15 @@ async function canonicalPathWithMissingSuffix(candidate, fsApi) {
   }
 }
 
-async function prepareTrustedOutputDirectories(plan, fsApi, { includeLive = true } = {}) {
-  const directories = [[plan.stagingDir, 'staging directory', 0o700]];
+async function prepareTrustedOutputDirectories(
+  plan,
+  fsApi,
+  { includeStaging = false, includeLive = true } = {},
+) {
+  const directories = [];
+  if (includeStaging) {
+    directories.push([plan.stagingDir, 'staging directory', 0o700]);
+  }
   if (includeLive) {
     directories.push(
       [path.dirname(plan.renderedConfig), 'rendered config directory', 0o755],
@@ -2257,6 +2274,9 @@ async function assertPathNotWritableByCurrentProcess(directory, label, fsApi) {
     if (stat.uid !== uid && stat.uid !== rootStat.uid) {
       throw new Error(`${label} ownership is not trusted: ${current}`);
     }
+    if (stat.uid === uid) {
+      throw new Error(`${label} must not be owned by the prepare worker: ${current}`);
+    }
     if (directoryWritableByCurrentProcess(stat)) {
       throw new Error(`${label} must not be writable by the prepare worker: ${current}`);
     }
@@ -2609,7 +2629,7 @@ function assertSafePlanPathTopology(plan) {
   const checkoutRoot = path.resolve(plan.checkoutDir);
   const checkoutWork = path.resolve(plan.checkoutWorkDir);
   const lockDir = path.resolve(plan.lockDir);
-  const stagingDir = path.resolve(plan.stagingDir);
+  const stagingDir = plan.prepare ? path.resolve(plan.stagingDir) : null;
   const botCodeDir = path.resolve(plan.botCodeDir);
   const botBin = path.resolve(plan.botBin);
   const liveOutputPaths = [
@@ -2617,12 +2637,17 @@ function assertSafePlanPathTopology(plan) {
     ['backup config', path.resolve(plan.backupConfig)],
     ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
+    ...(!plan.prepare
+      ? [['candidate config', path.resolve(plan.candidateConfig)]]
+      : []),
   ];
-  const stagingOutputPaths = [
-    ['candidate config', path.resolve(plan.candidateConfig)],
-    ['staged config', path.resolve(plan.stagedConfig)],
-    ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
-  ];
+  const stagingOutputPaths = plan.prepare
+    ? [
+        ['candidate config', path.resolve(plan.candidateConfig)],
+        ['staged config', path.resolve(plan.stagedConfig)],
+        ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
+      ]
+    : [];
   const outputPaths = [...liveOutputPaths, ...stagingOutputPaths];
   const credentialPaths = [
     ['SSH key', path.resolve(plan.sshKey)],
@@ -2641,9 +2666,11 @@ function assertSafePlanPathTopology(plan) {
     ...credentialPaths,
     ...liveOutputPaths,
   ];
-  for (const [label, protectedPath] of stagingConflicts) {
-    if (pathsOverlap(stagingDir, protectedPath)) {
-      throw new UsageError(`staging directory must not overlap ${label}`);
+  if (stagingDir) {
+    for (const [label, protectedPath] of stagingConflicts) {
+      if (pathsOverlap(stagingDir, protectedPath)) {
+        throw new UsageError(`staging directory must not overlap ${label}`);
+      }
     }
   }
   const protectedPaths = [

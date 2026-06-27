@@ -70,6 +70,23 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.outputLimitBytes, 1_048_576);
   });
 
+  it('uses separate default checkouts for apply and prepare while preserving overrides', () => {
+    assert.equal(
+      parseArgs(['--apply']).checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-checkout',
+    );
+    assert.equal(
+      parseArgs(['--prepare']).checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+    );
+    for (const mode of ['--apply', '--prepare']) {
+      assert.equal(
+        parseArgsAllow([mode, '--checkout-dir', '/tmp/explicit-config-checkout']).checkoutDir,
+        '/tmp/explicit-config-checkout',
+      );
+    }
+  });
+
   it('rejects refs, repositories, services, and paths that cannot be fixed host policy', () => {
     assert.throws(() => parseArgsAllow(['--config-ref', '../main']), /config-ref/);
     assert.throws(() => parseArgsAllow(['--config-ref', 'main;id']), /config-ref/);
@@ -100,6 +117,10 @@ describe('deploy-config argument parsing', () => {
     );
     assert.throws(
       () => parseArgs(['--staging-dir', '/var/lib/webex-generic-account-bot/config-staging']),
+      /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
+    );
+    assert.throws(
+      () => parseArgs(['--prepare', '--checkout-dir', '/tmp/prepare-checkout']),
       /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
     );
     assert.equal(
@@ -282,19 +303,21 @@ describe('deploy-config lock policy', () => {
       'ReadWritePaths=/run/webex-config-deploy/deploy-config.lock',
       'ReadWritePaths=/run/webex-config-pull',
       'ReadWritePaths=/var/lib/webex-generic-account-bot/config-actions',
-      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-checkout',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-prepare-checkout',
       'ReadWritePaths=/var/lib/webex-generic-account-bot/config-staging',
       'ReadOnlyPaths=-/var/lib/webex-generic-account-bot/rendered',
     ]);
+    assert.doesNotMatch(service, /ReadWritePaths=.*\/config-checkout$/m);
     assert.doesNotMatch(service, /^RuntimeDirectory=/m);
     assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
     assert.deepEqual(tmpfiles.trim().split('\n'), [
       'd /run/webex-config-deploy 0750 root webex-config-pull -',
       'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
       'd /run/webex-config-pull 0750 webex-config-deploy webex-config-pull -',
-      'd /var/lib/webex-generic-account-bot/config-checkout 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -',
       'd /var/lib/webex-generic-account-bot/config-staging 0700 webex-config-deploy webex-config-pull -',
     ]);
+    assert.doesNotMatch(tmpfiles, /\/config-checkout /);
   });
 });
 
@@ -409,6 +432,10 @@ describe('deploy-config plan', () => {
     const plan = buildDeployPlan(parseArgs(['--prepare', '--request-id', requestId]));
 
     assert.equal(plan.requestId, requestId);
+    assert.equal(
+      plan.checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+    );
     assert.equal(plan.candidateConfig, path.join(plan.stagingDir, 'production.toml.candidate'));
     assert.equal(buildDeployPlan(parseArgs(['--prepare'])).requestId, null);
   });
@@ -556,7 +583,7 @@ describe('deploy-config plan', () => {
     for (const { args, expected } of cases) {
       assert.throws(
         () => buildDeployPlan(parseArgsAllow([
-          '--apply',
+          '--prepare',
           '--rendered-config',
           renderedConfig,
           ...args,
@@ -597,7 +624,7 @@ describe('deploy-config plan', () => {
     for (const { renderedConfig, metadataFile, stagingDir, expected } of cases) {
       assert.throws(
         () => buildDeployPlan(parseArgsAllow([
-          '--apply',
+          '--prepare',
           '--rendered-config',
           renderedConfig,
           '--metadata-file',
@@ -1982,7 +2009,7 @@ describe('deploy-config CLI and execution', () => {
     const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
     const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
     const stagingDir = path.join(temp, 'staging');
-    await protectPrepareLiveDirectories(renderedConfig, metadataFile);
+    const fsApi = await protectPrepareLiveDirectories(renderedConfig, metadataFile);
     let stdout = '';
     const requestId = 'd'.repeat(64);
     const status = await runCli({
@@ -2011,6 +2038,7 @@ describe('deploy-config CLI and execution', () => {
         stdout += chunk;
       }),
       stderr: writer(),
+      fsApi,
       runner: async (command) => {
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(
@@ -2185,16 +2213,20 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.renderedConfig, liveConfig, { mode: 0o644 });
     await fs.writeFile(plan.metadataFile, deploymentStatus, { mode: 0o644 });
     await fs.writeFile(plan.backupConfig, backupConfig, { mode: 0o644 });
-    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     const calls = [];
     let chownCalled = false;
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async chown(...args) {
         chownCalled = true;
         return fs.chown(...args);
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     const metadata = await executePreparePlan({
       plan,
@@ -2248,7 +2280,7 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
-  it('rejects prepare when the live output directory is worker-writable', async () => {
+  it('rejects prepare when the live output directory is worker-owned mode 0555', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-live-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -2266,6 +2298,7 @@ describe('deploy-config CLI and execution', () => {
       ]),
     );
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.chmod(path.dirname(plan.renderedConfig), 0o555);
     let executed = false;
 
     await assert.rejects(
@@ -2276,14 +2309,14 @@ describe('deploy-config CLI and execution', () => {
           return { stdout: '', stderr: '' };
         },
       }),
-      /must not be writable by the prepare worker/,
+      /must not be owned by the prepare worker/,
     );
 
     assert.equal(executed, false);
     await assertLockReleased(plan.lockDir);
   });
 
-  it('rejects prepare when the live output parent is worker-writable', async () => {
+  it('rejects prepare when the checked existing live parent is worker-owned mode 0555', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-parent-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -2301,8 +2334,9 @@ describe('deploy-config CLI and execution', () => {
       ]),
     );
     const liveDirectory = path.dirname(plan.renderedConfig);
-    await fs.mkdir(liveDirectory, { recursive: true, mode: 0o755 });
-    await fs.chmod(liveDirectory, 0o555);
+    const existingParent = path.dirname(liveDirectory);
+    await fs.mkdir(existingParent, { recursive: true, mode: 0o755 });
+    await fs.chmod(existingParent, 0o555);
     let executed = false;
 
     await assert.rejects(
@@ -2313,7 +2347,7 @@ describe('deploy-config CLI and execution', () => {
           return { stdout: '', stderr: '' };
         },
       }),
-      /must not be writable by the prepare worker/,
+      /must not be owned by the prepare worker/,
     );
 
     assert.equal(executed, false);
@@ -2345,10 +2379,14 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(outsideMetadata, 'outside metadata sentinel\n', 'utf8');
     await fs.symlink(outsideConfig, plan.stagedConfig);
     await fs.symlink(outsideMetadata, plan.stagedMetadataFile);
-    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+    );
 
     await executePreparePlan({
       plan,
+      fsApi,
       runner: async (command) => {
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(plan.candidateConfig, 'prepared config\n', 'utf8');
@@ -2393,10 +2431,9 @@ describe('deploy-config CLI and execution', () => {
       serviceRestartRequired: true,
     });
     await fs.chmod(plan.transactionFile, 0o000);
-    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     let executed = false;
     let transactionRead = false;
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async open(file, ...args) {
         if (file === plan.transactionFile) {
@@ -2406,6 +2443,11 @@ describe('deploy-config CLI and execution', () => {
         return fs.open(file, ...args);
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
@@ -2451,8 +2493,7 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.stagedMetadataFile, '{"status":"prepared","stale":true}\n', {
       mode: 0o600,
     });
-    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async rename(source, destination) {
         if (destination === plan.stagedMetadataFile) {
@@ -2463,6 +2504,11 @@ describe('deploy-config CLI and execution', () => {
         return fs.rename(source, destination);
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
@@ -2507,10 +2553,9 @@ describe('deploy-config CLI and execution', () => {
     const stagingDirectory = plan.stagingDir;
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
     await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
-    await protectPrepareLiveDirectories(plan.renderedConfig, plan.metadataFile);
     let metadataRenamed = false;
     let metadataDirectorySyncFailed = false;
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async rename(source, destination) {
         await fs.rename(source, destination);
@@ -2538,6 +2583,11 @@ describe('deploy-config CLI and execution', () => {
         return handle;
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
@@ -2614,12 +2664,79 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).config_revision, 'a'.repeat(40));
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'candidate config\n');
     assert.equal((await fs.stat(plan.renderedConfig)).mode & 0o777, 0o644);
-    assert.equal((await fs.stat(plan.stagingDir)).isDirectory(), true);
+    await assert.rejects(fs.stat(plan.stagingDir), { code: 'ENOENT' });
     assert.equal((await fs.stat(path.dirname(plan.renderedConfig))).isDirectory(), true);
     assert.equal((await fs.stat(path.dirname(plan.lockDir))).isDirectory(), true);
     assert.equal(lockOwner.pid, process.pid);
     assert.match(lockOwner.process_start_ticks, /^[0-9]+$/);
     assert.equal(typeof lockOwner.token, 'string');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('apply ignores worker-owned staging and prepare checkout directories', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-boundary-test-'));
+    const workerStaging = path.join(temp, 'worker-staging');
+    const workerPrepareCheckout = path.join(temp, 'worker-prepare-checkout');
+    const preparePlan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        workerPrepareCheckout,
+        '--staging-dir',
+        workerStaging,
+        '--rendered-config',
+        path.join(temp, 'prepare-live', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'prepare-live', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'prepare-run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'apply-checkout'),
+        '--staging-dir',
+        workerStaging,
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const workerDirectories = [plan.stagingDir, preparePlan.checkoutDir];
+    for (const directory of workerDirectories) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, 'sentinel'), 'worker-owned\n', 'utf8');
+    }
+    const fsApi = rejectPathAccessFs(fs, workerDirectories);
+
+    const metadata = await executePlan({
+      plan,
+      fsApi,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'candidate config\n', 'utf8');
+        }
+        return {
+          stdout: command.capture === 'configRevision' ? `${'1'.repeat(40)}\n` : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'installed_without_restart');
+    for (const directory of workerDirectories) {
+      assert.equal(await fs.readFile(path.join(directory, 'sentinel'), 'utf8'), 'worker-owned\n');
+    }
     await assertLockReleased(plan.lockDir);
   });
 
@@ -4929,20 +5046,59 @@ async function writeInstallTransactionFixture(
   );
 }
 
-async function protectPrepareLiveDirectories(renderedConfig, metadataFile) {
+async function protectPrepareLiveDirectories(renderedConfig, metadataFile, fsApi = fs) {
   const directories = new Set([
     path.dirname(renderedConfig),
     path.dirname(metadataFile),
   ]);
-  const parents = new Set();
+  const protectedDirectories = new Set();
   for (const directory of directories) {
     await fs.mkdir(directory, { recursive: true, mode: 0o755 });
     await fs.chmod(directory, 0o555);
-    parents.add(path.dirname(directory));
+    protectedDirectories.add(path.resolve(directory));
+    protectedDirectories.add(path.resolve(path.dirname(directory)));
   }
-  for (const parent of parents) {
+  for (const parent of [...protectedDirectories].filter(
+    (candidate) => !directories.has(candidate),
+  )) {
     await fs.chmod(parent, 0o555);
   }
+  const rootUid = (await fs.lstat(path.parse(path.resolve(renderedConfig)).root)).uid;
+  return {
+    ...fsApi,
+    async lstat(candidate, ...args) {
+      const stat = await fsApi.lstat(candidate, ...args);
+      if (!protectedDirectories.has(path.resolve(candidate))) {
+        return stat;
+      }
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === 'uid') return rootUid;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+}
+
+function rejectPathAccessFs(fsApi, rejectedRoots) {
+  const roots = rejectedRoots.map((root) => path.resolve(root));
+  return new Proxy(fsApi, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        for (const candidate of args.filter((arg) => typeof arg === 'string')) {
+          const resolved = path.resolve(candidate);
+          if (roots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`))) {
+            throw new Error(`unexpected worker path access: ${resolved}`);
+          }
+        }
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
 }
 
 function fakeProcessIdentity(uid, gid, groups) {

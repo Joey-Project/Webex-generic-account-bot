@@ -87,7 +87,13 @@ const PREPARED_KEYS = [
   'version',
 ];
 const REQUEST_KEYS = ['action', 'message_id', 'version'];
-const REQUEST_RECORD_KEYS = ['action', 'action_id', 'message_id', 'version'];
+const REQUEST_RECORD_KEYS = [
+  'action',
+  'action_id',
+  'enqueue_sequence',
+  'message_id',
+  'version',
+];
 const STATE_KEYS = [
   'action',
   'action_id',
@@ -245,13 +251,20 @@ export async function prepareStorage({
   await ensureTrustedDirectory(stateDir, PRIVATE_DIRECTORY_MODE, fsApi);
 }
 
-export async function publishRequestRecord({ queueDir, request, fsApi = fs }) {
+export async function publishRequestRecord({
+  queueDir,
+  request,
+  enqueueSequence,
+  fsApi = fs,
+}) {
   const validated = validateEnqueueRequest(request);
+  validateEnqueueSequence(enqueueSequence);
   const actionId = actionIdForMessageId(validated.message_id);
   const record = Object.freeze({
     version: 1,
     action_id: actionId,
     action: 'pull',
+    enqueue_sequence: enqueueSequence,
     message_id: validated.message_id,
   });
   const finalPath = requestRecordPath(queueDir, actionId);
@@ -538,6 +551,7 @@ export class ConfigPullWorker {
     this.socketIdentity = null;
     this.connections = new Set();
     this.enqueueTail = Promise.resolve();
+    this.nextEnqueueSequence = null;
     this.publicStatusTail = Promise.resolve();
     this.latestPublicState = null;
     this.drainPromise = null;
@@ -645,11 +659,16 @@ export class ConfigPullWorker {
   }
 
   async #enqueue(request) {
+    validateEnqueueSequence(this.nextEnqueueSequence);
     const publication = await publishRequestRecord({
       queueDir: this.options.queueDir,
       request,
+      enqueueSequence: this.nextEnqueueSequence,
       fsApi: this.fsApi,
     });
+    if (publication.status === 'queued') {
+      this.nextEnqueueSequence = incrementEnqueueSequence(publication.record.enqueue_sequence);
+    }
     const existingState = await readActionState(
       this.options.stateDir,
       publication.actionId,
@@ -668,6 +687,9 @@ export class ConfigPullWorker {
 
   async #recoverQueue() {
     const records = await this.#listRequestRecords();
+    this.nextEnqueueSequence = records.length === 0
+      ? 1
+      : incrementEnqueueSequence(records.at(-1).enqueue_sequence);
     let newestState = null;
     for (const record of records) {
       let state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
@@ -792,9 +814,9 @@ export class ConfigPullWorker {
 
   async #listRequestRecords() {
     const entries = await this.fsApi.readdir(this.options.queueDir, { withFileTypes: true });
-    const names = entries.map((entry) => entry.name).sort();
     const records = [];
-    for (const name of names) {
+    const sequences = new Set();
+    for (const { name } of entries) {
       if (REQUEST_TEMPORARY_PATTERN.test(name)) {
         await this.#assertTrustedTemporaryFile(path.join(this.options.queueDir, name));
         continue;
@@ -803,9 +825,14 @@ export class ConfigPullWorker {
         throw new Error(`unexpected queue entry: ${name}`);
       }
       const actionId = name.slice(0, -'.json'.length);
-      records.push(await readRequestRecord(this.options.queueDir, actionId, this.fsApi));
+      const record = await readRequestRecord(this.options.queueDir, actionId, this.fsApi);
+      if (sequences.has(record.enqueue_sequence)) {
+        throw new Error(`duplicate enqueue sequence: ${record.enqueue_sequence}`);
+      }
+      sequences.add(record.enqueue_sequence);
+      records.push(record);
     }
-    return records;
+    return records.sort((left, right) => left.enqueue_sequence - right.enqueue_sequence);
   }
 
   async #cleanStaleTemporaryFiles() {
@@ -1179,6 +1206,7 @@ function validateMessageId(messageId) {
 
 function validateRequestRecord(record, expectedActionId) {
   assertExactObject(record, REQUEST_RECORD_KEYS, 'request record');
+  validateEnqueueSequence(record.enqueue_sequence);
   const request = validateEnqueueRequest({
     version: record.version,
     action: record.action,
@@ -1310,6 +1338,20 @@ function validateIsoTimestamp(value, label) {
 
 function validateActionId(actionId) {
   if (!ACTION_ID_PATTERN.test(actionId ?? '')) throw new Error('action ID is invalid');
+}
+
+function validateEnqueueSequence(sequence) {
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+    throw new Error('enqueue sequence is invalid');
+  }
+}
+
+function incrementEnqueueSequence(sequence) {
+  validateEnqueueSequence(sequence);
+  if (sequence === Number.MAX_SAFE_INTEGER) {
+    throw new Error('enqueue sequence overflow');
+  }
+  return sequence + 1;
 }
 
 function assertOwnedRegularFile(stat, file, expectedMode) {
