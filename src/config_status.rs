@@ -47,10 +47,10 @@ impl ConfigStatusSnapshot {
     pub fn markdown(&self) -> String {
         let revision = self.config_revision.as_deref().unwrap_or("unknown");
         let service = self.service.as_deref().unwrap_or("unknown");
-        let revision_label = if self.status.starts_with("failed_") {
-            "Attempted config revision"
-        } else {
-            "Config revision"
+        let revision_label = match self.status.as_str() {
+            "failed_after_commit" | "failed_after_commit_cleanup" => "Committed config revision",
+            status if status.starts_with("failed_") => "Attempted config revision",
+            _ => "Config revision",
         };
         format!(
             "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`\n- Service: `{service}`",
@@ -385,6 +385,19 @@ mod tests {
         assert!(snapshot.markdown().contains("Attempted config revision:"));
         assert!(!snapshot.markdown().contains("\n- Config revision:"));
         assert!(!snapshot.markdown().contains("must not leak"));
+
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "failed_after_commit",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert!(snapshot.markdown().contains("Committed config revision:"));
+        assert!(!snapshot.markdown().contains("Attempted config revision:"));
         std_fs::remove_dir_all(root).unwrap();
     }
 
