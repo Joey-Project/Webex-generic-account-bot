@@ -126,10 +126,12 @@ That mode writes `status=installed_without_restart` instead of `status=deployed`
 Normal apply renders and validates a candidate config first, installs it
 atomically, restarts the service, and restores the previous rendered config if
 `systemctl restart` fails. Failed fetch, validation, install, or restart paths
-write machine-readable failure metadata, so `--status` does not preserve an old
-success after a failed apply. If metadata writing fails after the new config has
-been installed and the service restart has succeeded, the entrypoint records
-`status=failed_after_commit` instead of implying the apply was rolled back.
+write machine-readable failure metadata. If that failure metadata cannot be
+written, the apply reports both the primary error and the metadata error; an
+existing status file must then be treated as stale. If metadata writing fails
+after the new config has been installed and the service restart has succeeded,
+the entrypoint records `status=failed_after_commit` when possible instead of
+implying the apply was rolled back.
 Child command stdout/stderr capture is bounded and each child has a deadline so
 a stuck fetch, validation, or restart cannot hold the deployment lock forever.
 Existing checkout and lock directories must be owned by the deployment user and
@@ -140,6 +142,19 @@ writes deployment metadata to
 `/var/lib/webex-generic-account-bot/rendered/deploy-status.json` after a
 successful apply. Fetch credentials must be provided by host policy without
 ambient agent, proxy, or token environment leakage.
+
+The config checkout is sparse and data-only: only `production/bot.toml` and
+`production/spaces/*.toml` are accepted. Before checkout, the entrypoint rejects
+unexpected paths, executable or symlink entries, more than 128 files, blobs
+over 1 MiB, or more than 8 MiB of declared config data. Git runs through fixed
+`/usr/bin/prlimit` CPU, address-space, file-size, process, and file-descriptor
+limits, in addition to the command deadline and output cap.
+
+The host-owned static policy allowlists every deployable Webex room and pins its
+sender, routing, trigger, prompt, Codex, follow-up, and Jenkins policy. The
+Jenkins helper independently caps JSON API responses at 1 MiB, emits a
+control-character-safe console URL block, and keeps the complete structured URL
+allowlist separate from the prompt text truncation used for Codex context.
 
 Point the `webex-headless-messenger` JS sidecar at the bot:
 

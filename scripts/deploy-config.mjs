@@ -32,6 +32,19 @@ const TRUSTED_CHILD_CWD = '/';
 const HOST_OVERRIDE_ENV = 'WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES';
 const MAX_COMMAND_TIMEOUT_MS = 3_600_000;
 const MAX_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+const PRLIMIT_BIN = '/usr/bin/prlimit';
+const GIT_RESOURCE_LIMITS = Object.freeze([
+  '--fsize=33554432',
+  '--as=1073741824',
+  '--cpu=600',
+  '--nproc=128',
+  '--nofile=256',
+]);
+const CONFIG_TREE_ROOT = 'production';
+const MAX_CONFIG_TREE_FILES = 128;
+const MAX_CONFIG_BLOB_BYTES = 1024 * 1024;
+const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
+const MAX_CONFIG_PATH_BYTES = 512;
 const HOST_OVERRIDE_KEYS = new Set([
   'configRepo',
   'configRef',
@@ -250,6 +263,36 @@ export function buildDeployPlan(options) {
       'origin',
       options.configRef,
     ], { ...commandDefaults, env: gitEnv }),
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      'ls-tree',
+      '-r',
+      '-z',
+      '--name-only',
+      '--full-tree',
+      'FETCH_HEAD',
+      '--',
+      CONFIG_TREE_ROOT,
+    ], { ...commandDefaults, env: gitEnv, validation: 'config-tree-paths' }),
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      'ls-tree',
+      '-r',
+      '-l',
+      '-z',
+      '--full-tree',
+      'FETCH_HEAD',
+      '--',
+      CONFIG_TREE_ROOT,
+    ], { ...commandDefaults, env: gitEnv, validation: 'config-tree-manifest' }),
+    gitCommand(options.gitBin, checkoutWorkDir, ['sparse-checkout', 'init', '--no-cone'], {
+      ...commandDefaults,
+      env: gitEnv,
+    }),
+    gitCommand(options.gitBin, checkoutWorkDir, [
+      'sparse-checkout',
+      'set',
+      '--no-cone',
+      `/${CONFIG_TREE_ROOT}/`,
+    ], { ...commandDefaults, env: gitEnv }),
     gitCommand(options.gitBin, checkoutWorkDir, ['checkout', '--detach', '--force', 'FETCH_HEAD'], {
       ...commandDefaults,
       env: gitEnv,
@@ -365,9 +408,15 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
   let backupCleanupError = null;
   let commitReached = false;
   let failureMetadataWritten = false;
+  let failureMetadataError = null;
   const recordFailure = async (status, reason) => {
-    failureMetadataWritten = true;
-    await writeFailureMetadata(plan, captures.configRevision || null, status, reason, fsApi).catch(() => {});
+    try {
+      await writeFailureMetadata(plan, captures.configRevision || null, status, reason, fsApi);
+      failureMetadataWritten = true;
+    } catch (error) {
+      failureMetadataError = error;
+      throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
+    }
   };
   try {
     await prepareFreshCheckout(plan, fsApi);
@@ -444,7 +493,7 @@ export async function executePlan({ plan, parentEnv = process.env, runner = runC
     return metadata;
   } catch (error) {
     primaryError = error;
-    if (!failureMetadataWritten) {
+    if (!failureMetadataWritten && !failureMetadataError) {
       await recordFailure(commitReached ? 'failed_after_commit' : 'failed_apply', error.message);
     }
     throw error;
@@ -514,15 +563,20 @@ function command(bin, args, options = {}) {
     cwd: options.cwd || TRUSTED_CHILD_CWD,
     optional: Boolean(options.optional),
     capture: options.capture,
+    validation: options.validation,
     env: options.env || {},
     timeoutMs: options.timeoutMs,
     outputLimitBytes: options.outputLimitBytes,
+    resourceLimits: options.resourceLimits || null,
   };
 }
 
 function gitCommand(bin, cwd, args, options = {}) {
   const gitArgs = cwd ? ['-C', cwd, ...GIT_SAFE_CONFIG, ...args] : [...GIT_SAFE_CONFIG, ...args];
-  return command(bin, gitArgs, options);
+  return command(bin, gitArgs, {
+    ...options,
+    resourceLimits: GIT_RESOURCE_LIMITS,
+  });
 }
 
 function gitEnvForRepo(options) {
@@ -552,7 +606,8 @@ function gitEnvForRepo(options) {
 export async function runCommand(commandSpec, env) {
   return await new Promise((resolve, reject) => {
     const detached = process.platform !== 'win32';
-    const child = spawn(commandSpec.bin, commandSpec.args, {
+    const invocation = commandInvocation(commandSpec);
+    const child = spawn(invocation.bin, invocation.args, {
       cwd: commandSpec.cwd || TRUSTED_CHILD_CWD,
       env,
       detached,
@@ -599,19 +654,125 @@ export async function runCommand(commandSpec, env) {
         return;
       }
       if (code === 0 || commandSpec.optional) {
-        resolve({
+        const result = {
           stdout,
           stderr,
           code,
           stdoutTruncated: stdoutCapture.truncated,
           stderrTruncated: stderrCapture.truncated,
-        });
+        };
+        try {
+          validateCommandResult(commandSpec, result);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        resolve(result);
         return;
       }
       const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
       reject(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
     });
   });
+}
+
+function commandInvocation(commandSpec) {
+  if (!commandSpec.resourceLimits) {
+    return { bin: commandSpec.bin, args: commandSpec.args };
+  }
+  return {
+    bin: PRLIMIT_BIN,
+    args: [...commandSpec.resourceLimits, '--', commandSpec.bin, ...commandSpec.args],
+  };
+}
+
+function validateCommandResult(commandSpec, result) {
+  if (!commandSpec.validation) {
+    return;
+  }
+  if (result.stdoutTruncated) {
+    throw new Error(`${commandSpec.validation} output exceeded the trusted capture limit`);
+  }
+  if (commandSpec.validation === 'config-tree-paths') {
+    validateConfigTreePaths(result.stdout);
+    return;
+  }
+  if (commandSpec.validation === 'config-tree-manifest') {
+    validateConfigTreeManifest(result.stdout);
+    return;
+  }
+  throw new Error(`unknown command output validation: ${commandSpec.validation}`);
+}
+
+export function validateConfigTreePaths(output) {
+  const paths = parseNulRecords(output, 'config tree path list');
+  validateConfigPaths(paths);
+  return paths;
+}
+
+export function validateConfigTreeManifest(output) {
+  const records = parseNulRecords(output, 'config tree manifest');
+  const paths = [];
+  let totalBytes = 0;
+  for (const record of records) {
+    const match = /^(\d{6}) (\S+) ([0-9a-f]{40,64})\s+(\d+)\t(.+)$/.exec(record);
+    if (!match) {
+      throw new Error('config tree manifest contains an invalid entry');
+    }
+    const [, mode, objectType, , sizeText, file] = match;
+    if (mode !== '100644' || objectType !== 'blob') {
+      throw new Error(`config tree entry must be a non-executable regular file: ${file}`);
+    }
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_CONFIG_BLOB_BYTES) {
+      throw new Error(`config tree blob exceeds max bytes ${MAX_CONFIG_BLOB_BYTES}: ${file}`);
+    }
+    totalBytes += size;
+    if (totalBytes > MAX_CONFIG_TREE_BYTES) {
+      throw new Error(`config tree exceeds max total bytes ${MAX_CONFIG_TREE_BYTES}`);
+    }
+    paths.push(file);
+  }
+  validateConfigPaths(paths);
+  return { files: paths.length, totalBytes };
+}
+
+function parseNulRecords(output, label) {
+  if (!output.endsWith('\0')) {
+    throw new Error(`${label} must be NUL terminated`);
+  }
+  return output.slice(0, -1).split('\0');
+}
+
+function validateConfigPaths(paths) {
+  if (paths.length === 0) {
+    throw new Error('config tree must contain production config files');
+  }
+  if (paths.length > MAX_CONFIG_TREE_FILES) {
+    throw new Error(`config tree exceeds max files ${MAX_CONFIG_TREE_FILES}`);
+  }
+  const seen = new Set();
+  for (const file of paths) {
+    if (Buffer.byteLength(file, 'utf8') > MAX_CONFIG_PATH_BYTES) {
+      throw new Error(`config tree path exceeds max bytes ${MAX_CONFIG_PATH_BYTES}`);
+    }
+    if (
+      file !== `${CONFIG_TREE_ROOT}/bot.toml`
+      && !new RegExp(`^${CONFIG_TREE_ROOT}/spaces/[A-Za-z0-9._-]+\\.toml$`).test(file)
+    ) {
+      throw new Error(`config tree contains an unexpected path: ${file}`);
+    }
+    if (seen.has(file)) {
+      throw new Error(`config tree contains duplicate path: ${file}`);
+    }
+    seen.add(file);
+  }
+  if (!seen.has(`${CONFIG_TREE_ROOT}/bot.toml`)) {
+    throw new Error(`config tree is missing ${CONFIG_TREE_ROOT}/bot.toml`);
+  }
+  if (![...seen].some((file) => file.startsWith(`${CONFIG_TREE_ROOT}/spaces/`))) {
+    throw new Error(`config tree must contain at least one ${CONFIG_TREE_ROOT}/spaces/*.toml file`);
+  }
 }
 
 function outputCapture(limit = DEFAULTS.outputLimitBytes) {
@@ -667,7 +828,8 @@ function writePlan(stdout, plan, json) {
   stdout.write(`rendered_config=${plan.renderedConfig}\n`);
   stdout.write(`candidate_config=${plan.candidateConfig}\n`);
   for (const [index, commandSpec] of allPlanCommands(plan).entries()) {
-    stdout.write(`command_${index + 1}=${commandSpec.bin} ${commandSpec.args.map(shellQuoteForDisplay).join(' ')}\n`);
+    const invocation = commandInvocation(commandSpec);
+    stdout.write(`command_${index + 1}=${invocation.bin} ${invocation.args.map(shellQuoteForDisplay).join(' ')}\n`);
   }
 }
 

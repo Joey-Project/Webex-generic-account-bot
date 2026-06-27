@@ -75,6 +75,29 @@ JENKINS_FOLLOWUP_PINS = {
 JENKINS_FOLLOWUP_FORBIDDEN_ROOM_IDS = {
     "Y2lzY29zcGFyazovL3VzL1JPT00vNTMxMzQ4ZjAtNmJlZC0xMWYxLWFhNWUtZGY0YjBjYzc4YzY5",
 }
+GENERIC_ROOM_PINS = {
+    (
+        "Y2lzY29zcGFyazovL3VzL1JPT00vNjI1MzcwNzAtNmJjOS0xMWYxLWFiMGEtMDUxM2Y2OGNiOGM0"
+    ): {
+        "name": "miku bot test",
+        "trigger": "prefix",
+        "prefixes": ["/codex"],
+        "allowed_person_emails": ["webex-generic-account-E2E-tester@webex.bot"],
+        "allowed_person_ids": [],
+        "prompt_template": """
+You are Codex running from the miku Webex generic-account bot.
+
+Reply concisely in Simplified Chinese unless the user asks otherwise.
+
+Room: {room_id}
+Message ID: {message_id}
+Sender: {person_email}
+
+User message:
+{body}
+""",
+    },
+}
 JENKINS_CODEX_PINS = {
     "model": "gpt-5.5",
     "model_reasoning_effort": "xhigh",
@@ -348,6 +371,9 @@ class Validator:
             if isinstance(room, dict) and isinstance(room.get("room_id"), str)
         }
         self.require_known_jenkins_rooms(rooms_by_id)
+        allowed_room_ids = set(JENKINS_ROOM_PINS) | set(GENERIC_ROOM_PINS)
+        for room_id in sorted(set(rooms_by_id) - allowed_room_ids):
+            self.error(f"room_id is not allowlisted by host policy: {room_id}")
         all_room_ids = set(rooms_by_id)
         seen_room_ids: set[str] = set()
         for index, raw_room in enumerate(rooms):
@@ -365,6 +391,7 @@ class Validator:
             read_only_source_pins = READ_ONLY_SOURCE_ROOM_PINS.get(room_id)
             jenkins_room_pins = JENKINS_ROOM_PINS.get(room_id)
             jenkins_followup_pins = JENKINS_FOLLOWUP_PINS.get(room_id)
+            generic_room_pins = GENERIC_ROOM_PINS.get(room_id)
             if "forward_source_message" in room and not isinstance(room["forward_source_message"], bool):
                 self.error(f"{path}.forward_source_message must be true or false")
             if "read_only_source" in room and not isinstance(room["read_only_source"], bool):
@@ -416,6 +443,25 @@ class Validator:
                 self.expect_string_list(room, path, "allowed_person_emails", allow_empty=True)
             if "prompt_template" in room and not non_empty_text(room["prompt_template"]):
                 self.error(f"{path}.prompt_template must be a non-empty string")
+            if generic_room_pins is not None:
+                for key, expected in generic_room_pins.items():
+                    if key == "prompt_template":
+                        self.require_prompt_equal(room.get(key), f"{path}.{key}", expected)
+                    elif key == "allowed_person_ids":
+                        self.expect_equal(room, path, key, expected)
+                    else:
+                        self.require_equal(room, path, key, expected)
+                for forbidden_key in (
+                    "output_room_id",
+                    "forward_source_message",
+                    "read_only_source",
+                    "jenkins_context",
+                    "followup",
+                    "reply_format",
+                    "codex",
+                ):
+                    if forbidden_key in room:
+                        self.error(f"{path}.{forbidden_key} is not allowed for this pinned room")
             if jenkins_room_pins is not None:
                 self.require_prompt_fragments(
                     room.get("prompt_template"),
@@ -593,6 +639,13 @@ class Validator:
         for fragment in fragments:
             if normalise_prompt_text(fragment) not in normalised_value:
                 self.error(f"{path} must include required Jenkins guardrail fragment: {fragment!r}")
+
+    def require_prompt_equal(self, value: Any, path: str, expected: str) -> None:
+        if not isinstance(value, str):
+            self.error(f"{path} must be a string")
+            return
+        if normalise_prompt_text(value) != normalise_prompt_text(expected):
+            self.error(f"{path} must match the host-pinned prompt template")
 
     def expect_or_require_equal(
         self,

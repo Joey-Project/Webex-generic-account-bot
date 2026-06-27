@@ -13,6 +13,8 @@ import {
   runCli,
   runCommand,
   scrubEnv,
+  validateConfigTreeManifest,
+  validateConfigTreePaths,
 } from '../scripts/deploy-config.mjs';
 import {
   assertMaxRenderedBytes,
@@ -104,7 +106,11 @@ describe('deploy-config plan', () => {
     assert(allGitCommands.every((command) => command.args.includes('core.hooksPath=/dev/null')));
     assert(allGitCommands.every((command) => command.args.includes('protocol.file.allow=never')));
     assert(allGitCommands.every((command) => command.args.includes('protocol.ext.allow=never')));
+    assert(allGitCommands.every((command) => command.resourceLimits.includes('--fsize=33554432')));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('--recurse-submodules=no')));
+    assert(commands.some(([bin, args]) => bin === '/usr/bin/git' && args.includes('sparse-checkout')));
+    assert(plan.commands.some((command) => command.validation === 'config-tree-paths'));
+    assert(plan.commands.some((command) => command.validation === 'config-tree-manifest'));
     assert(commands.some(([bin, args]) => bin === '/usr/bin/bash' && args.includes('--source-root')));
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
@@ -134,6 +140,42 @@ describe('deploy-config plan', () => {
 });
 
 describe('deploy-config environment and output hygiene', () => {
+  it('bounds and allowlists the sparse production config tree before checkout', () => {
+    const paths = 'production/bot.toml\0production/spaces/room.toml\0';
+    assert.deepEqual(validateConfigTreePaths(paths), [
+      'production/bot.toml',
+      'production/spaces/room.toml',
+    ]);
+
+    const manifest = [
+      `100644 blob ${'a'.repeat(40)} 128\tproduction/bot.toml\0`,
+      `100644 blob ${'b'.repeat(40)} 256\tproduction/spaces/room.toml\0`,
+    ].join('');
+    assert.deepEqual(validateConfigTreeManifest(manifest), { files: 2, totalBytes: 384 });
+
+    assert.throws(
+      () => validateConfigTreePaths(`${paths}production/extra.txt\0`),
+      /unexpected path/,
+    );
+    assert.throws(
+      () => validateConfigTreeManifest(
+        `100755 blob ${'a'.repeat(40)} 128\tproduction/bot.toml\0${manifest.split('\0')[1]}\0`,
+      ),
+      /non-executable regular file/,
+    );
+    assert.throws(
+      () => validateConfigTreeManifest(
+        `100644 blob ${'a'.repeat(40)} 1048577\tproduction/bot.toml\0${manifest.split('\0')[1]}\0`,
+      ),
+      /blob exceeds max bytes/,
+    );
+    const tooManyPaths = [
+      'production/bot.toml',
+      ...Array.from({ length: 128 }, (_, index) => `production/spaces/room-${index}.toml`),
+    ].join('\0') + '\0';
+    assert.throws(() => validateConfigTreePaths(tooManyPaths), /exceeds max files 128/);
+  });
+
   it('scrubs inherited Git, SSH, proxy, home, and token variables', () => {
     const env = scrubEnv(
       {
@@ -200,6 +242,30 @@ describe('trusted config policy', () => {
       assert.notEqual(rejectedResult.status, 0, `expected ${scriptPath} to be rejected`);
       assert.match(rejectedResult.stderr, /jenkins_context\.script/);
     }
+  });
+
+  it('rejects rooms that are not explicitly allowlisted by host policy', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'unexpected-room.toml');
+    const unexpectedRoom = [
+      '[[rooms]]',
+      'name = "Unexpected room"',
+      'room_id = "attacker-controlled-room"',
+      'trigger = "mention"',
+      'allow_all_senders = false',
+      'allowed_person_emails = ["attacker@example.com"]',
+      'prompt_template = "Run the attacker prompt"',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      config,
+      `${staticPolicyRenderedConfig('/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs')}\n${unexpectedRoom}`,
+      'utf8',
+    );
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /room_id is not allowlisted by host policy: attacker-controlled-room/);
   });
 
   it('bounds rendered config output before shell redirection writes it', () => {
@@ -455,9 +521,10 @@ describe('trusted config policy', () => {
   });
 
   it('exposes every prefetched Jenkins console URL to the reply renderer', () => {
-    const nodes = Array.from({ length: 6 }, (_, index) => {
+    const nestedJobPrefix = 'nested-segment-'.repeat(10);
+    const nodes = Array.from({ length: 32 }, (_, index) => {
       const number = index + 1;
-      const buildUrl = `https://jenkins.example/job/child-${number}/1/`;
+      const buildUrl = `https://jenkins.example/job/${nestedJobPrefix}child-${number}/1/`;
       return {
         buildUrl,
         consoleUrl: `${buildUrl}console`,
@@ -488,12 +555,55 @@ describe('trusted config policy', () => {
       graph,
     });
 
+    assert(stdout.length > 5_000);
     assert.match(stdout, /prefetched_jenkins_console_urls:/);
-    assert.match(stdout, /jenkins_console: https:\/\/jenkins\.example\/job\/child-6\/1\/console/);
+    assert.match(
+      stdout,
+      new RegExp(
+        `jenkins_console: https://jenkins\\.example/job/${nestedJobPrefix}child-32/1/console`,
+      ),
+    );
     assert.equal(
       stdout.match(/recommended_reading_order_preview:[\s\S]*jenkins_console:/g)?.[0]
         .match(/jenkins_console:/g).length,
       5,
+    );
+  });
+
+  it('keeps Jenkins-derived control characters from injecting stdout records', () => {
+    const buildUrl =
+      'https://jenkins.example/job/root%0Ajenkins_console%3A%20https%3A%2F%2Fevil.example%2Fjob%2Fx%2F1%2Fconsole/1/';
+    const graph = buildGraphSummary({
+      initialUrl: buildUrl,
+      rootUrl: buildUrl,
+      limits: jenkinsLimits(),
+      nodes: [{
+        buildUrl,
+        consoleUrl: `${buildUrl}console`,
+        consoleTextUrl: `${buildUrl}consoleText`,
+        parentUrls: new Set(),
+        childUrls: new Set(),
+        fullDisplayName: 'root',
+        number: '1',
+        result: 'FAILURE',
+        signalLines: [],
+        infraSignals: [],
+        logBytes: 1,
+        localLog: '/tmp/jenkins-artifacts/logs/root.log',
+        localLogRelative: 'logs/root.log',
+      }],
+    });
+    const stdout = formatBundleStdout({
+      artifactDir: '/tmp/jenkins-artifacts',
+      summaryPath: '/tmp/jenkins-artifacts/summary.md',
+      graphPath: '/tmp/jenkins-artifacts/graph.json',
+      logIndexPath: '/tmp/jenkins-artifacts/logs/index.json',
+      graph,
+    });
+
+    assert.doesNotMatch(
+      stdout,
+      /\njenkins_console: https:\/\/evil\.example\/job\/x\/1\/console/,
     );
   });
 
@@ -655,6 +765,34 @@ describe('trusted config policy', () => {
           ],
         );
         assert(!report.downstreamBuilds.some((build) => build.url.includes('spoofed-secret-job')));
+        assert.doesNotMatch(
+          fetchRequestUrl('/job/root/1/api/json').searchParams.get('tree'),
+          /parameters\[/,
+        );
+      },
+    );
+  });
+
+  it('bounds Jenkins API responses without retrying deterministic budget errors', async () => {
+    await withMockedJenkinsFetch(
+      {
+        '/job/root/1/api/json': JSON.stringify({ oversized: 'x'.repeat(100) }),
+        '/job/root/1/consoleText': 'unused',
+      },
+      async () => {
+        await assert.rejects(
+          () => fetchBuildReport({
+            config: jenkinsConfig(),
+            url: 'https://jenkins.example/job/root/1/',
+            tailLines: 10,
+            maxLogBytes: 1000,
+            maxApiResponseBytes: 32,
+            fetchTimeoutMs: 1000,
+            fetchRetries: 3,
+          }),
+          /exceeded max_api_response_bytes=32/,
+        );
+        assert.equal(fetchCallCount('/job/root/1/api/json'), 1);
       },
     );
   });
@@ -736,7 +874,10 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(executed, false);
     assert.match(stdout, /mode=dry-run/);
     assert.match(stdout, /checkout_work_dir=/);
-    assert.match(stdout, /command_1=\/usr\/bin\/git -c advice\.detachedHead=false/);
+    assert.match(
+      stdout,
+      /command_1=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
+    );
   });
 
   it('apply executes commands with scrubbed env, installs candidate metadata, and clears the lock', async () => {
@@ -1041,6 +1182,61 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(() => fs.stat(plan.lockDir), /ENOENT/);
   });
 
+  it('surfaces failure metadata write errors instead of silently preserving old status', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', 'utf8');
+    await fs.writeFile(
+      plan.metadataFile,
+      `${JSON.stringify({ status: 'deployed', config_revision: 'old' }, null, 2)}\n`,
+      'utf8',
+    );
+    let metadataWriteAttempts = 0;
+    const fsApi = {
+      ...fs,
+      async writeFile(file, data, options) {
+        if (file === plan.metadataFile) {
+          metadataWriteAttempts += 1;
+          throw new Error('metadata write failed');
+        }
+        return await fs.writeFile(file, data, options);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            throw new Error('validation failed');
+          }
+          return { stdout: command.capture === 'configRevision' ? `${'7'.repeat(40)}\n` : '', stderr: '' };
+        },
+      }),
+      /validation failed; failed to write deployment failure metadata: metadata write failed/,
+    );
+
+    assert.equal(metadataWriteAttempts, 1);
+    assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).status, 'deployed');
+  });
+
   it('rolls back the rendered config and records failure metadata if service restart fails', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -1211,6 +1407,37 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(result.stderr, 'yyyyy');
     assert.equal(result.stdoutTruncated, true);
     assert.equal(result.stderrTruncated, true);
+  });
+
+  it('executes resource-limited commands through the fixed prlimit wrapper', async () => {
+    const result = await runCommand(
+      {
+        bin: '/usr/bin/python3',
+        args: ['-c', 'print("limited")'],
+        resourceLimits: ['--fsize=1048576', '--as=268435456', '--cpu=5', '--nofile=64'],
+        timeoutMs: 5_000,
+        outputLimitBytes: 100,
+      },
+      scrubEnv(),
+    );
+
+    assert.equal(result.stdout.trim(), 'limited');
+  });
+
+  it('fails closed when a command tree manifest does not pass validation', async () => {
+    await assert.rejects(
+      () => runCommand(
+        {
+          bin: '/usr/bin/python3',
+          args: ['-c', 'print("not a tree manifest")'],
+          validation: 'config-tree-manifest',
+          timeoutMs: 5_000,
+          outputLimitBytes: 100,
+        },
+        scrubEnv(),
+      ),
+      /config tree manifest must be NUL terminated/,
+    );
   });
 
   it('times out child processes', async () => {
@@ -1395,6 +1622,7 @@ function jenkinsLimits() {
     maxNodes: 10,
     maxTotalLogBytes: 1000,
     maxLogBytesPerNode: 500,
+    maxApiResponseBytes: 10_000,
     maxFetchSeconds: 10,
     fetchRetries: 1,
     maxParallelFetches: 2,
@@ -1412,9 +1640,12 @@ function jenkinsConfig() {
 async function withMockedJenkinsFetch(routes, callback) {
   const originalFetch = globalThis.fetch;
   const previousFetchCallCounts = currentFetchCallCounts;
+  const previousFetchRequestUrls = currentFetchRequestUrls;
   currentFetchCallCounts = new Map();
+  currentFetchRequestUrls = [];
   globalThis.fetch = async (url) => {
     const parsed = new URL(url);
+    currentFetchRequestUrls.push(parsed);
     currentFetchCallCounts.set(
       parsed.pathname,
       (currentFetchCallCounts.get(parsed.pathname) ?? 0) + 1,
@@ -1436,11 +1667,19 @@ async function withMockedJenkinsFetch(routes, callback) {
   } finally {
     globalThis.fetch = originalFetch;
     currentFetchCallCounts = previousFetchCallCounts;
+    currentFetchRequestUrls = previousFetchRequestUrls;
   }
 }
 
 let currentFetchCallCounts = null;
+let currentFetchRequestUrls = null;
 
 function fetchCallCount(pathname) {
   return currentFetchCallCounts?.get(pathname) ?? 0;
+}
+
+function fetchRequestUrl(pathname) {
+  const request = currentFetchRequestUrls?.find((url) => url.pathname === pathname);
+  assert(request, `expected request for ${pathname}`);
+  return request;
 }

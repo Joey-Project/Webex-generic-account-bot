@@ -11,9 +11,11 @@ const DEFAULT_ENV_FILE = '/etc/webex-generic-account-bot/jenkins.env';
 const DEFAULT_MAX_NODES = 100;
 const DEFAULT_MAX_TOTAL_LOG_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_LOG_BYTES_PER_NODE = 200 * 1024 * 1024;
+const DEFAULT_MAX_API_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_FETCH_SECONDS = 600;
 const DEFAULT_FETCH_RETRIES = 3;
 const DEFAULT_MAX_PARALLEL_FETCHES = 6;
+const MAX_JENKINS_URL_CHARS = 4096;
 
 export function parseEnvFile(contents) {
   const env = {};
@@ -50,6 +52,9 @@ export function extractJenkinsUrls(text, baseUrl) {
 
 export function normalizeJenkinsUrl(value, baseUrl) {
   const base = normalizeBaseUrl(baseUrl);
+  if (String(value).length > MAX_JENKINS_URL_CHARS) {
+    throw new Error(`Jenkins URL exceeds ${MAX_JENKINS_URL_CHARS} characters`);
+  }
   const url = new URL(value);
   if (!url.toString().startsWith(base.toString())) {
     throw new Error(`url is outside configured Jenkins base URL: ${url.origin}${url.pathname}`);
@@ -230,6 +235,8 @@ class GraphFetcher {
         url: buildUrl,
         tailLines: this.tailLines,
         maxLogBytes: reservedLogBytes,
+        maxApiResponseBytes:
+          this.limits.maxApiResponseBytes ?? DEFAULT_MAX_API_RESPONSE_BYTES,
         fetchTimeoutMs: this.limits.maxFetchSeconds * 1000,
         fetchRetries: this.limits.fetchRetries,
       });
@@ -414,6 +421,7 @@ export async function fetchBuildReport({
   url,
   tailLines,
   maxLogBytes,
+  maxApiResponseBytes = DEFAULT_MAX_API_RESPONSE_BYTES,
   fetchTimeoutMs,
   fetchRetries,
 }) {
@@ -429,7 +437,7 @@ export async function fetchBuildReport({
       'url',
       'fullDisplayName',
       'number',
-      'actions[causes[shortDescription,userId,userName,upstreamProject,upstreamBuild,upstreamUrl],parameters[name,value],builds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],triggeredBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]]',
+      'actions[causes[shortDescription,userId,userName,upstreamProject,upstreamBuild,upstreamUrl],builds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],triggeredBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]]',
       'downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]',
       'subBuilds[fullDisplayName,fullName,displayName,name,jobName,jobAlias,number,buildNumber,buildNumberStr,result,url]',
       'artifacts[fileName,relativePath]',
@@ -437,7 +445,13 @@ export async function fetchBuildReport({
   );
   const consoleTextUrl = new URL('consoleText', buildUrl);
 
-  const build = await withRetries(() => getJson(buildApiUrl, config, { timeoutMs: fetchTimeoutMs }), fetchRetries);
+  const build = await withRetries(
+    () => getJsonLimited(buildApiUrl, config, {
+      maxBytes: maxApiResponseBytes,
+      timeoutMs: fetchTimeoutMs,
+    }),
+    fetchRetries,
+  );
   let consoleText = '';
   let consoleFetchError = null;
   try {
@@ -648,7 +662,7 @@ export async function diagnoseBuild({ config, url, tailLines, limits }) {
       'url',
       'fullDisplayName',
       'number',
-      'actions[causes[shortDescription,userId,userName],parameters[name,value],builds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],triggeredBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]]',
+      'actions[causes[shortDescription,userId,userName],builds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],triggeredBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url],downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]]',
       'downstreamBuilds[fullDisplayName,fullName,displayName,name,jobName,number,buildNumber,buildNumberStr,result,url]',
       'subBuilds[fullDisplayName,fullName,displayName,name,jobName,jobAlias,number,buildNumber,buildNumberStr,result,url]',
       'artifacts[fileName,relativePath]',
@@ -660,7 +674,13 @@ export async function diagnoseBuild({ config, url, tailLines, limits }) {
   const maxLogBytes = Math.min(limits.maxLogBytesPerNode, limits.maxTotalLogBytes);
 
   const [build, consoleText] = await Promise.all([
-    withRetries(() => getJson(buildApiUrl, config, { timeoutMs: fetchTimeoutMs }), limits.fetchRetries),
+    withRetries(
+      () => getJsonLimited(buildApiUrl, config, {
+        maxBytes: limits.maxApiResponseBytes ?? DEFAULT_MAX_API_RESPONSE_BYTES,
+        timeoutMs: fetchTimeoutMs,
+      }),
+      limits.fetchRetries,
+    ),
     withRetries(
       () => getTextLimited(consoleTextUrl, config, {
         maxBytes: maxLogBytes,
@@ -910,11 +930,17 @@ export function formatBundleStdout(bundle) {
   const first = bundle.graph.recommended_reading_order[0];
   const lines = [
     'jenkins_diagnostics_bundle=true',
-    `artifact_dir=${bundle.artifactDir}`,
-    `summary_file=${bundle.summaryPath}`,
-    `graph_file=${bundle.graphPath}`,
-    `log_index_file=${bundle.logIndexPath}`,
-    `logs_dir=${path.join(bundle.artifactDir, 'logs')}`,
+    'prefetched_jenkins_console_urls:',
+    ...bundle.graph.nodes.map(
+      (node) => `- jenkins_console: ${stdoutScalar(node.jenkins_console)}`,
+    ),
+    'prefetched_jenkins_console_urls_end=true',
+    '',
+    `artifact_dir=${stdoutScalar(bundle.artifactDir)}`,
+    `summary_file=${stdoutScalar(bundle.summaryPath)}`,
+    `graph_file=${stdoutScalar(bundle.graphPath)}`,
+    `log_index_file=${stdoutScalar(bundle.logIndexPath)}`,
+    `logs_dir=${stdoutScalar(path.join(bundle.artifactDir, 'logs'))}`,
     `total_jobs_discovered=${bundle.graph.counts.total_jobs_discovered}`,
     `log_files_written=${bundle.graph.counts.log_files_written}`,
     `fetch_error_jobs=${bundle.graph.counts.fetch_error_jobs}`,
@@ -923,34 +949,34 @@ export function formatBundleStdout(bundle) {
     `failed_trigger_jobs=${bundle.graph.counts.failed_trigger_jobs}`,
     `failure_handler_jobs=${bundle.graph.counts.failure_handler_jobs}`,
     `partial=${bundle.graph.partial ? 'true' : 'false'}`,
-    ...(bundle.graph.stop_reason ? [`stop_reason=${bundle.graph.stop_reason}`] : []),
-    first ? `recommended_first=${first.id}` : 'recommended_first=none',
+    ...(bundle.graph.stop_reason ? [`stop_reason=${stdoutScalar(bundle.graph.stop_reason)}`] : []),
+    first ? `recommended_first=${stdoutScalar(first.id)}` : 'recommended_first=none',
     '',
     'Read summary_file first. Use log_index_file to count every discovered job and map each job to its local_log. Use local_log files for evidence and jenkins_console GUI links in the final reply.',
   ];
-  if (bundle.graph.nodes.length > 0) {
-    lines.push('', 'prefetched_jenkins_console_urls:');
-    for (const node of bundle.graph.nodes) {
-      lines.push(`- jenkins_console: ${node.jenkins_console}`);
-    }
-  }
   if (bundle.graph.recommended_reading_order.length > 0) {
     lines.push('', 'recommended_reading_order_preview:');
     for (const item of bundle.graph.recommended_reading_order.slice(0, 5)) {
-      lines.push(`- ${item.role}: ${item.id}`);
-      lines.push(`  local_log: ${item.local_log ?? 'unavailable'}`);
-      lines.push(`  jenkins_console: ${item.jenkins_console}`);
+      lines.push(`- ${stdoutScalar(item.role)}: ${stdoutScalar(item.id)}`);
+      lines.push(`  local_log: ${stdoutScalar(item.local_log ?? 'unavailable')}`);
+      lines.push(`  jenkins_console: ${stdoutScalar(item.jenkins_console)}`);
       if (item.infra_signals.length === 0) {
         lines.push('  infra_signals: none');
       } else {
         lines.push('  infra_signals:');
         for (const signal of item.infra_signals.slice(0, 5)) {
-          lines.push(`    - ${signal.kind}: ${redactLog(signal.line)}`);
+          lines.push(
+            `    - ${stdoutScalar(signal.kind)}: ${stdoutScalar(redactLog(signal.line))}`,
+          );
         }
       }
     }
   }
   return lines.join('\n');
+}
+
+function stdoutScalar(value) {
+  return String(value).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
 }
 
 export function formatReport(report) {
@@ -1033,7 +1059,7 @@ async function withRetries(operation, retries) {
     try {
       return await operation();
     } catch (error) {
-      if (error instanceof JenkinsLogBudgetError) {
+      if (error instanceof JenkinsResponseBudgetError) {
         throw error;
       }
       lastError = error;
@@ -1049,17 +1075,45 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class JenkinsLogBudgetError extends Error {}
+class JenkinsResponseBudgetError extends Error {}
+
+class JenkinsLogBudgetError extends JenkinsResponseBudgetError {}
+
+class JenkinsApiBudgetError extends JenkinsResponseBudgetError {}
 
 async function getTextLimited(url, config, { maxBytes, timeoutMs }) {
   const response = await get(url, config, { timeoutMs });
+  const body = await readResponseBodyLimited(
+    response,
+    url,
+    maxBytes,
+    'max_log_bytes_per_node',
+    JenkinsLogBudgetError,
+  );
+  return body.toString('utf8');
+}
+
+async function getJsonLimited(url, config, { maxBytes, timeoutMs }) {
+  const response = await get(url, config, { timeoutMs });
+  const body = await readResponseBodyLimited(
+    response,
+    url,
+    maxBytes,
+    'max_api_response_bytes',
+    JenkinsApiBudgetError,
+  );
+  return JSON.parse(body.toString('utf8'));
+}
+
+async function readResponseBodyLimited(response, url, maxBytes, budgetName, ErrorType) {
+  const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await response.body?.cancel?.().catch(() => {});
+    throw new ErrorType(`GET ${url.pathname} exceeded ${budgetName}=${maxBytes}`);
+  }
   const reader = response.body?.getReader();
   if (!reader) {
-    const text = await response.text();
-    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
-      throw new JenkinsLogBudgetError(`GET ${url.pathname} exceeded max_log_bytes_per_node=${maxBytes}`);
-    }
-    return text;
+    throw new ErrorType(`GET ${url.pathname} cannot enforce ${budgetName}=${maxBytes}`);
   }
 
   const chunks = [];
@@ -1072,11 +1126,11 @@ async function getTextLimited(url, config, { maxBytes, timeoutMs }) {
     total += value.byteLength;
     if (total > maxBytes) {
       await reader.cancel?.().catch(() => {});
-      throw new JenkinsLogBudgetError(`GET ${url.pathname} exceeded max_log_bytes_per_node=${maxBytes}`);
+      throw new ErrorType(`GET ${url.pathname} exceeded ${budgetName}=${maxBytes}`);
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
 }
 
 export function redactLog(text) {
@@ -1179,16 +1233,6 @@ async function loadJenkinsConfig(envFile) {
   };
 }
 
-async function getJson(url, config, options = {}) {
-  const response = await get(url, config, options);
-  return response.json();
-}
-
-async function getText(url, config, options = {}) {
-  const response = await get(url, config, options);
-  return response.text();
-}
-
 async function get(url, config, options = {}) {
   normalizeJenkinsUrl(url.toString(), config.baseUrl);
   const response = await fetch(url, {
@@ -1217,6 +1261,7 @@ function parseArgs(args) {
       maxNodes: DEFAULT_MAX_NODES,
       maxTotalLogBytes: DEFAULT_MAX_TOTAL_LOG_BYTES,
       maxLogBytesPerNode: DEFAULT_MAX_LOG_BYTES_PER_NODE,
+      maxApiResponseBytes: DEFAULT_MAX_API_RESPONSE_BYTES,
       maxFetchSeconds: DEFAULT_MAX_FETCH_SECONDS,
       fetchRetries: DEFAULT_FETCH_RETRIES,
       maxParallelFetches: DEFAULT_MAX_PARALLEL_FETCHES,
@@ -1241,6 +1286,8 @@ function parseArgs(args) {
       options.limits.maxTotalLogBytes = parsePositiveInteger(requiredValue(args, (index += 1), arg));
     } else if (arg === '--max-log-bytes-per-node') {
       options.limits.maxLogBytesPerNode = parsePositiveInteger(requiredValue(args, (index += 1), arg));
+    } else if (arg === '--max-api-response-bytes') {
+      options.limits.maxApiResponseBytes = parsePositiveInteger(requiredValue(args, (index += 1), arg));
     } else if (arg === '--max-fetch-seconds') {
       options.limits.maxFetchSeconds = parsePositiveInteger(requiredValue(args, (index += 1), arg));
     } else if (arg === '--fetch-retries') {

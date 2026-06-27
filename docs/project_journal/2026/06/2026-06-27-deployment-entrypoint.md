@@ -5,7 +5,7 @@ status: active
 created: 2026-06-27
 updated: 2026-06-27
 branch: codex/deploy-entrypoint-pr1b
-pr:
+pr: https://github.com/Joey-Project/Webex-generic-account-bot/pull/8
 supersedes: []
 superseded_by:
 ---
@@ -24,6 +24,9 @@ superseded_by:
   apply and is passed to the trusted policy helper only as `--source-root`.
 - GitHub fetch uses fixed host SSH policy rather than ambient agent, home, or
   proxy state.
+- Git commands run through fixed `/usr/bin/prlimit` resource limits; the
+  checkout is sparse to `production/` and validates path shape, file count,
+  file type, per-blob size, and total declared config bytes before checkout.
 - Host policy overrides for executable paths, repo paths, timeouts, and output
   caps require `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`.
 - The entrypoint defaults to dry-run/status and requires `--apply` for mutation.
@@ -42,8 +45,18 @@ superseded_by:
 - The trusted Jenkins helper is vendored into the bot repo with service-bounded
   graph fetch limits, redacted diagnostics snippets, explicit partial collection
   markers, and downstream traversal limited to structured Jenkins API metadata.
+- Jenkins JSON API responses have a separate 1 MiB streaming cap and omit
+  unused build parameter values.
 - Jenkins helper stdout exposes every prefetched GUI console URL for reply
-  rendering allowlists while keeping the recommended reading preview short.
+  rendering allowlists while keeping the recommended reading preview short;
+  control characters are collapsed and Rust consumes only the explicit URL
+  block.
+- Reply rendering receives the full structured URL allowlist before prompt
+  truncation, so long 32-node graphs cannot silently lose valid log links.
+- Host policy rejects every room outside the pinned production, staging, and
+  `miku bot test` room set.
+- Failure metadata write errors are surfaced together with the primary apply
+  error, so operators know an existing status file is stale.
 - Jenkins API graph discovery is kept separate from console log fetches so a
   missing or oversized root log does not prevent traversal to downstream jobs.
 
@@ -52,6 +65,7 @@ superseded_by:
 - Add stronger protected-check verification before accepting a config revision
   when deployment host credentials and GitHub status access are finalised.
 - Update config repo Jenkins helper paths to the trusted bot repo helper path
-  before deploying with this entrypoint.
+  plus the pinned Codex workspace and `skip_git_repo_check` values before
+  deploying with this entrypoint.
 - Replace `systemctl restart` with a stronger handoff primitive if the service
   needs more availability guarantees than restore-on-restart-failure.
