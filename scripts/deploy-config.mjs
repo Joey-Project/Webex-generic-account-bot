@@ -376,6 +376,7 @@ export function buildDeployPlan(options) {
           commandDefaults,
         ),
         command(SERVICE_READINESS_BIN, [
+          '--disable',
           '--silent',
           '--show-error',
           '--output',
@@ -1522,13 +1523,52 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
       continue;
     }
     seen.add(directory);
+    await assertTrustedOutputAncestors(directory, label, fsApi);
     await createDirectoryDurably(directory, 0o755, fsApi);
+    await assertTrustedOutputAncestors(directory, label, fsApi);
     const resolved = await fsApi.realpath(directory);
     if (resolved !== path.resolve(directory)) {
       throw new Error(`${label} must not contain symlinks: ${directory}`);
     }
     const directoryStat = await fsApi.lstat(directory);
     assertTrustedOutputDirectory(directory, directoryStat, label);
+  }
+}
+
+async function assertTrustedOutputAncestors(directory, label, fsApi) {
+  const candidates = [];
+  let current = path.dirname(path.resolve(directory));
+  for (;;) {
+    candidates.unshift(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  const deploymentUid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const rootStat = await fsApi.lstat(path.parse(path.resolve(directory)).root);
+  const trustedOwnerUids = new Set([deploymentUid, rootStat.uid]);
+  for (const candidate of candidates) {
+    let stat;
+    try {
+      stat = await fsApi.lstat(candidate);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        break;
+      }
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${label} ancestor must be a real directory: ${candidate}`);
+    }
+    if (!trustedOwnerUids.has(stat.uid)) {
+      throw new Error(`${label} ancestor ownership is not trusted: ${candidate}`);
+    }
+    const mode = stat.mode & 0o7777;
+    if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+      throw new Error(`${label} ancestor mode is not trusted: ${candidate}`);
+    }
   }
 }
 

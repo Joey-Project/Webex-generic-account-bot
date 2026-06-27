@@ -39,8 +39,8 @@ superseded_by:
   fsynced before deployment continues.
 - Mutable checkout, lock, output, metadata, bot-code, and credential paths must
   be topologically disjoint when host overrides are enabled. Existing ancestors
-  are canonicalised and symlink ancestors are rejected before lock creation or
-  recursive cleanup.
+  are canonicalised; symlink, untrusted-owner, and non-sticky writable output
+  ancestors are rejected before lock creation or recursive cleanup.
 - Host policy overrides for executable paths, repo paths, timeouts, and output
   caps require `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`.
 - The entrypoint defaults to dry-run/status and requires `--apply` for mutation.

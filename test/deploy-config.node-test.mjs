@@ -146,6 +146,7 @@ describe('deploy-config plan', () => {
         [
           '/usr/bin/curl',
           [
+            '--disable',
             '--silent',
             '--show-error',
             '--output',
@@ -2034,6 +2035,45 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('rejects an untrusted writable ancestor before creating output directories', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const unsafeParent = path.join(temp, 'unsafe-parent');
+    await fs.mkdir(unsafeParent, { mode: 0o755 });
+    await fs.chmod(unsafeParent, 0o777);
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(unsafeParent, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(unsafeParent, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /rendered config directory ancestor mode is not trusted/,
+    );
+
+    assert.equal(commandRan, false);
+    await assert.rejects(() => fs.access(path.dirname(plan.renderedConfig)));
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('does not roll back a successful deployment when backup cleanup fails', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -2653,7 +2693,7 @@ describe('deploy-config CLI and execution', () => {
     assert.deepEqual(calls.slice(0, 4), [
       ['/usr/bin/systemctl', 'restart'],
       ['/usr/bin/systemctl', 'is-active'],
-      ['/usr/bin/curl', '--silent'],
+      ['/usr/bin/curl', '--disable'],
       ['/usr/bin/git', '-c'],
     ]);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');

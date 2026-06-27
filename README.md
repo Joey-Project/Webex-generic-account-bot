@@ -197,7 +197,8 @@ symlinks, have unexpected ownership, or are group/world writable.
 Host path overrides are also rejected when checkout, lock, rendered config,
 metadata, bot code, or credential paths overlap a mutable deployment tree or
 one another. Existing path ancestors are canonicalised before any lock or
-recursive cleanup, and symlink ancestors are rejected.
+recursive cleanup, and symlink or untrusted writable ancestors are rejected.
+Root-owned sticky directories such as `/tmp` remain valid ancestors.
 
 The host-owned static policy allowlists every deployable Webex room and pins its
 sender, routing, trigger, Codex, follow-up, and Jenkins policy. Jenkins prompts
