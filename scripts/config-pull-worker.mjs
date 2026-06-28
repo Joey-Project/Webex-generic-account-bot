@@ -506,6 +506,7 @@ export async function runPrepareCommand({
     let stderrBytes = 0;
     let failure = null;
     let settled = false;
+    let outerSigkillStarted = false;
     let killTimer = null;
     let closeTimer = null;
 
@@ -526,7 +527,9 @@ export async function runPrepareCommand({
       failure = error;
       killChild(child, 'SIGTERM', killImpl);
       killTimer = setTimeout(() => {
+        outerSigkillStarted = true;
         killChild(child, 'SIGKILL', killImpl);
+        if (settled) return;
         closeTimer = setTimeout(() => {
           child.stdout.destroy();
           child.stderr.destroy();
@@ -562,6 +565,10 @@ export async function runPrepareCommand({
       settled = true;
       cleanup();
       if (code === PREPARE_EXIT_PROCESS_TREE_UNCONTAINED) {
+        reject(new WorkerFailure('prepare_process_tree_uncontained'));
+        return;
+      }
+      if (outerSigkillStarted) {
         reject(new WorkerFailure('prepare_process_tree_uncontained'));
         return;
       }
@@ -712,6 +719,10 @@ export class ConfigPullWorker {
 
   waitForFatal() {
     return this.fatalPromise;
+  }
+
+  getFatalError() {
+    return this.fatalError;
   }
 
   #throwIfStopping() {
@@ -914,13 +925,16 @@ export class ConfigPullWorker {
       });
       validatePreparedProjection(prepared);
     } catch (error) {
-      if (this.stopping || this.abortController.signal.aborted) return;
       if (
         error instanceof WorkerFailure
         && error.code === 'prepare_process_tree_uncontained'
       ) {
+        await this.#persistState(this.#makeState(record, 'failed', {
+          failureCode: error.code,
+        }));
         throw error;
       }
+      if (this.stopping || this.abortController.signal.aborted) return;
       if (error instanceof WorkerFailure && error.code === 'prepare_lock_busy') {
         await this.#persistState(this.#makeState(record, 'queued'));
         this.#scheduleRetry();
@@ -1138,8 +1152,11 @@ export class ConfigPullWorker {
   }
 
   #fail(error) {
-    if (this.fatalError || this.stopping) return;
-    this.fatalError = error instanceof Error ? error : new Error('worker failed');
+    const fatalError = error instanceof Error ? error : new Error('worker failed');
+    const isContainmentFatal = fatalError instanceof WorkerFailure
+      && fatalError.code === 'prepare_process_tree_uncontained';
+    if (this.fatalError || (this.stopping && !isContainmentFatal)) return;
+    this.fatalError = fatalError;
     this.#clearRetryTimer();
     this.resolveFatal(this.fatalError);
   }
@@ -1162,6 +1179,10 @@ export async function runCli({
   });
   let signalReceived = false;
   let stopPromise = null;
+  const hasFatalError = () => (
+    typeof activeWorker.getFatalError === 'function'
+    && activeWorker.getFatalError() !== null
+  );
   const beginStop = () => {
     if (stopPromise) return stopPromise;
     try {
@@ -1188,12 +1209,12 @@ export async function runCli({
     const startupResult = await Promise.race([startup, signalPromise]);
     if (startupResult.type === 'signal') {
       await beginStop();
-      exitCode = 0;
+      exitCode = hasFatalError() ? 1 : 0;
     } else if (startupResult.type === 'startup_failed') {
       if (signalReceived && startupResult.error instanceof WorkerFailure
         && startupResult.error.code === 'worker_stopping') {
         await beginStop();
-        exitCode = 0;
+        exitCode = hasFatalError() ? 1 : 0;
       } else {
         throw startupResult.error;
       }
@@ -1204,7 +1225,7 @@ export async function runCli({
       ]);
       if (outcome.type === 'signal') {
         await beginStop();
-        exitCode = 0;
+        exitCode = hasFatalError() ? 1 : 0;
       } else {
         exitCode = 1;
       }
@@ -1221,6 +1242,7 @@ export async function runCli({
       if (exitCode === 0) stderr.write('config pull worker failed\n');
       exitCode = 1;
     }
+    if (hasFatalError()) exitCode = 1;
   }
   return exitCode;
 }

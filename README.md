@@ -231,9 +231,11 @@ Lock contention is reported by the fixed deployment entrypoint as a structured
 retryable status. The worker durably moves that oldest action back to `queued`,
 waits one second, and retries without allowing newer actions to pass it. A
 deployment child tree that cannot be fully reaped is instead an integrity
-failure: the worker leaves the action recoverable, exits non-zero, and relies on
-the unit's explicit `KillMode=control-group` to remove every process in the
-worker cgroup before systemd restarts it.
+failure: the worker persists a terminal taint for that action, exits non-zero,
+and relies on the unit's explicit `KillMode=control-group` to remove every
+process in the worker cgroup before systemd restarts it. The tainted staged pair
+is never reconciled as success; after operator review, a new Webex message is
+required to request another preparation.
 The unit requires Linux cgroup v2. Each fixed deployment command records the
 unit cgroup's PID and process-start-time identities before spawn and verifies
 the same membership after the direct child closes. A new live identity, or an

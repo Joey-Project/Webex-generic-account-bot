@@ -832,10 +832,51 @@ describe('config pull worker lifecycle', () => {
       assert.equal(stopCalls, 1);
     }
   });
+
+  it('returns failure when SIGTERM races with a containment fatal', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request: { version: 1, message_id: 'signal-containment-race', action: 'pull' },
+      enqueueSequence: 1,
+    });
+    const prepareStarted = deferred();
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async ({ signal }) => {
+        prepareStarted.resolve();
+        await new Promise((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener('abort', resolve, { once: true });
+        });
+        throw new WorkerFailure('prepare_process_tree_uncontained');
+      },
+    });
+    context.after(async () => worker.stop());
+    const processApi = new EventEmitter();
+    const result = runCli({
+      worker,
+      processApi,
+      stderr: { write: () => {} },
+    });
+
+    await prepareStarted.promise;
+    processApi.emit('SIGTERM');
+
+    assert.equal(await result, 1);
+    const state = await readActionState(layout.stateDir, publication.actionId);
+    assert.equal(state.status, 'failed');
+    assert.equal(state.failure_code, 'prepare_process_tree_uncontained');
+    assert.equal(worker.getFatalError()?.code, 'prepare_process_tree_uncontained');
+  });
 });
 
 describe('config pull worker recovery', () => {
-  it('keeps integrity-fatal work recoverable and stops before newer records', async (context) => {
+  it('persists integrity-fatal taint and skips matching staged work after restart', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
     const publications = [];
@@ -865,10 +906,9 @@ describe('config pull worker recovery', () => {
 
     assert.equal(exitCode, 1);
     assert.deepEqual(attempts, [publications[0].actionId]);
-    assert.equal(
-      (await readActionState(layout.stateDir, publications[0].actionId)).status,
-      'running',
-    );
+    const taintedState = await readActionState(layout.stateDir, publications[0].actionId);
+    assert.equal(taintedState.status, 'failed');
+    assert.equal(taintedState.failure_code, 'prepare_process_tree_uncontained');
     assert.equal(
       (await readActionState(layout.stateDir, publications[1].actionId)).status,
       'queued',
@@ -877,6 +917,23 @@ describe('config pull worker recovery', () => {
     const fatal = await worker.waitForFatal();
     assert(fatal instanceof WorkerFailure);
     assert.equal(fatal.code, 'prepare_process_tree_uncontained');
+
+    const restartAttempts = [];
+    const restartedWorker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async ({ actionId }) => {
+        restartAttempts.push(actionId);
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => restartedWorker.stop());
+    await restartedWorker.start();
+    await restartedWorker.waitForIdle();
+
+    const recoveredTaint = await readActionState(layout.stateDir, publications[0].actionId);
+    assert.equal(recoveredTaint.status, 'failed');
+    assert.equal(recoveredTaint.failure_code, 'prepare_process_tree_uncontained');
+    assert.deepEqual(restartAttempts, [publications[1].actionId]);
   });
 
   it('commits a matching staged result when prepare fails after publication', async (context) => {
@@ -1812,6 +1869,37 @@ describe('config pull worker execution boundary', () => {
     context.mock.timers.tick(PREPARE_CLOSE_GRACE_MS);
 
     await rejection;
+  });
+
+  it('keeps containment fatal when the child closes during outer SIGKILL', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const signals = [];
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 4_000_006;
+    child.kill = () => {
+      throw new Error('process-group signaling should succeed');
+    };
+    const result = runPrepareCommand({
+      actionId: PREPARE_ACTION_ID,
+      spawnImpl: () => child,
+      timeoutMs: 100,
+      killImpl: (_pid, signal) => {
+        signals.push(signal);
+        if (signal === 'SIGKILL') child.emit('close', null, 'SIGKILL');
+      },
+    });
+
+    context.mock.timers.tick(100);
+    context.mock.timers.tick(PREPARE_TERMINATION_GRACE_MS);
+
+    await assert.rejects(
+      result,
+      (error) => error instanceof WorkerFailure
+        && error.code === 'prepare_process_tree_uncontained',
+    );
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
   });
 
   it('prefers a final uncontained exit over an earlier outer timeout', async (context) => {

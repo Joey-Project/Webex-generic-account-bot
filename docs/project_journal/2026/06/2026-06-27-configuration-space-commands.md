@@ -50,8 +50,9 @@ superseded_by:
 - Preserve queue order across deployment-lock contention by durably requeueing
   and retrying the oldest action instead of recording a terminal failure.
 - Treat an uncontained deployment process tree as a worker integrity failure;
-  leave the action recoverable and exit so systemd kills the complete worker
-  cgroup before restart.
+  persist a terminal taint and exit so systemd kills the complete worker cgroup
+  before restart. Never reconcile that action's staged pair as success; a new
+  Webex message is required after operator review.
 - Require cgroup v2 and verify PID/start-time membership around every fixed
   deployment child without granting cgroup delegation or write access.
 - Serialise the worker's single-use startup and shutdown path, including a
