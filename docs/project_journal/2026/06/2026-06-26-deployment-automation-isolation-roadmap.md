@@ -22,8 +22,10 @@ superseded_by:
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
   2b2a (separate-worker durable queue foundation), completed PR 3 (runner
   backend abstraction), PR 4a (root-owned launcher foundation), PR 4b
-  (isolated execution), PR 4c (runner activation and production-image smoke
-  tests), PR 2b2b (`/config pull` enablement), and PR 2b3 (recoverable
+  (isolated execution), PR 4c1a (boot-scoped activation receipt foundation),
+  PR 4c1b (root fresh-inode input sealer), PR 4c1c (gated runner wiring), PR
+  4c2 (production-image smoke tests and final activation), PR 2b2b (`/config
+  pull` enablement), and PR 2b3 (recoverable
   activation plus `/config reload` and `/config sync`). Mutating commands
   remain undeployable until their security dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
@@ -42,10 +44,13 @@ superseded_by:
   It remains inactive: the bot is not a member of either input or launcher
   group, a compile-time launcher gate rejects preflight/execute, and config
   validation still rejects `ephemeral-linux-user`.
-- PR 4c still owns production-image permission canaries and runner activation.
-  It must also add the root-owned input sealer required to convert bot output
-  into the recursively immutable PR 4b workspace contract. The bot socket
-  groups and `/config pull`, `/config reload`, and `/config sync` remain disabled.
+- PR 4c is split further so each privilege boundary receives an independent
+  frozen review. PR 4c1a defines and verifies the root-owned boot-scoped
+  activation receipt but does not call it or provide a minting command. PR
+  4c1b owns the root fresh-inode input sealer, PR 4c1c owns client/runner
+  wiring, and PR 4c2 owns live canaries plus final activation. Bot socket
+  groups and `/config pull`, `/config reload`, and `/config sync` remain
+  disabled in PR 4c1a.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -215,13 +220,37 @@ superseded_by:
 - Use crash/orphan cleanup or a UID/workspace non-reuse policy so stale prompt data, cache files, and credentials cannot be observed by later runs even when normal cleanup did not complete.
 - Add negative tests showing an ephemeral run cannot read its own Codex auth material, bot/deployment secrets such as Webex token files, Jenkins env files, persistent Codex home, or host-owned config and deployment metadata.
 
-### PR 4c: Runner Activation and Production-Image Smoke Tests
+### PR 4c1a: Boot-Scoped Activation Receipt Foundation
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Define a deny-unknown-fields receipt that binds the current boot ID, active
+  runtime manifest and image identity, fixed executable digests, pinned Codex
+  version/model, and the exact required production-canary result set.
+- Verify fixed root-owned paths with bounded no-follow reads, stable file
+  identities, strict owner/mode/link/type checks, and atomic root-only writes.
+- Provision only the root-owned `/run/webex-codex-activation` directory. Do not
+  pre-create a receipt, call the verifier from runtime paths, add bot groups,
+  or provide a command that can mint a receipt in this slice.
+
+### PR 4c1b: Root Fresh-Inode Input Sealer
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Add the narrow root-owned input sealer required to convert bot output into
+  the recursively immutable PR 4b workspace contract without relabelling
+  bot-owned inodes in place.
+
+### PR 4c1c: Gated Runner Wiring
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Connect the `ephemeral-linux-user` runner backend to the fixed PR 4a launcher
   only after the PR 4b boundary is present, then add only the minimum reviewed
   bot group/drop-in access required to reach the launcher socket.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
+- Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
+  with a root-owned systemd credential and verify activation through
+  `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
+
+### PR 4c2: Production-Image Smoke Tests and Final Activation
+- Repository: `Joey-Project/Webex-generic-account-bot`, with a matching config
+  change only after the host canaries pass.
 - Run permission-capable opt-in integration smoke tests against the production
   image, fixed executable/socket paths, systemd units, ownership, group, and
   socket permissions before the mode is considered deployable.
@@ -229,7 +258,7 @@ superseded_by:
   prompt-controlled descendants cannot reuse the credential/model channel,
   launcher socket, bot/config-worker sockets, or forbidden network paths; and
   timeout, launcher crash, bot crash, and host-reboot cleanup converge safely.
-- PR 4c activates only the runner. `/config pull`, `/config reload`, and
+- PR 4c2 activates only the runner. `/config pull`, `/config reload`, and
   `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
 
 ## Current Open Decisions
@@ -243,8 +272,9 @@ superseded_by:
   section, separate from ordinary room policies and with an explicit admin
   Space and sender allowlist.
 - PR 4 is split into 4a launcher protocol/caller-authorisation/socket
-  foundation, 4b isolated transient execution, and 4c runner activation plus
-  permission-capable production-image smoke tests.
+  foundation, 4b isolated transient execution, 4c1a activation-receipt
+  foundation, 4c1b fresh-inode sealer, 4c1c gated runner wiring, and 4c2
+  permission-capable production-image smoke tests plus final activation.
 - `DynamicUser` alone cannot separate Codex main-process credentials or network
   access from same-UID tool descendants, and UID/group-only launcher
   authorisation cannot distinguish the trusted bot process from inherited
@@ -252,7 +282,7 @@ superseded_by:
 - PR 4b uses two enforced layers: a root-owned systemd `RootImage`/
   `DynamicUser` boundary for the entire run, plus Codex `0.142.3`'s named Linux
   permission profile for same-UID tool filesystem and network separation.
-  Activation remains conditional on PR 4c proving the profile with live
+  Activation remains conditional on PR 4c2 proving the profile with live
   credential, `/proc`, descriptor, socket, and egress canaries on the target
   host.
 
