@@ -13,6 +13,10 @@ RemoveOnStop=yes
 FlushPending=yes
 Backlog=32
 MaxConnections=32
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=64
+PollLimitIntervalSec=2s
+PollLimitBurst=32
 
 [Install]
 WantedBy=sockets.target

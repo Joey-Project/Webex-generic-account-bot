@@ -30,6 +30,10 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'SocketMode'), ['0660']);
     assert.deepEqual(directiveValues(socket, 'DirectoryMode'), ['0750']);
     assert.deepEqual(directiveValues(socket, 'RemoveOnStop'), ['yes']);
+    assert.deepEqual(directiveValues(socket, 'TriggerLimitIntervalSec'), ['10s']);
+    assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), ['64']);
+    assert.deepEqual(directiveValues(socket, 'PollLimitIntervalSec'), ['2s']);
+    assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['32']);
     assert.deepEqual(directiveValues(socket, 'WantedBy'), ['sockets.target']);
 
     assert.equal(sysusers, 'g webex-codex-launch -\n');
@@ -52,6 +56,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'Service'), []);
     assert.deepEqual(directiveValues(service, 'Requires'), ['webex-codex-launcher.socket']);
     assert.deepEqual(directiveValues(service, 'After'), ['webex-codex-launcher.socket']);
+    assert.deepEqual(directiveValues(service, 'CollectMode'), ['inactive-or-failed']);
     assert.deepEqual(directiveValues(service, 'User'), ['root']);
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
@@ -155,6 +160,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.doesNotMatch(source, /std::process::Command|tokio::process::Command/);
     assert.doesNotMatch(source, /tokio::io::(?:stdin|stdout)/);
     assert.match(source, /tokio::net::UnixStream::from_std/);
+    assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
     assert.match(source, /ExecutionUnavailable/);
     assert.match(source, /LauncherResponse::ready\(false\)/);
   });

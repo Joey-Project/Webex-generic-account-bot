@@ -26,7 +26,7 @@ use webex_generic_account_bot::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     validate_launcher_process()?;
     let stdin_fd = std::io::stdin().as_raw_fd();
