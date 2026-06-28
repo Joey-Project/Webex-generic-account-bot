@@ -29,8 +29,8 @@ pub const CODEX_SOURCE_CONSUMED_INPUT_ROOT: &str =
 const STAGING_PREFIX: &str = ".seal-";
 const SOURCE_DIRECTORY_MODE: u32 = 0o2770;
 const SOURCE_FILE_MODE: u32 = 0o640;
-const SEALED_DIRECTORY_MODE: u32 = 0o550;
-const SEALED_FILE_MODE: u32 = 0o440;
+const SEALED_DIRECTORY_MODE: u32 = 0o500;
+const SEALED_FILE_MODE: u32 = 0o400;
 const PENDING_ROOT_MODE: u32 = 0o2770;
 const SHARED_ROOT_MODE: u32 = 0o1730;
 const PRIVATE_ROOT_MODE: u32 = 0o700;
@@ -1372,6 +1372,26 @@ mod tests {
 
         assert!(!roots.paths.input_root.join("guarded").exists());
         assert!(!roots.paths.source_consumed_root.join("guarded").exists());
+    }
+
+    #[test]
+    fn abandoned_published_workspace_is_not_group_readable() {
+        let roots = TestRoots::new();
+        let source = roots.source("abandoned");
+        roots.write_file(&source.join("evidence"), b"data");
+
+        let published = roots.seal_guard("abandoned").unwrap();
+        let published_path = published.path().to_owned();
+        std::mem::forget(published);
+
+        assert_eq!(fs::metadata(&published_path).unwrap().mode() & 0o070, 0);
+        assert_eq!(
+            fs::metadata(published_path.join("evidence"))
+                .unwrap()
+                .mode()
+                & 0o070,
+            0
+        );
     }
 
     #[test]

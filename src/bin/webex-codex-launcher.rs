@@ -64,7 +64,10 @@ async fn main() -> Result<()> {
     } else {
         decode_request_frame(&packet.frame)
     };
-    let response = response_for_request(request, &peer, &socket).await?;
+    let response = match pre_dispatch_protocol_response(socket.get_ref().as_raw_fd())? {
+        Some(response) => response,
+        None => response_for_request(request, &peer, &socket).await?,
+    };
     peer.ensure_alive()?;
     write_response(&socket, &response).await
 }
@@ -101,16 +104,7 @@ async fn response_for_request(
                 let output_limit = request.output_char_limit;
                 match execute_until_disconnect(&request, peer, socket).await {
                     Ok(result) => execution_response(run_id, output_limit, result),
-                    Err(IsolatedExecutionError::Unavailable(_)) => Ok(rejected(
-                        Some(run_id),
-                        RejectionCode::ExecutionUnavailable,
-                        "isolated Codex runtime is unavailable",
-                    )?),
-                    Err(IsolatedExecutionError::Failed(_)) => Ok(rejected(
-                        Some(run_id),
-                        RejectionCode::InternalError,
-                        "isolated Codex execution failed internally",
-                    )?),
+                    Err(error) => execute_error_response(run_id, error),
                 }
             }
         },
@@ -119,6 +113,42 @@ async fn response_for_request(
             protocol_rejection_code(error),
             "launcher request failed protocol validation",
         )?),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_error_response(run_id: String, error: ExecuteRequestError) -> Result<LauncherResponse> {
+    match error {
+        ExecuteRequestError::Execution(IsolatedExecutionError::Unavailable(_)) => rejected(
+            Some(run_id),
+            RejectionCode::ExecutionUnavailable,
+            "isolated Codex runtime is unavailable",
+        ),
+        ExecuteRequestError::Execution(IsolatedExecutionError::Failed(_)) => rejected(
+            Some(run_id),
+            RejectionCode::InternalError,
+            "isolated Codex execution failed internally",
+        ),
+        ExecuteRequestError::Protocol => rejected(
+            Some(run_id),
+            RejectionCode::MalformedRequest,
+            "launcher connection violated the one-packet protocol",
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pre_dispatch_protocol_response(socket_fd: RawFd) -> Result<Option<LauncherResponse>> {
+    match inspect_client_socket(socket_fd) {
+        Ok(ClientSocketState::Open) => Ok(None),
+        Ok(ClientSocketState::Closed) => Err(anyhow!(
+            "launcher client disconnected before request dispatch"
+        )),
+        Err(_) => Ok(Some(rejected(
+            None,
+            RejectionCode::MalformedRequest,
+            "launcher connection violated the one-packet protocol",
+        )?)),
     }
 }
 
@@ -154,16 +184,14 @@ async fn execute_until_disconnect(
     request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
     peer: &AuthorisedPeer,
     socket: &AsyncFd<OwnedFd>,
-) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
+) -> std::result::Result<IsolatedRunResult, ExecuteRequestError> {
     let cancellation = ExecutionCancellation::new();
     let execution = isolated_execution::execute(request, peer, &cancellation);
     tokio::pin!(execution);
     tokio::select! {
         result = &mut execution => match inspect_client_socket(socket.get_ref().as_raw_fd()) {
-            Ok(_) => result,
-            Err(error) => Err(IsolatedExecutionError::Failed(anyhow!(
-                "launcher connection violated the one-packet protocol: {error}"
-            ))),
+            Ok(_) => result.map_err(ExecuteRequestError::Execution),
+            Err(_) => Err(ExecuteRequestError::Protocol),
         },
         disconnect = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
@@ -177,13 +205,18 @@ async fn execute_until_disconnect(
                 Err(_) => terminate_stuck_launcher("cancelled execution did not drain"),
             };
             match disconnect {
-                Ok(()) => result,
-                Err(error) => Err(IsolatedExecutionError::Failed(anyhow!(
-                    "launcher connection violated the one-packet protocol: {error}"
-                ))),
+                Ok(()) => result.map_err(ExecuteRequestError::Execution),
+                Err(_) => Err(ExecuteRequestError::Protocol),
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ExecuteRequestError {
+    Execution(IsolatedExecutionError),
+    Protocol,
 }
 
 #[cfg(target_os = "linux")]
@@ -557,6 +590,10 @@ mod tests {
                 LauncherResponseKind::Rejected(response) if response.code == code
             ));
         }
+
+        assert_malformed_response(
+            execute_error_response("run-1".to_owned(), ExecuteRequestError::Protocol).unwrap(),
+        );
     }
 
     #[test]
@@ -625,6 +662,11 @@ mod tests {
         receive_request_packet(&reader).await.unwrap();
         send_packet(writer.as_raw_fd(), &frame);
 
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("queued packet must block dispatch"),
+        );
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
@@ -644,6 +686,11 @@ mod tests {
         );
         drop(writer);
 
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("queued empty packet must block dispatch"),
+        );
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
@@ -662,8 +709,20 @@ mod tests {
             0
         );
 
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("write half-close must block dispatch"),
+        );
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn assert_malformed_response(response: LauncherResponse) {
+        let LauncherResponseKind::Rejected(response) = response.response else {
+            panic!("protocol violation must be rejected");
+        };
+        assert_eq!(response.code, RejectionCode::MalformedRequest);
     }
 
     #[tokio::test]

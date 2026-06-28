@@ -80,7 +80,8 @@ superseded_by:
   largest request plus preparation, cleanup, and response budget.
   Normal success, rejection, timeout, client disconnect, and cancellation
   remove ready, source-quarantine, and consumed sealed trees by verified inode;
-  tmpfiles remains the crash fallback.
+  ready trees remain group-inaccessible until consumed, and tmpfiles remains
+  the crash fallback.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

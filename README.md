@@ -605,9 +605,13 @@ validates and emits only that bounded UTF-8 file.
 
 Input workspaces live below `/var/lib/webex-codex-runtime-inputs/ready`. The host provisions
 that root as sticky `root:webex-codex-input` mode `1730`; each run must be
-sealed by a root-owned broker before launch. The run root and every nested directory must
-be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
-the same owner/group and a single hard link. Symlinks, special files, more than
+sealed by a root-owned broker before launch. Ready run directories are
+`root:webex-codex-input` mode `0500` and files are mode `0400`, so a launcher
+hard stop cannot leave group-readable evidence there. After the verified inode
+is moved below the root-only consumed quarantine, the launcher recursively
+grants directory mode `0550` and file mode `0440` before creating the transient
+unit. Regular files retain the same owner/group and a single hard link.
+Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
 2 GiB plus 64 MiB are rejected. The host group database entry must have no
 static members, no numeric-GID alias, and no static user with that primary GID.

@@ -145,6 +145,21 @@ struct VerifiedWorkspace {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceAccess {
+    Private,
+    GroupReadable,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceMetadataPolicy {
+    expected_uid: u32,
+    input_gid: u32,
+    access: WorkspaceAccess,
+}
+
+#[cfg(target_os = "linux")]
 impl VerifiedWorkspace {
     fn cleanup(&mut self) -> Result<()> {
         if !self.cleanup_armed {
@@ -574,7 +589,7 @@ fn verify_workspace(
     if !metadata.is_dir()
         || metadata.uid() != 0
         || metadata.gid() != input_gid
-        || !sealed_directory_mode_valid(metadata.mode())
+        || !workspace_directory_mode_valid(metadata.mode(), WorkspaceAccess::Private)
     {
         return Err(anyhow!("runtime workspace metadata is invalid"));
     }
@@ -585,7 +600,13 @@ fn verify_workspace(
     if !same_file_identity(&metadata, &validation_directory.metadata()?) {
         return Err(anyhow!("runtime workspace changed before validation"));
     }
-    validate_workspace_tree_with_deadline(&validation_directory, 0, input_gid, deadline.clone())?;
+    validate_workspace_tree_with_deadline(
+        &validation_directory,
+        0,
+        input_gid,
+        WorkspaceAccess::Private,
+        deadline.clone(),
+    )?;
     if fs::canonicalize(&request.workspace)? != request.workspace {
         return Err(anyhow!("runtime workspace path is not canonical"));
     }
@@ -634,6 +655,14 @@ fn verify_workspace(
     input_root_directory
         .sync_all()
         .context("failed to persist removal of the public runtime workspace")?;
+    grant_workspace_group_read(&validation_directory, 0, input_gid, deadline.clone())?;
+    validate_workspace_tree_with_deadline(
+        &validation_directory,
+        0,
+        input_gid,
+        WorkspaceAccess::GroupReadable,
+        deadline,
+    )?;
     let consumed = fs::symlink_metadata(&consumed_path)?;
     if consumed.dev() != metadata.dev() || consumed.ino() != metadata.ino() {
         return Err(anyhow!("consumed runtime workspace identity changed"));
@@ -685,7 +714,13 @@ fn rename_workspace(
 
 #[cfg(all(test, target_os = "linux"))]
 fn validate_workspace_tree(root: &File, expected_uid: u32, input_gid: u32) -> Result<()> {
-    validate_workspace_tree_with_deadline(root, expected_uid, input_gid, None)
+    validate_workspace_tree_with_deadline(
+        root,
+        expected_uid,
+        input_gid,
+        WorkspaceAccess::GroupReadable,
+        None,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -693,26 +728,23 @@ fn validate_workspace_tree_with_deadline(
     root: &File,
     expected_uid: u32,
     input_gid: u32,
+    access: WorkspaceAccess,
     deadline: Option<WorkBudget>,
 ) -> Result<()> {
     let mut entries = 0_usize;
     let mut total_bytes = 0_u64;
-    validate_workspace_directory(
-        root,
+    let policy = WorkspaceMetadataPolicy {
         expected_uid,
         input_gid,
-        0,
-        &mut entries,
-        &mut total_bytes,
-        deadline,
-    )
+        access,
+    };
+    validate_workspace_directory(root, &policy, 0, &mut entries, &mut total_bytes, deadline)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_workspace_directory(
     directory: &File,
-    expected_uid: u32,
-    input_gid: u32,
+    policy: &WorkspaceMetadataPolicy,
     depth: usize,
     entries: &mut usize,
     total_bytes: &mut u64,
@@ -744,14 +776,14 @@ fn validate_workspace_directory(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink()
-            || metadata.uid() != expected_uid
-            || metadata.gid() != input_gid
+            || metadata.uid() != policy.expected_uid
+            || metadata.gid() != policy.input_gid
         {
             return Err(anyhow!("runtime workspace entry metadata is invalid"));
         }
         use std::os::unix::fs::OpenOptionsExt;
         if metadata.is_dir() {
-            if !sealed_directory_mode_valid(metadata.mode()) {
+            if !workspace_directory_mode_valid(metadata.mode(), policy.access) {
                 return Err(anyhow!("runtime workspace directory mode is invalid"));
             }
             let child = OpenOptions::new()
@@ -763,15 +795,14 @@ fn validate_workspace_directory(
             }
             validate_workspace_directory(
                 &child,
-                expected_uid,
-                input_gid,
+                policy,
                 depth + 1,
                 entries,
                 total_bytes,
                 deadline.clone(),
             )?;
         } else if metadata.is_file() {
-            if !sealed_file_mode_valid(metadata.mode()) || metadata.nlink() != 1 {
+            if !workspace_file_mode_valid(metadata.mode(), policy.access) || metadata.nlink() != 1 {
                 return Err(anyhow!("runtime workspace file metadata is invalid"));
             }
             let file = OpenOptions::new()
@@ -797,13 +828,139 @@ fn validate_workspace_directory(
 }
 
 #[cfg(target_os = "linux")]
-fn sealed_directory_mode_valid(mode: u32) -> bool {
-    mode & 0o7777 == 0o550
+fn grant_workspace_group_read(
+    root: &File,
+    expected_uid: u32,
+    input_gid: u32,
+    deadline: Option<WorkBudget>,
+) -> Result<()> {
+    let mut entries = 0_usize;
+    grant_workspace_directory_group_read(root, expected_uid, input_gid, 0, &mut entries, deadline)
 }
 
 #[cfg(target_os = "linux")]
-fn sealed_file_mode_valid(mode: u32) -> bool {
-    mode & 0o7777 == 0o440
+fn grant_workspace_directory_group_read(
+    directory: &File,
+    expected_uid: u32,
+    input_gid: u32,
+    depth: usize,
+    entries: &mut usize,
+    deadline: Option<WorkBudget>,
+) -> Result<()> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("consumed workspace access grant")?;
+    }
+    if depth > WORKSPACE_DEPTH_MAX {
+        return Err(anyhow!("runtime workspace nesting exceeds its limit"));
+    }
+    let directory_metadata = directory.metadata()?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != expected_uid
+        || directory_metadata.gid() != input_gid
+        || !workspace_directory_mode_valid(directory_metadata.mode(), WorkspaceAccess::Private)
+    {
+        return Err(anyhow!("private runtime workspace directory is invalid"));
+    }
+    ensure_posix_acl_absent(directory, "private runtime workspace directory")?;
+    let directory_path = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    for entry in fs::read_dir(&directory_path)? {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("consumed workspace access grant")?;
+        }
+        let entry = entry?;
+        *entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("runtime workspace entry count overflowed"))?;
+        if *entries > WORKSPACE_ENTRY_MAX {
+            return Err(anyhow!("runtime workspace has too many entries"));
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != expected_uid
+            || metadata.gid() != input_gid
+        {
+            return Err(anyhow!("private runtime workspace entry is invalid"));
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        if metadata.is_dir() {
+            if !workspace_directory_mode_valid(metadata.mode(), WorkspaceAccess::Private) {
+                return Err(anyhow!(
+                    "private runtime workspace directory mode is invalid"
+                ));
+            }
+            let child = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&path)?;
+            if !same_file_identity(&metadata, &child.metadata()?) {
+                return Err(anyhow!("private runtime workspace directory changed"));
+            }
+            grant_workspace_directory_group_read(
+                &child,
+                expected_uid,
+                input_gid,
+                depth + 1,
+                entries,
+                deadline.clone(),
+            )?;
+        } else if metadata.is_file() {
+            if !workspace_file_mode_valid(metadata.mode(), WorkspaceAccess::Private)
+                || metadata.nlink() != 1
+            {
+                return Err(anyhow!("private runtime workspace file is invalid"));
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&path)?;
+            if !same_file_identity(&metadata, &file.metadata()?) {
+                return Err(anyhow!("private runtime workspace file changed"));
+            }
+            ensure_posix_acl_absent(&file, "private runtime workspace file")?;
+            set_fd_mode(&file, 0o440)?;
+            file.sync_all()
+                .context("failed to persist consumed workspace file access")?;
+        } else {
+            return Err(anyhow!("private runtime workspace contains a special file"));
+        }
+    }
+    set_fd_mode(directory, 0o550)?;
+    directory
+        .sync_all()
+        .context("failed to persist consumed workspace directory access")
+}
+
+#[cfg(target_os = "linux")]
+fn set_fd_mode(file: &File, mode: libc::mode_t) -> Result<()> {
+    // SAFETY: fchmod uses the live descriptor and does not dereference pointers.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to set consumed workspace access mode");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_directory_mode_valid(mode: u32, access: WorkspaceAccess) -> bool {
+    let expected = match access {
+        WorkspaceAccess::Private => 0o500,
+        WorkspaceAccess::GroupReadable => 0o550,
+    };
+    mode & 0o7777 == expected
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_file_mode_valid(mode: u32, access: WorkspaceAccess) -> bool {
+    let expected = match access {
+        WorkspaceAccess::Private => 0o400,
+        WorkspaceAccess::GroupReadable => 0o440,
+    };
+    mode & 0o7777 == expected
 }
 
 #[cfg(target_os = "linux")]
@@ -1700,14 +1857,63 @@ mod tests {
 
     #[test]
     fn sealed_workspace_modes_reject_special_bits() {
-        assert!(sealed_directory_mode_valid(0o550));
-        assert!(sealed_file_mode_valid(0o440));
-        for mode in [0o1550, 0o2550, 0o4550] {
-            assert!(!sealed_directory_mode_valid(mode));
+        assert!(workspace_directory_mode_valid(
+            0o500,
+            WorkspaceAccess::Private
+        ));
+        assert!(workspace_file_mode_valid(0o400, WorkspaceAccess::Private));
+        assert!(workspace_directory_mode_valid(
+            0o550,
+            WorkspaceAccess::GroupReadable
+        ));
+        assert!(workspace_file_mode_valid(
+            0o440,
+            WorkspaceAccess::GroupReadable
+        ));
+        for mode in [0o1500, 0o2500, 0o4500] {
+            assert!(!workspace_directory_mode_valid(
+                mode,
+                WorkspaceAccess::Private
+            ));
         }
-        for mode in [0o1440, 0o2440, 0o4440] {
-            assert!(!sealed_file_mode_valid(mode));
+        for mode in [0o1400, 0o2400, 0o4400] {
+            assert!(!workspace_file_mode_valid(mode, WorkspaceAccess::Private));
         }
+    }
+
+    #[test]
+    fn consumed_workspace_access_is_granted_only_after_private_validation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "webex-codex-private-workspace-{}-{suffix}",
+            std::process::id()
+        ));
+        let nested = root.join("logs");
+        let evidence = nested.join("console.log");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(&evidence, b"evidence").unwrap();
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let root_file = File::open(&root).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        grant_workspace_group_read(&root_file, uid, gid, None).unwrap();
+        validate_workspace_tree(&root_file, uid, gid).unwrap();
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o7777, 0o550);
+        assert_eq!(fs::metadata(&nested).unwrap().mode() & 0o7777, 0o550);
+        assert_eq!(fs::metadata(&evidence).unwrap().mode() & 0o7777, 0o440);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

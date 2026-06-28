@@ -47,7 +47,9 @@
   and then rejects all ephemeral activation until PR 4c2 installs the required
   permissions in the same change that removes that final gate.
   Cooperative work deadlines and launcher-socket disconnect cancellation
-  clean inode-verified ready and consumed trees before returning. Independent
+  clean inode-verified ready and consumed trees before returning. Ready trees
+  remain group-inaccessible until moved below the root-only consumed root.
+  Independent
   process watchdogs hard-stop stuck staging and preparation syscalls before
   their lease budgets expire. Production configuration remains on
   `current-user` until PR 4c2 mints a receipt after live capability canaries
