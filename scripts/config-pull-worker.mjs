@@ -250,6 +250,7 @@ export async function prepareStorage({
   stateDir,
   fsApi = fs,
 }) {
+  await assertTrustedStateRootAncestors(stateRoot, fsApi);
   await ensureTrustedDirectory(stateRoot, PUBLIC_STATE_ROOT_MODE, fsApi);
   await ensureTrustedDirectory(queueDir, PRIVATE_DIRECTORY_MODE, fsApi);
   await ensureTrustedDirectory(stateDir, PRIVATE_DIRECTORY_MODE, fsApi);
@@ -1143,6 +1144,37 @@ async function assertTrustedDirectory(directory, mode, fsApi) {
     || actualMode !== mode
   ) {
     throw new Error(`directory metadata is not trusted: ${directory}`);
+  }
+}
+
+async function assertTrustedStateRootAncestors(stateRoot, fsApi) {
+  if (!path.isAbsolute(stateRoot)) {
+    throw new Error(`state root must be absolute: ${stateRoot}`);
+  }
+  const ancestors = [];
+  let current = path.dirname(path.resolve(stateRoot));
+  for (;;) {
+    ancestors.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  for (const ancestor of ancestors.reverse()) {
+    const stat = await fsApi.lstat(ancestor);
+    const actualMode = stat.mode & 0o7777;
+    const writableByNonRoot = (actualMode & 0o022) !== 0;
+    const allowedStickyTemporaryAncestor = ancestor === '/tmp'
+      && (actualMode & 0o1000) !== 0;
+    if (
+      !stat.isDirectory()
+      || stat.isSymbolicLink()
+      || stat.uid !== 0
+      || stat.gid !== 0
+      || (writableByNonRoot && !allowedStickyTemporaryAncestor)
+    ) {
+      throw new Error(`state root ancestor metadata is not trusted: ${ancestor}`);
+    }
   }
 }
 

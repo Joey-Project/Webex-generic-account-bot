@@ -198,11 +198,18 @@ The reviewed pull worker assets are:
 The service runs as the stable `webex-config-deploy` user with the dedicated
 `webex-config-pull` primary group; it is not lifecycle-coupled to the bot unit.
 The mode `0660` socket is at `/run/webex-config-pull/config-pull.sock`; the
-public action-status root is mode `0755`, while its queue and state
-subdirectories remain mode `0700` and worker-owned. The only public worker
+common state parent `/var/lib/webex-generic-account-bot` is root-owned with mode
+`0755`. The worker state root
+`/var/lib/webex-generic-account-bot/config-actions` is owned by
+`webex-config-deploy:webex-config-pull` with mode `0755`, while its worker-owned
+`queue` and `state` subdirectories remain mode `0700`. The only public worker
 artifact is the mode `0644`
 `/var/lib/webex-generic-account-bot/config-actions/public-status.json`, whose
 schema excludes message text, stderr, paths, and failure details.
+Before creating its state directories, the worker verifies every state-root
+ancestor through `/` is a real root-owned directory that non-root identities
+cannot write. The root-owned sticky `/tmp` directory is accepted only for the
+isolated test layout, relying on sticky-directory replacement protection.
 Before connecting, the bot resolves the fixed system account and group names and
 requires both the socket and its mode `0750` parent to be owned by
 `webex-config-deploy:webex-config-pull`. The worker is never added to the bot's
@@ -232,13 +239,21 @@ when mode `0555`, because that owner could restore write permission.
 
 Before enabling the unit, provision the sysusers and tmpfiles definitions and
 make the fixed deploy key readable only by `webex-config-deploy`. Tmpfiles
-creates worker-owned `config-prepare-checkout` and `config-staging`; it does not
-create or change the existing root/apply
+enforces the common state parent as `root:root` mode `0755`, creates the
+worker-owned `config-actions` root and its private `queue` and `state` leaves,
+and creates worker-owned `config-prepare-checkout` and `config-staging`; it does
+not create or change the existing root/apply
 `/var/lib/webex-generic-account-bot/config-checkout`. On hosts deployed from an
-older worker definition, stop the worker before migration, provision the new
-prepare checkout, and restore `config-checkout` to the root/apply identity if
-the old definition assigned it to `webex-config-deploy`. Do not grant the worker
-write access to that apply checkout. Keep the live `rendered` directory and
+older worker definition, stop the worker before migration, remove the old
+nested `StateDirectory=` management by installing the current unit, then apply
+the current tmpfiles definition. Verify the common parent is `root:root` mode
+`0755`, the `config-actions` root is
+`webex-config-deploy:webex-config-pull` mode `0755`, and its `queue` and `state`
+leaves are mode `0700` before restarting the worker. Do not recursively change
+the common parent's children: restore `config-checkout` to the root/apply
+identity if the old definition assigned it to `webex-config-deploy`. Do not
+grant the worker write access to that apply checkout. Keep the live `rendered`
+directory and
 `/opt/webex-generic-account-bot` outside the worker's write boundary. The worker
 has no bot token, Codex home, Jenkins credential,
 `systemctl`, or live-config activation permission. It invokes only

@@ -1277,6 +1277,70 @@ describe('config pull worker execution boundary', () => {
 });
 
 describe('config pull worker durable files', () => {
+  it('accepts a state root directly below the root-owned sticky temp directory', async (context) => {
+    const layout = await createLayout(context);
+
+    await prepareStorage(layout);
+
+    assert.equal((await fs.stat(layout.stateRoot)).mode & 0o7777, 0o755);
+    assert.equal((await fs.stat(layout.queueDir)).mode & 0o7777, 0o700);
+    assert.equal((await fs.stat(layout.stateDir)).mode & 0o7777, 0o700);
+  });
+
+  it('rejects untrusted state root ancestors before creating private storage', async (context) => {
+    await context.test('non-root owner', async (subcontext) => {
+      const currentUid = typeof process.getuid === 'function' && process.getuid() !== 0
+        ? process.getuid()
+        : 1001;
+      const untrustedOwners = [
+        { uid: currentUid },
+        { uid: 4242 },
+        { gid: 4242 },
+      ];
+      for (const metadata of untrustedOwners) {
+        const layout = await createLayout(subcontext);
+        const fsApi = metadataOverridingFsApi(os.tmpdir(), metadata);
+
+        await assert.rejects(
+          prepareStorage({ ...layout, fsApi }),
+          /state root ancestor metadata is not trusted/,
+        );
+        await assertPrivateStorageDoesNotExist(layout);
+      }
+    });
+
+    await context.test('non-sticky writable mode', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      const fsApi = metadataOverridingFsApi(os.tmpdir(), { mode: 0o040777 });
+
+      await assert.rejects(
+        prepareStorage({ ...layout, fsApi }),
+        /state root ancestor metadata is not trusted/,
+      );
+      await assertPrivateStorageDoesNotExist(layout);
+    });
+
+    await context.test('symlink', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      const symlinkParent = `${layout.stateRoot}-parent-link`;
+      const stateRoot = path.join(symlinkParent, 'config-actions');
+      const symlinkLayout = {
+        ...layout,
+        stateRoot,
+        queueDir: path.join(stateRoot, 'queue'),
+        stateDir: path.join(stateRoot, 'state'),
+      };
+      await fs.symlink(layout.root, symlinkParent);
+      subcontext.after(async () => fs.rm(symlinkParent, { force: true }));
+
+      await assert.rejects(
+        prepareStorage(symlinkLayout),
+        /state root ancestor metadata is not trusted/,
+      );
+      await assertPrivateStorageDoesNotExist(symlinkLayout);
+    });
+  });
+
   it('publishes the exact public status schema with mode 0644', async (context) => {
     const fixture = await startWorker(context, { prepareRunner: async () => PREPARED_PROJECTION });
     const response = await sendRequest(fixture.socketPath, {
@@ -1377,15 +1441,18 @@ describe('config pull worker systemd boundary', () => {
       /^ExecStart=\/usr\/bin\/node \/opt\/webex-generic-account-bot\/code\/scripts\/config-pull-worker\.mjs$/m,
     );
     assert.match(unit, /^Restart=on-failure$/m);
-    assert.match(unit, /^StateDirectory=webex-generic-account-bot\/config-actions$/m);
-    assert.match(unit, /^StateDirectoryMode=0755$/m);
-    assert.match(unit, /^ReadOnlyPaths=\/run\/webex-config-deploy$/m);
-    assert.match(unit, /^ReadWritePaths=\/run\/webex-config-deploy\/deploy-config\.lock$/m);
-    assert.match(unit, /^ReadWritePaths=\/run\/webex-config-pull$/m);
-    assert.doesNotMatch(unit, /^ReadWritePaths=\/run\/webex-generic-account-bot$/m);
-    assert.match(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/config-staging$/m);
-    assert.match(unit, /^ReadOnlyPaths=-\/var\/lib\/webex-generic-account-bot\/rendered$/m);
-    assert.doesNotMatch(unit, /^ReadWritePaths=\/var\/lib\/webex-generic-account-bot\/rendered$/m);
+    assert.doesNotMatch(unit, /^StateDirectory(?:Mode)?=/m);
+    assert.deepEqual(unitDirectiveValues(unit, 'ReadOnlyPaths'), [
+      '/run/webex-config-deploy',
+      '-/var/lib/webex-generic-account-bot/rendered',
+    ]);
+    assert.deepEqual(unitDirectiveValues(unit, 'ReadWritePaths'), [
+      '/run/webex-config-deploy/deploy-config.lock',
+      '/run/webex-config-pull',
+      '/var/lib/webex-generic-account-bot/config-actions',
+      '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+      '/var/lib/webex-generic-account-bot/config-staging',
+    ]);
     assert.match(unit, /^NoNewPrivileges=true$/m);
     assert.match(unit, /^ProtectSystem=strict$/m);
     assert.match(unit, /^ProtectHome=true$/m);
@@ -1393,6 +1460,7 @@ describe('config pull worker systemd boundary', () => {
     assert.match(unit, /^CapabilityBoundingSet=$/m);
     assert.doesNotMatch(unit, /^(?:PartOf|BindsTo)=/m);
     assert.doesNotMatch(unit, /^User=root$/m);
+    assert.doesNotMatch(unit, /^SupplementaryGroups=.*webex-generic-account-bot/m);
 
     const plan = buildDeployPlan(parseArgs(['--prepare']));
     assert.equal(plan.lockDir, '/run/webex-config-deploy/deploy-config.lock');
@@ -1427,26 +1495,46 @@ describe('config pull worker systemd boundary', () => {
       ),
       { code: 'ENOENT' },
     );
-    assert.match(tmpfiles, /^d \/run\/webex-config-deploy 0750 root webex-config-pull -$/m);
-    assert.match(
-      tmpfiles,
-      /^f \/run\/webex-config-deploy\/deploy-config\.lock 0660 root webex-config-pull -$/m,
+    const tmpfilesRecords = tmpfiles.trim().split('\n').map((line) => line.split(/\s+/));
+    assert.deepEqual(tmpfilesRecords, [
+      ['d', '/run/webex-config-deploy', '0750', 'root', 'webex-config-pull', '-'],
+      [
+        'f',
+        '/run/webex-config-deploy/deploy-config.lock',
+        '0660',
+        'root',
+        'webex-config-pull',
+        '-',
+      ],
+      [
+        'd',
+        '/run/webex-config-pull',
+        '0750',
+        'webex-config-deploy',
+        'webex-config-pull',
+        '-',
+      ],
+      ['d', '/var/lib/webex-generic-account-bot', '0755', 'root', 'root', '-'],
+      ...[
+        '/var/lib/webex-generic-account-bot/config-actions',
+        '/var/lib/webex-generic-account-bot/config-actions/queue',
+        '/var/lib/webex-generic-account-bot/config-actions/state',
+        '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+        '/var/lib/webex-generic-account-bot/config-staging',
+      ].map((recordPath, index) => [
+        'd',
+        recordPath,
+        index === 0 ? '0755' : '0700',
+        'webex-config-deploy',
+        'webex-config-pull',
+        '-',
+      ]),
+    ]);
+    assert.equal(
+      tmpfilesRecords.some((record) => record[3] === 'webex-generic-account-bot'
+        || record[4] === 'webex-generic-account-bot'),
+      false,
     );
-    assert.match(
-      tmpfiles,
-      /^d \/run\/webex-config-pull 0750 webex-config-deploy webex-config-pull -$/m,
-    );
-    assert.match(
-      tmpfiles,
-      /^d \/var\/lib\/webex-generic-account-bot\/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -$/m,
-    );
-    assert.doesNotMatch(tmpfiles, /\/config-checkout /);
-    assert.match(
-      tmpfiles,
-      /^d \/var\/lib\/webex-generic-account-bot\/config-staging 0700 webex-config-deploy webex-config-pull -$/m,
-    );
-    assert.doesNotMatch(tmpfiles, /\/rendered /);
-    assert.doesNotMatch(tmpfiles, /codex-home|jenkins\.env|access-token/);
   });
 });
 
@@ -1461,8 +1549,11 @@ async function startWorker(context, options = {}) {
 async function createLayout(context) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-config-pull-worker-test-'));
   await fs.chmod(root, 0o750);
-  context.after(async () => fs.rm(root, { recursive: true, force: true }));
-  const stateRoot = path.join(root, 'data');
+  const stateRoot = `${root}-state`;
+  context.after(async () => {
+    await fs.rm(stateRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const stagingDir = path.join(root, 'config-staging');
   await fs.mkdir(stagingDir, { mode: 0o700 });
   return {
@@ -1478,6 +1569,39 @@ async function createLayout(context) {
     commandTimeoutMs: 1_000,
     outputLimitBytes: 4_096,
   };
+}
+
+function metadataOverridingFsApi(targetPath, metadata) {
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'lstat') return target[property];
+      return async (candidate) => {
+        const stat = await target.lstat(candidate);
+        if (candidate !== targetPath) return stat;
+        return new Proxy(stat, {
+          get(statTarget, statProperty) {
+            if (Object.hasOwn(metadata, statProperty)) return metadata[statProperty];
+            const value = Reflect.get(statTarget, statProperty, statTarget);
+            return typeof value === 'function' ? value.bind(statTarget) : value;
+          },
+        });
+      };
+    },
+  });
+}
+
+async function assertPrivateStorageDoesNotExist(layout) {
+  await Promise.all([
+    assert.rejects(fs.stat(layout.queueDir), { code: 'ENOENT' }),
+    assert.rejects(fs.stat(layout.stateDir), { code: 'ENOENT' }),
+  ]);
+}
+
+function unitDirectiveValues(unit, directive) {
+  return unit
+    .split('\n')
+    .filter((line) => line.startsWith(`${directive}=`))
+    .map((line) => line.slice(directive.length + 1));
 }
 
 function deferred() {

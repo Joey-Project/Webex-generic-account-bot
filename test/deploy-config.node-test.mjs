@@ -314,6 +314,10 @@ describe('deploy-config lock policy', () => {
       'd /run/webex-config-deploy 0750 root webex-config-pull -',
       'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
       'd /run/webex-config-pull 0750 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot 0755 root root -',
+      'd /var/lib/webex-generic-account-bot/config-actions 0755 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-actions/queue 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-actions/state 0700 webex-config-deploy webex-config-pull -',
       'd /var/lib/webex-generic-account-bot/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -',
       'd /var/lib/webex-generic-account-bot/config-staging 0700 webex-config-deploy webex-config-pull -',
     ]);
@@ -2348,6 +2352,63 @@ describe('deploy-config CLI and execution', () => {
         },
       }),
       /must not be owned by the prepare worker/,
+    );
+
+    assert.equal(executed, false);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when a live grandparent is worker-owned mode 0555', async () => {
+    const temp = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'deploy-config-prepare-grandparent-test-'),
+    );
+    const workerGrandparent = path.join(temp, 'worker-grandparent');
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--staging-dir',
+        path.join(temp, 'staging'),
+        '--rendered-config',
+        path.join(workerGrandparent, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(workerGrandparent, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.chmod(workerGrandparent, 0o555);
+    const trustedFsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+    );
+    const fsApi = {
+      ...trustedFsApi,
+      async lstat(candidate, ...args) {
+        if (path.resolve(candidate) === workerGrandparent) {
+          return fs.lstat(candidate, ...args);
+        }
+        return trustedFsApi.lstat(candidate, ...args);
+      },
+    };
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        fsApi,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      {
+        message: `rendered config directory must not be owned by the prepare worker: ${workerGrandparent}`,
+      },
     );
 
     assert.equal(executed, false);
@@ -5048,17 +5109,25 @@ async function writeInstallTransactionFixture(
 
 async function protectPrepareLiveDirectories(renderedConfig, metadataFile, fsApi = fs) {
   const directories = new Set([
-    path.dirname(renderedConfig),
-    path.dirname(metadataFile),
+    path.resolve(path.dirname(renderedConfig)),
+    path.resolve(path.dirname(metadataFile)),
   ]);
-  const protectedDirectories = new Set();
+  const readOnlyDirectories = new Set();
+  const trustedAncestors = new Set();
   for (const directory of directories) {
     await fs.mkdir(directory, { recursive: true, mode: 0o755 });
     await fs.chmod(directory, 0o555);
-    protectedDirectories.add(path.resolve(directory));
-    protectedDirectories.add(path.resolve(path.dirname(directory)));
+    readOnlyDirectories.add(directory);
+    readOnlyDirectories.add(path.dirname(directory));
+    let current = directory;
+    for (;;) {
+      trustedAncestors.add(current);
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
   }
-  for (const parent of [...protectedDirectories].filter(
+  for (const parent of [...readOnlyDirectories].filter(
     (candidate) => !directories.has(candidate),
   )) {
     await fs.chmod(parent, 0o555);
@@ -5068,12 +5137,13 @@ async function protectPrepareLiveDirectories(renderedConfig, metadataFile, fsApi
     ...fsApi,
     async lstat(candidate, ...args) {
       const stat = await fsApi.lstat(candidate, ...args);
-      if (!protectedDirectories.has(path.resolve(candidate))) {
+      if (!trustedAncestors.has(path.resolve(candidate))) {
         return stat;
       }
       return new Proxy(stat, {
         get(target, property) {
           if (property === 'uid') return rootUid;
+          if (property === 'mode') return target.mode & ~0o022;
           const value = Reflect.get(target, property, target);
           return typeof value === 'function' ? value.bind(target) : value;
         },

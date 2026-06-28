@@ -2254,7 +2254,6 @@ async function assertPrepareLiveDirectoriesReadOnly(plan, fsApi) {
 
 async function assertPathNotWritableByCurrentProcess(directory, label, fsApi) {
   let current = path.resolve(directory);
-  let verified = 0;
   for (;;) {
     let stat;
     try {
@@ -2280,9 +2279,8 @@ async function assertPathNotWritableByCurrentProcess(directory, label, fsApi) {
     if (directoryWritableByCurrentProcess(stat)) {
       throw new Error(`${label} must not be writable by the prepare worker: ${current}`);
     }
-    verified += 1;
     const parent = path.dirname(current);
-    if (verified >= 2 || parent === current) return;
+    if (parent === current) return;
     current = parent;
   }
 }
