@@ -15,8 +15,15 @@ const LAUNCHER_SOURCE_PATH = fileURLToPath(
 const LAUNCHER_MODULE_PATH = fileURLToPath(
   new URL('../src/codex_launcher.rs', import.meta.url),
 );
+const CARGO_TOML_PATH = fileURLToPath(new URL('../Cargo.toml', import.meta.url));
 
 describe('Codex launcher systemd boundary', () => {
+  it('keeps the bot as the default Cargo run target', async () => {
+    const cargoToml = await fs.readFile(CARGO_TOML_PATH, 'utf8');
+
+    assert.match(cargoToml, /^default-run = "webex-generic-account-bot"$/m);
+  });
+
   it('provisions only a root-owned group-gated accepted socket', async () => {
     const [socket, sysusers, tmpfiles] = await Promise.all([
       fs.readFile(SOCKET_PATH, 'utf8'),

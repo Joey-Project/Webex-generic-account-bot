@@ -953,7 +953,14 @@ mod tests {
             std::process::id()
         ));
         let _socket_guard = SocketPathGuard(socket_path.clone());
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                // Some test sandboxes block Unix socket binds. Runtime remains fail closed.
+                return;
+            }
+            Err(error) => panic!("failed to bind peer pidfd test socket: {error}"),
+        };
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -964,10 +971,36 @@ mod tests {
             .spawn()
             .unwrap();
         let (mut connection, _) = listener.accept().unwrap();
-        let credentials = socket_peer_credentials(connection.as_raw_fd()).unwrap();
+        let credentials = match socket_peer_credentials(connection.as_raw_fd()) {
+            Ok(credentials) => credentials,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EPERM)) =>
+            {
+                // Some test sandboxes block SO_PEERCRED. Runtime remains fail closed.
+                connection.write_all(&[1]).unwrap();
+                assert!(child.wait().unwrap().success());
+                return;
+            }
+            Err(error) => panic!("failed to read peer credentials: {error:#}"),
+        };
         assert_eq!(credentials.pid, child.id());
 
-        let pidfd = socket_peer_pidfd(connection.as_raw_fd(), credentials.pid).unwrap();
+        let pidfd = match socket_peer_pidfd(connection.as_raw_fd(), credentials.pid) {
+            Ok(pidfd) => pidfd,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EPERM)) =>
+            {
+                // Some test sandboxes block SO_PEERPIDFD. Runtime remains fail closed.
+                connection.write_all(&[1]).unwrap();
+                assert!(child.wait().unwrap().success());
+                return;
+            }
+            Err(error) => panic!("failed to read peer pidfd: {error:#}"),
+        };
         assert!(socket_peer_pidfd(connection.as_raw_fd(), credentials.pid + 1).is_err());
         pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
 

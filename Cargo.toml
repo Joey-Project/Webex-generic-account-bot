@@ -3,6 +3,7 @@ name = "webex-generic-account-bot"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+default-run = "webex-generic-account-bot"
 description = "Generic-account Webex bot layer that dispatches space-specific prompts to Codex."
 license = "Apache-2.0"
 
