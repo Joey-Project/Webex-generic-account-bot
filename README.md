@@ -588,7 +588,10 @@ or stricter. systemd copies it into the transient unit with `LoadCredential`;
 the wrapper then creates a private main-process `CODEX_HOME`. Codex tool
 commands use the OS-enforced `webex-isolated` permission profile, which denies
 that home and credential directory, supplies separate temporary home paths,
-and disables tool network access.
+disables tool network access, and always uses `--skip-git-repo-check` because a
+sealed evidence workspace cannot contain a `.git` control directory. The
+launcher validates the complete request policy before consuming the sealed
+workspace pathname.
 
 Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
 that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a

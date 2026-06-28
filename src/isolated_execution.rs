@@ -180,6 +180,7 @@ pub async fn execute(
     peer: &AuthorisedPeer,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
     ensure_activation_enabled().map_err(IsolatedExecutionError::Unavailable)?;
+    validate_execution_policy(request).map_err(IsolatedExecutionError::Failed)?;
     let paths = RuntimePaths::default();
     let runtime = verify_runtime(&paths, 0).map_err(IsolatedExecutionError::Unavailable)?;
     let workspace = verify_workspace(
@@ -209,6 +210,15 @@ fn ensure_activation_enabled() -> Result<()> {
         return Err(anyhow!(
             "isolated Codex execution awaits production capability canaries"
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_execution_policy(request: &ExecuteRequest) -> Result<()> {
+    request.validate().map_err(|error| anyhow!(error))?;
+    if request.model.as_deref() != Some("gpt-5.5") {
+        return Err(anyhow!("runtime model is not allowlisted"));
     }
     Ok(())
 }
@@ -503,10 +513,7 @@ fn build_transient_run_plan(
     workspace_bind_source: &str,
     launcher_unit: &str,
 ) -> Result<TransientRunPlan> {
-    request.validate().map_err(|error| anyhow!(error))?;
-    if request.model.as_deref() != Some("gpt-5.5") {
-        return Err(anyhow!("runtime model is not allowlisted"));
-    }
+    validate_execution_policy(request)?;
     validate_launcher_unit(launcher_unit)?;
     validate_workspace_bind_source(workspace_bind_source)?;
     let unit = transient_unit_name(&request.run_id);
@@ -593,9 +600,6 @@ fn build_transient_run_plan(
     if let Some(reasoning_effort) = request.reasoning_effort {
         args.push("--reasoning-effort".into());
         args.push(reasoning_effort_text(reasoning_effort)?.into());
-    }
-    if request.skip_git_repo_check {
-        args.push("--skip-git-repo-check".into());
     }
     Ok(TransientRunPlan {
         unit,
@@ -1276,6 +1280,7 @@ mod tests {
     fn rejects_unallowlisted_models_and_launcher_units() {
         let mut unallowlisted = request();
         unallowlisted.model = Some("other-model".to_owned());
+        assert!(validate_execution_policy(&unallowlisted).is_err());
         assert!(
             build_transient_run_plan(
                 &unallowlisted,

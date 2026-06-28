@@ -79,9 +79,6 @@ struct Cli {
 
     #[arg(long, value_enum)]
     reasoning_effort: Option<ReasoningEffort>,
-
-    #[arg(long, default_value_t = false)]
-    skip_git_repo_check: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -294,10 +291,8 @@ fn codex_args(cli: &Cli) -> Vec<OsString> {
         "--ephemeral".into(),
         "--cd".into(),
         cli.workspace.as_os_str().into(),
+        "--skip-git-repo-check".into(),
     ];
-    if cli.skip_git_repo_check {
-        args.push("--skip-git-repo-check".into());
-    }
     if let Some(reasoning_effort) = cli.reasoning_effort {
         args.push("-c".into());
         args.push(format!("model_reasoning_effort=\"{}\"", reasoning_effort.as_str()).into());
@@ -322,7 +317,6 @@ mod tests {
             workspace: PathBuf::from(WORKSPACE_PATH),
             model: "gpt-5.5".to_owned(),
             reasoning_effort: Some(ReasoningEffort::Xhigh),
-            skip_git_repo_check: true,
         }
     }
 
@@ -363,6 +357,17 @@ mod tests {
         ] {
             assert!(rendered.iter().any(|value| value == required), "{required}");
         }
+        let strict_config = rendered
+            .iter()
+            .position(|value| value == "--strict-config")
+            .unwrap();
+        let exec = rendered.iter().position(|value| value == "exec").unwrap();
+        let skip_git = rendered
+            .iter()
+            .position(|value| value == "--skip-git-repo-check")
+            .unwrap();
+        assert!(strict_config < exec);
+        assert!(skip_git > exec);
         assert!(PERMISSION_PROFILE.contains("/tmp/webex-codex-main\"=\"deny"));
         assert!(PERMISSION_PROFILE.contains("/run/credentials\"=\"deny"));
         assert!(PERMISSION_PROFILE.contains("/opt/codex/codex-resources\"=\"deny"));
