@@ -153,24 +153,28 @@ superseded_by:
 - Reserve the fixed socket path
   `/run/webex-codex-launcher/launcher.sock` and fixed executable path
   `/opt/webex-generic-account-bot/bin/webex-codex-launcher`.
-- Define a versioned, bounded, length-prefixed request/response protocol for
-  preflight and execution without accepting arbitrary executables, argv,
-  environment variables, unit properties, or paths outside validated fields.
+- Define a versioned, bounded, length-prefixed request/response protocol with
+  one frame per credentialled `SOCK_SEQPACKET` packet, without accepting
+  arbitrary executables, argv, environment variables, unit properties, or
+  paths outside validated fields.
 - Add root-owned systemd socket activation with one launcher service instance
   per accepted connection and host-owned sysusers/tmpfiles definitions.
-- Authorise each connection from kernel `SO_PEERCRED`, but never by UID or
-  group alone. Require the peer PID to be the exact live `MainPID` of
+- Authorise each connection from kernel `SO_PEERCRED` plus atomic
+  `SO_PEERPIDFD`, and require the request packet's `SCM_CREDENTIALS` to match,
+  but never authorise by UID or group alone. Require the peer PID to be the
+  exact live `MainPID` of
   `webex-generic-account-bot.service`, running the fixed root-owned bot binary
   in the exact service cgroup; bind authorisation to a pidfd and stable process
   snapshot so child callers, PID reuse, executable replacement, and caller
   exit fail closed.
 - Require Linux cgroup v2 explicitly through
-  `/sys/fs/cgroup/cgroup.controllers`.
-- Start the root launcher service with only `CAP_SYS_PTRACE` so it can inspect
-  the different-UID bot `MainPID`; expose no ambient capability, permanently
-  drop the capability after caller authorisation and before reading the
-  untrusted request frame, and never pass it into a launcher-created Codex
-  unit.
+  `/sys/fs/cgroup/cgroup.controllers` and require kernel `SO_PEERPIDFD`
+  support; unsupported hosts fail closed before request parsing.
+- Start the root launcher service with only `CAP_SYS_PTRACE` for different-UID
+  bot inspection and `CAP_SETPCAP` for the irreversible drop; expose no ambient
+  capability, remove both capabilities from the bounding and thread sets after
+  caller authorisation and before reading the untrusted request packet, and
+  never pass them into a launcher-created Codex unit.
 - UID/group-only authorisation is insufficient because prompt-controlled Codex
   descendants inherit the bot identity and supplementary groups.
 - PR 4a does not grant the bot membership in `webex-codex-launch` or any config

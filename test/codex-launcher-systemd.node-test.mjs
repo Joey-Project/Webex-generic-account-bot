@@ -24,10 +24,12 @@ describe('Codex launcher systemd boundary', () => {
       fs.readFile(TMPFILES_PATH, 'utf8'),
     ]);
 
-    assert.deepEqual(directiveValues(socket, 'ListenStream'), [
+    assert.deepEqual(directiveValues(socket, 'ListenSequentialPacket'), [
       '/run/webex-codex-launcher/launcher.sock',
     ]);
+    assert.deepEqual(directiveValues(socket, 'ListenStream'), []);
     assert.deepEqual(directiveValues(socket, 'Accept'), ['yes']);
+    assert.deepEqual(directiveValues(socket, 'PassCredentials'), ['yes']);
     assert.deepEqual(directiveValues(socket, 'SocketUser'), ['root']);
     assert.deepEqual(directiveValues(socket, 'SocketGroup'), ['webex-codex-launch']);
     assert.deepEqual(directiveValues(socket, 'SocketMode'), ['0660']);
@@ -37,6 +39,8 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), ['64']);
     assert.deepEqual(directiveValues(socket, 'PollLimitIntervalSec'), ['2s']);
     assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['32']);
+    assert.deepEqual(directiveValues(socket, 'ReceiveBuffer'), ['1M']);
+    assert.deepEqual(directiveValues(socket, 'SendBuffer'), ['2M']);
     assert.deepEqual(directiveValues(socket, 'ConditionPathExists'), [
       '/sys/fs/cgroup/cgroup.controllers',
     ]);
@@ -105,7 +109,7 @@ describe('Codex launcher systemd boundary', () => {
       RestrictSUIDSGID: 'true',
       LockPersonality: 'true',
       MemoryDenyWriteExecute: 'true',
-      CapabilityBoundingSet: 'CAP_SYS_PTRACE',
+      CapabilityBoundingSet: 'CAP_SYS_PTRACE CAP_SETPCAP',
       AmbientCapabilities: '',
       SystemCallArchitectures: 'native',
       IPAddressDeny: 'any',
@@ -127,7 +131,7 @@ describe('Codex launcher systemd boundary', () => {
       /^(?:RuntimeDirectory|StateDirectory|CacheDirectory|LogsDirectory)=/m,
     );
     assert.deepEqual(directiveValues(service, 'CapabilityBoundingSet'), [
-      'CAP_SYS_PTRACE',
+      'CAP_SYS_PTRACE CAP_SETPCAP',
     ]);
     assert.deepEqual(directiveValues(service, 'AmbientCapabilities'), ['']);
     assert.deepEqual(directiveValues(service, 'TasksMax'), ['64']);
@@ -181,13 +185,17 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(launcherModule, /Command::new\(SYSTEMCTL_PATH\)/);
     assert.equal((launcherModule.match(/Command::new\(/g) ?? []).length, 1);
     assert.doesNotMatch(source, /tokio::io::(?:stdin|stdout)/);
-    assert.match(source, /tokio::net::UnixStream::from_std/);
+    assert.match(source, /AsyncFd<OwnedFd>/);
+    assert.match(source, /libc::SCM_CREDENTIALS/);
+    assert.match(launcherModule, /SO_PEERPIDFD/);
+    assert.match(launcherModule, /PR_CAPBSET_DROP/);
+    assert.match(launcherModule, /capability_bounding_set\(\)\?\.is_empty\(\)/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
     assert.match(source, /ExecutionUnavailable/);
     assert.match(source, /LauncherResponse::ready\(false\)/);
 
     const dropCapability = source.indexOf('drop_peer_inspection_capability()?;');
-    const readRequest = source.indexOf('read_request_frame_from(&mut socket)');
+    const readRequest = source.indexOf('receive_request_packet(&socket)');
     assert.notEqual(dropCapability, -1);
     assert.notEqual(readRequest, -1);
     assert.ok(dropCapability < readRequest);

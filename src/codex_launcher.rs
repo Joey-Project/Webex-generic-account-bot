@@ -34,6 +34,8 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 #[cfg(target_os = "linux")]
 const CAP_SYS_PTRACE_NUMBER: u32 = 19;
 #[cfg(target_os = "linux")]
+const CAP_SETPCAP_NUMBER: u32 = 8;
+#[cfg(target_os = "linux")]
 const SYSTEMCTL_MAIN_PID_ARGS: [&str; 5] = [
     "show",
     "--property=MainPID",
@@ -91,7 +93,6 @@ use std::os::fd::AsRawFd;
 #[async_trait]
 trait HostProbe: Send + Sync {
     async fn bot_main_pid(&self) -> Result<u32>;
-    fn open_pidfd(&self, pid: u32) -> Result<OwnedFd>;
     fn process_snapshot(&self, pid: u32) -> Result<ProcessSnapshot>;
     fn executable_metadata(&self, path: &Path) -> Result<ExecutableMetadata>;
 }
@@ -120,10 +121,6 @@ impl HostProbe for SystemHostProbe {
             return Err(anyhow!("failed to resolve the bot service MainPID"));
         }
         parse_main_pid(&output.stdout)
-    }
-
-    fn open_pidfd(&self, pid: u32) -> Result<OwnedFd> {
-        open_pidfd(pid)
     }
 
     fn process_snapshot(&self, pid: u32) -> Result<ProcessSnapshot> {
@@ -174,8 +171,10 @@ pub fn socket_peer_credentials(fd: RawFd) -> Result<PeerCredentials> {
 }
 
 #[cfg(target_os = "linux")]
-pub async fn authorise_bot_peer(peer: PeerCredentials) -> Result<AuthorisedPeer> {
-    authorise_bot_peer_with(peer, &SystemHostProbe).await
+pub async fn authorise_bot_peer(socket_fd: RawFd, peer: PeerCredentials) -> Result<AuthorisedPeer> {
+    let pidfd =
+        socket_peer_pidfd(socket_fd).map_err(|_| anyhow!("launcher caller is not authorised"))?;
+    authorise_bot_peer_with(peer, pidfd, &SystemHostProbe).await
 }
 
 #[cfg(target_os = "linux")]
@@ -197,10 +196,28 @@ pub fn drop_peer_inspection_capability() -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("failed to read launcher capabilities");
     }
-    if !capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER) {
+    let allowed = [CAP_SYS_PTRACE_NUMBER, CAP_SETPCAP_NUMBER];
+    if !capability_sets_only_allow(&data, &allowed) {
         return Err(anyhow!("launcher has an unexpected capability"));
     }
-    clear_capability(&mut data, CAP_SYS_PTRACE_NUMBER);
+    let bounding = capability_bounding_set()?;
+    if bounding
+        .iter()
+        .any(|capability| !allowed.contains(capability))
+    {
+        return Err(anyhow!(
+            "launcher capability bounding set contains an unexpected capability"
+        ));
+    }
+    if !bounding.is_empty() && !capability_is_effective(&data, CAP_SETPCAP_NUMBER) {
+        return Err(anyhow!("launcher cannot clear its capability bounding set"));
+    }
+    for capability in [CAP_SYS_PTRACE_NUMBER, CAP_SETPCAP_NUMBER] {
+        if bounding.contains(&capability) {
+            drop_bounding_capability(capability)?;
+        }
+        clear_capability(&mut data, capability);
+    }
     // SAFETY: header and data retain the layout required by capset.
     if unsafe {
         libc::syscall(
@@ -232,6 +249,11 @@ pub fn drop_peer_inspection_capability() -> Result<()> {
             "launcher capability set remained populated after drop"
         ));
     }
+    if !capability_bounding_set()?.is_empty() {
+        return Err(anyhow!(
+            "launcher capability bounding set remained populated after drop"
+        ));
+    }
     Ok(())
 }
 
@@ -251,9 +273,13 @@ pub fn validate_launcher_process() -> Result<()> {
 pub fn validate_socket_stdio(stdin_fd: RawFd, stdout_fd: RawFd) -> Result<()> {
     let stdin = descriptor_metadata(stdin_fd)?;
     let stdout = descriptor_metadata(stdout_fd)?;
-    if stdin != stdout || stdin.file_type != libc::S_IFSOCK {
+    if stdin != stdout
+        || stdin.file_type != libc::S_IFSOCK
+        || socket_option(stdin_fd, libc::SO_TYPE)? != libc::SOCK_SEQPACKET
+        || socket_option(stdin_fd, libc::SO_PASSCRED)? != 1
+    {
         return Err(anyhow!(
-            "Codex launcher stdin and stdout must be the same accepted socket"
+            "Codex launcher stdin and stdout must be the same credentialled sequential-packet socket"
         ));
     }
     Ok(())
@@ -262,15 +288,14 @@ pub fn validate_socket_stdio(stdin_fd: RawFd, stdout_fd: RawFd) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn authorise_bot_peer_with(
     peer: PeerCredentials,
+    pidfd: OwnedFd,
     probe: &dyn HostProbe,
 ) -> Result<AuthorisedPeer> {
     if peer.pid <= 1 || peer.uid == 0 {
         return Err(anyhow!("launcher caller is not authorised"));
     }
 
-    let pidfd = probe
-        .open_pidfd(peer.pid)
-        .map_err(|_| anyhow!("launcher caller is not authorised"))?;
+    pidfd_is_alive(pidfd.as_raw_fd()).map_err(|_| anyhow!("launcher caller is not authorised"))?;
     let before = probe
         .process_snapshot(peer.pid)
         .map_err(|_| anyhow!("launcher caller is not authorised"))?;
@@ -298,6 +323,7 @@ async fn authorise_bot_peer_with(
     if before != after {
         return Err(anyhow!("launcher caller is not authorised"));
     }
+    pidfd_is_alive(pidfd.as_raw_fd()).map_err(|_| anyhow!("launcher caller is not authorised"))?;
 
     Ok(AuthorisedPeer {
         credentials: peer,
@@ -397,14 +423,32 @@ fn trusted_root_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_pidfd(pid: u32) -> Result<OwnedFd> {
-    // SAFETY: pidfd_open does not dereference userspace pointers.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-    if fd < 0 {
+fn socket_peer_pidfd(fd: RawFd) -> Result<OwnedFd> {
+    let mut pidfd = -1;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: pidfd and length point to writable values of the expected sizes.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut pidfd as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    } != 0
+    {
         return Err(std::io::Error::last_os_error().into());
     }
-    // SAFETY: pidfd_open returned a new descriptor owned by this process.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    if length as usize != std::mem::size_of::<libc::c_int>() || pidfd < 0 {
+        return Err(anyhow!("launcher peer pidfd is unavailable"));
+    }
+    // SAFETY: SO_PEERPIDFD returned a new descriptor owned by this process.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to protect launcher peer pidfd");
+    }
+    Ok(pidfd)
 }
 
 #[cfg(target_os = "linux")]
@@ -451,23 +495,58 @@ fn clear_capability(data: &mut [LinuxCapabilityData; 2], capability: u32) {
 }
 
 #[cfg(target_os = "linux")]
-fn capability_sets_only_allow(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
-    let allowed_index = (capability / 32) as usize;
-    let allowed_mask = 1_u32 << (capability % 32);
+fn capability_sets_only_allow(data: &[LinuxCapabilityData; 2], allowed: &[u32]) -> bool {
     data.iter().enumerate().all(|(index, set)| {
-        let mask = if index == allowed_index {
-            allowed_mask
-        } else {
-            0
-        };
+        let mask = allowed.iter().fold(0_u32, |mask, capability| {
+            if (*capability / 32) as usize == index {
+                mask | (1_u32 << (*capability % 32))
+            } else {
+                mask
+            }
+        });
         set.effective & !mask == 0 && set.permitted & !mask == 0 && set.inheritable & !mask == 0
     })
+}
+
+#[cfg(target_os = "linux")]
+fn capability_is_effective(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
+    data[(capability / 32) as usize].effective & (1_u32 << (capability % 32)) != 0
 }
 
 #[cfg(target_os = "linux")]
 fn capability_sets_are_empty(data: &[LinuxCapabilityData; 2]) -> bool {
     data.iter()
         .all(|set| set.effective == 0 && set.permitted == 0 && set.inheritable == 0)
+}
+
+#[cfg(target_os = "linux")]
+fn capability_bounding_set() -> Result<Vec<u32>> {
+    let mut capabilities = Vec::new();
+    for capability in 0_u32..64 {
+        // SAFETY: PR_CAPBSET_READ does not dereference userspace pointers.
+        let status = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if status < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(capabilities);
+            }
+            return Err(error).context("failed to read launcher capability bounding set");
+        }
+        if status == 1 {
+            capabilities.push(capability);
+        }
+    }
+    Err(anyhow!("launcher kernel capability range is unsupported"))
+}
+
+#[cfg(target_os = "linux")]
+fn drop_bounding_capability(capability: u32) -> Result<()> {
+    // SAFETY: PR_CAPBSET_DROP does not dereference userspace pointers.
+    if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to clear launcher capability bounding set");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -492,6 +571,29 @@ fn descriptor_metadata(fd: RawFd) -> Result<DescriptorMetadata> {
         inode: metadata.st_ino,
         file_type: metadata.st_mode & libc::S_IFMT,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn socket_option(fd: RawFd, option: libc::c_int) -> Result<libc::c_int> {
+    let mut value = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: value and length point to writable values of the expected sizes.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to inspect launcher socket");
+    }
+    if length as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(anyhow!("launcher socket option is invalid"));
+    }
+    Ok(value)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -521,11 +623,6 @@ mod tests {
     impl HostProbe for FakeProbe {
         async fn bot_main_pid(&self) -> Result<u32> {
             Ok(self.main_pid)
-        }
-
-        fn open_pidfd(&self, _pid: u32) -> Result<OwnedFd> {
-            let file = fs::File::open("/dev/null")?;
-            Ok(file.into())
         }
 
         fn process_snapshot(&self, _pid: u32) -> Result<ProcessSnapshot> {
@@ -572,7 +669,9 @@ mod tests {
             metadata: trusted_metadata(),
         };
 
-        let authorised = authorise_bot_peer_with(peer, &probe).await.unwrap();
+        let authorised = authorise_bot_peer_with(peer, live_test_pidfd(), &probe)
+            .await
+            .unwrap();
 
         assert_eq!(authorised.credentials(), peer);
     }
@@ -590,7 +689,9 @@ mod tests {
             metadata: trusted_metadata(),
         };
 
-        let error = authorise_bot_peer_with(peer, &probe).await.unwrap_err();
+        let error = authorise_bot_peer_with(peer, live_test_pidfd(), &probe)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.to_string(), "launcher caller is not authorised");
     }
@@ -610,7 +711,9 @@ mod tests {
             metadata: trusted_metadata(),
         };
 
-        let error = authorise_bot_peer_with(peer, &probe).await.unwrap_err();
+        let error = authorise_bot_peer_with(peer, live_test_pidfd(), &probe)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.to_string(), "launcher caller is not authorised");
     }
@@ -631,7 +734,9 @@ mod tests {
             },
         };
 
-        let error = authorise_bot_peer_with(peer, &probe).await.unwrap_err();
+        let error = authorise_bot_peer_with(peer, live_test_pidfd(), &probe)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.to_string(), "launcher caller is not authorised");
     }
@@ -654,6 +759,7 @@ mod tests {
                 uid: 0,
                 ..base_peer
             },
+            live_test_pidfd(),
             &base_probe(),
         )
         .await
@@ -667,7 +773,7 @@ mod tests {
             ..base_probe()
         };
         assert!(
-            authorise_bot_peer_with(base_peer, &executable_probe)
+            authorise_bot_peer_with(base_peer, live_test_pidfd(), &executable_probe)
                 .await
                 .is_err()
         );
@@ -679,7 +785,7 @@ mod tests {
             ..base_probe()
         };
         assert!(
-            authorise_bot_peer_with(base_peer, &cgroup_probe)
+            authorise_bot_peer_with(base_peer, live_test_pidfd(), &cgroup_probe)
                 .await
                 .is_err()
         );
@@ -708,8 +814,10 @@ mod tests {
     }
 
     #[test]
-    fn accepted_socket_must_back_both_standard_streams() {
-        let (left, _right) = UnixStream::pair().unwrap();
+    fn accepted_socket_must_be_one_credentialled_sequential_packet_socket() {
+        let Some((left, _right)) = credentialled_sequential_packet_pair() else {
+            return;
+        };
         let duplicate = unsafe { libc::dup(left.as_raw_fd()) };
         assert!(duplicate >= 0);
         // SAFETY: dup returned a new descriptor owned by this test.
@@ -792,7 +900,19 @@ mod tests {
 
     #[test]
     fn pidfd_poll_reports_the_current_process_alive() {
-        let pidfd = open_pidfd(std::process::id()).unwrap();
+        let (left, _right) = UnixStream::pair().unwrap();
+        let pidfd = match socket_peer_pidfd(left.as_raw_fd()) {
+            Ok(pidfd) => pidfd,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EPERM)) =>
+            {
+                // Some test sandboxes block SO_PEERPIDFD. Runtime remains fail closed.
+                return;
+            }
+            Err(error) => panic!("failed to read peer pidfd: {error:#}"),
+        };
 
         pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
     }
@@ -800,18 +920,68 @@ mod tests {
     #[test]
     fn permits_only_peer_inspection_and_clears_all_thread_capability_sets() {
         let mut data = [LinuxCapabilityData::default(); 2];
-        let mask = 1_u32 << CAP_SYS_PTRACE_NUMBER;
+        let mask = (1_u32 << CAP_SYS_PTRACE_NUMBER) | (1_u32 << CAP_SETPCAP_NUMBER);
         data[0] = LinuxCapabilityData {
             effective: mask,
             permitted: mask,
             inheritable: mask,
         };
 
-        assert!(capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER));
+        let allowed = [CAP_SYS_PTRACE_NUMBER, CAP_SETPCAP_NUMBER];
+        assert!(capability_sets_only_allow(&data, &allowed));
         clear_capability(&mut data, CAP_SYS_PTRACE_NUMBER);
+        clear_capability(&mut data, CAP_SETPCAP_NUMBER);
         assert!(capability_sets_are_empty(&data));
 
         data[0].permitted = 1_u32 << (CAP_SYS_PTRACE_NUMBER - 1);
-        assert!(!capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER));
+        assert!(!capability_sets_only_allow(&data, &allowed));
+    }
+
+    fn live_test_pidfd() -> OwnedFd {
+        // SAFETY: pidfd_open does not dereference userspace pointers.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) } as i32;
+        assert!(fd >= 0);
+        // SAFETY: pidfd_open returned a new descriptor owned by this test.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    fn credentialled_sequential_packet_pair() -> Option<(OwnedFd, OwnedFd)> {
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has storage for both descriptors returned by socketpair.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    descriptors.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: socketpair returned descriptors owned by this test.
+        let left = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: socketpair returned descriptors owned by this test.
+        let right = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let enabled: libc::c_int = 1;
+        // SAFETY: enabled points to one initialized c_int.
+        let status = unsafe {
+            libc::setsockopt(
+                left.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EPERM) {
+                // Some test sandboxes block SO_PASSCRED. Runtime remains fail closed.
+                return None;
+            }
+            panic!("failed to enable SO_PASSCRED: {error}");
+        }
+        Some((left, right))
     }
 }

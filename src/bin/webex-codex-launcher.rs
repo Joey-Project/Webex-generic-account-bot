@@ -1,15 +1,11 @@
 #[cfg(target_os = "linux")]
-use std::os::{
-    fd::{AsRawFd, FromRawFd, RawFd},
-    unix::net::UnixStream as StdUnixStream,
-};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use tokio::io::unix::AsyncFd;
 
 use anyhow::{Result, anyhow};
 #[cfg(target_os = "linux")]
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::{Duration, timeout},
-};
+use tokio::time::{Duration, timeout};
 #[cfg(target_os = "linux")]
 use webex_generic_account_bot::{
     codex_launcher::{
@@ -24,6 +20,19 @@ use webex_generic_account_bot::{
 
 #[cfg(target_os = "linux")]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const CONTROL_BUFFER_BYTES: usize = 128;
+
+#[cfg(target_os = "linux")]
+struct ReceivedPacket {
+    frame: Vec<u8>,
+    sender: webex_generic_account_bot::codex_launcher::PeerCredentials,
+    truncated: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+struct ControlBuffer([u8; CONTROL_BUFFER_BYTES]);
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
@@ -32,20 +41,36 @@ async fn main() -> Result<()> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
     validate_socket_stdio(stdin_fd, stdout_fd)?;
-    let mut socket = duplicate_launcher_socket(stdin_fd)?;
+    let socket = duplicate_launcher_socket(stdin_fd)?;
 
     let peer = socket_peer_credentials(stdin_fd)?;
-    let peer = authorise_bot_peer(peer).await?;
+    let peer = authorise_bot_peer(stdin_fd, peer).await?;
     drop_peer_inspection_capability()?;
     peer.ensure_alive()?;
 
-    let frame = timeout(IO_TIMEOUT, read_request_frame_from(&mut socket))
+    let packet = timeout(IO_TIMEOUT, receive_request_packet(&socket))
         .await
         .map_err(|_| anyhow!("launcher request read timed out"))??;
+    if !request_writer_is_authorised(packet.sender, peer.credentials()) {
+        return Err(anyhow!("launcher request writer is not authorised"));
+    }
     peer.ensure_alive()?;
-    let response = response_for_request(decode_request_frame(&frame))?;
+    let request = if packet.truncated {
+        Err(webex_generic_account_bot::launcher_protocol::ProtocolError::RequestTooLarge)
+    } else {
+        decode_request_frame(&packet.frame)
+    };
+    let response = response_for_request(request)?;
     peer.ensure_alive()?;
-    write_response(&mut socket, &response).await
+    write_response(&socket, &response).await
+}
+
+#[cfg(target_os = "linux")]
+fn request_writer_is_authorised(
+    sender: webex_generic_account_bot::codex_launcher::PeerCredentials,
+    peer: webex_generic_account_bot::codex_launcher::PeerCredentials,
+) -> bool {
+    sender == peer
 }
 
 #[cfg(target_os = "linux")]
@@ -75,48 +100,140 @@ fn response_for_request(
 }
 
 #[cfg(target_os = "linux")]
-fn duplicate_launcher_socket(fd: RawFd) -> Result<tokio::net::UnixStream> {
+fn duplicate_launcher_socket(fd: RawFd) -> Result<AsyncFd<OwnedFd>> {
     // SAFETY: fcntl does not dereference userspace pointers for F_DUPFD_CLOEXEC.
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if duplicate < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this process.
-    let socket = unsafe { StdUnixStream::from_raw_fd(duplicate) };
-    socket.set_nonblocking(true)?;
-    Ok(tokio::net::UnixStream::from_std(socket)?)
-}
-
-#[cfg(target_os = "linux")]
-async fn read_request_frame_from<R>(input: &mut R) -> Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut header = [0_u8; FRAME_HEADER_BYTES];
-    input.read_exact(&mut header).await?;
-    let payload_len = u32::from_be_bytes(header) as usize;
-    let mut frame =
-        Vec::with_capacity(FRAME_HEADER_BYTES.saturating_add(payload_len.min(REQUEST_MAX_BYTES)));
-    frame.extend_from_slice(&header);
-    if payload_len == 0 || payload_len > REQUEST_MAX_BYTES {
-        return Ok(frame);
+    let socket = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
     }
-
-    let mut payload = vec![0_u8; payload_len];
-    input.read_exact(&mut payload).await?;
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    Ok(AsyncFd::new(socket)?)
 }
 
 #[cfg(target_os = "linux")]
-async fn write_response<W>(output: &mut W, response: &LauncherResponse) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
+async fn receive_request_packet(socket: &AsyncFd<OwnedFd>) -> Result<ReceivedPacket> {
+    loop {
+        let mut guard = socket.readable().await?;
+        match guard.try_io(|socket| receive_request_packet_now(socket.get_ref().as_raw_fd())) {
+            Ok(result) => return Ok(result?),
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn receive_request_packet_now(fd: RawFd) -> std::io::Result<ReceivedPacket> {
+    let mut frame = vec![0_u8; FRAME_HEADER_BYTES + REQUEST_MAX_BYTES + 1];
+    let mut control = ControlBuffer([0_u8; CONTROL_BUFFER_BYTES]);
+    let mut iovec = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen = control.0.len();
+
+    // SAFETY: message references initialized frame, control, and iovec storage for this call.
+    let received = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sender = message_credentials(&message)?;
+    frame.truncate(received as usize);
+    Ok(ReceivedPacket {
+        frame,
+        sender,
+        truncated: message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn message_credentials(
+    message: &libc::msghdr,
+) -> std::io::Result<webex_generic_account_bot::codex_launcher::PeerCredentials> {
+    let mut credentials = None;
+    // SAFETY: message and its control buffer remain valid for the complete traversal.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    while !header.is_null() {
+        // SAFETY: CMSG_FIRSTHDR/CMSG_NXTHDR return headers within the validated control buffer.
+        let control = unsafe { &*header };
+        if control.cmsg_level == libc::SOL_SOCKET && control.cmsg_type == libc::SCM_CREDENTIALS {
+            if control.cmsg_len
+                < unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) } as usize
+                || credentials.is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "launcher packet credentials are invalid",
+                ));
+            }
+            // SAFETY: the checked cmsg length contains one ucred; read_unaligned avoids alignment assumptions.
+            let raw =
+                unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>()) };
+            if raw.pid <= 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "launcher packet sender is invalid",
+                ));
+            }
+            credentials = Some(webex_generic_account_bot::codex_launcher::PeerCredentials {
+                pid: raw.pid as u32,
+                uid: raw.uid,
+                gid: raw.gid,
+            });
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher packet contains unexpected control data",
+            ));
+        }
+        // SAFETY: message and header describe the same live control buffer.
+        header = unsafe { libc::CMSG_NXTHDR(message, header) };
+    }
+    credentials.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "launcher packet credentials are unavailable",
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn write_response(socket: &AsyncFd<OwnedFd>, response: &LauncherResponse) -> Result<()> {
     let frame = encode_response_frame(response)?;
     timeout(IO_TIMEOUT, async {
-        output.write_all(&frame).await?;
-        output.shutdown().await
+        loop {
+            let mut guard = socket.writable().await?;
+            match guard.try_io(|socket| {
+                let fd = socket.get_ref().as_raw_fd();
+                // SAFETY: frame is a valid immutable buffer for the duration of send.
+                let sent = unsafe {
+                    libc::send(fd, frame.as_ptr().cast(), frame.len(), libc::MSG_NOSIGNAL)
+                };
+                if sent < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if sent as usize != frame.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "launcher response packet was truncated",
+                    ));
+                }
+                Ok(())
+            }) {
+                Ok(result) => break result,
+                Err(_) => continue,
+            }
+        }
     })
     .await
     .map_err(|_| anyhow!("launcher response write timed out"))??;
@@ -206,20 +323,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn length_prefixed_request_does_not_wait_for_eof() {
+    async fn credentialled_packet_does_not_wait_for_eof() {
         let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
-        let (mut writer, mut reader) = tokio::io::duplex(frame.len());
-        writer.write_all(&frame).await.unwrap();
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        send_packet(writer.as_raw_fd(), &frame);
 
-        let decoded = timeout(
-            Duration::from_millis(100),
-            read_request_frame_from(&mut reader),
-        )
-        .await
-        .expect("reader must not wait for the writer to close")
-        .unwrap();
+        let packet = timeout(Duration::from_millis(100), receive_request_packet(&reader))
+            .await
+            .expect("receiver must not wait for the writer to close")
+            .unwrap();
 
-        assert_eq!(decoded, frame);
-        drop(writer);
+        assert_eq!(packet.frame, frame);
+        assert!(!packet.truncated);
+        assert_eq!(packet.sender.pid, std::process::id());
+        assert_eq!(packet.sender.uid, unsafe { libc::geteuid() });
+        assert_eq!(packet.sender.gid, unsafe { libc::getegid() });
+    }
+
+    #[tokio::test]
+    async fn partial_frame_packets_receive_stable_rejections() {
+        for frame in [
+            vec![0_u8; 2],
+            [10_u32.to_be_bytes().as_slice(), b"{}"].concat(),
+        ] {
+            let Some((writer, reader)) = credentialled_packet_pair() else {
+                return;
+            };
+            send_packet(writer.as_raw_fd(), &frame);
+            let packet = receive_request_packet(&reader).await.unwrap();
+            let response = response_for_request(decode_request_frame(&packet.frame)).unwrap();
+
+            assert!(matches!(
+                response.response,
+                LauncherResponseKind::Rejected(response)
+                    if response.code == RejectionCode::MalformedRequest
+            ));
+        }
+    }
+
+    #[test]
+    fn request_writer_must_match_the_authorised_peer() {
+        let peer = webex_generic_account_bot::codex_launcher::PeerCredentials {
+            pid: 42,
+            uid: 1000,
+            gid: 1000,
+        };
+        assert!(request_writer_is_authorised(peer, peer));
+        assert!(!request_writer_is_authorised(
+            webex_generic_account_bot::codex_launcher::PeerCredentials { pid: 43, ..peer },
+            peer
+        ));
+    }
+
+    fn credentialled_packet_pair() -> Option<(OwnedFd, AsyncFd<OwnedFd>)> {
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has storage for the two fds returned by socketpair.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                    descriptors.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: socketpair returned two descriptors owned by this test.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: socketpair returned two descriptors owned by this test.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let enabled: libc::c_int = 1;
+        // SAFETY: enabled points to one initialized c_int.
+        let status = unsafe {
+            libc::setsockopt(
+                reader.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EPERM) {
+                // Some test sandboxes block SO_PASSCRED. Runtime remains fail closed.
+                return None;
+            }
+            panic!("failed to enable SO_PASSCRED: {error}");
+        }
+        Some((writer, AsyncFd::new(reader).unwrap()))
+    }
+
+    fn send_packet(fd: RawFd, packet: &[u8]) {
+        // SAFETY: packet is readable for the complete send call.
+        let sent = unsafe { libc::send(fd, packet.as_ptr().cast(), packet.len(), 0) };
+        assert_eq!(sent, packet.len() as isize);
     }
 }

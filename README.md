@@ -507,21 +507,26 @@ The fixed launcher paths are:
 - socket: `/run/webex-codex-launcher/launcher.sock`
 - executable: `/opt/webex-generic-account-bot/bin/webex-codex-launcher`
 
-The socket unit owns the runtime directory and socket and uses `Accept=yes` to
-start one root-owned `webex-codex-launcher@.service` instance per connection.
-The launcher protocol is versioned, length-prefixed JSON with bounded request
-and response frames. Caller authorisation starts with `SO_PEERCRED`, but also
-requires the peer to be the exact live `MainPID` of
+The socket unit owns the runtime directory and credentialled
+`SOCK_SEQPACKET` socket and uses `Accept=yes` to start one root-owned
+`webex-codex-launcher@.service` instance per connection. The launcher protocol
+is versioned, length-prefixed JSON with one bounded request or response per
+packet. Caller authorisation uses `SO_PEERCRED` and an atomic `SO_PEERPIDFD`;
+the request packet's `SCM_CREDENTIALS` must identify that same peer. The peer
+must also be the exact live `MainPID` of
 `webex-generic-account-bot.service`, running the fixed root-owned bot
 executable in the exact service cgroup; a pidfd and repeated process snapshot
 close PID-reuse and caller-exit races. The launcher units explicitly require
-Linux cgroup v2, detected through `/sys/fs/cgroup/cgroup.controllers`.
-The root launcher service starts with only `CAP_SYS_PTRACE` so it can inspect
-the different-UID bot `MainPID`; it has no ambient capabilities. The launcher
-permanently drops that capability immediately after caller authorisation and
-before reading the untrusted request frame. This capability is not exposed to
-Codex runs, whose capability sets remain part of PR 4b's deny-by-default
-transient-unit boundary.
+Linux cgroup v2, detected through `/sys/fs/cgroup/cgroup.controllers`, and a
+kernel that supports `SO_PEERPIDFD`; an unsupported kernel fails closed before
+reading a request packet.
+The root launcher service starts with only `CAP_SYS_PTRACE` for different-UID
+bot inspection and `CAP_SETPCAP` for the subsequent irreversible drop; it has
+no ambient capabilities. Immediately after caller authorisation and before
+reading the untrusted request packet, the launcher removes both capabilities
+from its bounding, effective, permitted, and inheritable sets. Neither
+capability is exposed to Codex runs, whose capability sets remain part of PR
+4b's deny-by-default transient-unit boundary.
 
 PR 4a is only a foundation and must remain fail closed. It does not add the bot
 to `webex-codex-launch`, execute `systemd-run`, enable
