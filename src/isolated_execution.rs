@@ -150,6 +150,7 @@ struct RuntimePaths {
     input_root: PathBuf,
     consumed_input_root: PathBuf,
     group_file: PathBuf,
+    passwd_file: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -164,6 +165,7 @@ impl Default for RuntimePaths {
             input_root: PathBuf::from(CODEX_INPUT_ROOT),
             consumed_input_root: PathBuf::from(CODEX_CONSUMED_INPUT_ROOT),
             group_file: PathBuf::from("/etc/group"),
+            passwd_file: PathBuf::from("/etc/passwd"),
         }
     }
 }
@@ -243,6 +245,7 @@ fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRun
     trusted_file(&paths.systemd_run, expected_uid, FilePolicy::Executable)?;
     trusted_file(&paths.systemctl, expected_uid, FilePolicy::Executable)?;
     trusted_file(&paths.group_file, expected_uid, FilePolicy::HostData)?;
+    trusted_file(&paths.passwd_file, expected_uid, FilePolicy::HostData)?;
     let manifest_bytes = read_bounded_file(&paths.active_manifest, ACTIVE_MANIFEST_MAX_BYTES)?;
     let manifest: ActiveRuntimeManifest =
         serde_json::from_slice(&manifest_bytes).context("runtime active manifest is invalid")?;
@@ -278,6 +281,7 @@ fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRun
         return Err(anyhow!("Codex credential is not a JSON object"));
     }
     let input_gid = resolve_group_gid(&paths.group_file, CODEX_INPUT_GROUP)?;
+    reject_primary_gid_users(&paths.passwd_file, input_gid)?;
     trusted_input_root(&paths.input_root, input_gid)?;
     trusted_directory(&paths.consumed_input_root, 0, true)?;
     let consumed_metadata = fs::symlink_metadata(&paths.consumed_input_root)?;
@@ -1050,7 +1054,32 @@ fn parse_group_gid(contents: &str, expected_name: &str) -> Result<u32> {
         }
         result = Some(gid);
     }
-    result.ok_or_else(|| anyhow!("Codex input group is unavailable"))
+    let expected_gid = result.ok_or_else(|| anyhow!("Codex input group is unavailable"))?;
+    for line in contents.lines() {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() == 4
+            && fields[0] != expected_name
+            && fields[2].parse::<u32>().ok() == Some(expected_gid)
+        {
+            return Err(anyhow!("Codex input group identifier is aliased"));
+        }
+    }
+    Ok(expected_gid)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_primary_gid_users(passwd_file: &Path, input_gid: u32) -> Result<()> {
+    let bytes = read_bounded_file(passwd_file, 1024 * 1024)?;
+    let contents = std::str::from_utf8(&bytes).context("host passwd database is not UTF-8")?;
+    if contents.lines().any(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        fields.len() >= 4 && fields[3].parse::<u32>().ok() == Some(input_gid)
+    }) {
+        return Err(anyhow!(
+            "Codex input group is used as a static primary group"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1176,11 +1205,39 @@ mod tests {
         );
         assert!(
             parse_group_gid(
+                "shared:x:4321:\nwebex-codex-input:x:4321:\n",
+                CODEX_INPUT_GROUP
+            )
+            .is_err()
+        );
+        assert!(
+            parse_group_gid(
                 "webex-codex-input:x:4321:\nwebex-codex-input:x:4322:\n",
                 CODEX_INPUT_GROUP
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn input_group_cannot_be_a_static_users_primary_group() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "webex-codex-passwd-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&path, b"root:x:0:0:root:/root:/bin/sh\n").unwrap();
+        assert!(reject_primary_gid_users(&path, 4321).is_ok());
+        fs::write(
+            &path,
+            b"root:x:0:0:root:/root:/bin/sh\nbot:x:1000:4321:bot:/tmp:/bin/false\n",
+        )
+        .unwrap();
+        assert!(reject_primary_gid_users(&path, 4321).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
