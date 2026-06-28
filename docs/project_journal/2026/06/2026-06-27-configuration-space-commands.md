@@ -50,11 +50,14 @@ superseded_by:
   `/config status`; keep it separate from the private worker queue and staging
   state.
 - Publish the credential-free production root-apply recovery journal as
-  `root:root` mode `0644` so the non-root bot can strictly expose only
-  allowlisted phase, config revision, and service fields. Keep deployment
-  recovery compatible with legacy same-owner mode `0600` journals, while
-  `/config status` maps those private legacy files, malformed journals, and
-  untrusted files to generic `recovery_required` without exposing contents.
+  root-owned (UID 0) mode `0644` so the non-root bot can strictly expose only
+  allowlisted phase, config revision, and service fields. Do not trust or
+  require its GID because mode `0644` grants no group write. Deployment recovery
+  trusts the same-owner UID for both current mode `0644` and legacy mode `0600`
+  journals. `/config status` still parses only the root-owned (UID 0), mode
+  `0644` journal at the fixed path, mapping private legacy files, malformed
+  journals, and files with an untrusted UID or mode to generic
+  `recovery_required` without exposing contents.
 - Keep the deployment recovery journal distinct from both the worker's private
   queue/staging artifacts and its public status projection; the deployment
   journal is not private worker transaction state.

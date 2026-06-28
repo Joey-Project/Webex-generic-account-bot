@@ -3861,6 +3861,129 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('recovers current and legacy journals owned by the same UID after a GID change', async () => {
+    for (const mode of [0o644, 0o600]) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+      const plan = buildDeployPlan(
+        parseArgsAllow([
+          '--apply',
+          '--skip-restart',
+          '--checkout-dir',
+          path.join(temp, 'checkout'),
+          '--rendered-config',
+          path.join(temp, 'rendered', 'production.toml'),
+          '--metadata-file',
+          path.join(temp, 'rendered', 'deploy-status.json'),
+          '--lock-dir',
+          path.join(temp, 'deploy.lock'),
+          '--bot-code-dir',
+          path.join(temp, 'bot-code'),
+        ]),
+      );
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+      await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+      await writeInstallTransactionFixture(plan, {
+        configRevision: '2'.repeat(40),
+        serviceRestartRequired: false,
+        mode,
+      });
+      const transactionStat = await fs.stat(plan.transactionFile);
+      const fsApi = overrideInstallTransactionStat(fs, plan.transactionFile, {
+        gid: transactionStat.gid + 1,
+      });
+      let commandRan = false;
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandRan = true;
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+            await assert.rejects(() => fs.access(plan.transactionFile));
+            throw new Error(`stop after ${mode.toString(8)} recovery`);
+          },
+        }),
+        new RegExp(`stop after ${mode.toString(8)} recovery`),
+      );
+
+      assert.equal(commandRan, true);
+      await assertLockReleased(plan.lockDir);
+    }
+  });
+
+  it('rejects recovery journals with a wrong UID or unsafe modes', async () => {
+    const cases = [
+      {
+        label: 'wrong UID',
+        override: (transactionStat) => ({ uid: transactionStat.uid + 1 }),
+        expected: /deployment transaction ownership is not trusted/,
+      },
+      {
+        label: 'group-writable mode',
+        override: () => ({ mode: 0o664 }),
+        expected: /deployment transaction mode is not trusted/,
+      },
+      {
+        label: 'world-writable mode',
+        override: () => ({ mode: 0o646 }),
+        expected: /deployment transaction mode is not trusted/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+      const plan = buildDeployPlan(
+        parseArgsAllow([
+          '--apply',
+          '--skip-restart',
+          '--checkout-dir',
+          path.join(temp, 'checkout'),
+          '--rendered-config',
+          path.join(temp, 'rendered', 'production.toml'),
+          '--metadata-file',
+          path.join(temp, 'rendered', 'deploy-status.json'),
+          '--lock-dir',
+          path.join(temp, 'deploy.lock'),
+          '--bot-code-dir',
+          path.join(temp, 'bot-code'),
+        ]),
+      );
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+      await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+      await writeInstallTransactionFixture(plan, {
+        configRevision: '3'.repeat(40),
+        serviceRestartRequired: false,
+      });
+      const transactionStat = await fs.stat(plan.transactionFile);
+      const fsApi = overrideInstallTransactionStat(
+        fs,
+        plan.transactionFile,
+        testCase.override(transactionStat),
+      );
+      let commandRan = false;
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandRan = true;
+            return { stdout: '', stderr: '' };
+          },
+        }),
+        testCase.expected,
+        testCase.label,
+      );
+
+      assert.equal(commandRan, false, testCase.label);
+      assert.equal((await fs.stat(plan.transactionFile)).isFile(), true, testCase.label);
+      await assertLockReleased(plan.lockDir);
+    }
+  });
+
   it('rolls back a prepared first install without stopping or restarting the service', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
     const plan = buildDeployPlan(
@@ -5703,6 +5826,38 @@ async function writeInstallTransactionFixture(
     }, null, 2)}\n`,
     { mode },
   );
+}
+
+function overrideInstallTransactionStat(fsApi, transactionFile, overrides) {
+  return {
+    ...fsApi,
+    async open(file, ...args) {
+      const handle = await fsApi.open(file, ...args);
+      if (file !== transactionFile) {
+        return handle;
+      }
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === 'stat') {
+            return async (...statArgs) => {
+              const metadata = await target.stat(...statArgs);
+              return new Proxy(metadata, {
+                get(statTarget, statProperty) {
+                  if (Object.prototype.hasOwnProperty.call(overrides, statProperty)) {
+                    return overrides[statProperty];
+                  }
+                  const value = Reflect.get(statTarget, statProperty, statTarget);
+                  return typeof value === 'function' ? value.bind(statTarget) : value;
+                },
+              });
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
 }
 
 async function protectPrepareLiveDirectories(renderedConfig, metadataFile, fsApi = fs) {

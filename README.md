@@ -66,12 +66,14 @@ Codex runs use the isolated runner. The worker runs immutable staged preparation
 only; it cannot reload the bot. `reload` and `sync` also remain undeployable.
 When a trusted, valid deployment recovery journal exists, status reports only
 its allowlisted phase, config revision, and service. Production root apply
-writes that credential-free journal as `root:root` with mode `0644` so the
-non-root bot can read it. Deployment recovery remains compatible with legacy
-same-owner mode `0600` journals, but `/config status` treats those private
-legacy files as generic `recovery_required` until recovery removes or rewrites
-them. Malformed journals and files with any other ownership or mode fail closed
-without exposing their contents. This deployment journal is separate
+writes that credential-free journal as root-owned (UID 0) with mode `0644` so
+the non-root bot can read it. Its GID is not trusted or required because mode
+`0644` grants no group write. Deployment recovery trusts the same-owner UID for
+both current mode `0644` and legacy mode `0600` journals. `/config status`
+still parses only the root-owned (UID 0), mode `0644` journal at the fixed path;
+private legacy files and files with an untrusted UID or mode map to generic
+`recovery_required` without exposing their contents. Malformed journals also
+fail closed. This deployment journal is separate
 from the worker's private queue and staging state. A strict, bounded mode
 `0644` public worker status file projects only the latest pull action state and
 prepared revision, without exposing private queue records or failure output.
@@ -325,11 +327,14 @@ the previous config before returning. If rollback changes the live path but its
 final directory fsync fails, service restart/stop compensation still runs and
 the recovery journal is preserved. Before replacing the live config, the
 entrypoint writes and fsyncs a credential-free recovery journal beside it.
-Production root apply publishes the journal as `root:root` with mode `0644`,
-allowing the non-root bot to strictly parse and expose only its allowlisted
-phase, config revision, and service. Deployment recovery continues to accept
-legacy same-owner mode `0600` journals, while `/config status` reports those
-private legacy files only as generic `recovery_required`. The journal
+Production root apply publishes the journal as root-owned (UID 0) with mode
+`0644`, allowing the non-root bot to strictly parse and expose only its
+allowlisted phase, config revision, and service. Its GID is not trusted or
+required because mode `0644` grants no group write. Deployment recovery trusts
+the same-owner UID for both current mode `0644` and legacy mode `0600` journals,
+while `/config status` parses only the root-owned (UID 0), mode `0644` journal
+at the fixed path and reports private legacy files only as generic
+`recovery_required`. The journal
 advances through
 `prepared`, `service_transition_started`, and `committed_pending_metadata`, and
 remains until success metadata is durable. After an unclean exit, the next apply

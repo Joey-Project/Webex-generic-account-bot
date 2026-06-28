@@ -2918,8 +2918,7 @@ function assertTrustedInstallTransaction(file, fileStat) {
   }
   const mode = fileStat.mode & 0o7777;
   const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
-  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
-  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+  if (fileStat.uid !== uid) {
     throw new Error(`deployment transaction ownership is not trusted: ${file}`);
   }
   if (![INSTALL_TRANSACTION_MODE, LEGACY_INSTALL_TRANSACTION_MODE].includes(mode)) {
