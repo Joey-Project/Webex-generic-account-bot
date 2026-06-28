@@ -31,7 +31,7 @@ use crate::{
     codex_launcher::AuthorisedPeer,
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
-        ExecuteRequest, LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS,
+        ExecuteRequest, LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS, LAUNCHER_CLEANUP_STEP_SECONDS,
         LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
         OUTPUT_MAX_BYTES, ReasoningEffort,
     },
@@ -73,7 +73,7 @@ const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const PEER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
-const CLEANUP_MARGIN: Duration = Duration::from_secs(10);
+const CLEANUP_MARGIN: Duration = Duration::from_secs(LAUNCHER_CLEANUP_STEP_SECONDS);
 #[cfg(target_os = "linux")]
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
 #[cfg(target_os = "linux")]
@@ -1156,7 +1156,7 @@ async fn terminate_systemd_run(child: &mut Child) {
         ) {
             // SAFETY: a negative PID targets only the same process group.
             unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(CLEANUP_MARGIN, child.wait()).await;
         }
     } else {
         let _ = child.wait().await;

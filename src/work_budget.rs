@@ -23,11 +23,14 @@ where
 {
     let deadline = Instant::now() + hard_timeout;
     let (completed, completion) = mpsc::channel();
+    let (confirmed, confirmation) = tokio::sync::oneshot::channel();
     thread::Builder::new()
         .name("webex-bounded-work".to_owned())
         .spawn(move || {
             match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(completed_at) if completed_at <= deadline => {}
+                Ok(completed_at) if completed_at <= deadline => {
+                    let _ = confirmed.send(());
+                }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     tracing::error!(operation, "blocking work exceeded its process deadline");
                     std::process::exit(STUCK_WORK_EXIT_CODE);
@@ -37,13 +40,17 @@ where
         })
         .context("failed to start the blocking-work process watchdog")?;
 
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let result = work();
         let _ = completed.send(Instant::now());
         result
     })
     .await
-    .with_context(|| format!("{operation} task failed"))
+    .with_context(|| format!("{operation} task failed"))?;
+    confirmation
+        .await
+        .with_context(|| format!("{operation} watchdog did not confirm completion"))?;
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Default)]

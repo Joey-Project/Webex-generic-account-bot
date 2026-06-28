@@ -310,6 +310,8 @@ fn stage_workspace_at(
             launch_gid,
             SOURCE_DIRECTORY_MODE,
         )?;
+        sync_best_effort(&pending_root)
+            .context("failed to persist the pending workspace publication")?;
         Ok(())
     })();
 
@@ -829,7 +831,7 @@ fn remove_owned_workspace(
         bail!("refusing to clean a replaced pending workspace");
     }
     remove_tree_at(pending_root.as_raw_fd(), workspace_name)?;
-    Ok(())
+    sync_best_effort(pending_root).context("failed to persist pending workspace cleanup")
 }
 
 fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {

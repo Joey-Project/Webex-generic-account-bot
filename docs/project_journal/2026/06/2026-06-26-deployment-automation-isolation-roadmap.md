@@ -65,11 +65,14 @@ superseded_by:
   the launcher waits for their scoped cleanup instead of detaching them.
   Independent process watchdogs terminate stuck staging or launcher
   preparation before the surrounding 10-minute lease budget, while client
-  disconnect gives cooperative launcher cleanup a final 30-second grace.
+  disconnect gives cooperative launcher cleanup a final 105-second grace.
   Source-quarantine deletion fsyncs its parent before success, and consumed
   cleanup runs in a blocking worker with a 50-second hard bound inside the
-  protocol's 60-second cleanup allowance. Socket trigger capacity includes
+  protocol's 110-second cleanup allowance after at most 50 seconds of
+  transient-unit cleanup. Socket trigger capacity includes
   startup preflight and both per-run launcher connections.
+  Pending workspace publication and bot-side removal also fsync their parent
+  directory before returning.
   Configured request concurrency cannot exceed the socket's four accepted
   connections, and the service runtime maximum stays above the protocol's
   largest request plus preparation, cleanup, and response budget.

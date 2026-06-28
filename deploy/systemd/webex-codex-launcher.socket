@@ -18,9 +18,9 @@ MaxConnections=4
 ReceiveBuffer=1M
 SendBuffer=2M
 TriggerLimitIntervalSec=10s
-TriggerLimitBurst=10
+TriggerLimitBurst=32
 PollLimitIntervalSec=2s
-PollLimitBurst=10
+PollLimitBurst=32
 
 [Install]
 WantedBy=sockets.target

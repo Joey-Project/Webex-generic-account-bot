@@ -732,6 +732,10 @@ connections per concurrent run. The launcher service runtime maximum is
 protocol-bound above the largest request, preparation, cleanup, and response
 budget.
 
+Pending workspace publication and removal fsync the pending parent directory;
+the launcher likewise fsyncs source-quarantine removal before it can consume a
+sealed run.
+
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
 `activation-boot-id` credential, preserving `ProcSubset=pid`; isolated child
@@ -747,11 +751,12 @@ Source quarantine trees are removed immediately after sealing, and the
 inode-guarded consumed tree is removed when the transient run finishes, fails,
 times out, or is cancelled. Closing the bot's launcher socket cancels
 preflight, preparation, and a running transient unit even while the authorised
-bot process remains alive. Cancellation receives a 30-second cleanup grace;
+bot process remains alive. Cancellation receives a 105-second cleanup grace;
 the per-connection launcher then exits if blocked work cannot drain. A normal
 launcher response is emitted only after source and consumed parent-directory
 cleanup is durable. Consumed cleanup runs off the current-thread runtime and
-has its own 50-second process watchdog inside the 60-second response budget;
+has its own 50-second process watchdog after at most 50 seconds of transient
+unit cleanup, all inside the 110-second response budget;
 one-day tmpfiles expiry remains only a crash, hard-watchdog, or host-reboot
 fallback.
 
