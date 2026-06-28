@@ -16,7 +16,7 @@ use webex_generic_account_bot::{
     launcher_protocol::{
         CompletedResponse, FRAME_HEADER_BYTES, LAUNCHER_CANCELLATION_DRAIN_SECONDS,
         LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES, RejectedResponse, RejectionCode,
-        decode_request_frame, encode_response_frame,
+        bound_error_message, decode_request_frame, encode_response_frame,
     },
 };
 
@@ -26,6 +26,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BUFFER_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const STUCK_WORK_EXIT_CODE: i32 = 70;
+#[cfg(target_os = "linux")]
+const DIAGNOSTIC_BUFFER_MAX_CHARS: usize = 512;
 
 #[cfg(target_os = "linux")]
 struct ReceivedPacket {
@@ -122,9 +124,12 @@ async fn response_for_request(
                         execution_response(run_id, output_limit, result).map(Some)
                     }
                     Ok(ExecuteRequestOutcome::Disconnected) => Ok(None),
-                    Err(ExecuteRequestError::DisconnectedFailure(error)) => Err(anyhow!(
-                        "isolated execution failed while draining a disconnected client: {error}"
-                    )),
+                    Err(ExecuteRequestError::DisconnectedFailure(error)) => {
+                        log_isolated_execution_error("disconnected execute drain", &error);
+                        Err(anyhow!(
+                            "isolated execution failed while draining a disconnected client"
+                        ))
+                    }
                     Err(error) => execute_error_response(run_id, error).map(Some),
                 }
             }
@@ -154,21 +159,30 @@ fn execute_policy_rejection(
 #[cfg(target_os = "linux")]
 fn execute_error_response(run_id: String, error: ExecuteRequestError) -> Result<LauncherResponse> {
     match error {
-        ExecuteRequestError::Execution(IsolatedExecutionError::Unavailable(_)) => rejected(
-            Some(run_id),
-            RejectionCode::ExecutionUnavailable,
-            "isolated Codex runtime is unavailable",
-        ),
-        ExecuteRequestError::Execution(IsolatedExecutionError::Failed(_)) => rejected(
-            Some(run_id),
-            RejectionCode::InternalError,
-            "isolated Codex execution failed internally",
-        ),
-        ExecuteRequestError::Execution(IsolatedExecutionError::Cancelled) => rejected(
-            Some(run_id),
-            RejectionCode::InternalError,
-            "isolated Codex execution was cancelled unexpectedly",
-        ),
+        ExecuteRequestError::Execution(IsolatedExecutionError::Unavailable(error)) => {
+            log_launcher_error("execute unavailable", &error);
+            rejected(
+                Some(run_id),
+                RejectionCode::ExecutionUnavailable,
+                "isolated Codex runtime is unavailable",
+            )
+        }
+        ExecuteRequestError::Execution(IsolatedExecutionError::Failed(error)) => {
+            log_launcher_error("execute failed", &error);
+            rejected(
+                Some(run_id),
+                RejectionCode::InternalError,
+                "isolated Codex execution failed internally",
+            )
+        }
+        ExecuteRequestError::Execution(IsolatedExecutionError::Cancelled) => {
+            tracing::error!(operation = "execute cancelled", "launcher operation failed");
+            rejected(
+                Some(run_id),
+                RejectionCode::InternalError,
+                "isolated Codex execution was cancelled unexpectedly",
+            )
+        }
         ExecuteRequestError::Protocol => rejected(
             Some(run_id),
             RejectionCode::MalformedRequest,
@@ -202,8 +216,15 @@ async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<Optio
     tokio::pin!(preflight);
     tokio::select! {
         result = &mut preflight => {
+            let available = match result {
+                Ok(_) => true,
+                Err(error) => {
+                    log_launcher_error("preflight unavailable", &error);
+                    false
+                }
+            };
             match inspect_client_socket(socket.get_ref().as_raw_fd())? {
-                ClientSocketState::Open => Ok(Some(result.is_ok())),
+                ClientSocketState::Open => Ok(Some(available)),
                 ClientSocketState::Closed => Ok(None),
             }
         },
@@ -222,6 +243,58 @@ async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<Optio
             Ok(None)
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn log_launcher_error(operation: &'static str, error: &anyhow::Error) {
+    let diagnostic = bounded_error_diagnostic(error);
+    tracing::error!(operation, error = %diagnostic, "launcher operation failed");
+}
+
+#[cfg(target_os = "linux")]
+fn log_isolated_execution_error(operation: &'static str, error: &IsolatedExecutionError) {
+    match error {
+        IsolatedExecutionError::Unavailable(error) | IsolatedExecutionError::Failed(error) => {
+            log_launcher_error(operation, error);
+        }
+        IsolatedExecutionError::Cancelled => {
+            tracing::error!(operation, "launcher operation was cancelled unexpectedly");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_error_diagnostic(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+
+    struct DiagnosticWriter {
+        value: String,
+        remaining: usize,
+    }
+
+    impl std::fmt::Write for DiagnosticWriter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            for character in value.chars() {
+                if self.remaining == 0 {
+                    break;
+                }
+                self.value.push(if character.is_control() {
+                    ' '
+                } else {
+                    character
+                });
+                self.remaining -= 1;
+            }
+            Ok(())
+        }
+    }
+
+    let mut writer = DiagnosticWriter {
+        value: String::new(),
+        remaining: DIAGNOSTIC_BUFFER_MAX_CHARS,
+    };
+    let _ = write!(&mut writer, "{error:#}");
+    bound_error_message(&writer.value)
 }
 
 #[cfg(target_os = "linux")]
@@ -691,6 +764,15 @@ mod tests {
                 if response.run_id.is_none()
                     && response.code == RejectionCode::MalformedRequest
         ));
+    }
+
+    #[test]
+    fn internal_diagnostics_are_bounded_and_single_line() {
+        let error = anyhow!("{}\nsecret-shaped continuation", "x".repeat(4096));
+        let diagnostic = bounded_error_diagnostic(&error);
+
+        assert!(diagnostic.chars().count() <= 512);
+        assert!(!diagnostic.chars().any(char::is_control));
     }
 
     #[test]

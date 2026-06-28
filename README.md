@@ -771,7 +771,9 @@ The verified activation snapshot is carried into runtime selection: the exact
 active-manifest bytes and selected image digest must still match the receipt,
 so an overlapping runtime rollout cannot substitute an untested image. Launcher
 diagnostics are emitted only to `stderr`, which systemd sends to the journal;
-protocol `stdout` remains the accepted socket.
+protocol `stdout` remains the accepted socket. Preflight and execution failures
+log only bounded, control-character-sanitised internal causes while clients
+continue to receive stable generic rejection messages.
 Their own Codex credential remains available to the runtime wrapper and is
 denied to tool subprocesses by the fixed permission profile. Static config
 requires model `gpt-5.5`, no profile, `--ephemeral`, the fixed repository-check

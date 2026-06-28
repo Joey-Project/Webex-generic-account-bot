@@ -362,6 +362,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
     assert.match(source, /tracing_subscriber::fmt\(\)/);
     assert.match(source, /\.with_writer\(std::io::stderr\)/);
+    assert.match(source, /log_launcher_error\("preflight unavailable", &error\)/);
+    assert.match(source, /log_launcher_error\("execute unavailable", &error\)/);
+    assert.match(source, /log_launcher_error\("execute failed", &error\)/);
     assert.match(source, /isolated_execution::preflight_bounded\(&cancellation\)/);
     assert.match(source, /wait_for_client_disconnect\(socket\)/);
     assert.match(source, /ExecutionCancellation::new\(\)/);

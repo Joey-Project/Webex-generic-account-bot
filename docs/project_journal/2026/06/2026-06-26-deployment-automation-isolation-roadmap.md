@@ -297,7 +297,8 @@ superseded_by:
   `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
 - Bind each verified activation snapshot to the exact active-manifest bytes and
   selected image digest used by the run, and send launcher diagnostics only to
-  journal-backed `stderr` so protocol `stdout` remains unmodified.
+  journal-backed `stderr` so protocol `stdout` remains unmodified. Bound and
+  sanitise internal failure causes before logging them.
 
 ### PR 4c2: Production-Image Smoke Tests and Final Activation
 - Repository: `Joey-Project/Webex-generic-account-bot`, with a matching config
