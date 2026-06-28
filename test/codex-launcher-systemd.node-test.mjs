@@ -172,6 +172,10 @@ describe('Codex launcher systemd boundary', () => {
       fs.readFile(LAUNCHER_MODULE_PATH, 'utf8'),
     ]);
     const launcherSources = `${source}\n${launcherModule}`;
+    const productionLauncherModule = launcherModule.split(
+      '#[cfg(all(test, target_os = "linux"))]',
+      1,
+    )[0];
 
     assert.doesNotMatch(
       launcherSources,
@@ -182,8 +186,8 @@ describe('Codex launcher systemd boundary', () => {
       launcherModule,
       /const SYSTEMCTL_PATH: &str = "\/usr\/bin\/systemctl";/,
     );
-    assert.match(launcherModule, /Command::new\(SYSTEMCTL_PATH\)/);
-    assert.equal((launcherModule.match(/Command::new\(/g) ?? []).length, 1);
+    assert.match(productionLauncherModule, /Command::new\(SYSTEMCTL_PATH\)/);
+    assert.equal((productionLauncherModule.match(/Command::new\(/g) ?? []).length, 1);
     assert.doesNotMatch(source, /tokio::io::(?:stdin|stdout)/);
     assert.match(source, /AsyncFd<OwnedFd>/);
     assert.match(source, /libc::SCM_CREDENTIALS/);

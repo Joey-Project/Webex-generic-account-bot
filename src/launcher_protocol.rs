@@ -432,8 +432,7 @@ fn validate_workspace(workspace: &Path) -> Result<(), ProtocolError> {
     let Some(workspace_text) = workspace.to_str() else {
         return Err(ProtocolError::InvalidWorkspace);
     };
-    if !workspace.is_absolute()
-        || workspace_text.len() > WORKSPACE_PATH_MAX_BYTES
+    if workspace_text.len() > WORKSPACE_PATH_MAX_BYTES
         || workspace_text.chars().any(char::is_control)
     {
         return Err(ProtocolError::InvalidWorkspace);
@@ -722,6 +721,8 @@ mod tests {
     fn rejects_invalid_paths_and_limits() {
         for workspace in [
             "relative/path",
+            "C:/workspace",
+            r"\\server\workspace",
             "/",
             "/srv/../root",
             "/srv/./repo",

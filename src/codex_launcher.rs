@@ -172,8 +172,8 @@ pub fn socket_peer_credentials(fd: RawFd) -> Result<PeerCredentials> {
 
 #[cfg(target_os = "linux")]
 pub async fn authorise_bot_peer(socket_fd: RawFd, peer: PeerCredentials) -> Result<AuthorisedPeer> {
-    let pidfd =
-        socket_peer_pidfd(socket_fd).map_err(|_| anyhow!("launcher caller is not authorised"))?;
+    let pidfd = socket_peer_pidfd(socket_fd, peer.pid)
+        .map_err(|_| anyhow!("launcher caller is not authorised"))?;
     authorise_bot_peer_with(peer, pidfd, &SystemHostProbe).await
 }
 
@@ -423,7 +423,7 @@ fn trusted_root_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn socket_peer_pidfd(fd: RawFd) -> Result<OwnedFd> {
+fn socket_peer_pidfd(fd: RawFd, expected_pid: u32) -> Result<OwnedFd> {
     let mut pidfd = -1;
     let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: pidfd and length point to writable values of the expected sizes.
@@ -448,7 +448,25 @@ fn socket_peer_pidfd(fd: RawFd) -> Result<OwnedFd> {
         return Err(std::io::Error::last_os_error())
             .context("failed to protect launcher peer pidfd");
     }
+    if pidfd_process_id(pidfd.as_raw_fd())? != expected_pid {
+        return Err(anyhow!("launcher peer pidfd identity does not match"));
+    }
     Ok(pidfd)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_process_id(pidfd: RawFd) -> Result<u32> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}"))?;
+    let pid = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .ok_or_else(|| anyhow!("launcher peer pidfd identity is unavailable"))?
+        .trim()
+        .parse::<i64>()?;
+    if pid <= 1 || pid > u32::MAX as i64 {
+        return Err(anyhow!("launcher peer pidfd identity is invalid"));
+    }
+    Ok(pid as u32)
 }
 
 #[cfg(target_os = "linux")]
@@ -604,14 +622,24 @@ pub fn unsupported_platform_error() -> anyhow::Error {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
+        io::{Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
-            unix::net::UnixStream,
+            unix::net::{UnixListener, UnixStream},
         },
-        sync::Mutex,
+        process::Command,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
+        time::Duration,
     };
 
     use super::*;
+
+    const PEER_PIDFD_HELPER_SOCKET_ENV: &str = "WEBEX_LAUNCHER_PIDFD_TEST_SOCKET";
+    static PEER_PIDFD_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct FakeProbe {
         main_pid: u32,
@@ -901,7 +929,7 @@ mod tests {
     #[test]
     fn pidfd_poll_reports_the_current_process_alive() {
         let (left, _right) = UnixStream::pair().unwrap();
-        let pidfd = match socket_peer_pidfd(left.as_raw_fd()) {
+        let pidfd = match socket_peer_pidfd(left.as_raw_fd(), std::process::id()) {
             Ok(pidfd) => pidfd,
             Err(error)
                 if error
@@ -915,6 +943,53 @@ mod tests {
         };
 
         pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn socket_peer_pidfd_binds_identity_and_reports_peer_exit() {
+        let sequence = PEER_PIDFD_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let socket_path = PathBuf::from(format!(
+            "/tmp/webex-launcher-pidfd-{}-{sequence}.sock",
+            std::process::id()
+        ));
+        let _socket_guard = SocketPathGuard(socket_path.clone());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "codex_launcher::tests::socket_peer_pidfd_child_helper",
+                "--nocapture",
+            ])
+            .env(PEER_PIDFD_HELPER_SOCKET_ENV, &socket_path)
+            .spawn()
+            .unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        let credentials = socket_peer_credentials(connection.as_raw_fd()).unwrap();
+        assert_eq!(credentials.pid, child.id());
+
+        let pidfd = socket_peer_pidfd(connection.as_raw_fd(), credentials.pid).unwrap();
+        assert!(socket_peer_pidfd(connection.as_raw_fd(), credentials.pid + 1).is_err());
+        pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
+
+        connection.write_all(&[1]).unwrap();
+        assert!(child.wait().unwrap().success());
+        for _ in 0..50 {
+            if pidfd_is_alive(pidfd.as_raw_fd()).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("peer pidfd did not report child exit");
+    }
+
+    #[test]
+    fn socket_peer_pidfd_child_helper() {
+        let Some(socket_path) = std::env::var_os(PEER_PIDFD_HELPER_SOCKET_ENV) else {
+            return;
+        };
+        let mut socket = UnixStream::connect(socket_path).unwrap();
+        let mut release = [0_u8; 1];
+        socket.read_exact(&mut release).unwrap();
     }
 
     #[test]
@@ -983,5 +1058,13 @@ mod tests {
             panic!("failed to enable SO_PASSCRED: {error}");
         }
         Some((left, right))
+    }
+
+    struct SocketPathGuard(PathBuf);
+
+    impl Drop for SocketPathGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 }
