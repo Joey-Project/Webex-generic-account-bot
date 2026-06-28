@@ -591,7 +591,8 @@ that home and credential directory, supplies separate temporary home paths,
 disables tool network access, and always uses `--skip-git-repo-check` because a
 sealed evidence workspace cannot contain a `.git` control directory. The
 launcher validates the complete request policy before consuming the sealed
-workspace pathname.
+workspace pathname and rejects requests that do not opt into that fixed
+repository-check bypass.
 
 Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
 that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a

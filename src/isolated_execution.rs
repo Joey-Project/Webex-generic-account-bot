@@ -220,6 +220,11 @@ fn validate_execution_policy(request: &ExecuteRequest) -> Result<()> {
     if request.model.as_deref() != Some("gpt-5.5") {
         return Err(anyhow!("runtime model is not allowlisted"));
     }
+    if !request.skip_git_repo_check {
+        return Err(anyhow!(
+            "isolated runtime requires the fixed Git repository bypass"
+        ));
+    }
     Ok(())
 }
 
@@ -1281,6 +1286,9 @@ mod tests {
         let mut unallowlisted = request();
         unallowlisted.model = Some("other-model".to_owned());
         assert!(validate_execution_policy(&unallowlisted).is_err());
+        let mut git_check_enabled = request();
+        git_check_enabled.skip_git_repo_check = false;
+        assert!(validate_execution_policy(&git_check_enabled).is_err());
         assert!(
             build_transient_run_plan(
                 &unallowlisted,
