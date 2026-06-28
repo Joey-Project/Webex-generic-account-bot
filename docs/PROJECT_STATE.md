@@ -23,11 +23,12 @@
   `/opt/webex-generic-account-bot/bin/webex-codex-launcher`. It remains
   fail-closed and is not a deployable isolation backend.
 - Runner PR 4b adds the pinned immutable runtime image, FD-bound read-only
-  input handoff with root-only consumed-input quarantine, transient
+  root-sealed input handoff with root-only consumed-input quarantine, transient
   `DynamicUser` execution, two-layer Codex permission profile, bounded cleanup,
   and static runtime dependency checks. The bot is
-  still not a member of the launcher or input groups, and the runner remains
-  rejected until PR 4c passes production-image capability canaries.
+  still not a member of the launcher or input groups, and a compile-time gate
+  rejects launcher preflight/execute until PR 4c adds a root input sealer and
+  passes production-image capability canaries.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -39,7 +40,9 @@
 - PR 4c must still prove the inner Codex/bwrap credential, `/proc`, inherited
   descriptor, and network boundaries against the production image and host
   kernel policy before activating the runner. Static PR 4b preflight is not a
-  substitute for those canaries.
+  substitute for those canaries. It must also deliver the narrow root-owned
+  broker that converts bot-produced inputs into the recursively validated
+  sealed workspace tree.
 - PRs 4a and 4b do not grant bot group access, enable
   `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
   `/config sync`.

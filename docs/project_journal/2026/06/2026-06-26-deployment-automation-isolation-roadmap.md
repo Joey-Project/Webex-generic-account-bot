@@ -37,13 +37,15 @@ superseded_by:
   and is not deployable. It does not grant bot group access, execute
   `systemd-run`, enable `ephemeral-linux-user`, or enable any config command.
 - PR 4b adds the pinned content-addressed SquashFS image, static ELF checks,
-  FD-bound input handoff through a dedicated read-only group, transient
+  FD-bound root-sealed input handoff through a dedicated read-only group, transient
   `DynamicUser` unit, inner Codex permission profile, and bounded unit cleanup.
   It remains inactive: the bot is not a member of either input or launcher
-  group and config validation still rejects `ephemeral-linux-user`.
+  group, a compile-time launcher gate rejects preflight/execute, and config
+  validation still rejects `ephemeral-linux-user`.
 - PR 4c still owns production-image permission canaries and runner activation.
-  The bot socket groups and `/config pull`, `/config reload`, and `/config sync`
-  remain disabled.
+  It must also add the root-owned input sealer required to convert bot output
+  into the recursively immutable PR 4b workspace contract. The bot socket
+  groups and `/config pull`, `/config reload`, and `/config sync` remain disabled.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

@@ -106,7 +106,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'StandardError'), ['journal']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['15s']);
     assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);
-    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['3630s']);
+    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['3660s']);
     assert.deepEqual(directiveValues(service, 'OOMPolicy'), ['kill']);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
@@ -275,6 +275,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(isolatedExecution, /\.stdout\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stderr\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /DynamicUser=yes/);
+    assert.match(isolatedExecution, /const ISOLATED_EXECUTION_ACTIVATED: bool = false/);
     assert.match(isolatedExecution, /RootImage=/);
     assert.match(isolatedExecution, /O_PATH/);
     assert.match(isolatedExecution, /O_NOFOLLOW/);

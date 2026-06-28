@@ -44,6 +44,8 @@ const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 #[cfg(target_os = "linux")]
 const CODEX_INPUT_GROUP: &str = "webex-codex-input";
 #[cfg(target_os = "linux")]
+const ISOLATED_EXECUTION_ACTIVATED: bool = false;
+#[cfg(target_os = "linux")]
 const ACTIVE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const RUNTIME_IMAGE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -65,6 +67,15 @@ const SUPPORTED_CODEX_VERSION: &str = "0.142.3";
 const SUPPORTED_CODEX_TARGET: &str = "x86_64-unknown-linux-musl";
 #[cfg(target_os = "linux")]
 const SUPPORTED_CODEX_LAYOUT_VERSION: u16 = 1;
+#[cfg(target_os = "linux")]
+const EXPECTED_MKSQUASHFS_ARGV_SHA256: &str =
+    "700c3e735fb100cddedd05dec3e8a45866e330522b74d2f96389ea2300564bd5";
+#[cfg(target_os = "linux")]
+const WORKSPACE_ENTRY_MAX: usize = 8_192;
+#[cfg(target_os = "linux")]
+const WORKSPACE_DEPTH_MAX: usize = 32;
+#[cfg(target_os = "linux")]
+const WORKSPACE_TOTAL_BYTES_MAX: u64 = 2 * 1024 * 1024 * 1024 + 64 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 type CaptureTask = JoinHandle<Result<(String, bool)>>;
@@ -159,6 +170,7 @@ impl Default for RuntimePaths {
 
 #[cfg(target_os = "linux")]
 pub fn preflight() -> Result<VerifiedRuntime> {
+    ensure_activation_enabled()?;
     verify_runtime(&RuntimePaths::default(), 0)
 }
 
@@ -167,13 +179,13 @@ pub async fn execute(
     request: &ExecuteRequest,
     peer: &AuthorisedPeer,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
+    ensure_activation_enabled().map_err(IsolatedExecutionError::Unavailable)?;
     let paths = RuntimePaths::default();
     let runtime = verify_runtime(&paths, 0).map_err(IsolatedExecutionError::Unavailable)?;
     let workspace = verify_workspace(
         &paths.input_root,
         &paths.consumed_input_root,
         request,
-        peer.credentials().uid,
         runtime.input_gid,
     )
     .map_err(IsolatedExecutionError::Failed)?;
@@ -189,6 +201,16 @@ pub async fn execute(
     run_transient(plan, request, peer, workspace)
         .await
         .map_err(IsolatedExecutionError::Failed)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_activation_enabled() -> Result<()> {
+    if !ISOLATED_EXECUTION_ACTIVATED {
+        return Err(anyhow!(
+            "isolated Codex execution awaits production capability canaries"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -265,7 +287,7 @@ fn validate_active_manifest(manifest: &ActiveRuntimeManifest) -> Result<()> {
         || !valid_digest(&manifest.image_sha256)
         || !valid_digest(&manifest.source_manifest_sha256)
         || !valid_digest(&manifest.mksquashfs_sha256)
-        || !valid_digest(&manifest.mksquashfs_argv_sha256)
+        || manifest.mksquashfs_argv_sha256 != EXPECTED_MKSQUASHFS_ARGV_SHA256
         || manifest.image_size <= SQUASHFS_MAGIC.len() as u64
         || manifest.image_size > RUNTIME_IMAGE_MAX_BYTES
     {
@@ -285,7 +307,6 @@ fn verify_workspace(
     input_root: &Path,
     consumed_input_root: &Path,
     request: &ExecuteRequest,
-    peer_uid: u32,
     input_gid: u32,
 ) -> Result<VerifiedWorkspace> {
     trusted_input_root(input_root, input_gid)?;
@@ -302,12 +323,13 @@ fn verify_workspace(
         .open(&request.workspace)?;
     let metadata = guard.metadata()?;
     if !metadata.is_dir()
-        || metadata.uid() != peer_uid
+        || metadata.uid() != 0
         || metadata.gid() != input_gid
-        || metadata.mode() & 0o777 != 0o750
+        || metadata.mode() & 0o777 != 0o550
     {
         return Err(anyhow!("runtime workspace metadata is invalid"));
     }
+    validate_workspace_tree(&guard, 0, input_gid)?;
     if fs::canonicalize(&request.workspace)? != request.workspace {
         return Err(anyhow!("runtime workspace path is not canonical"));
     }
@@ -339,6 +361,112 @@ fn verify_workspace(
         bind_source,
         _guard: guard,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace_tree(root: &File, expected_uid: u32, input_gid: u32) -> Result<()> {
+    let mut entries = 0_usize;
+    let mut total_bytes = 0_u64;
+    validate_workspace_directory(
+        root,
+        expected_uid,
+        input_gid,
+        0,
+        &mut entries,
+        &mut total_bytes,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace_directory(
+    directory: &File,
+    expected_uid: u32,
+    input_gid: u32,
+    depth: usize,
+    entries: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<()> {
+    if depth > WORKSPACE_DEPTH_MAX {
+        return Err(anyhow!("runtime workspace nesting exceeds its limit"));
+    }
+    let directory_path = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    for entry in fs::read_dir(&directory_path)? {
+        let entry = entry?;
+        *entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("runtime workspace entry count overflowed"))?;
+        if *entries > WORKSPACE_ENTRY_MAX {
+            return Err(anyhow!("runtime workspace has too many entries"));
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != expected_uid
+            || metadata.gid() != input_gid
+        {
+            return Err(anyhow!("runtime workspace entry metadata is invalid"));
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        if metadata.is_dir() {
+            if metadata.mode() & 0o777 != 0o550 {
+                return Err(anyhow!("runtime workspace directory mode is invalid"));
+            }
+            let child = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&path)?;
+            if !same_file_identity(&metadata, &child.metadata()?) {
+                return Err(anyhow!("runtime workspace directory changed"));
+            }
+            validate_workspace_directory(
+                &child,
+                expected_uid,
+                input_gid,
+                depth + 1,
+                entries,
+                total_bytes,
+            )?;
+        } else if metadata.is_file() {
+            if metadata.mode() & 0o777 != 0o440 || metadata.nlink() != 1 {
+                return Err(anyhow!("runtime workspace file metadata is invalid"));
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&path)?;
+            let opened = file.metadata()?;
+            if !same_file_identity(&metadata, &opened) {
+                return Err(anyhow!("runtime workspace file changed"));
+            }
+            *total_bytes = total_bytes
+                .checked_add(opened.len())
+                .ok_or_else(|| anyhow!("runtime workspace size overflowed"))?;
+            if *total_bytes > WORKSPACE_TOTAL_BYTES_MAX {
+                return Err(anyhow!("runtime workspace exceeds its size limit"));
+            }
+        } else {
+            return Err(anyhow!("runtime workspace contains a special file"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.mode() == right.mode()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[cfg(target_os = "linux")]
@@ -540,20 +668,20 @@ async fn run_transient(
     match write_outcome {
         PromptWriteOutcome::Completed(Ok(())) => {}
         PromptWriteOutcome::Completed(Err(error)) => {
-            terminate_transient_unit(&plan.unit, &mut child).await;
-            discard_captures(stdout_task, stderr_task).await;
+            terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
+                .await?;
             return Err(error).context("failed to write the bounded Codex prompt");
         }
         PromptWriteOutcome::PeerExited => {
-            terminate_transient_unit(&plan.unit, &mut child).await;
-            discard_captures(stdout_task, stderr_task).await;
+            terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
+                .await?;
             return Err(anyhow!(
                 "authorised bot caller exited during Codex prompt delivery"
             ));
         }
         PromptWriteOutcome::TimedOut => {
-            terminate_transient_unit(&plan.unit, &mut child).await;
-            discard_captures(stdout_task, stderr_task).await;
+            terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
+                .await?;
             return Ok(IsolatedRunResult::TimedOut);
         }
     }
@@ -563,20 +691,35 @@ async fn run_transient(
             result = child.wait() => match result {
                 Ok(status) => break status,
                 Err(error) => {
-                    terminate_transient_unit(&plan.unit, &mut child).await;
-                    discard_captures(stdout_task, stderr_task).await;
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
                     return Err(error).context("failed while waiting for transient Codex unit");
                 }
             },
             _ = sleep(PEER_POLL_INTERVAL) => {
                 if peer.ensure_alive().is_err() {
-                    terminate_transient_unit(&plan.unit, &mut child).await;
-                    discard_captures(stdout_task, stderr_task).await;
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
                     return Err(anyhow!("authorised bot caller exited during Codex execution"));
                 }
                 if Instant::now() >= deadline {
-                    terminate_transient_unit(&plan.unit, &mut child).await;
-                    discard_captures(stdout_task, stderr_task).await;
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
                     return Ok(IsolatedRunResult::TimedOut);
                 }
             }
@@ -636,7 +779,7 @@ async fn terminate_systemd_run(child: &mut Child) {
 }
 
 #[cfg(target_os = "linux")]
-async fn terminate_transient_unit(unit: &str, systemd_run: &mut Child) {
+async fn terminate_transient_unit(unit: &str, systemd_run: &mut Child) -> Result<()> {
     let mut command = Command::new(SYSTEMCTL_PATH);
     command
         .args([
@@ -655,15 +798,26 @@ async fn terminate_transient_unit(unit: &str, systemd_run: &mut Child) {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     command.process_group(0);
-    if let Ok(mut stop) = command.spawn() {
-        if !matches!(
-            tokio::time::timeout(CLEANUP_MARGIN, stop.wait()).await,
-            Ok(Ok(_))
-        ) {
-            terminate_systemd_run(&mut stop).await;
+    let stop_result = async {
+        let mut stop = command
+            .spawn()
+            .context("failed to start fixed transient-unit cleanup")?;
+        let wait = tokio::time::timeout(CLEANUP_MARGIN, stop.wait()).await;
+        let status = match wait {
+            Ok(result) => result.context("failed while waiting for transient-unit cleanup")?,
+            Err(_) => {
+                terminate_systemd_run(&mut stop).await;
+                return Err(anyhow!("transient-unit cleanup timed out"));
+            }
+        };
+        if !status.success() {
+            return Err(anyhow!("transient-unit cleanup failed"));
         }
+        Ok(())
     }
+    .await;
     terminate_systemd_run(systemd_run).await;
+    stop_result
 }
 
 #[cfg(target_os = "linux")]
@@ -684,6 +838,18 @@ async fn discard_captures(stdout: CaptureTask, stderr: CaptureTask) {
     stderr.abort();
     let _ = stdout.await;
     let _ = stderr.await;
+}
+
+#[cfg(target_os = "linux")]
+async fn terminate_and_discard_captures(
+    unit: &str,
+    systemd_run: &mut Child,
+    stdout: CaptureTask,
+    stderr: CaptureTask,
+) -> Result<()> {
+    let result = terminate_transient_unit(unit, systemd_run).await;
+    discard_captures(stdout, stderr).await;
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -781,12 +947,7 @@ fn trusted_file(path: &Path, expected_uid: u32, policy: FilePolicy) -> Result<()
     )?;
     let metadata = fs::symlink_metadata(path)?;
     let mode = metadata.mode();
-    let mode_valid = match policy {
-        FilePolicy::Executable => mode & 0o111 != 0 && mode & 0o022 == 0,
-        FilePolicy::ReadOnlyData => mode & 0o777 == 0o444,
-        FilePolicy::PrivateCredential => mode & 0o077 == 0 && mode & 0o200 != 0,
-        FilePolicy::HostData => mode & 0o022 == 0 && mode & 0o400 != 0,
-    };
+    let mode_valid = file_policy_mode_valid(policy, mode);
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.uid() != expected_uid
@@ -795,6 +956,16 @@ fn trusted_file(path: &Path, expected_uid: u32, policy: FilePolicy) -> Result<()
         return Err(anyhow!("trusted runtime file metadata is invalid"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn file_policy_mode_valid(policy: FilePolicy, mode: u32) -> bool {
+    match policy {
+        FilePolicy::Executable => mode & 0o111 != 0 && mode & 0o022 == 0,
+        FilePolicy::ReadOnlyData => mode & 0o777 == 0o444,
+        FilePolicy::PrivateCredential => matches!(mode & 0o777, 0o400 | 0o600),
+        FilePolicy::HostData => mode & 0o022 == 0 && mode & 0o400 != 0,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -959,12 +1130,15 @@ mod tests {
             image_size: 4096,
             source_manifest_sha256: "b".repeat(64),
             mksquashfs_sha256: "c".repeat(64),
-            mksquashfs_argv_sha256: "d".repeat(64),
+            mksquashfs_argv_sha256: EXPECTED_MKSQUASHFS_ARGV_SHA256.to_owned(),
         };
         validate_active_manifest(&manifest).unwrap();
 
         let mut invalid = manifest;
         invalid.image = format!("images/{}.squashfs", "e".repeat(64));
+        assert!(validate_active_manifest(&invalid).is_err());
+        invalid.image = format!("images/{}.squashfs", "a".repeat(64));
+        invalid.mksquashfs_argv_sha256 = "d".repeat(64);
         assert!(validate_active_manifest(&invalid).is_err());
     }
 
@@ -982,6 +1156,65 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn activation_and_private_credentials_fail_closed() {
+        assert!(ensure_activation_enabled().is_err());
+        assert!(file_policy_mode_valid(FilePolicy::PrivateCredential, 0o400));
+        assert!(file_policy_mode_valid(FilePolicy::PrivateCredential, 0o600));
+        for mode in [0o200, 0o500, 0o640, 0o777] {
+            assert!(!file_policy_mode_valid(FilePolicy::PrivateCredential, mode));
+        }
+    }
+
+    #[test]
+    fn sealed_workspace_tree_rejects_mutable_and_linked_entries() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "webex-codex-workspace-tree-{}-{suffix}",
+            std::process::id()
+        ));
+        let nested = root.join("logs");
+        let evidence = nested.join("console.log");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(&evidence, b"sealed evidence\n").unwrap();
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o550)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o550)).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let guard = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&root)
+            .unwrap();
+
+        validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).unwrap();
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).is_err());
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink("logs/console.log", root.join("linked.log")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o550)).unwrap();
+        assert!(validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).is_err());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::remove_file(root.join("linked.log")).unwrap();
+        fs::hard_link(&evidence, root.join("hard-linked.log")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o550)).unwrap();
+        assert!(validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).is_err());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

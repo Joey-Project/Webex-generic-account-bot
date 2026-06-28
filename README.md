@@ -591,8 +591,12 @@ that home and credential directory, supplies separate temporary home paths,
 and disables tool network access.
 
 Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
-that root as `root:webex-codex-input` mode `0730`; individual runs must be owned
-by the authorised bot UID and group `webex-codex-input` with mode `0750`.
+that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a
+root-owned broker before launch. The run root and every nested directory must
+be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
+the same owner/group and a single hard link. Symlinks, special files, more than
+8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
+2 GiB plus 64 MiB are rejected.
 The root launcher has only this supplementary input group after systemd starts
 it; it has no bot, launcher-socket, or worker group membership. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held
@@ -602,15 +606,18 @@ unit it atomically moves the pathname into the root-only
 `/var/lib/webex-codex-inputs-consumed` quarantine. The open inode remains the
 unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
-does not add the bot to it.
+does not add the bot to it or provide the privileged sealing broker.
 
 The minimum host contract is systemd 255, Linux 5.9 or newer, cgroup v2,
 SquashFS/loop support, mount and PID namespaces, `close_range(2)`, and a host
 policy that permits the bundled `bwrap` to create its inner sandbox. These are
 not inferred from version strings alone. PR 4c must run the real image and
-permission canaries on the deployment host before granting either input-group
-or launcher-socket access. If any canary fails, configuration continues to
-reject `ephemeral-linux-user` with no current-user fallback.
+permission canaries on the deployment host, add the narrow root-owned input
+sealer, and remove PR 4b's compile-time activation gate before granting either
+input-group or launcher-socket access. Until then launcher preflight and execute
+requests both fail closed even if an operator installs every PR 4b asset. If
+any canary fails, configuration continues to reject `ephemeral-linux-user` with
+no current-user fallback.
 
 Until PR 4c and the separate command-enablement changes land, the bot has no
 launcher-, input-, or worker-socket group access and `/config pull`,
