@@ -22,6 +22,12 @@
   `/run/webex-codex-launcher/launcher.sock`, backed by
   `/opt/webex-generic-account-bot/bin/webex-codex-launcher`. It remains
   fail-closed and is not a deployable isolation backend.
+- Runner PR 4b adds the pinned immutable runtime image, FD-bound read-only
+  input handoff with root-only consumed-input quarantine, transient
+  `DynamicUser` execution, two-layer Codex permission profile, bounded cleanup,
+  and static runtime dependency checks. The bot is
+  still not a member of the launcher or input groups, and the runner remains
+  rejected until PR 4c passes production-image capability canaries.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -30,13 +36,11 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4b must still provide the immutable root image, transient `DynamicUser`
-  execution, credential/model-channel separation, and crash cleanup; PR 4c
-  must activate the runner and pass permission-capable production-image smoke
-  tests. `DynamicUser` alone does not separate Codex main-process credentials
-  or network access from same-UID tool descendants, and UID/group-only launcher
-  authorisation does not distinguish those descendants.
-- PR 4a does not grant bot group access, execute `systemd-run`, enable
+- PR 4c must still prove the inner Codex/bwrap credential, `/proc`, inherited
+  descriptor, and network boundaries against the production image and host
+  kernel policy before activating the runner. Static PR 4b preflight is not a
+  substitute for those canaries.
+- PRs 4a and 4b do not grant bot group access, enable
   `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
   `/config sync`.
 

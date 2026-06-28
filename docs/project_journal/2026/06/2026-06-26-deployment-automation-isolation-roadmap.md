@@ -36,9 +36,14 @@ superseded_by:
   caller-authorisation, and systemd socket foundation, but remains fail-closed
   and is not deployable. It does not grant bot group access, execute
   `systemd-run`, enable `ephemeral-linux-user`, or enable any config command.
-- PRs 4b and 4c still own the complete execution boundary and runner
-  activation. The bot socket groups and `/config pull`, `/config reload`, and
-  `/config sync` remain disabled.
+- PR 4b adds the pinned content-addressed SquashFS image, static ELF checks,
+  FD-bound input handoff through a dedicated read-only group, transient
+  `DynamicUser` unit, inner Codex permission profile, and bounded unit cleanup.
+  It remains inactive: the bot is not a member of either input or launcher
+  group and config validation still rejects `ephemeral-linux-user`.
+- PR 4c still owns production-image permission canaries and runner activation.
+  The bot socket groups and `/config pull`, `/config reload`, and `/config sync`
+  remain disabled.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -242,6 +247,12 @@ superseded_by:
   access from same-UID tool descendants, and UID/group-only launcher
   authorisation cannot distinguish the trusted bot process from inherited
   prompt-controlled descendants.
+- PR 4b uses two enforced layers: a root-owned systemd `RootImage`/
+  `DynamicUser` boundary for the entire run, plus Codex `0.142.3`'s named Linux
+  permission profile for same-UID tool filesystem and network separation.
+  Activation remains conditional on PR 4c proving the profile with live
+  credential, `/proc`, descriptor, socket, and egress canaries on the target
+  host.
 
 ## Evidence
 - Main bot PR #6 merged as `b44e509`.

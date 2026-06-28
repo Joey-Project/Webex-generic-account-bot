@@ -537,8 +537,83 @@ fixed path, root-owned, and not writable by the bot or launcher socket group;
 the socket path must be created by the reviewed systemd/tmpfiles assets rather
 than by the bot.
 
-Until PRs 4b and 4c and the separate command-enablement changes land, the bot
-has no launcher- or worker-socket group access and `/config pull`,
+### PR 4b Isolated Execution (Not Activated)
+
+PR 4b adds the root-owned execution boundary without making it selectable by
+bot configuration. Each accepted launcher request uses a content-addressed,
+read-only SquashFS image and a transient `DynamicUser` service. The transient
+unit has fixed resource limits, no host capabilities, a private temporary
+filesystem, a read-only input bind, and no bot, config-worker, systemd, or host
+filesystem paths inside its root image.
+
+The reviewed runtime is pinned to Codex `0.142.3`, package layout version `1`,
+and target `x86_64-unknown-linux-musl`. The image builder rejects extra source
+entries, unexpected package metadata, writable published images, and any
+runtime executable with an ELF interpreter. Build the runtime wrapper as a
+static PIE before installing it at the fixed source path:
+
+```bash
+cargo rustc --release --bin webex-codex-runtime -- -C target-feature=+crt-static
+file target/release/webex-codex-runtime
+ldd target/release/webex-codex-runtime
+```
+
+The fixed root-owned source layout is:
+
+```text
+/opt/webex-generic-account-bot/bin/webex-codex-runtime
+/opt/webex-generic-account-bot/runtime-sources/busybox
+/opt/webex-generic-account-bot/runtime-sources/codex/bin/codex
+/opt/webex-generic-account-bot/runtime-sources/codex/codex-path/rg
+/opt/webex-generic-account-bot/runtime-sources/codex/codex-resources/bwrap
+/opt/webex-generic-account-bot/runtime-sources/codex/codex-package.json
+```
+
+Copy the files from the matching Codex vendor package without following
+symlinks. Every source and parent directory must be root-owned and not writable
+by group or other. The runtime wrapper, BusyBox, Codex, `rg`, and `bwrap` must
+be static x86-64 ELF executables. With `/usr/bin/mksquashfs` installed, generate
+and consume the fixed source manifest as root:
+
+```bash
+node scripts/build-codex-runtime-image.mjs --write-source-manifest
+node scripts/build-codex-runtime-image.mjs
+```
+
+The builder atomically selects
+`/opt/webex-generic-account-bot/runtime/active.json` only after fsyncing and
+publishing `images/<sha256>.squashfs`. Codex auth remains outside the image at
+`/etc/webex-generic-account-bot/codex-auth.json`, owned by root with mode `0600`
+or stricter. systemd copies it into the transient unit with `LoadCredential`;
+the wrapper then creates a private main-process `CODEX_HOME`. Codex tool
+commands use the OS-enforced `webex-isolated` permission profile, which denies
+that home and credential directory, supplies separate temporary home paths,
+and disables tool network access.
+
+Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
+that root as `root:webex-codex-input` mode `0730`; individual runs must be owned
+by the authorised bot UID and group `webex-codex-input` with mode `0750`.
+The root launcher has only this supplementary input group after systemd starts
+it; it has no bot, launcher-socket, or worker group membership. It opens the run
+directory with `O_PATH|O_NOFOLLOW` and binds the held
+inode through `/proc/<launcher-pid>/fd/<fd>`, preventing a path replacement
+between validation and transient-unit creation. Before starting the transient
+unit it atomically moves the pathname into the root-only
+`/var/lib/webex-codex-inputs-consumed` quarantine. The open inode remains the
+unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
+abandoned quarantined inputs after one day. PR 4b creates the input group but
+does not add the bot to it.
+
+The minimum host contract is systemd 255, Linux 5.9 or newer, cgroup v2,
+SquashFS/loop support, mount and PID namespaces, `close_range(2)`, and a host
+policy that permits the bundled `bwrap` to create its inner sandbox. These are
+not inferred from version strings alone. PR 4c must run the real image and
+permission canaries on the deployment host before granting either input-group
+or launcher-socket access. If any canary fails, configuration continues to
+reject `ephemeral-linux-user` with no current-user fallback.
+
+Until PR 4c and the separate command-enablement changes land, the bot has no
+launcher-, input-, or worker-socket group access and `/config pull`,
 `/config reload`, and `/config sync` remain disabled.
 
 ## Development

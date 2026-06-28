@@ -13,14 +13,14 @@ SocketMode=0660
 DirectoryMode=0750
 RemoveOnStop=yes
 FlushPending=yes
-Backlog=32
-MaxConnections=32
+Backlog=16
+MaxConnections=4
 ReceiveBuffer=1M
 SendBuffer=2M
 TriggerLimitIntervalSec=10s
-TriggerLimitBurst=64
+TriggerLimitBurst=8
 PollLimitIntervalSec=2s
-PollLimitBurst=32
+PollLimitBurst=8
 
 [Install]
 WantedBy=sockets.target

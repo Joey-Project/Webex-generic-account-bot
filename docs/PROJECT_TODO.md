@@ -10,7 +10,7 @@
 - [completed] Complete PR 4a's root-owned launcher protocol,
   caller-authorisation, and systemd socket foundation while keeping it
   fail-closed and undeployable.
-- [pending] Implement PR 4b's immutable root image, transient `DynamicUser`
+- [completed] Implement PR 4b's immutable root image, transient `DynamicUser`
   execution, credential/model-channel separation, containment, and crash
   cleanup.
 - [pending] Implement PR 4c runner activation and permission-capable
