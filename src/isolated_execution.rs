@@ -27,6 +27,7 @@ use tokio::{
 #[cfg(target_os = "linux")]
 use crate::{
     codex_launcher::AuthorisedPeer,
+    input_sealer::ensure_posix_acl_absent,
     launcher_protocol::{ExecuteRequest, OUTPUT_MAX_BYTES, ReasoningEffort},
 };
 
@@ -43,6 +44,8 @@ const SYSTEMD_RUN_PATH: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 #[cfg(target_os = "linux")]
 const CODEX_INPUT_GROUP: &str = "webex-codex-input";
+#[cfg(target_os = "linux")]
+const CODEX_LAUNCH_GROUP: &str = "webex-codex-launch";
 #[cfg(target_os = "linux")]
 const ISOLATED_EXECUTION_ACTIVATED: bool = false;
 #[cfg(target_os = "linux")]
@@ -86,6 +89,13 @@ pub struct VerifiedRuntime {
     pub image: PathBuf,
     pub codex_version: String,
     input_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexGroupIds {
+    pub(crate) launch: u32,
+    pub(crate) input: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -174,6 +184,14 @@ impl Default for RuntimePaths {
 pub fn preflight() -> Result<VerifiedRuntime> {
     ensure_activation_enabled()?;
     verify_runtime(&RuntimePaths::default(), 0)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn production_codex_group_ids() -> Result<CodexGroupIds> {
+    let paths = RuntimePaths::default();
+    trusted_file(&paths.group_file, 0, FilePolicy::HostData)?;
+    trusted_file(&paths.passwd_file, 0, FilePolicy::HostData)?;
+    resolve_codex_group_ids(&paths.group_file, &paths.passwd_file)
 }
 
 #[cfg(target_os = "linux")]
@@ -280,9 +298,8 @@ fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRun
     {
         return Err(anyhow!("Codex credential is not a JSON object"));
     }
-    let input_gid = resolve_group_gid(&paths.group_file, CODEX_INPUT_GROUP)?;
-    reject_primary_gid_users(&paths.passwd_file, input_gid)?;
-    trusted_input_root(&paths.input_root, input_gid)?;
+    let groups = resolve_codex_group_ids(&paths.group_file, &paths.passwd_file)?;
+    trusted_input_root(&paths.input_root, groups.input)?;
     trusted_directory(&paths.consumed_input_root, 0, true)?;
     let consumed_metadata = fs::symlink_metadata(&paths.consumed_input_root)?;
     if consumed_metadata.mode() & 0o777 != 0o700 {
@@ -291,7 +308,7 @@ fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRun
     Ok(VerifiedRuntime {
         image,
         codex_version: manifest.codex_version,
-        input_gid,
+        input_gid: groups.input,
     })
 }
 
@@ -348,7 +365,14 @@ fn verify_workspace(
     {
         return Err(anyhow!("runtime workspace metadata is invalid"));
     }
-    validate_workspace_tree(&guard, 0, input_gid)?;
+    let validation_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&request.workspace)?;
+    if !same_file_identity(&metadata, &validation_directory.metadata()?) {
+        return Err(anyhow!("runtime workspace changed before validation"));
+    }
+    validate_workspace_tree(&validation_directory, 0, input_gid)?;
     if fs::canonicalize(&request.workspace)? != request.workspace {
         return Err(anyhow!("runtime workspace path is not canonical"));
     }
@@ -408,6 +432,7 @@ fn validate_workspace_directory(
     if depth > WORKSPACE_DEPTH_MAX {
         return Err(anyhow!("runtime workspace nesting exceeds its limit"));
     }
+    ensure_posix_acl_absent(directory, "runtime workspace directory")?;
     let directory_path = PathBuf::from(format!(
         "/proc/{}/fd/{}",
         std::process::id(),
@@ -461,6 +486,7 @@ fn validate_workspace_directory(
             if !same_file_identity(&metadata, &opened) {
                 return Err(anyhow!("runtime workspace file changed"));
             }
+            ensure_posix_acl_absent(&file, "runtime workspace file")?;
             *total_bytes = total_bytes
                 .checked_add(opened.len())
                 .ok_or_else(|| anyhow!("runtime workspace size overflowed"))?;
@@ -1035,6 +1061,12 @@ fn trusted_input_root(path: &Path, input_gid: u32) -> Result<()> {
     {
         return Err(anyhow!("runtime input root metadata is invalid"));
     }
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure_posix_acl_absent(&directory, "runtime input root")?;
     Ok(())
 }
 
@@ -1044,10 +1076,16 @@ fn input_root_mode_valid(mode: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_group_gid(group_file: &Path, expected_name: &str) -> Result<u32> {
+fn resolve_codex_group_ids(group_file: &Path, passwd_file: &Path) -> Result<CodexGroupIds> {
     let bytes = read_bounded_file(group_file, 1024 * 1024)?;
     let contents = std::str::from_utf8(&bytes).context("host group database is not UTF-8")?;
-    parse_group_gid(contents, expected_name)
+    let launch = parse_group_gid(contents, CODEX_LAUNCH_GROUP)?;
+    let input = parse_group_gid(contents, CODEX_INPUT_GROUP)?;
+    if launch == input {
+        return Err(anyhow!("Codex launch and input groups must be distinct"));
+    }
+    reject_primary_gid_users(passwd_file, input)?;
+    Ok(CodexGroupIds { launch, input })
 }
 
 #[cfg(target_os = "linux")]
@@ -1059,24 +1097,24 @@ fn parse_group_gid(contents: &str, expected_name: &str) -> Result<u32> {
             continue;
         }
         if fields.len() != 4 || !fields[3].is_empty() || result.is_some() {
-            return Err(anyhow!("Codex input group database entry is invalid"));
+            return Err(anyhow!("Codex group database entry is invalid"));
         }
         let gid = fields[2]
             .parse::<u32>()
-            .context("Codex input group identifier is invalid")?;
+            .context("Codex group identifier is invalid")?;
         if gid == 0 {
-            return Err(anyhow!("Codex input group must not be root"));
+            return Err(anyhow!("Codex group must not be root"));
         }
         result = Some(gid);
     }
-    let expected_gid = result.ok_or_else(|| anyhow!("Codex input group is unavailable"))?;
+    let expected_gid = result.ok_or_else(|| anyhow!("Codex group is unavailable"))?;
     for line in contents.lines() {
         let fields = line.split(':').collect::<Vec<_>>();
         if fields.len() == 4
             && fields[0] != expected_name
             && fields[2].parse::<u32>().ok() == Some(expected_gid)
         {
-            return Err(anyhow!("Codex input group identifier is aliased"));
+            return Err(anyhow!("Codex group identifier is aliased"));
         }
     }
     Ok(expected_gid)
@@ -1218,6 +1256,38 @@ mod tests {
             )
             .is_err()
         );
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "webex-codex-groups-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let group_file = directory.join("group");
+        let passwd_file = directory.join("passwd");
+        fs::write(
+            &group_file,
+            b"webex-codex-launch:x:4320:\nwebex-codex-input:x:4321:\n",
+        )
+        .unwrap();
+        fs::write(&passwd_file, b"root:x:0:0:root:/root:/bin/sh\n").unwrap();
+        assert_eq!(
+            resolve_codex_group_ids(&group_file, &passwd_file).unwrap(),
+            CodexGroupIds {
+                launch: 4320,
+                input: 4321,
+            }
+        );
+        fs::write(
+            &group_file,
+            b"webex-codex-launch:x:4321:\nwebex-codex-input:x:4321:\n",
+        )
+        .unwrap();
+        assert!(resolve_codex_group_ids(&group_file, &passwd_file).is_err());
+        fs::remove_dir_all(directory).unwrap();
         assert!(
             parse_group_gid(
                 "shared:x:4321:\nwebex-codex-input:x:4321:\n",
@@ -1308,7 +1378,7 @@ mod tests {
         let metadata = fs::metadata(&root).unwrap();
         let guard = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&root)
             .unwrap();
 
@@ -1316,6 +1386,17 @@ mod tests {
         fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).is_err());
         fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
+        if install_test_access_acl(&evidence) {
+            fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+            assert!(validate_workspace_tree(&guard, metadata.uid(), metadata.gid()).is_err());
+            fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
+            remove_test_access_acl(&evidence);
+            fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+        } else {
+            fs::set_permissions(&evidence, fs::Permissions::from_mode(0o440)).unwrap();
+        }
 
         fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
         symlink("logs/console.log", root.join("linked.log")).unwrap();
@@ -1332,6 +1413,58 @@ mod tests {
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o750)).unwrap();
         fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn install_test_access_acl(path: &Path) -> bool {
+        let mut acl = Vec::new();
+        acl.extend_from_slice(&2_u32.to_le_bytes());
+        // SAFETY: `geteuid` has no preconditions.
+        let named_uid = unsafe { libc::geteuid() };
+        for (tag, permissions, id) in [
+            (0x01_u16, 0o6_u16, u32::MAX),
+            (0x02_u16, 0o4_u16, named_uid),
+            (0x04_u16, 0o4_u16, u32::MAX),
+            (0x10_u16, 0o4_u16, u32::MAX),
+            (0x20_u16, 0o0_u16, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"system.posix_acl_access";
+        // SAFETY: the path and name are NUL-terminated and `acl` remains live.
+        if unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        } == 0
+        {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENOTSUP)
+            ),
+            "failed to install test ACL: {error}"
+        );
+        false
+    }
+
+    fn remove_test_access_acl(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"system.posix_acl_access";
+        // SAFETY: the path and name are valid NUL-terminated strings.
+        assert_eq!(
+            unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) },
+            0
+        );
     }
 
     #[test]

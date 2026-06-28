@@ -15,6 +15,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::isolated_execution::production_codex_group_ids;
+
 pub const CODEX_PENDING_INPUT_ROOT: &str =
     "/var/lib/webex-generic-account-bot/codex-input-staging/pending";
 pub const CODEX_SOURCE_CONSUMED_INPUT_ROOT: &str =
@@ -142,7 +144,18 @@ impl StatSnapshot {
     }
 }
 
-pub fn seal_workspace(
+pub fn seal_workspace(run_id: &str, source_uid: u32) -> Result<PathBuf> {
+    let groups = production_codex_group_ids()?;
+    seal_workspace_at(
+        &SealPaths::production(),
+        run_id,
+        source_uid,
+        groups.launch,
+        groups.input,
+    )
+}
+
+fn seal_workspace_at(
     paths: &SealPaths,
     run_id: &str,
     source_uid: u32,
@@ -438,6 +451,7 @@ fn validate_root(
     {
         bail!("{description} metadata is invalid");
     }
+    ensure_posix_acl_absent(directory, description)?;
     Ok(())
 }
 
@@ -515,6 +529,7 @@ fn copy_directory(
     }
     let before = stat_fd(source.as_raw_fd())?;
     validate_source_directory(&before, source_uid, source_gid)?;
+    ensure_posix_acl_absent(source, "pending workspace directory")?;
     let remaining_entries = state.limits.entries.saturating_sub(state.entries);
     let entries = list_directory(source.as_raw_fd(), remaining_entries)?;
 
@@ -569,6 +584,7 @@ fn copy_directory(
                     sealer_uid,
                     target_gid,
                 )?;
+                ensure_posix_acl_absent(&target_child, "sealed workspace directory")?;
                 if stat_fd(source_child.as_raw_fd())? != entry {
                     bail!("pending workspace directory changed during copy");
                 }
@@ -605,6 +621,7 @@ fn copy_file(
     if stat_fd(source.as_raw_fd())? != *entry {
         bail!("pending workspace file changed before copy");
     }
+    ensure_posix_acl_absent(&source, "pending workspace file")?;
     #[cfg(test)]
     if let Some(hook) = state.limits.mutation_hook {
         hook(source_directory.as_raw_fd(), name)?;
@@ -648,6 +665,36 @@ fn copy_file(
         || sealed.size != entry.size
     {
         bail!("sealed workspace file metadata is invalid");
+    }
+    ensure_posix_acl_absent(&target, "sealed workspace file")?;
+    Ok(())
+}
+
+pub(crate) fn ensure_posix_acl_absent(file: &File, description: &str) -> Result<()> {
+    for name in [
+        b"system.posix_acl_access\0".as_slice(),
+        b"system.posix_acl_default\0".as_slice(),
+    ] {
+        // SAFETY: each name is a fixed NUL-terminated byte string, `file` owns a
+        // live descriptor, and a null value pointer requests only the size.
+        let size = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size >= 0 {
+            bail!("{description} has an unexpected POSIX ACL");
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::ENOTSUP)
+        ) {
+            return Err(error).with_context(|| format!("failed to inspect {description} ACL"));
+        }
     }
     Ok(())
 }
@@ -954,7 +1001,7 @@ mod tests {
         }
 
         fn seal(&self, run_id: &str) -> Result<PathBuf> {
-            seal_workspace(&self.paths, run_id, self.uid, self.gid, self.gid)
+            seal_workspace_at(&self.paths, run_id, self.uid, self.gid, self.gid)
         }
 
         fn seal_with_limits(&self, run_id: &str, limits: Limits) -> Result<PathBuf> {
@@ -1102,7 +1149,7 @@ mod tests {
         roots.write_file(&source.join("owned"), b"data");
         let wrong_uid = roots.uid.checked_add(1).unwrap();
         assert_error_contains(
-            seal_workspace(&roots.paths, "bad-owner", wrong_uid, roots.gid, roots.gid),
+            seal_workspace_at(&roots.paths, "bad-owner", wrong_uid, roots.gid, roots.gid),
             "owner or mode",
         );
         assert_quarantined_failure(&roots, "bad-owner");
@@ -1112,7 +1159,7 @@ mod tests {
         roots.write_file(&source.join("owned"), b"data");
         let wrong_gid = roots.gid.checked_add(1).unwrap();
         assert_error_contains(
-            seal_workspace(&roots.paths, "bad-group", roots.uid, wrong_gid, roots.gid),
+            seal_workspace_at(&roots.paths, "bad-group", roots.uid, wrong_gid, roots.gid),
             "pending input root metadata is invalid",
         );
 
@@ -1130,7 +1177,7 @@ mod tests {
             &roots.paths.input_root,
         );
         assert_error_contains(
-            seal_workspace(&relative, "run", roots.uid, roots.gid, roots.gid),
+            seal_workspace_at(&relative, "run", roots.uid, roots.gid, roots.gid),
             "non-root absolute path",
         );
 
@@ -1140,7 +1187,7 @@ mod tests {
             &roots.paths.input_root,
         );
         assert_error_contains(
-            seal_workspace(&root, "run", roots.uid, roots.gid, roots.gid),
+            seal_workspace_at(&root, "run", roots.uid, roots.gid, roots.gid),
             "non-root absolute path",
         );
 
@@ -1150,7 +1197,7 @@ mod tests {
             &roots.paths.input_root,
         );
         assert_error_contains(
-            seal_workspace(&overlap, "run", roots.uid, roots.gid, roots.gid),
+            seal_workspace_at(&overlap, "run", roots.uid, roots.gid, roots.gid),
             "must not overlap",
         );
 
@@ -1160,7 +1207,7 @@ mod tests {
             &roots.paths.input_root,
         );
         assert_error_contains(
-            seal_workspace(&escaped, "run", roots.uid, roots.gid, roots.gid),
+            seal_workspace_at(&escaped, "run", roots.uid, roots.gid, roots.gid),
             "path escape",
         );
 
@@ -1172,7 +1219,7 @@ mod tests {
             &roots.paths.input_root,
         );
         assert_error_contains(
-            seal_workspace(&linked, "run", roots.uid, roots.gid, roots.gid),
+            seal_workspace_at(&linked, "run", roots.uid, roots.gid, roots.gid),
             "failed to open the pending input root",
         );
     }
@@ -1250,6 +1297,29 @@ mod tests {
         assert_quarantined_failure(&roots, "growth");
     }
 
+    #[test]
+    fn rejects_posix_acls_on_roots_and_source_entries() {
+        let roots = TestRoots::new();
+        let source = roots.source("source-acl");
+        let evidence = source.join("evidence");
+        roots.write_file(&evidence, b"data");
+        if install_test_acl(&evidence, b"system.posix_acl_access\0") {
+            set_mode(&evidence, SOURCE_FILE_MODE);
+            assert_error_contains(roots.seal("source-acl"), "POSIX ACL");
+            assert_quarantined_failure(&roots, "source-acl");
+        }
+
+        let roots = TestRoots::new();
+        let source = roots.source("root-acl");
+        roots.write_file(&source.join("evidence"), b"data");
+        if install_test_acl(&roots.paths.input_root, b"system.posix_acl_default\0") {
+            set_mode(&roots.paths.input_root, SHARED_ROOT_MODE);
+            assert_error_contains(roots.seal("root-acl"), "POSIX ACL");
+            assert!(roots.paths.pending_root.join("root-acl").exists());
+            assert!(!roots.paths.input_root.join("root-acl").exists());
+        }
+    }
+
     fn append_source_byte(directory_fd: RawFd, name: &CStr) -> Result<()> {
         let flags =
             libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -1263,6 +1333,47 @@ mod tests {
         file.write_all(b"+")?;
         file.sync_all()?;
         Ok(())
+    }
+
+    fn install_test_acl(path: &Path, name: &[u8]) -> bool {
+        let path = c_string(path.as_os_str()).unwrap();
+        let mut acl = Vec::new();
+        acl.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, permissions, id) in [
+            (0x01_u16, 0o6_u16, u32::MAX),
+            (0x02_u16, 0o4_u16, effective_uid()),
+            (0x04_u16, 0o4_u16, u32::MAX),
+            (0x10_u16, 0o4_u16, u32::MAX),
+            (0x20_u16, 0o0_u16, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let name = CStr::from_bytes_with_nul(name).unwrap();
+        // SAFETY: the path and attribute name are NUL-terminated and `acl`
+        // remains live for the duration of the syscall.
+        if unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        } == 0
+        {
+            return true;
+        }
+        let error = io::Error::last_os_error();
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENOTSUP)
+            ),
+            "failed to install test ACL: {error}"
+        );
+        false
     }
 
     fn assert_quarantined_failure(roots: &TestRoots, run_id: &str) {

@@ -668,8 +668,11 @@ that pathname into a root-only consumed-source
 quarantine, recursively validates it through no-follow descriptor-relative
 operations, and copies only regular files and directories into fresh
 `root:webex-codex-input` inodes. It rejects links, special files, control
-directories, owner/mode changes, duplicate publication, and the PR 4b depth,
-entry, and byte limits before publishing a read-only tree.
+directories, POSIX ACLs, owner/mode changes, duplicate publication, and the PR
+4b depth, entry, and byte limits before publishing a read-only tree. The public
+sealer entrypoint accepts only the authorised source UID; it resolves the fixed
+`webex-codex-launch` and `webex-codex-input` groups through the same trusted
+host group policy used by runtime verification.
 
 The staging parent is traversable only by `webex-codex-launch`; the sticky
 sealed-input root prevents non-root input-group members from replacing
