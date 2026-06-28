@@ -9,12 +9,14 @@ use tokio::time::{Duration, timeout};
 #[cfg(target_os = "linux")]
 use webex_generic_account_bot::{
     codex_launcher::{
-        authorise_bot_peer, drop_peer_inspection_capability, socket_peer_credentials,
-        validate_launcher_process, validate_socket_stdio,
+        AuthorisedPeer, authorise_bot_peer, drop_peer_inspection_capability,
+        socket_peer_credentials, validate_launcher_process, validate_socket_stdio,
     },
+    isolated_execution::{self, IsolatedExecutionError, IsolatedRunResult},
     launcher_protocol::{
-        FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES,
-        RejectedResponse, RejectionCode, decode_request_frame, encode_response_frame,
+        CompletedResponse, FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse,
+        REQUEST_MAX_BYTES, RejectedResponse, RejectionCode, decode_request_frame,
+        encode_response_frame,
     },
 };
 
@@ -60,7 +62,7 @@ async fn main() -> Result<()> {
     } else {
         decode_request_frame(&packet.frame)
     };
-    let response = response_for_request(request)?;
+    let response = response_for_request(request, &peer).await?;
     peer.ensure_alive()?;
     write_response(&socket, &response).await
 }
@@ -74,29 +76,78 @@ fn request_writer_is_authorised(
 }
 
 #[cfg(target_os = "linux")]
-fn response_for_request(
+async fn response_for_request(
     request: Result<
         webex_generic_account_bot::launcher_protocol::LauncherRequest,
         webex_generic_account_bot::launcher_protocol::ProtocolError,
     >,
+    peer: &AuthorisedPeer,
 ) -> Result<LauncherResponse> {
-    Ok(match request {
+    match request {
         Ok(request) => match request.request {
-            LauncherRequestKind::Preflight(_) => LauncherResponse::ready(false),
+            LauncherRequestKind::Preflight(_) => Ok(LauncherResponse::ready(
+                isolated_execution::preflight().is_ok(),
+            )),
             LauncherRequestKind::Execute(request) => {
-                LauncherResponse::rejected(RejectedResponse::bounded(
-                    Some(request.run_id),
-                    RejectionCode::ExecutionUnavailable,
-                    "ephemeral Codex execution is not enabled",
-                )?)
+                let run_id = request.run_id.clone();
+                let output_limit = request.output_char_limit;
+                match isolated_execution::execute(&request, peer).await {
+                    Ok(result) => execution_response(run_id, output_limit, result),
+                    Err(IsolatedExecutionError::Unavailable(_)) => Ok(rejected(
+                        Some(run_id),
+                        RejectionCode::ExecutionUnavailable,
+                        "isolated Codex runtime is unavailable",
+                    )?),
+                    Err(IsolatedExecutionError::Failed(_)) => Ok(rejected(
+                        Some(run_id),
+                        RejectionCode::InternalError,
+                        "isolated Codex execution failed internally",
+                    )?),
+                }
             }
         },
-        Err(error) => LauncherResponse::rejected(RejectedResponse::bounded(
+        Err(error) => Ok(rejected(
             None,
             protocol_rejection_code(error),
             "launcher request failed protocol validation",
         )?),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execution_response(
+    run_id: String,
+    output_char_limit: u64,
+    result: IsolatedRunResult,
+) -> Result<LauncherResponse> {
+    Ok(match result {
+        IsolatedRunResult::Completed { output, truncated } => {
+            let mut completed = CompletedResponse::bounded(run_id, &output, output_char_limit)?;
+            completed.truncated |= truncated;
+            LauncherResponse::completed(completed)
+        }
+        IsolatedRunResult::TimedOut => rejected(
+            Some(run_id),
+            RejectionCode::ExecutionTimedOut,
+            "isolated Codex execution timed out",
+        )?,
+        IsolatedRunResult::Failed => rejected(
+            Some(run_id),
+            RejectionCode::ExecutionFailed,
+            "isolated Codex execution failed",
+        )?,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn rejected(
+    run_id: Option<String>,
+    code: RejectionCode,
+    message: &str,
+) -> Result<LauncherResponse> {
+    Ok(LauncherResponse::rejected(RejectedResponse::bounded(
+        run_id, code, message,
+    )?))
 }
 
 #[cfg(target_os = "linux")]
@@ -268,51 +319,54 @@ fn main() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::{path::PathBuf, process::Command};
+    use std::process::Command;
 
     use webex_generic_account_bot::launcher_protocol::{
-        ExecuteRequest, LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
+        LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
     };
 
     use super::*;
 
     #[test]
-    fn preflight_reports_that_execution_is_unavailable() {
-        let response = response_for_request(Ok(LauncherRequest::preflight())).unwrap();
-
+    fn execution_results_map_to_stable_protocol_responses() {
+        let completed = execution_response(
+            "run-1".to_owned(),
+            100,
+            IsolatedRunResult::Completed {
+                output: "done".to_owned(),
+                truncated: false,
+            },
+        )
+        .unwrap();
         assert!(matches!(
-            response.response,
-            LauncherResponseKind::Ready(response) if !response.execution_available
+            completed.response,
+            LauncherResponseKind::Completed(response)
+                if response.run_id == "run-1" && response.output == "done"
         ));
-    }
 
-    #[test]
-    fn execute_is_rejected_without_an_execution_backend() {
-        let request = ExecuteRequest {
-            run_id: "run-1".to_owned(),
-            message_id: "message-1".to_owned(),
-            prompt: "Inspect the workspace".to_owned(),
-            workspace: PathBuf::from("/srv/workspaces/run-1"),
-            model: None,
-            reasoning_effort: None,
-            timeout_seconds: 60,
-            output_char_limit: 6_000,
-            skip_git_repo_check: true,
-        };
-
-        let response = response_for_request(Ok(LauncherRequest::execute(request))).unwrap();
-
-        assert!(matches!(
-            response.response,
-            LauncherResponseKind::Rejected(response)
-                if response.run_id.as_deref() == Some("run-1")
-                    && response.code == RejectionCode::ExecutionUnavailable
-        ));
+        for (result, code) in [
+            (
+                IsolatedRunResult::TimedOut,
+                RejectionCode::ExecutionTimedOut,
+            ),
+            (IsolatedRunResult::Failed, RejectionCode::ExecutionFailed),
+        ] {
+            let response = execution_response("run-1".to_owned(), 100, result).unwrap();
+            assert!(matches!(
+                response.response,
+                LauncherResponseKind::Rejected(response) if response.code == code
+            ));
+        }
     }
 
     #[test]
     fn malformed_requests_receive_a_bounded_stable_rejection() {
-        let response = response_for_request(Err(ProtocolError::InvalidRequestJson)).unwrap();
+        let response = rejected(
+            None,
+            protocol_rejection_code(ProtocolError::InvalidRequestJson),
+            "launcher request failed protocol validation",
+        )
+        .unwrap();
 
         assert!(matches!(
             response.response,
@@ -353,7 +407,13 @@ mod tests {
             };
             send_packet(writer.as_raw_fd(), &frame);
             let packet = receive_request_packet(&reader).await.unwrap();
-            let response = response_for_request(decode_request_frame(&packet.frame)).unwrap();
+            let error = decode_request_frame(&packet.frame).unwrap_err();
+            let response = rejected(
+                None,
+                protocol_rejection_code(error),
+                "launcher request failed protocol validation",
+            )
+            .unwrap();
 
             assert!(matches!(
                 response.response,
