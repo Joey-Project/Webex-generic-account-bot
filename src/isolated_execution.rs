@@ -31,8 +31,9 @@ use crate::{
     codex_launcher::AuthorisedPeer,
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
-        ExecuteRequest, LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS,
-        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS, OUTPUT_MAX_BYTES, ReasoningEffort,
+        ExecuteRequest, LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS,
+        LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+        OUTPUT_MAX_BYTES, ReasoningEffort,
     },
     work_budget::{WorkBudget, WorkCancellation, run_blocking_with_process_watchdog},
 };
@@ -302,12 +303,18 @@ pub async fn execute(
     )
     .await
     .map_err(IsolatedExecutionError::Failed)??;
-    let PreparedExecution {
-        plan,
-        mut workspace,
-    } = prepared;
+    let PreparedExecution { plan, workspace } = prepared;
     let execution = run_transient(plan, request, peer, cancellation, &workspace).await;
-    let cleanup = workspace.cleanup();
+    let cleanup = run_blocking_with_process_watchdog(
+        "consumed runtime workspace cleanup",
+        Duration::from_secs(LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS),
+        move || {
+            let mut workspace = workspace;
+            workspace.cleanup()
+        },
+    )
+    .await
+    .and_then(|result| result);
     finalise_execution(execution, cleanup)
 }
 
@@ -1098,6 +1105,10 @@ async fn run_transient(
             }
         }
     };
+    if Instant::now() >= deadline {
+        terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task).await?;
+        return Ok(IsolatedRunResult::TimedOut);
+    }
     let (stdout_result, stderr_result) = tokio::join!(
         collect_capture(stdout_task, "stdout"),
         collect_capture(stderr_task, "stderr")

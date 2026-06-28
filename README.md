@@ -301,8 +301,9 @@ unwind, and removes any socket already created before the process exits.
 
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no
-bot socket-group drop-in is shipped. A later enablement PR may allow `pull` only
-after `ephemeral-linux-user` runner isolation is deployable and verified;
+config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
+only the Codex launcher group drop-in. A later enablement PR may allow `pull`
+only after `ephemeral-linux-user` runner isolation is deployable and verified;
 `reload` and `sync` require the later activation work as well.
 
 Use `--skip-restart` when validating an install without restarting the service.
@@ -726,8 +727,10 @@ normal paths finish scoped cleanup before their futures return. These fixed
 costs are included in ephemeral attempt-lease validation. Ephemeral
 configuration also caps
 `server.max_concurrent_requests` at the launcher's fixed four accepted
-connections. The launcher service runtime maximum is protocol-bound above the
-largest request, preparation, cleanup, and response budget.
+connections. Socket trigger and poll bursts include startup preflight plus two
+connections per concurrent run. The launcher service runtime maximum is
+protocol-bound above the largest request, preparation, cleanup, and response
+budget.
 
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
@@ -746,7 +749,9 @@ times out, or is cancelled. Closing the bot's launcher socket cancels
 preflight, preparation, and a running transient unit even while the authorised
 bot process remains alive. Cancellation receives a 30-second cleanup grace;
 the per-connection launcher then exits if blocked work cannot drain. A normal
-launcher response is emitted only after consumed-tree cleanup succeeds;
+launcher response is emitted only after source and consumed parent-directory
+cleanup is durable. Consumed cleanup runs off the current-thread runtime and
+has its own 50-second process watchdog inside the 60-second response budget;
 one-day tmpfiles expiry remains only a crash, hard-watchdog, or host-reboot
 fallback.
 

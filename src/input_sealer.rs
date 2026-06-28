@@ -448,7 +448,10 @@ fn seal_workspace_with_limits(
             source_identity.device,
             source_identity.inode,
         )
-        .context("failed to clean the quarantined source workspace")
+        .context("failed to clean the quarantined source workspace")?;
+        source_consumed_root
+            .sync_all()
+            .context("failed to persist quarantined source cleanup")
     };
     let cleanup_target = || -> Result<()> {
         if published_by_us {
@@ -456,11 +459,17 @@ fn seal_workspace_with_limits(
                 .as_ref()
                 .ok_or_else(|| anyhow!("published workspace identity is unavailable"))?;
             remove_owned_tree_at(&input_root, &run_name, expected.device, expected.inode)
-                .context("failed to clean the published workspace")
+                .context("failed to clean the published workspace")?;
+            input_root
+                .sync_all()
+                .context("failed to persist published workspace cleanup")
         } else if let Some(staging_name) = &staging_name {
             remove_tree_at(input_root.as_raw_fd(), staging_name)
                 .map_err(::anyhow::Error::from)
-                .context("failed to clean the staged workspace")
+                .context("failed to clean the staged workspace")?;
+            input_root
+                .sync_all()
+                .context("failed to persist staged workspace cleanup")
         } else {
             Ok(())
         }

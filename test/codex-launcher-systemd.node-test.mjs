@@ -83,9 +83,14 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'DirectoryMode'), ['0750']);
     assert.deepEqual(directiveValues(socket, 'RemoveOnStop'), ['yes']);
     assert.deepEqual(directiveValues(socket, 'TriggerLimitIntervalSec'), ['10s']);
-    assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), ['8']);
+    const triggerBurst = protocol.match(
+      /pub const LAUNCHER_TRIGGER_LIMIT_BURST: usize = ([\d_]+);/,
+    );
+    assert.ok(triggerBurst);
+    const triggerBurstValue = triggerBurst[1].replaceAll('_', '');
+    assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), [triggerBurstValue]);
     assert.deepEqual(directiveValues(socket, 'PollLimitIntervalSec'), ['2s']);
-    assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['8']);
+    assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), [triggerBurstValue]);
     assert.deepEqual(directiveValues(socket, 'Backlog'), ['16']);
     assert.deepEqual(directiveValues(socket, 'MaxConnections'), ['4']);
     assert.match(protocol, /pub const LAUNCHER_MAX_CONNECTIONS: usize = 4;/);
