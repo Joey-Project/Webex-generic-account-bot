@@ -51,6 +51,9 @@
   Cooperative work deadlines and launcher-socket disconnect cancellation
   clean inode-verified ready and consumed trees before returning. Ready trees
   remain group-inaccessible until moved below the root-only consumed root.
+  Bot and launcher activation verification bind the currently executing
+  `/proc/self/exe` path, inode metadata, and digest to the fixed executable and
+  receipt, rejecting receipts minted after an atomic binary replacement.
   Independent
   process watchdogs hard-stop stuck staging and preparation syscalls before
   their lease budgets expire. Production configuration remains on

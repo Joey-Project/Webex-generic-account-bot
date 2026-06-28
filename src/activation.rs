@@ -107,6 +107,19 @@ pub struct ActivationPaths {
     trusted_root: PathBuf,
     expected_uid: u32,
     expected_gid: u32,
+    current_process: Option<CurrentProcessExecutable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessExecutableRole {
+    Bot,
+    Launcher,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentProcessExecutable {
+    proc_path: PathBuf,
+    role: ProcessExecutableRole,
 }
 
 impl ActivationPaths {
@@ -130,6 +143,7 @@ impl ActivationPaths {
             trusted_root: PathBuf::from("/"),
             expected_uid: 0,
             expected_gid: 0,
+            current_process: None,
         }
     }
 
@@ -147,6 +161,27 @@ impl ActivationPaths {
             RUNTIME_EXECUTABLE_PATH,
             RUNTIME_SOURCE_MANIFEST_PATH,
         )
+    }
+
+    fn production_for_bot() -> Self {
+        Self::production().with_current_process("/proc/self/exe", ProcessExecutableRole::Bot)
+    }
+
+    pub(crate) fn production_for_launcher_with_boot_id(boot_id: impl Into<PathBuf>) -> Self {
+        Self::production_with_boot_id(boot_id)
+            .with_current_process("/proc/self/exe", ProcessExecutableRole::Launcher)
+    }
+
+    fn with_current_process(
+        mut self,
+        proc_path: impl Into<PathBuf>,
+        role: ProcessExecutableRole,
+    ) -> Self {
+        self.current_process = Some(CurrentProcessExecutable {
+            proc_path: proc_path.into(),
+            role,
+        });
+        self
     }
 
     pub fn receipt(&self) -> &Path {
@@ -359,7 +394,7 @@ enum TrustedFileKind {
 }
 
 pub fn verify_activation() -> Result<VerifiedActivation> {
-    verify_activation_with(&ActivationPaths::production())
+    verify_activation_with(&ActivationPaths::production_for_bot())
 }
 
 pub async fn verify_activation_bounded() -> Result<VerifiedActivation> {
@@ -369,7 +404,9 @@ pub async fn verify_activation_bounded() -> Result<VerifiedActivation> {
     run_blocking_with_process_watchdog(
         "bot activation verification",
         Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
-        move || verify_activation_with_deadline(&ActivationPaths::production(), Some(deadline)),
+        move || {
+            verify_activation_with_deadline(&ActivationPaths::production_for_bot(), Some(deadline))
+        },
     )
     .await?
 }
@@ -391,8 +428,9 @@ pub(crate) fn verify_activation_with_deadline(
     )?;
     let receipt: ActivationReceipt = serde_json::from_slice(&receipt_file.bytes)
         .context("activation receipt is invalid JSON")?;
-    let binding = load_activation_binding_with_deadline(paths, deadline)?;
+    let binding = load_activation_binding_with_deadline(paths, deadline.clone())?;
     let verified = validate_receipt(&receipt, &binding)?;
+    verify_current_process_executable(paths, &receipt, &binding, deadline)?;
     ensure_path_identity(paths, &paths.receipt, &receipt_file.identity)?;
     for (path, identity) in &binding.identities {
         ensure_path_identity(paths, path, identity)?;
@@ -737,6 +775,13 @@ fn hash_trusted_file(
         TrustedFileKind::Executable,
         EXECUTABLE_MAX_BYTES,
     )?;
+    let digest = hash_open_executable(&mut file, deadline)?;
+    ensure_open_file_identity(&file, &identity)?;
+    ensure_path_identity(paths, path, &identity)?;
+    Ok(TrustedDigest { digest, identity })
+}
+
+fn hash_open_executable(file: &mut File, deadline: Option<WorkBudget>) -> Result<String> {
     let mut context = DigestContext::new(&SHA256);
     let mut total = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
@@ -759,12 +804,66 @@ fn hash_trusted_file(
     if total == 0 {
         return Err(anyhow!("trusted executable is empty"));
     }
-    ensure_open_file_identity(&file, &identity)?;
-    ensure_path_identity(paths, path, &identity)?;
-    Ok(TrustedDigest {
-        digest: hex(context.finish().as_ref()),
-        identity,
-    })
+    Ok(hex(context.finish().as_ref()))
+}
+
+fn verify_current_process_executable(
+    paths: &ActivationPaths,
+    receipt: &ActivationReceipt,
+    binding: &ActivationBinding,
+    deadline: Option<WorkBudget>,
+) -> Result<()> {
+    let Some(current) = paths.current_process.as_ref() else {
+        return Ok(());
+    };
+    let (expected_path, expected_digest) = match current.role {
+        ProcessExecutableRole::Bot => (&paths.bot_executable, &receipt.bot_executable_sha256),
+        ProcessExecutableRole::Launcher => (
+            &paths.launcher_executable,
+            &receipt.launcher_executable_sha256,
+        ),
+    };
+    let expected_identity = binding
+        .identities
+        .iter()
+        .find_map(|(path, identity)| (path == expected_path).then_some(identity))
+        .ok_or_else(|| anyhow!("activation binding omitted the current executable"))?;
+
+    if fs::read_link(&current.proc_path)? != *expected_path {
+        return Err(anyhow!("current process executable path is invalid"));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&current.proc_path)
+        .context("failed to open current process executable")?;
+    let metadata = file.metadata()?;
+    validate_file_metadata(
+        paths,
+        &metadata,
+        TrustedFileKind::Executable,
+        EXECUTABLE_MAX_BYTES,
+    )?;
+    let current_identity = FileIdentity::from_metadata(&metadata);
+    if !expected_identity.matches(&current_identity) {
+        return Err(anyhow!(
+            "current process executable does not match the active path"
+        ));
+    }
+    ensure_xattr_absent(&file, b"security.capability\0", "file capability")?;
+    let digest = hash_open_executable(&mut file, deadline)?;
+    if digest != *expected_digest {
+        return Err(anyhow!(
+            "current process executable does not match the activation receipt"
+        ));
+    }
+    ensure_open_file_identity(&file, &current_identity)?;
+    if fs::read_link(&current.proc_path)? != *expected_path {
+        return Err(anyhow!(
+            "current process executable changed during verification"
+        ));
+    }
+    ensure_path_identity(paths, expected_path, expected_identity)
 }
 
 fn hash_runtime_image(
@@ -1218,6 +1317,18 @@ mod tests {
                 0o444,
             );
         }
+
+        fn bind_current_process(&mut self, role: ProcessExecutableRole) -> File {
+            let executable = match role {
+                ProcessExecutableRole::Bot => &self.paths.bot_executable,
+                ProcessExecutableRole::Launcher => &self.paths.launcher_executable,
+            };
+            let file = File::open(executable).unwrap();
+            let proc_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            assert_eq!(fs::read_link(&proc_path).unwrap(), *executable);
+            self.paths = self.paths.clone().with_current_process(proc_path, role);
+            file
+        }
     }
 
     impl Drop for Fixture {
@@ -1317,6 +1428,13 @@ mod tests {
         assert_eq!(
             paths.runtime_source_manifest(),
             Path::new(RUNTIME_SOURCE_MANIFEST_PATH)
+        );
+        assert!(paths.current_process.is_none());
+
+        let launcher = ActivationPaths::production_for_launcher_with_boot_id(&boot_id);
+        assert_eq!(
+            launcher.current_process.as_ref().unwrap().role,
+            ProcessExecutableRole::Launcher
         );
     }
 
@@ -1429,6 +1547,33 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+    }
+
+    #[test]
+    fn verifies_current_bot_and_launcher_images_against_the_receipt() {
+        for role in [ProcessExecutableRole::Bot, ProcessExecutableRole::Launcher] {
+            let mut fixture = Fixture::new();
+            let current_image = fixture.bind_current_process(role);
+            let receipt = fixture.receipt();
+            fixture.install(&receipt);
+
+            verify_activation_with(&fixture.paths).unwrap();
+            drop(current_image);
+        }
+    }
+
+    #[test]
+    fn rejects_a_running_launcher_replaced_before_a_new_receipt_is_minted() {
+        let mut fixture = Fixture::new();
+        let current_image = fixture.bind_current_process(ProcessExecutableRole::Launcher);
+        let replacement = fixture.root.join("replacement-launcher");
+        write_mode(&replacement, b"replacement launcher executable\n", 0o555);
+        fs::rename(&replacement, &fixture.paths.launcher_executable).unwrap();
+        let receipt = fixture.receipt();
+        fixture.install(&receipt);
+
+        assert!(verify_activation_with(&fixture.paths).is_err());
+        drop(current_image);
     }
 
     #[test]

@@ -448,7 +448,7 @@ fn ensure_activation_enabled_with_deadline(
     let directory = env::var_os(CREDENTIALS_DIRECTORY_ENV)
         .ok_or_else(|| anyhow!("launcher credential directory is unavailable"))?;
     let boot_id = boot_id_credential_path(&directory)?;
-    let paths = ActivationPaths::production_with_boot_id(boot_id);
+    let paths = ActivationPaths::production_for_launcher_with_boot_id(boot_id);
     activation::verify_activation_with_deadline(&paths, deadline)
         .context("isolated Codex execution awaits current production capability canaries")
 }

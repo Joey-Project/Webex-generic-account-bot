@@ -296,7 +296,11 @@ superseded_by:
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
 - Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
   with a root-owned systemd credential and verify activation through
-  `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
+  the launcher-specific activation path instead of exposing `/proc/sys`.
+- Bind bot startup and every launcher verification to the currently executing
+  `/proc/self/exe` path, inode metadata, and digest as well as the fixed path
+  and receipt, so an old process cannot accept a receipt minted for an
+  atomically replaced executable.
 - Bind each verified activation snapshot to the exact active-manifest bytes and
   selected image digest used by the run, and send launcher diagnostics only to
   journal-backed `stderr` so protocol `stdout` remains unmodified. Bound and

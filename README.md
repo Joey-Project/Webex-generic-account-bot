@@ -678,7 +678,7 @@ provides no command that can mint a receipt. Runner activation remains blocked
 until the later sealer/client wiring and production-image canary PRs land.
 Because the launcher keeps `ProcSubset=pid`, PR 4c1c must copy the current boot
 ID with a root-owned systemd credential and pass that fixed credential path to
-`ActivationPaths::production_with_boot_id`; it must not loosen the launcher
+the launcher-specific activation verifier; it must not loosen the launcher
 procfs boundary. Executable verification also rejects Linux file capabilities
 so a canary-approved binary cannot gain ambient privilege without invalidating
 activation.
@@ -770,6 +770,10 @@ The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
 `activation-boot-id` credential, preserving `ProcSubset=pid`; isolated child
 units do not receive that credential and cannot read the activation directory.
+Bot startup and every launcher verification also open `/proc/self/exe` and
+require its path, inode metadata, and SHA-256 digest to match both the fixed
+root-owned executable and the receipt. An already-running process therefore
+cannot accept a receipt minted after an atomic executable replacement.
 The verified activation snapshot is carried into runtime selection: the exact
 active-manifest bytes and selected image digest must still match the receipt,
 so an overlapping runtime rollout cannot substitute an untested image. Launcher

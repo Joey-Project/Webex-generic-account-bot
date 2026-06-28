@@ -413,7 +413,7 @@ describe('Codex launcher systemd boundary', () => {
     );
     assert.match(
       isolatedExecution,
-      /ActivationPaths::production_with_boot_id\(boot_id\)/,
+      /ActivationPaths::production_for_launcher_with_boot_id\(boot_id\)/,
     );
     assert.match(isolatedExecution, /RootImage=/);
     assert.match(isolatedExecution, /O_PATH/);
