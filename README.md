@@ -767,6 +767,11 @@ The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
 `activation-boot-id` credential, preserving `ProcSubset=pid`; isolated child
 units do not receive that credential and cannot read the activation directory.
+The verified activation snapshot is carried into runtime selection: the exact
+active-manifest bytes and selected image digest must still match the receipt,
+so an overlapping runtime rollout cannot substitute an untested image. Launcher
+diagnostics are emitted only to `stderr`, which systemd sends to the journal;
+protocol `stdout` remains the accepted socket.
 Their own Codex credential remains available to the runtime wrapper and is
 denied to tool subprocesses by the fixed permission profile. Static config
 requires model `gpt-5.5`, no profile, `--ephemeral`, the fixed repository-check

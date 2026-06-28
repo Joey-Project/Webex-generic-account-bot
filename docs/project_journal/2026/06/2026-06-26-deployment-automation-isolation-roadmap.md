@@ -295,6 +295,9 @@ superseded_by:
 - Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
   with a root-owned systemd credential and verify activation through
   `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
+- Bind each verified activation snapshot to the exact active-manifest bytes and
+  selected image digest used by the run, and send launcher diagnostics only to
+  journal-backed `stderr` so protocol `stdout` remains unmodified.
 
 ### PR 4c2: Production-Image Smoke Tests and Final Activation
 - Repository: `Joey-Project/Webex-generic-account-bot`, with a matching config

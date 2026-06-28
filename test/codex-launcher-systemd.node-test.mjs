@@ -360,6 +360,8 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(launcherModule, /PR_CAPBSET_DROP/);
     assert.match(launcherModule, /capability_bounding_set\(\)\?\.is_empty\(\)/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
+    assert.match(source, /tracing_subscriber::fmt\(\)/);
+    assert.match(source, /\.with_writer\(std::io::stderr\)/);
     assert.match(source, /isolated_execution::preflight_bounded\(&cancellation\)/);
     assert.match(source, /wait_for_client_disconnect\(socket\)/);
     assert.match(source, /ExecutionCancellation::new\(\)/);
@@ -368,6 +370,10 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(source, /terminate_stuck_launcher/);
     assert.match(source, /IsolatedRunResult::Completed/);
     assert.match(isolatedExecution, /run_blocking_with_process_watchdog/);
+    assert.match(
+      isolatedExecution,
+      /if Instant::now\(\) >= deadline \{\s*discard_captures\(stdout_task, stderr_task\)\.await;\s*return Ok\(IsolatedRunResult::TimedOut\);/,
+    );
     assert.match(runnerInput, /run_blocking_with_process_watchdog/);
     assert.match(workBudget, /completion\.recv_timeout\(/);
     assert.match(workBudget, /std::process::exit\(STUCK_WORK_EXIT_CODE\)/);

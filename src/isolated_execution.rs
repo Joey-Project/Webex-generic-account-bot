@@ -27,7 +27,7 @@ use tokio::{
 
 #[cfg(target_os = "linux")]
 use crate::{
-    activation::{self, ActivationPaths},
+    activation::{self, ActivationPaths, VerifiedActivation},
     codex_launcher::AuthorisedPeer,
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
@@ -290,9 +290,9 @@ pub async fn preflight_bounded(cancellation: &ExecutionCancellation) -> Result<V
 
 #[cfg(target_os = "linux")]
 fn preflight_with_deadline(deadline: Option<WorkBudget>) -> Result<VerifiedRuntime> {
-    ensure_activation_enabled_with_deadline(deadline.clone())?;
+    let activation = ensure_activation_enabled_with_deadline(deadline.clone())?;
     input_sealer::preflight()?;
-    verify_runtime_with_deadline(&RuntimePaths::default(), 0, deadline)
+    verify_runtime_with_deadline(&RuntimePaths::default(), 0, &activation, deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -392,7 +392,7 @@ fn prepare_execution(
     validate_execution_policy(request).map_err(|error| {
         IsolatedExecutionError::Failed(anyhow!("isolated request policy is invalid: {error}"))
     })?;
-    ensure_activation_enabled_with_deadline(Some(deadline.clone()))
+    let activation = ensure_activation_enabled_with_deadline(Some(deadline.clone()))
         .map_err(IsolatedExecutionError::Unavailable)?;
     let paths = RuntimePaths::default();
     let expected_workspace = paths.input_root.join(&request.run_id);
@@ -401,7 +401,7 @@ fn prepare_execution(
             "runtime workspace does not match the run identifier"
         )));
     }
-    let runtime = verify_runtime_with_deadline(&paths, 0, Some(deadline.clone()))
+    let runtime = verify_runtime_with_deadline(&paths, 0, &activation, Some(deadline.clone()))
         .map_err(IsolatedExecutionError::Unavailable)?;
     let launcher_unit = current_launcher_unit().map_err(IsolatedExecutionError::Failed)?;
     let sealed_workspace = input_sealer::seal_workspace_with_deadline(
@@ -437,18 +437,19 @@ fn prepare_execution(
 
 #[cfg(target_os = "linux")]
 #[cfg(test)]
-fn ensure_activation_enabled() -> Result<()> {
+fn ensure_activation_enabled() -> Result<VerifiedActivation> {
     ensure_activation_enabled_with_deadline(None)
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_activation_enabled_with_deadline(deadline: Option<WorkBudget>) -> Result<()> {
+fn ensure_activation_enabled_with_deadline(
+    deadline: Option<WorkBudget>,
+) -> Result<VerifiedActivation> {
     let directory = env::var_os(CREDENTIALS_DIRECTORY_ENV)
         .ok_or_else(|| anyhow!("launcher credential directory is unavailable"))?;
     let boot_id = boot_id_credential_path(&directory)?;
     let paths = ActivationPaths::production_with_boot_id(boot_id);
     activation::verify_activation_with_deadline(&paths, deadline)
-        .map(|_| ())
         .context("isolated Codex execution awaits current production capability canaries")
 }
 
@@ -489,6 +490,7 @@ pub fn validate_execution_policy(
 fn verify_runtime_with_deadline(
     paths: &RuntimePaths,
     expected_uid: u32,
+    activation: &VerifiedActivation,
     deadline: Option<WorkBudget>,
 ) -> Result<VerifiedRuntime> {
     if let Some(deadline) = deadline.as_ref() {
@@ -512,6 +514,7 @@ fn verify_runtime_with_deadline(
     let manifest: ActiveRuntimeManifest =
         serde_json::from_slice(&manifest_bytes).context("runtime active manifest is invalid")?;
     validate_active_manifest(&manifest)?;
+    validate_active_manifest_binding(activation, &manifest_bytes, &manifest)?;
 
     let image = paths.root.join(&manifest.image);
     if !image.starts_with(paths.root.join("images")) {
@@ -536,6 +539,7 @@ fn verify_runtime_with_deadline(
     if digest != manifest.image_sha256 {
         return Err(anyhow!("runtime image digest does not match its manifest"));
     }
+    validate_runtime_image_binding(activation, &digest)?;
     let credential = read_bounded_file(&paths.credential, CODEX_AUTH_MAX_BYTES)?;
     if !serde_json::from_slice::<serde_json::Value>(&credential)
         .is_ok_and(|value| value.is_object())
@@ -554,6 +558,36 @@ fn verify_runtime_with_deadline(
         codex_version: manifest.codex_version,
         input_gid: groups.input,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_active_manifest_binding(
+    activation: &VerifiedActivation,
+    manifest_bytes: &[u8],
+    manifest: &ActiveRuntimeManifest,
+) -> Result<()> {
+    let digest = hex(ring::digest::digest(&SHA256, manifest_bytes).as_ref());
+    if digest != activation.active_manifest_sha256
+        || manifest.codex_version != activation.codex_version
+    {
+        return Err(anyhow!(
+            "runtime active manifest does not match the verified activation"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_runtime_image_binding(
+    activation: &VerifiedActivation,
+    image_sha256: &str,
+) -> Result<()> {
+    if image_sha256 != activation.runtime_image_sha256 {
+        return Err(anyhow!(
+            "runtime image does not match the verified activation"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -678,25 +712,44 @@ fn verify_workspace(
         _guard: guard,
     };
     published_workspace.disarm();
-    consumed_root_directory
-        .sync_all()
-        .context("failed to persist the consumed runtime workspace")?;
-    input_root_directory
-        .sync_all()
-        .context("failed to persist removal of the public runtime workspace")?;
-    grant_workspace_group_read(&validation_directory, 0, input_gid, deadline.clone())?;
-    validate_workspace_tree_with_deadline(
-        &validation_directory,
-        0,
-        input_gid,
-        WorkspaceAccess::GroupReadable,
-        deadline,
-    )?;
-    let consumed = fs::symlink_metadata(&consumed_path)?;
-    if consumed.dev() != metadata.dev() || consumed.ino() != metadata.ino() {
-        return Err(anyhow!("consumed runtime workspace identity changed"));
+    let validation = (|| {
+        consumed_root_directory
+            .sync_all()
+            .context("failed to persist the consumed runtime workspace")?;
+        input_root_directory
+            .sync_all()
+            .context("failed to persist removal of the public runtime workspace")?;
+        grant_workspace_group_read(&validation_directory, 0, input_gid, deadline.clone())?;
+        validate_workspace_tree_with_deadline(
+            &validation_directory,
+            0,
+            input_gid,
+            WorkspaceAccess::GroupReadable,
+            deadline,
+        )?;
+        let consumed = fs::symlink_metadata(&consumed_path)?;
+        if consumed.dev() != metadata.dev() || consumed.ino() != metadata.ino() {
+            return Err(anyhow!("consumed runtime workspace identity changed"));
+        }
+        Ok(())
+    })();
+    finalise_workspace_preparation(workspace, validation)
+}
+
+#[cfg(target_os = "linux")]
+fn finalise_workspace_preparation(
+    mut workspace: VerifiedWorkspace,
+    validation: Result<()>,
+) -> Result<VerifiedWorkspace> {
+    match validation {
+        Ok(()) => Ok(workspace),
+        Err(validation_error) => match workspace.cleanup() {
+            Ok(()) => Err(validation_error),
+            Err(cleanup_error) => Err(anyhow!(
+                "{validation_error:#}; failed to clean consumed runtime workspace after preparation failure: {cleanup_error:#}"
+            )),
+        },
     }
-    Ok(workspace)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1288,7 +1341,7 @@ async fn run_transient(
         }
     };
     if Instant::now() >= deadline {
-        terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task).await?;
+        discard_captures(stdout_task, stderr_task).await;
         return Ok(IsolatedRunResult::TimedOut);
     }
     let (stdout_result, stderr_result) = tokio::join!(
@@ -1756,6 +1809,50 @@ mod tests {
     }
 
     #[test]
+    fn verified_activation_binds_the_runtime_manifest_and_image() {
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "builder_version": 1,
+            "codex_version": SUPPORTED_CODEX_VERSION,
+            "codex_target": SUPPORTED_CODEX_TARGET,
+            "codex_layout_version": SUPPORTED_CODEX_LAYOUT_VERSION,
+            "image": format!("images/{}.squashfs", "a".repeat(64)),
+            "image_sha256": "a".repeat(64),
+            "image_size": 4096,
+            "source_manifest_sha256": "b".repeat(64),
+            "mksquashfs_sha256": "c".repeat(64),
+            "mksquashfs_argv_sha256": EXPECTED_MKSQUASHFS_ARGV_SHA256
+        }))
+        .unwrap();
+        let manifest: ActiveRuntimeManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        let activation = VerifiedActivation {
+            schema_version: 1,
+            boot_id: "boot-id".to_owned(),
+            active_manifest_sha256: hex(ring::digest::digest(&SHA256, &manifest_bytes).as_ref()),
+            runtime_image_sha256: "a".repeat(64),
+            bot_executable_sha256: "d".repeat(64),
+            launcher_executable_sha256: "e".repeat(64),
+            runtime_executable_sha256: "f".repeat(64),
+            codex_version: SUPPORTED_CODEX_VERSION.to_owned(),
+            model: "gpt-5.5".to_owned(),
+            canaries: vec!["runner".to_owned()],
+        };
+
+        validate_active_manifest_binding(&activation, &manifest_bytes, &manifest).unwrap();
+        validate_runtime_image_binding(&activation, &manifest.image_sha256).unwrap();
+
+        let mut drifted_manifest = activation.clone();
+        drifted_manifest.active_manifest_sha256 = "0".repeat(64);
+        assert!(
+            validate_active_manifest_binding(&drifted_manifest, &manifest_bytes, &manifest)
+                .is_err()
+        );
+        let mut drifted_image = activation;
+        drifted_image.runtime_image_sha256 = "0".repeat(64);
+        assert!(validate_runtime_image_binding(&drifted_image, &manifest.image_sha256).is_err());
+    }
+
+    #[test]
     fn input_group_resolution_is_exact_and_non_root() {
         assert_eq!(
             parse_group_gid("root:x:0:\nwebex-codex-input:x:4321:\n", CODEX_INPUT_GROUP).unwrap(),
@@ -2081,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_workspace_explicit_cleanup_fails_on_inode_replacement() {
+    fn workspace_preparation_failure_reports_cleanup_failure() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2100,7 +2197,7 @@ mod tests {
         fs::rename(&workspace_path, &retained_path).unwrap();
         fs::create_dir(&workspace_path).unwrap();
 
-        let mut workspace = VerifiedWorkspace {
+        let workspace = VerifiedWorkspace {
             path: workspace_path.clone(),
             bind_source: "/proc/self/fd/test".to_owned(),
             consumed_root: consumed_root_file,
@@ -2110,11 +2207,56 @@ mod tests {
             cleanup_armed: true,
             _guard: guard,
         };
-        assert!(workspace.cleanup().is_err());
+        let error = finalise_workspace_preparation(
+            workspace,
+            Err(anyhow!("post-rename validation failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("post-rename validation failed"), "{error}");
+        assert!(
+            error.contains("failed to clean consumed runtime workspace"),
+            "{error}"
+        );
         assert!(workspace_path.exists());
-        workspace.cleanup_armed = false;
+        fs::remove_dir_all(base).unwrap();
+    }
 
-        drop(workspace);
+    #[test]
+    fn workspace_preparation_failure_removes_the_consumed_tree() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "webex-codex-prepare-cleanup-{}-{suffix}",
+            std::process::id()
+        ));
+        let consumed_root = base.join("consumed");
+        let workspace_path = consumed_root.join("run-one");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let consumed_root_file = File::open(&consumed_root).unwrap();
+        let guard = File::open(&workspace_path).unwrap();
+        let metadata = guard.metadata().unwrap();
+        let workspace = VerifiedWorkspace {
+            path: workspace_path.clone(),
+            bind_source: "/proc/self/fd/test".to_owned(),
+            consumed_root: consumed_root_file,
+            consumed_name: CString::new("run-one").unwrap(),
+            expected_device: metadata.dev(),
+            expected_inode: metadata.ino(),
+            cleanup_armed: true,
+            _guard: guard,
+        };
+
+        let error = finalise_workspace_preparation(
+            workspace,
+            Err(anyhow!("post-rename validation failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("post-rename validation failed"), "{error}");
+        assert!(!workspace_path.exists());
         fs::remove_dir_all(base).unwrap();
     }
 

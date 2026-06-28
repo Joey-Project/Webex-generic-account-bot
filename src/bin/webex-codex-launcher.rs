@@ -41,6 +41,14 @@ struct ControlBuffer([u8; CONTROL_BUFFER_BYTES]);
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "webex_codex_launcher=info,webex_generic_account_bot=info".into()
+            }),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     validate_launcher_process()?;
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
