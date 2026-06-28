@@ -48,6 +48,9 @@ export const PREPARE_ENV = Object.freeze({
 
 export const MAX_REQUEST_BYTES = 4 * 1024;
 export const MAX_MESSAGE_ID_BYTES = 256;
+// Must exceed deploy-config's 5s SIGTERM + 1s pipe-close cleanup window.
+export const PREPARE_TERMINATION_GRACE_MS = 10_000;
+export const PREPARE_CLOSE_GRACE_MS = 1_000;
 
 const MAX_REQUEST_RECORD_BYTES = 1024;
 const MAX_STATE_RECORD_BYTES = 2048;
@@ -339,15 +342,70 @@ export async function publishRequestRecord({
 }
 
 export async function readRequestRecord(queueDir, actionId, fsApi = fs) {
+  return (await readRequestRecordSnapshot(queueDir, actionId, fsApi)).record;
+}
+
+async function readRequestRecordSnapshot(queueDir, actionId, fsApi) {
   validateActionId(actionId);
-  const record = await readBoundedJsonFile(
-    requestRecordPath(queueDir, actionId),
-    MAX_REQUEST_RECORD_BYTES,
-    PRIVATE_FILE_MODE,
-    fsApi,
-  );
-  validateRequestRecord(record, actionId);
-  return record;
+  const file = requestRecordPath(queueDir, actionId);
+  let snapshot = null;
+  try {
+    snapshot = await openBoundedRegularFile(
+      file,
+      MAX_REQUEST_RECORD_BYTES,
+      PRIVATE_FILE_MODE,
+      fsApi,
+    );
+    const record = parseBoundedJson(snapshot.contents, file);
+    validateRequestRecord(record, actionId);
+    return Object.freeze({
+      record,
+      stat: snapshot.stat,
+      contents: snapshot.contents,
+    });
+  } finally {
+    await snapshot?.handle.close().catch(() => {});
+  }
+}
+
+async function requestRecordSnapshotIsCurrent(queueDir, snapshot, fsApi) {
+  const file = requestRecordPath(queueDir, snapshot.record.action_id);
+  let current = null;
+  try {
+    try {
+      current = await openBoundedRegularFile(
+        file,
+        MAX_REQUEST_RECORD_BYTES,
+        PRIVATE_FILE_MODE,
+        fsApi,
+      );
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!sameFileIdentity(current.stat, snapshot.stat)) return false;
+    if (!current.contents.equals(snapshot.contents)) {
+      throw new Error(`request record changed after queue snapshot: ${file}`);
+    }
+    const record = parseBoundedJson(current.contents, file);
+    validateRequestRecord(record, snapshot.record.action_id);
+
+    let published;
+    try {
+      published = await fsApi.lstat(file);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!sameFileIdentity(published, snapshot.stat)) return false;
+    assertOwnedRegularFile(published, file, PRIVATE_FILE_MODE);
+    if (published.size !== current.contents.length) {
+      throw new Error(`request record changed after queue snapshot: ${file}`);
+    }
+    return true;
+  } finally {
+    await current?.handle.close().catch(() => {});
+  }
 }
 
 export async function writeActionState({ stateDir, state, fsApi = fs }) {
@@ -468,8 +526,8 @@ export async function runPrepareCommand({
           child.stdout.destroy();
           child.stderr.destroy();
           rejectOnce(failure);
-        }, 1_000);
-      }, 1_000);
+        }, PREPARE_CLOSE_GRACE_MS);
+      }, PREPARE_TERMINATION_GRACE_MS);
     };
     const onAbort = () => terminate(new WorkerFailure('worker_stopping'));
     const timeoutTimer = setTimeout(
@@ -692,12 +750,12 @@ export class ConfigPullWorker {
   }
 
   async #recoverQueue() {
-    const records = await this.#listRequestRecords();
-    this.nextEnqueueSequence = records.length === 0
+    const snapshots = await this.#listRequestRecords();
+    this.nextEnqueueSequence = snapshots.length === 0
       ? 1
-      : incrementEnqueueSequence(records.at(-1).enqueue_sequence);
+      : incrementEnqueueSequence(snapshots.at(-1).record.enqueue_sequence);
     let newestState = null;
-    for (const record of records) {
+    for (const { record } of snapshots) {
       let state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
       if (!state) {
         state = this.#makeState(record, 'queued');
@@ -744,12 +802,20 @@ export class ConfigPullWorker {
   }
 
   async #drain() {
-    const records = await this.#listRequestRecords();
-    for (const record of records) {
+    const snapshots = await this.#listRequestRecords();
+    for (const snapshot of snapshots) {
       if (this.stopping) return;
+      const { record } = snapshot;
       let state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
       if (!state) {
         await this.enqueueTail;
+        if (!await requestRecordSnapshotIsCurrent(
+          this.options.queueDir,
+          snapshot,
+          this.fsApi,
+        )) {
+          continue;
+        }
         state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
       }
       if (!state) {
@@ -837,14 +903,21 @@ export class ConfigPullWorker {
         throw new Error(`unexpected queue entry: ${name}`);
       }
       const actionId = name.slice(0, -'.json'.length);
-      const record = await readRequestRecord(this.options.queueDir, actionId, this.fsApi);
+      const snapshot = await readRequestRecordSnapshot(
+        this.options.queueDir,
+        actionId,
+        this.fsApi,
+      );
+      const { record } = snapshot;
       if (sequences.has(record.enqueue_sequence)) {
         throw new Error(`duplicate enqueue sequence: ${record.enqueue_sequence}`);
       }
       sequences.add(record.enqueue_sequence);
-      records.push(record);
+      records.push(snapshot);
     }
-    return records.sort((left, right) => left.enqueue_sequence - right.enqueue_sequence);
+    return records.sort(
+      (left, right) => left.record.enqueue_sequence - right.record.enqueue_sequence,
+    );
   }
 
   async #cleanStaleTemporaryFiles() {

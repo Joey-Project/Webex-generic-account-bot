@@ -12,8 +12,10 @@ import {
   ConfigPullWorker,
   DEFAULTS,
   MAX_REQUEST_BYTES,
+  PREPARE_CLOSE_GRACE_MS,
   PREPARE_COMMAND,
   PREPARE_ENV,
+  PREPARE_TERMINATION_GRACE_MS,
   WorkerFailure,
   actionIdForMessageId,
   parsePreparedResult,
@@ -398,6 +400,123 @@ describe('config pull worker socket protocol', () => {
 
     assert.equal(response.action_id, actionId);
     assert.equal((await readActionState(layout.stateDir, actionId)).status, 'succeeded');
+  });
+
+  it('skips a stale drain snapshot when request publication fsync fails', async (context) => {
+    const layout = await createLayout(context);
+    const staleRequest = {
+      version: 1,
+      message_id: 'stale-publication-snapshot',
+      action: 'pull',
+    };
+    const liveRequest = {
+      version: 1,
+      message_id: 'live-request-during-stale-publication',
+      action: 'pull',
+    };
+    const staleActionId = actionIdForMessageId(staleRequest.message_id);
+    const liveActionId = actionIdForMessageId(liveRequest.message_id);
+    const staleRecordFile = path.join(layout.queueDir, `${staleActionId}.json`);
+    const publicationSyncBlocked = deferred();
+    const releasePublicationSync = deferred();
+    const liveStateWriteBlocked = deferred();
+    const releaseLiveStateWrite = deferred();
+    const staleSnapshotOpened = deferred();
+    let observeRace = false;
+    let failNextQueueSync = false;
+    let blockNextQueueRead = true;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'readdir') {
+          return async (directory, options) => {
+            if (observeRace && blockNextQueueRead && directory === layout.queueDir) {
+              blockNextQueueRead = false;
+              await liveStateWriteBlocked.promise;
+            }
+            return target.readdir(directory, options);
+          };
+        }
+        if (property === 'open') {
+          return async (file, flags, ...rest) => {
+            if (
+              observeRace
+              && flags === 'wx'
+              && path.dirname(file) === layout.stateDir
+              && path.basename(file).startsWith(`.atomic-${liveActionId}.json-`)
+            ) {
+              liveStateWriteBlocked.resolve();
+              await releaseLiveStateWrite.promise;
+            }
+            const handle = await target.open(file, flags, ...rest);
+            if (observeRace && file === staleRecordFile && typeof flags === 'number') {
+              staleSnapshotOpened.resolve();
+            }
+            if (file !== layout.queueDir || flags !== 'r' || !failNextQueueSync) {
+              return handle;
+            }
+            failNextQueueSync = false;
+            return new Proxy(handle, {
+              get(handleTarget, handleProperty) {
+                if (handleProperty === 'sync') {
+                  return async () => {
+                    publicationSyncBlocked.resolve();
+                    await releasePublicationSync.promise;
+                    const error = new Error('injected publication directory fsync failure');
+                    error.code = 'EIO';
+                    throw error;
+                  };
+                }
+                const value = Reflect.get(handleTarget, handleProperty, handleTarget);
+                return typeof value === 'function' ? value.bind(handleTarget) : value;
+              },
+            });
+          };
+        }
+        return target[property];
+      },
+    });
+    const preparedActionIds = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      prepareRunner: async ({ actionId }) => {
+        preparedActionIds.push(actionId);
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => {
+      releasePublicationSync.resolve();
+      releaseLiveStateWrite.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+    observeRace = true;
+    failNextQueueSync = true;
+
+    const publicationFailure = assert.rejects(
+      publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: staleRequest,
+        enqueueSequence: 2,
+        fsApi,
+      }),
+      /injected publication directory fsync failure/,
+    );
+    await publicationSyncBlocked.promise;
+    const liveResponsePromise = sendRequest(layout.socketPath, liveRequest);
+    await liveStateWriteBlocked.promise;
+    await staleSnapshotOpened.promise;
+
+    releasePublicationSync.resolve();
+    await publicationFailure;
+    releaseLiveStateWrite.resolve();
+    const liveResponse = await liveResponsePromise;
+    await worker.waitForIdle();
+
+    assert.equal(liveResponse.action_id, liveActionId);
+    assert.equal(await readActionState(layout.stateDir, staleActionId), null);
+    assert.deepEqual(preparedActionIds, [liveActionId]);
+    assert.deepEqual(await fs.readdir(layout.queueDir), [`${liveActionId}.json`]);
   });
 
   it('orders live and replayed public status by sequence when the clock moves backwards', async (context) => {
@@ -1274,6 +1393,50 @@ describe('config pull worker execution boundary', () => {
     );
     assert.equal(killed, true);
   });
+
+  it('lets deploy-config finish descendant cleanup before outer SIGKILL', async (context) => {
+    const deploySource = await fs.readFile(
+      new URL('../scripts/deploy-config.mjs', import.meta.url),
+      'utf8',
+    );
+    const innerTerminationGraceMs = sourceIntegerConstant(
+      deploySource,
+      'CHILD_TERMINATION_GRACE_MS',
+    );
+    const innerCloseGraceMs = sourceIntegerConstant(
+      deploySource,
+      'CHILD_CLOSE_GRACE_MS',
+    );
+    const innerCleanupGraceMs = innerTerminationGraceMs + innerCloseGraceMs;
+    assert.ok(PREPARE_TERMINATION_GRACE_MS > innerCleanupGraceMs);
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const signals = [];
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 4_000_002;
+    child.kill = () => {
+      throw new Error('process-group signaling should succeed');
+    };
+    const result = runPrepareCommand({
+      actionId: PREPARE_ACTION_ID,
+      spawnImpl: () => child,
+      timeoutMs: 100,
+      killImpl: (_pid, signal) => signals.push(signal),
+    });
+
+    context.mock.timers.tick(100);
+    assert.deepEqual(signals, ['SIGTERM']);
+    context.mock.timers.tick(innerCleanupGraceMs);
+    assert.deepEqual(signals, ['SIGTERM']);
+
+    child.emit('close', null, 'SIGTERM');
+    await assert.rejects(
+      result,
+      (error) => error instanceof WorkerFailure && error.code === 'prepare_timeout',
+    );
+    assert.deepEqual(signals, ['SIGTERM']);
+  });
 });
 
 describe('config pull worker durable files', () => {
@@ -1441,6 +1604,8 @@ describe('config pull worker systemd boundary', () => {
       /^ExecStart=\/usr\/bin\/node \/opt\/webex-generic-account-bot\/code\/scripts\/config-pull-worker\.mjs$/m,
     );
     assert.match(unit, /^Restart=on-failure$/m);
+    const timeoutStopMs = Number(unit.match(/^TimeoutStopSec=([0-9]+)s$/m)?.[1]) * 1_000;
+    assert.ok(PREPARE_TERMINATION_GRACE_MS + PREPARE_CLOSE_GRACE_MS < timeoutStopMs);
     assert.doesNotMatch(unit, /^StateDirectory(?:Mode)?=/m);
     assert.deepEqual(unitDirectiveValues(unit, 'ReadOnlyPaths'), [
       '/run/webex-config-deploy',
@@ -1602,6 +1767,12 @@ function unitDirectiveValues(unit, directive) {
     .split('\n')
     .filter((line) => line.startsWith(`${directive}=`))
     .map((line) => line.slice(directive.length + 1));
+}
+
+function sourceIntegerConstant(source, name) {
+  const match = source.match(new RegExp(`^const ${name} = ([0-9_]+);$`, 'm'));
+  assert(match, `missing integer constant ${name}`);
+  return Number(match[1].replaceAll('_', ''));
 }
 
 function deferred() {
