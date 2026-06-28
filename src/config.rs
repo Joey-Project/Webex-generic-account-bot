@@ -101,12 +101,21 @@ impl BotConfig {
                 .validate()
                 .map_err(|error| anyhow!("invalid {name}: {error}"))?;
         }
-        if self.uses_ephemeral_linux_user()
-            && self.server.max_concurrent_requests > LAUNCHER_MAX_CONNECTIONS
-        {
-            return Err(anyhow!(
-                "server.max_concurrent_requests must not exceed the fixed launcher connection limit ({LAUNCHER_MAX_CONNECTIONS}) when ephemeral-linux-user is enabled"
-            ));
+        if self.uses_ephemeral_linux_user() {
+            if let Some((name, _)) = self
+                .codex_configs()
+                .into_iter()
+                .find(|(_, codex)| codex.isolation.mode == IsolationMode::CurrentUser)
+            {
+                return Err(anyhow!(
+                    "ephemeral-linux-user cannot be mixed with current-user execution ({name})"
+                ));
+            }
+            if self.server.max_concurrent_requests > LAUNCHER_MAX_CONNECTIONS {
+                return Err(anyhow!(
+                    "server.max_concurrent_requests must not exceed the fixed launcher connection limit ({LAUNCHER_MAX_CONNECTIONS}) when ephemeral-linux-user is enabled"
+                ));
+            }
         }
         self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
@@ -1184,7 +1193,7 @@ allow_all_senders = true
     }
 
     #[test]
-    fn accepts_room_ephemeral_user_during_config_validation() {
+    fn rejects_room_ephemeral_user_with_global_current_user() {
         let config: BotConfig = toml::from_str(
             r#"
 [server]
@@ -1215,7 +1224,50 @@ trusted_prompt_authors = false
             IsolationMode::EphemeralLinuxUser
         );
 
-        config.validate().unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be mixed with current-user")
+        );
+        assert!(config.uses_ephemeral_linux_user());
+    }
+
+    #[test]
+    fn rejects_room_current_user_with_global_ephemeral_user() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 3000
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.codex.isolation]
+mode = "current-user"
+trusted_prompt_authors = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be mixed with current-user")
+        );
         assert!(config.uses_ephemeral_linux_user());
     }
 

@@ -56,7 +56,8 @@ superseded_by:
   `ephemeral-linux-user` dispatcher path. It grants no bot launcher group or
   pending-root path while current-user children could inherit them; PR 4c2
   owns that access as part of atomic ephemeral activation. The bot never
-  receives the sealed-input group.
+  receives the sealed-input group. Config validation rejects mixed
+  current-user and ephemeral effective runner configurations.
   Static config accepts only the fixed launcher contract, while
   `--check-config` and live startup remain fail closed without a valid
   boot-scoped activation receipt. PR 4c2 still owns the production canaries and

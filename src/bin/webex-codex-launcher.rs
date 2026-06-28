@@ -220,6 +220,7 @@ enum ClientSocketState {
 #[cfg(target_os = "linux")]
 fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState> {
     let mut byte = 0_u8;
+    let mut control = ControlBuffer([0_u8; CONTROL_BUFFER_BYTES]);
     let mut iovec = libc::iovec {
         iov_base: (&mut byte as *mut u8).cast(),
         iov_len: 1,
@@ -227,11 +228,25 @@ fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState>
     let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
-    // SAFETY: message references initialized byte and iovec storage for this call.
-    let received =
-        unsafe { libc::recvmsg(socket_fd, &mut message, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen = control.0.len();
+    // SAFETY: message references initialized byte, control, and iovec storage for this call.
+    let received = unsafe {
+        libc::recvmsg(
+            socket_fd,
+            &mut message,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
     if received == 0 {
-        if message.msg_flags & libc::MSG_EOR != 0 {
+        // A real zero-length packet still carries SCM_CREDENTIALS on this SO_PASSCRED
+        // socket. EOF carries no packet metadata and must also report read-side HUP.
+        // MSG_EOR is not reliable for distinguishing an empty SEQPACKET record.
+        let has_packet_metadata = unsafe { !libc::CMSG_FIRSTHDR(&message).is_null() };
+        if has_packet_metadata
+            || message.msg_flags & libc::MSG_CTRUNC != 0
+            || !client_read_side_closed(socket_fd)?
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "launcher client sent an empty extra request packet",
@@ -251,6 +266,30 @@ fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState>
     } else {
         Err(error)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn client_read_side_closed(socket_fd: RawFd) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: socket_fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: descriptor points to one initialized pollfd for this nonblocking probe.
+    let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    let closed = descriptor.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0;
+    if descriptor.revents & libc::POLLERR != 0 && !closed {
+        return Err(std::io::Error::other(
+            "launcher client socket reported a read error",
+        ));
+    }
+    Ok(closed)
 }
 
 #[cfg(target_os = "linux")]
@@ -581,6 +620,7 @@ mod tests {
             unsafe { libc::send(writer.as_raw_fd(), std::ptr::null(), 0, libc::MSG_NOSIGNAL,) },
             0
         );
+        drop(writer);
 
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

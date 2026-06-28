@@ -43,6 +43,8 @@
 - Runner PR 4c1c wires the fixed launcher client, explicit evidence staging,
   and receipt-gated runner dispatch, but grants no bot socket/pending-root
   access while production still uses current-user execution.
+  Configuration validation rejects mixed current-user and ephemeral backends
+  before the later launcher permission can be activated.
   Cooperative work deadlines and launcher-socket disconnect cancellation
   clean inode-verified ready and consumed trees before returning. Independent
   process watchdogs hard-stop stuck staging and preparation syscalls before
