@@ -211,16 +211,24 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
                 None => ConfigStatusSnapshot::unknown(),
             },
         };
-        snapshot.config_action = match read_optional_bounded_file(
+        let config_action = read_optional_bounded_file(
             &self.action_status_file,
             CONFIG_ACTION_STATUS_MAX_BYTES,
             Some(0o644),
             false,
         )
-        .await?
-        {
-            Some(contents) => Some(parse_config_action_status(&contents)?),
-            None => None,
+        .await
+        .and_then(|contents| {
+            contents
+                .map(|contents| parse_config_action_status(&contents))
+                .transpose()
+        });
+        snapshot.config_action = match config_action {
+            Ok(config_action) => config_action,
+            Err(_) => {
+                tracing::warn!("ignoring unavailable public config action status");
+                None
+            }
         };
         Ok(snapshot)
     }
@@ -982,7 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn succeeded_config_action_requires_a_revision() {
+    async fn succeeded_config_action_requires_a_revision_when_present() {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
@@ -1015,7 +1023,9 @@ mod tests {
             serde_json::to_vec(&invalid).unwrap(),
         )
         .unwrap();
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.config_action, None);
         invalid["state"] = Value::String("failed".to_owned());
         invalid["config_revision"] =
             Value::String("abcdef0123456789abcdef0123456789abcdef01".to_owned());
@@ -1024,17 +1034,28 @@ mod tests {
             serde_json::to_vec(&invalid).unwrap(),
         )
         .unwrap();
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.config_action, None);
         std_fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn public_config_action_status_rejects_bad_mode_schema_and_symlink() {
+    async fn invalid_public_config_action_status_preserves_deployment_metadata() {
         use std::os::unix::fs::symlink;
 
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
         std_fs::write(
             &provider.action_status_file,
             serde_json::to_vec(&action_status("running", None)).unwrap(),
@@ -1045,7 +1066,13 @@ mod tests {
             std_fs::Permissions::from_mode(0o666),
         )
         .unwrap();
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
 
         std_fs::set_permissions(
             &provider.action_status_file,
@@ -1053,7 +1080,13 @@ mod tests {
         )
         .unwrap();
         std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
 
         std_fs::remove_file(&provider.action_status_file).unwrap();
         let target = root.join("target.json");
@@ -1063,7 +1096,54 @@ mod tests {
         )
         .unwrap();
         symlink(target, &provider.action_status_file).unwrap();
-        assert!(provider.status().await.is_err());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_public_config_action_status_preserves_recovery_required_transaction() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        write_transaction(
+            &provider,
+            &serde_json::to_vec(&deployment_transaction()).unwrap(),
+            0o600,
+        );
+        std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "recovery_required");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            snapshot.transaction_phase.as_deref(),
+            Some("service_transition_started")
+        );
+        assert_eq!(snapshot.config_action, None);
         std_fs::remove_dir_all(root).unwrap();
     }
 

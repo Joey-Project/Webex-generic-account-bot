@@ -186,6 +186,75 @@ describe('config pull worker socket protocol', () => {
     assert.equal(stagedMetadata.request_id, actionIds.at(-1));
   });
 
+  it('keeps newer queued status visible when an older action finishes at the same time', async (context) => {
+    const layout = await createLayout(context);
+    const firstRequest = { version: 1, message_id: 'same-time-first', action: 'pull' };
+    const secondRequest = { version: 1, message_id: 'same-time-second', action: 'pull' };
+    const firstActionId = actionIdForMessageId(firstRequest.message_id);
+    const secondActionId = actionIdForMessageId(secondRequest.message_id);
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const secondRunningWriteBlocked = deferred();
+    const releaseSecondRunningWrite = deferred();
+    let secondStateWrites = 0;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'open') return target[property];
+        return async (file, flags, ...rest) => {
+          if (
+            flags === 'wx'
+            && path.dirname(file) === layout.stateDir
+            && path.basename(file).startsWith(`.atomic-${secondActionId}.json-`)
+          ) {
+            secondStateWrites += 1;
+            if (secondStateWrites === 2) {
+              secondRunningWriteBlocked.resolve();
+              await releaseSecondRunningWrite.promise;
+            }
+          }
+          return target.open(file, flags, ...rest);
+        };
+      },
+    });
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      now: () => new Date('2026-06-27T13:00:00.000Z'),
+      prepareRunner: async ({ actionId }) => {
+        if (actionId === firstActionId) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => {
+      releaseFirst.resolve();
+      releaseSecondRunningWrite.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+
+    await sendRequest(layout.socketPath, firstRequest);
+    await firstStarted.promise;
+    await sendRequest(layout.socketPath, secondRequest);
+    releaseFirst.resolve();
+    await secondRunningWriteBlocked.promise;
+
+    const publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
+    const firstState = await readActionState(layout.stateDir, firstActionId);
+    const secondState = await readActionState(layout.stateDir, secondActionId);
+    assert.equal(publicStatus.action_id, secondActionId);
+    assert.equal(publicStatus.state, 'queued');
+    assert.equal(firstState.enqueue_sequence, 1);
+    assert.equal(firstState.status, 'succeeded');
+    assert.equal(secondState.enqueue_sequence, 2);
+    assert.equal(secondState.status, 'queued');
+
+    releaseSecondRunningWrite.resolve();
+    await worker.waitForIdle();
+  });
+
   it('ignores a trusted request temporary file exposed during a live drain', async (context) => {
     const layout = await createLayout(context);
     const tempExposed = deferred();
@@ -331,12 +400,12 @@ describe('config pull worker socket protocol', () => {
     assert.equal((await readActionState(layout.stateDir, actionId)).status, 'succeeded');
   });
 
-  it('does not regress public status when an older action is replayed out of order', async (context) => {
+  it('orders live and replayed public status by sequence when the clock moves backwards', async (context) => {
     let timestamp = Date.parse('2026-06-27T13:00:00.000Z');
     const fixture = await startWorker(context, {
       now: () => {
         const current = new Date(timestamp);
-        timestamp += 1_000;
+        timestamp -= 1_000;
         return current;
       },
       prepareRunner: async () => PREPARED_PROJECTION,
@@ -489,6 +558,99 @@ describe('config pull worker recovery', () => {
     assert.equal((await readActionState(layout.stateDir, publication.actionId)).status, 'succeeded');
   });
 
+  it('cleans and fsyncs stale public status temporaries in safe transitional modes', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const temporaryNames = [
+      '.atomic-public-status.json-1234-12345678-1234-4123-8123-123456789abc.tmp',
+      '.atomic-public-status.json-5678-abcdefab-cdef-4abc-8def-abcdefabcdef.tmp',
+    ];
+    const temporaryPaths = temporaryNames.map((name) => path.join(layout.stateRoot, name));
+    await fs.writeFile(temporaryPaths[0], 'partial\n', { mode: 0o600 });
+    await fs.writeFile(temporaryPaths[1], 'complete\n', { mode: 0o644 });
+    await fs.chmod(temporaryPaths[0], 0o600);
+    await fs.chmod(temporaryPaths[1], 0o644);
+    const events = [];
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'unlink') {
+          return async (file) => {
+            if (temporaryPaths.includes(file)) events.push(path.basename(file));
+            return target.unlink(file);
+          };
+        }
+        if (property !== 'open') return target[property];
+        return async (file, flags, ...rest) => {
+          const handle = await target.open(file, flags, ...rest);
+          if (file !== layout.stateRoot || flags !== 'r') return handle;
+          return new Proxy(handle, {
+            get(handleTarget, handleProperty) {
+              if (handleProperty === 'sync') {
+                return async () => {
+                  events.push('state-root-sync');
+                  return handleTarget.sync();
+                };
+              }
+              const value = Reflect.get(handleTarget, handleProperty, handleTarget);
+              return typeof value === 'function' ? value.bind(handleTarget) : value;
+            },
+          });
+        };
+      },
+    });
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => worker.stop());
+
+    await worker.start();
+
+    assert.deepEqual(events.slice(0, -1).sort(), [...temporaryNames].sort());
+    assert.equal(events.at(-1), 'state-root-sync');
+    await Promise.all(temporaryPaths.map(
+      (file) => assert.rejects(fs.stat(file), { code: 'ENOENT' }),
+    ));
+  });
+
+  it('rejects suspicious public status temporary entries', async (context) => {
+    await context.test('malformed prefixed name', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      await fs.writeFile(
+        path.join(layout.stateRoot, '.atomic-public-status.json-1234-not-a-uuid.tmp'),
+        'unexpected\n',
+        { mode: 0o600 },
+      );
+      const worker = new ConfigPullWorker({
+        ...layout,
+        prepareRunner: async () => PREPARED_PROJECTION,
+      });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /unexpected temporary entry/);
+    });
+
+    await context.test('unsafe mode', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      const temporary = path.join(
+        layout.stateRoot,
+        '.atomic-public-status.json-1234-12345678-1234-4123-8123-123456789abc.tmp',
+      );
+      await fs.writeFile(temporary, 'unexpected\n', { mode: 0o600 });
+      await fs.chmod(temporary, 0o666);
+      const worker = new ConfigPullWorker({
+        ...layout,
+        prepareRunner: async () => PREPARED_PROJECTION,
+      });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /record metadata is not trusted/);
+    });
+  });
+
   it('recovers pending requests in acceptance order and resumes at durable max plus one', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
@@ -546,6 +708,56 @@ describe('config pull worker recovery', () => {
     assert.equal(stagedMetadata.request_id, afterRestart.action_id);
   });
 
+  it('recovers the highest sequence across equal timestamps and a backwards clock', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const timestamps = [
+      '2026-06-27T14:00:00.000Z',
+      '2026-06-27T13:00:00.000Z',
+      '2026-06-27T13:00:00.000Z',
+    ];
+    const publications = [];
+    for (const [index, timestamp] of timestamps.entries()) {
+      const publication = await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: {
+          version: 1,
+          message_id: `restart-clock-${index + 1}`,
+          action: 'pull',
+        },
+        enqueueSequence: index + 1,
+      });
+      publications.push(publication);
+      await writeActionState({
+        stateDir: layout.stateDir,
+        state: actionState(
+          publication.actionId,
+          index + 1,
+          'failed',
+          timestamp,
+          { failureCode: 'prepare_failed' },
+        ),
+      });
+    }
+    let executions = 0;
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => {
+        executions += 1;
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => worker.stop());
+
+    await worker.start();
+    await worker.waitForIdle();
+
+    const publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
+    assert.equal(executions, 0);
+    assert.equal(publicStatus.action_id, publications.at(-1).actionId);
+    assert.equal(publicStatus.state, 'failed');
+  });
+
   it('replays a running request after restart', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
@@ -557,7 +769,7 @@ describe('config pull worker recovery', () => {
     });
     await writeActionState({
       stateDir: layout.stateDir,
-      state: actionState(publication.actionId, 'running', '2026-06-27T12:01:00.000Z'),
+      state: actionState(publication.actionId, 1, 'running', '2026-06-27T12:01:00.000Z'),
     });
     let executions = 0;
     const worker = new ConfigPullWorker({
@@ -589,7 +801,7 @@ describe('config pull worker recovery', () => {
     });
     await writeActionState({
       stateDir: layout.stateDir,
-      state: actionState(publication.actionId, 'running', '2026-06-27T12:01:30.000Z'),
+      state: actionState(publication.actionId, 1, 'running', '2026-06-27T12:01:30.000Z'),
     });
     await fs.writeFile(layout.stagedConfigFile, STAGED_CONFIG, { mode: 0o600 });
     await fs.writeFile(
@@ -659,7 +871,7 @@ describe('config pull worker recovery', () => {
         });
         await writeActionState({
           stateDir: layout.stateDir,
-          state: actionState(publication.actionId, 'running', '2026-06-27T12:01:35.000Z'),
+          state: actionState(publication.actionId, 1, 'running', '2026-06-27T12:01:35.000Z'),
         });
         await fs.writeFile(layout.stagedConfigFile, scenario.contents, { mode: scenario.mode });
         await fs.writeFile(
@@ -706,7 +918,7 @@ describe('config pull worker recovery', () => {
     });
     await writeActionState({
       stateDir: layout.stateDir,
-      state: actionState(publication.actionId, 'running', '2026-06-27T12:01:45.000Z'),
+      state: actionState(publication.actionId, 1, 'running', '2026-06-27T12:01:45.000Z'),
     });
     await fs.writeFile(
       layout.stagedMetadataFile,
@@ -747,6 +959,7 @@ describe('config pull worker recovery', () => {
       stateDir: layout.stateDir,
       state: actionState(
         succeeded.actionId,
+        1,
         'succeeded',
         '2026-06-27T12:02:00.000Z',
         PREPARED_PROJECTION,
@@ -756,6 +969,7 @@ describe('config pull worker recovery', () => {
       stateDir: layout.stateDir,
       state: actionState(
         failed.actionId,
+        2,
         'failed',
         '2026-06-27T12:03:00.000Z',
         { failureCode: 'prepare_failed' },
@@ -869,6 +1083,61 @@ describe('config pull worker recovery', () => {
       subcontext.after(async () => worker.stop());
 
       await assert.rejects(worker.start(), /enqueue sequence is invalid/);
+    });
+
+    await context.test('action state without enqueue sequence', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      const publication = await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: 'state-without-sequence', action: 'pull' },
+        enqueueSequence: 1,
+      });
+      const state = actionState(
+        publication.actionId,
+        1,
+        'queued',
+        '2026-06-27T12:04:00.000Z',
+      );
+      delete state.enqueue_sequence;
+      await fs.writeFile(
+        path.join(layout.stateDir, `${publication.actionId}.json`),
+        `${JSON.stringify(state)}\n`,
+        { mode: 0o600 },
+      );
+      const worker = new ConfigPullWorker({
+        ...layout,
+        prepareRunner: async () => PREPARED_PROJECTION,
+      });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /action state contains unexpected fields/);
+    });
+
+    await context.test('action state sequence mismatch', async (subcontext) => {
+      const layout = await createLayout(subcontext);
+      await prepareStorage(layout);
+      const publication = await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: 'state-sequence-mismatch', action: 'pull' },
+        enqueueSequence: 1,
+      });
+      await writeActionState({
+        stateDir: layout.stateDir,
+        state: actionState(
+          publication.actionId,
+          2,
+          'queued',
+          '2026-06-27T12:04:00.000Z',
+        ),
+      });
+      const worker = new ConfigPullWorker({
+        ...layout,
+        prepareRunner: async () => PREPARED_PROJECTION,
+      });
+      subcontext.after(async () => worker.stop());
+
+      await assert.rejects(worker.start(), /state enqueue sequence mismatch/);
     });
 
     await context.test('duplicate enqueue sequence', async (subcontext) => {
@@ -1308,11 +1577,12 @@ async function sendRaw(socketPath, payload) {
   });
 }
 
-function actionState(actionId, status, updatedAt, details = {}) {
+function actionState(actionId, enqueueSequence, status, updatedAt, details = {}) {
   return {
     version: 1,
     action_id: actionId,
     action: 'pull',
+    enqueue_sequence: enqueueSequence,
     status,
     config_revision: details.configRevision ?? null,
     config_sha256: details.configSha256 ?? null,

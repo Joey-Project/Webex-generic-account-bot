@@ -68,6 +68,9 @@ const REQUEST_TEMPORARY_PATTERN = new RegExp(
 const STATE_TEMPORARY_PATTERN = new RegExp(
   `^\\.atomic-([0-9a-f]{64})\\.json-([1-9][0-9]*)-(${UUID_PATTERN})\\.tmp$`,
 );
+const PUBLIC_STATUS_TEMPORARY_PATTERN = new RegExp(
+  `^\\.atomic-public-status\\.json-([1-9][0-9]*)-(${UUID_PATTERN})\\.tmp$`,
+);
 const TERMINAL_STATES = new Set(['succeeded', 'failed']);
 const ACTION_STATES = new Set(['queued', 'running', ...TERMINAL_STATES]);
 const STATE_PROGRESS = Object.freeze({ queued: 0, running: 1, failed: 2, succeeded: 2 });
@@ -99,6 +102,7 @@ const STATE_KEYS = [
   'action_id',
   'config_revision',
   'config_sha256',
+  'enqueue_sequence',
   'failure_code',
   'prepared_at',
   'status',
@@ -678,9 +682,10 @@ export class ConfigPullWorker {
       throw new Error(`state exists without an immutable request: ${publication.actionId}`);
     }
     if (!existingState) {
-      await this.#persistState(this.#makeState(publication.actionId, 'queued'));
+      await this.#persistState(this.#makeState(publication.record, 'queued'));
     } else {
-      await this.#publishPublicStatus(existingState, { replay: true });
+      assertStateMatchesRecord(existingState, publication.record);
+      await this.#publishPublicStatus(existingState);
     }
     return publication;
   }
@@ -694,9 +699,12 @@ export class ConfigPullWorker {
     for (const record of records) {
       let state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
       if (!state) {
-        state = this.#makeState(record.action_id, 'queued');
+        state = this.#makeState(record, 'queued');
         await writeActionState({ stateDir: this.options.stateDir, state, fsApi: this.fsApi });
-      } else if (state.status === 'running') {
+      } else {
+        assertStateMatchesRecord(state, record);
+      }
+      if (state.status === 'running') {
         let prepared = null;
         try {
           prepared = await readDurablePreparedResultForAction({
@@ -707,11 +715,11 @@ export class ConfigPullWorker {
           });
         } catch (_) {}
         state = prepared
-          ? this.#makeState(record.action_id, 'succeeded', prepared)
-          : this.#makeState(record.action_id, 'queued');
+          ? this.#makeState(record, 'succeeded', prepared)
+          : this.#makeState(record, 'queued');
         await writeActionState({ stateDir: this.options.stateDir, state, fsApi: this.fsApi });
       }
-      if (!newestState || state.updated_at > newestState.updated_at) newestState = state;
+      if (!newestState || shouldPublishPublicState(state, newestState)) newestState = state;
     }
     if (newestState) {
       await this.#publishPublicStatus(newestState);
@@ -744,8 +752,10 @@ export class ConfigPullWorker {
         state = await readActionState(this.options.stateDir, record.action_id, this.fsApi);
       }
       if (!state) {
-        state = this.#makeState(record.action_id, 'queued');
+        state = this.#makeState(record, 'queued');
         await this.#persistState(state);
+      } else {
+        assertStateMatchesRecord(state, record);
       }
       if (TERMINAL_STATES.has(state.status)) continue;
       if (state.status !== 'queued') {
@@ -756,7 +766,7 @@ export class ConfigPullWorker {
   }
 
   async #processRecord(record) {
-    await this.#persistState(this.#makeState(record.action_id, 'running'));
+    await this.#persistState(this.#makeState(record, 'running'));
     let prepared;
     try {
       prepared = await this.prepareRunner({
@@ -767,10 +777,10 @@ export class ConfigPullWorker {
     } catch (error) {
       if (this.stopping || this.abortController.signal.aborted) return;
       const failureCode = error instanceof WorkerFailure ? error.code : 'prepare_failed';
-      await this.#persistState(this.#makeState(record.action_id, 'failed', { failureCode }));
+      await this.#persistState(this.#makeState(record, 'failed', { failureCode }));
       return;
     }
-    await this.#persistState(this.#makeState(record.action_id, 'succeeded', prepared));
+    await this.#persistState(this.#makeState(record, 'succeeded', prepared));
   }
 
   async #persistState(state) {
@@ -778,10 +788,10 @@ export class ConfigPullWorker {
     await this.#publishPublicStatus(state);
   }
 
-  #publishPublicStatus(state, { replay = false } = {}) {
+  #publishPublicStatus(state) {
     validateActionState(state);
     const operation = this.publicStatusTail.then(async () => {
-      if (!shouldPublishPublicState(state, this.latestPublicState, replay)) return false;
+      if (!shouldPublishPublicState(state, this.latestPublicState)) return false;
       await writePublicStatus({
         publicStatusFile: this.options.publicStatusFile,
         state,
@@ -794,13 +804,14 @@ export class ConfigPullWorker {
     return operation;
   }
 
-  #makeState(actionId, status, details = {}) {
+  #makeState(record, status, details = {}) {
     const timestamp = this.now();
     const updatedAt = timestamp instanceof Date ? timestamp.toISOString() : String(timestamp);
     const state = {
       version: 1,
-      action_id: actionId,
+      action_id: record.action_id,
       action: 'pull',
+      enqueue_sequence: record.enqueue_sequence,
       status,
       config_revision: details.configRevision ?? null,
       config_sha256: details.configSha256 ?? null,
@@ -836,9 +847,10 @@ export class ConfigPullWorker {
   }
 
   async #cleanStaleTemporaryFiles() {
-    for (const [directory, pattern] of [
-      [this.options.queueDir, REQUEST_TEMPORARY_PATTERN],
-      [this.options.stateDir, STATE_TEMPORARY_PATTERN],
+    for (const [directory, pattern, expectedMode] of [
+      [this.options.stateRoot, PUBLIC_STATUS_TEMPORARY_PATTERN, PUBLIC_FILE_MODE],
+      [this.options.queueDir, REQUEST_TEMPORARY_PATTERN, PRIVATE_FILE_MODE],
+      [this.options.stateDir, STATE_TEMPORARY_PATTERN, PRIVATE_FILE_MODE],
     ]) {
       const entries = await this.fsApi.readdir(directory, { withFileTypes: true });
       let changed = false;
@@ -851,7 +863,7 @@ export class ConfigPullWorker {
         }
         const temporary = path.join(directory, entry.name);
         const stat = await this.fsApi.lstat(temporary);
-        assertOwnedRegularFile(stat, temporary, PRIVATE_FILE_MODE);
+        assertOwnedRegularTemporaryFile(stat, temporary, expectedMode);
         await this.fsApi.unlink(temporary);
         changed = true;
       }
@@ -862,7 +874,7 @@ export class ConfigPullWorker {
   async #assertTrustedTemporaryFile(temporary) {
     try {
       const stat = await this.fsApi.lstat(temporary);
-      assertOwnedRegularFile(stat, temporary, PRIVATE_FILE_MODE);
+      assertOwnedRegularTemporaryFile(stat, temporary, PRIVATE_FILE_MODE);
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
@@ -1221,6 +1233,7 @@ function validateRequestRecord(record, expectedActionId) {
 function validateActionState(state, expectedActionId = null) {
   assertExactObject(state, STATE_KEYS, 'action state');
   validateActionId(state.action_id);
+  validateEnqueueSequence(state.enqueue_sequence);
   if (expectedActionId && state.action_id !== expectedActionId) {
     throw new Error(`state identity mismatch: ${expectedActionId}`);
   }
@@ -1366,6 +1379,19 @@ function assertOwnedRegularFile(stat, file, expectedMode) {
   }
 }
 
+function assertOwnedRegularTemporaryFile(stat, file, finalMode) {
+  const actualMode = stat.mode & 0o7777;
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.uid !== currentUid(stat.uid)
+    || stat.gid !== currentGid(stat.gid)
+    || (actualMode & ~finalMode) !== 0
+  ) {
+    throw new Error(`record metadata is not trusted: ${file}`);
+  }
+}
+
 function assertSocketMetadata(stat, socketPath) {
   if (
     !stat.isSocket()
@@ -1415,13 +1441,23 @@ async function assertPublishedFileIdentity(file, record, fsApi) {
   }
 }
 
-function shouldPublishPublicState(candidate, current, replay) {
+function assertStateMatchesRecord(state, record) {
+  if (
+    state.action_id !== record.action_id
+    || state.enqueue_sequence !== record.enqueue_sequence
+  ) {
+    throw new Error(`state enqueue sequence mismatch: ${record.action_id}`);
+  }
+}
+
+function shouldPublishPublicState(candidate, current) {
   if (!current) return true;
-  const timestampOrder = candidate.updated_at.localeCompare(current.updated_at);
-  if (timestampOrder < 0) return false;
-  if (timestampOrder > 0) return true;
-  if (candidate.action_id !== current.action_id) return !replay;
-  return STATE_PROGRESS[candidate.status] >= STATE_PROGRESS[current.status];
+  if (candidate.enqueue_sequence < current.enqueue_sequence) return false;
+  if (candidate.enqueue_sequence > current.enqueue_sequence) return true;
+  if (candidate.action_id !== current.action_id) return false;
+  if (candidate.status === current.status) return true;
+  if (TERMINAL_STATES.has(current.status)) return false;
+  return STATE_PROGRESS[candidate.status] > STATE_PROGRESS[current.status];
 }
 
 function currentUid(fallback) {
