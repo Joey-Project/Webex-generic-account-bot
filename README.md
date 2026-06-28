@@ -490,12 +490,13 @@ chat-driven prompts. `codex.isolation.mode = "current-user"` remains only a
 trusted-prompt-author mode and requires
 `codex.isolation.trusted_prompt_authors = true`; it is not a secret-read
 boundary against allowed prompt authors. Static configuration validation
-accepts `ephemeral-linux-user` only for the fixed launcher contract.
-`--check-config` additionally requires a current boot-scoped activation
-receipt and verifies the fixed launcher socket installation. The live service
-also performs an authorised launcher preflight before reading Webex
-credentials or opening its listener. No failure falls back to current-user
-execution.
+validates the fixed `ephemeral-linux-user` contract but PR 4c1c then rejects
+activation before `--check-config` can reach host receipt or socket checks. PR
+4c2 must remove that final gate only while adding bot access; after that,
+`--check-config` requires a current boot-scoped activation receipt and verifies
+the fixed launcher socket installation. The live service then also performs an
+authorised launcher preflight before reading Webex credentials or opening its
+listener. No failure falls back to current-user execution.
 
 PR 4 is split into three fail-closed slices: PR 4a establishes the root-owned
 launcher protocol, caller authorisation, and systemd socket foundation; PR 4b
@@ -640,8 +641,13 @@ policy that permits the bundled `bwrap` to create its inner sandbox. These are
 not inferred from version strings alone. PR 4c2 must run the real image and
 permission canaries on the deployment host and mint the boot-scoped activation
 receipt before the wired runner can be selected by a deployable configuration.
-Without that receipt, `--check-config`, launcher preflight, and execute requests
-all fail closed. If any canary fails, `ephemeral-linux-user` remains
+Those executable canaries must prove that the Codex main process can write the
+bounded final message, tool subprocesses cannot read the auth credential, main
+home, or final output, and launcher stdout contains only the final message.
+In PR 4c1c, config validation rejects activation before receipt or socket
+preflight. After PR 4c2 atomically removes that gate, a missing receipt makes
+`--check-config`, launcher preflight, and execute requests fail closed. If any
+canary fails, `ephemeral-linux-user` remains
 undeployable with no current-user fallback. In particular, ordinary `exec`
 resets process dumpability: the transient unit denies the `@debug` syscall group, process-VM
 access calls, and core dumps, while PR 4c2 must still prove that the inner tool
@@ -662,7 +668,9 @@ verifier. The root-owned receipt path is
 parent directory and deliberately does not pre-create a receipt. A valid
 receipt binds the current boot ID, active runtime manifest, runtime image
 digest, fixed bot/launcher/runtime executable digests, Codex version, model,
-and the exact required production-canary result set. Unknown, missing, false,
+and the exact required production-canary result set. The active image's source
+manifest digest and `/usr/libexec/webex-codex-runtime` entry must match the
+fixed host runtime wrapper digest, size, source path, and mode. Unknown, missing, false,
 stale, oversized, linked, misowned, or modified-runtime receipts are rejected.
 
 This foundation does not call the verifier from config or execution paths and
@@ -761,9 +769,11 @@ Their own Codex credential remains available to the runtime wrapper and is
 denied to tool subprocesses by the fixed permission profile. Static config
 requires model `gpt-5.5`, no profile, `--ephemeral`, the fixed repository-check
 bypass, bounded timeout/output values, and
-`trusted_prompt_authors = false`. `--check-config` verifies the activation
-receipt and fixed root-owned socket metadata, while the live bot additionally
-performs the caller-authorised launcher preflight before Webex startup.
+`trusted_prompt_authors = false`. This slice then rejects activation, so its
+`--check-config` path does not claim host receipt/socket coverage. PR 4c2 must
+remove that gate only after deployment preflight verifies the activation
+receipt and fixed root-owned socket metadata; the live bot must additionally
+perform the caller-authorised launcher preflight before Webex startup.
 Source quarantine trees are removed immediately after sealing, and the
 inode-guarded consumed tree is removed when the transient run finishes, fails,
 times out, or is cancelled. Closing the bot's launcher socket cancels

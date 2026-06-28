@@ -46,6 +46,8 @@
   Configuration validation rejects mixed current-user and ephemeral backends
   and then rejects all ephemeral activation until PR 4c2 installs the required
   permissions in the same change that removes that final gate.
+  Consequently, 4c1c `--check-config` stops at the gate; receipt, socket, and
+  live image canary validation become reachable only in PR 4c2.
   Cooperative work deadlines and launcher-socket disconnect cancellation
   clean inode-verified ready and consumed trees before returning. Ready trees
   remain group-inaccessible until moved below the root-only consumed root.

@@ -30,6 +30,8 @@ pub const BOT_EXECUTABLE_PATH: &str =
 pub const LAUNCHER_EXECUTABLE_PATH: &str =
     "/opt/webex-generic-account-bot/bin/webex-codex-launcher";
 pub const RUNTIME_EXECUTABLE_PATH: &str = "/opt/webex-generic-account-bot/bin/webex-codex-runtime";
+pub const RUNTIME_SOURCE_MANIFEST_PATH: &str =
+    "/etc/webex-generic-account-bot/codex-runtime-sources.json";
 
 pub const ACTIVATION_SCHEMA_VERSION: u16 = 1;
 pub const SUPPORTED_CODEX_VERSION: &str = "0.142.3";
@@ -53,6 +55,7 @@ pub const REQUIRED_CANARIES: &[&str] = &[
 const RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 const BOOT_ID_MAX_BYTES: u64 = 128;
 const ACTIVE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+const RUNTIME_SOURCE_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const EXECUTABLE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const RUNTIME_IMAGE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
@@ -100,6 +103,7 @@ pub struct ActivationPaths {
     bot_executable: PathBuf,
     launcher_executable: PathBuf,
     runtime_executable: PathBuf,
+    runtime_source_manifest: PathBuf,
     trusted_root: PathBuf,
     expected_uid: u32,
     expected_gid: u32,
@@ -113,6 +117,7 @@ impl ActivationPaths {
         bot_executable: impl Into<PathBuf>,
         launcher_executable: impl Into<PathBuf>,
         runtime_executable: impl Into<PathBuf>,
+        runtime_source_manifest: impl Into<PathBuf>,
     ) -> Self {
         Self {
             receipt: receipt.into(),
@@ -121,6 +126,7 @@ impl ActivationPaths {
             bot_executable: bot_executable.into(),
             launcher_executable: launcher_executable.into(),
             runtime_executable: runtime_executable.into(),
+            runtime_source_manifest: runtime_source_manifest.into(),
             trusted_root: PathBuf::from("/"),
             expected_uid: 0,
             expected_gid: 0,
@@ -139,6 +145,7 @@ impl ActivationPaths {
             BOT_EXECUTABLE_PATH,
             LAUNCHER_EXECUTABLE_PATH,
             RUNTIME_EXECUTABLE_PATH,
+            RUNTIME_SOURCE_MANIFEST_PATH,
         )
     }
 
@@ -166,6 +173,10 @@ impl ActivationPaths {
         &self.runtime_executable
     }
 
+    pub fn runtime_source_manifest(&self) -> &Path {
+        &self.runtime_source_manifest
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     fn for_test(root: &Path) -> Self {
         let mut paths = Self::new(
@@ -175,6 +186,7 @@ impl ActivationPaths {
             root.join("webex-generic-account-bot"),
             root.join("webex-codex-launcher"),
             root.join("webex-codex-runtime"),
+            root.join("codex-runtime-sources.json"),
         );
         paths.trusted_root = root.to_path_buf();
         // SAFETY: these libc calls have no pointer arguments or side effects.
@@ -405,7 +417,17 @@ fn load_activation_binding_with_deadline(
     )?;
     let bot = hash_trusted_file(paths, &paths.bot_executable, deadline.clone())?;
     let launcher = hash_trusted_file(paths, &paths.launcher_executable, deadline.clone())?;
-    let runtime = hash_trusted_file(paths, &paths.runtime_executable, deadline)?;
+    let runtime = hash_trusted_file(paths, &paths.runtime_executable, deadline.clone())?;
+    let source_manifest = read_trusted_file(
+        paths,
+        &paths.runtime_source_manifest,
+        TrustedFileKind::ReadOnlyData,
+        RUNTIME_SOURCE_MANIFEST_MAX_BYTES,
+    )?;
+    validate_runtime_source_binding(paths, &manifest, &source_manifest.bytes, &runtime)?;
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("activation source manifest verification")?;
+    }
 
     Ok(ActivationBinding {
         boot_id,
@@ -421,8 +443,71 @@ fn load_activation_binding_with_deadline(
             (paths.bot_executable.clone(), bot.identity),
             (paths.launcher_executable.clone(), launcher.identity),
             (paths.runtime_executable.clone(), runtime.identity),
+            (
+                paths.runtime_source_manifest.clone(),
+                source_manifest.identity,
+            ),
         ],
     })
+}
+
+fn validate_runtime_source_binding(
+    paths: &ActivationPaths,
+    active: &ActiveRuntimeManifest,
+    source_bytes: &[u8],
+    runtime: &TrustedDigest,
+) -> Result<()> {
+    if sha256(source_bytes) != active.source_manifest_sha256 {
+        return Err(anyhow!(
+            "runtime source manifest digest does not match the active image"
+        ));
+    }
+    let source: serde_json::Value =
+        serde_json::from_slice(source_bytes).context("runtime source manifest is invalid JSON")?;
+    let runtime_source = paths
+        .runtime_executable
+        .to_str()
+        .ok_or_else(|| anyhow!("runtime executable path is not UTF-8"))?;
+    if source.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || source
+            .get("codex_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(active.codex_version.as_str())
+        || source
+            .get("codex_target")
+            .and_then(serde_json::Value::as_str)
+            != Some(active.codex_target.as_str())
+        || source
+            .get("codex_layout_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(active.codex_layout_version))
+    {
+        return Err(anyhow!(
+            "runtime source manifest policy does not match the active image"
+        ));
+    }
+    let files = source
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("runtime source manifest files are unavailable"))?;
+    let mut entries = files.iter().filter(|entry| {
+        entry.get("destination").and_then(serde_json::Value::as_str)
+            == Some("/usr/libexec/webex-codex-runtime")
+    });
+    let entry = entries
+        .next()
+        .ok_or_else(|| anyhow!("runtime source manifest is missing the runtime wrapper"))?;
+    if entries.next().is_some()
+        || entry.get("source").and_then(serde_json::Value::as_str) != Some(runtime_source)
+        || entry.get("mode").and_then(serde_json::Value::as_str) != Some("0555")
+        || entry.get("sha256").and_then(serde_json::Value::as_str) != Some(runtime.digest.as_str())
+        || entry.get("size").and_then(serde_json::Value::as_u64) != Some(runtime.identity.length)
+    {
+        return Err(anyhow!(
+            "runtime source manifest wrapper binding is invalid"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_receipt(
@@ -998,6 +1083,7 @@ mod tests {
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
     const BOOT_ID: &str = "11111111-2222-3333-4444-555555555555";
     const RUNTIME_IMAGE: &[u8] = b"hsqstest runtime image\n";
+    const RUNTIME_EXECUTABLE: &[u8] = b"runtime executable\n";
 
     struct Fixture {
         root: PathBuf,
@@ -1022,14 +1108,16 @@ mod tests {
             fs::create_dir(&image_directory).unwrap();
             fs::set_permissions(&image_directory, fs::Permissions::from_mode(0o755)).unwrap();
             write_mode(&paths.boot_id, format!("{BOOT_ID}\n").as_bytes(), 0o444);
-            write_mode(
-                &paths.active_manifest,
-                &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
-                0o444,
-            );
             write_mode(&paths.bot_executable, b"bot executable\n", 0o555);
             write_mode(&paths.launcher_executable, b"launcher executable\n", 0o555);
-            write_mode(&paths.runtime_executable, b"runtime executable\n", 0o555);
+            write_mode(&paths.runtime_executable, RUNTIME_EXECUTABLE, 0o555);
+            let source_manifest = serde_json::to_vec_pretty(&source_manifest(&paths)).unwrap();
+            write_mode(&paths.runtime_source_manifest, &source_manifest, 0o444);
+            write_mode(
+                &paths.active_manifest,
+                &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_manifest))).unwrap(),
+                0o444,
+            );
             write_mode(&runtime_image_path(&paths), RUNTIME_IMAGE, 0o444);
             Self { root, paths }
         }
@@ -1057,7 +1145,7 @@ mod tests {
         }
     }
 
-    fn active_manifest() -> serde_json::Value {
+    fn active_manifest(source_manifest_sha256: &str) -> serde_json::Value {
         let image_digest = sha256(RUNTIME_IMAGE);
         json!({
             "version": 1,
@@ -1068,10 +1156,31 @@ mod tests {
             "image": format!("images/{image_digest}.squashfs"),
             "image_sha256": image_digest,
             "image_size": RUNTIME_IMAGE.len(),
-            "source_manifest_sha256": "b".repeat(64),
+            "source_manifest_sha256": source_manifest_sha256,
             "mksquashfs_sha256": "c".repeat(64),
             "mksquashfs_argv_sha256": EXPECTED_MKSQUASHFS_ARGV_SHA256,
         })
+    }
+
+    fn source_manifest(paths: &ActivationPaths) -> serde_json::Value {
+        json!({
+            "version": 1,
+            "codex_version": SUPPORTED_CODEX_VERSION,
+            "codex_target": SUPPORTED_CODEX_TARGET,
+            "codex_layout_version": SUPPORTED_CODEX_LAYOUT_VERSION,
+            "files": [{
+                "source": paths.runtime_executable.to_string_lossy(),
+                "destination": "/usr/libexec/webex-codex-runtime",
+                "size": RUNTIME_EXECUTABLE.len(),
+                "sha256": sha256(RUNTIME_EXECUTABLE),
+                "mode": "0555"
+            }],
+            "symlinks": []
+        })
+    }
+
+    fn active_manifest_for(paths: &ActivationPaths) -> serde_json::Value {
+        active_manifest(&sha256(&fs::read(&paths.runtime_source_manifest).unwrap()))
     }
 
     fn runtime_image_path(paths: &ActivationPaths) -> PathBuf {
@@ -1092,6 +1201,10 @@ mod tests {
         assert_eq!(
             paths.runtime_executable(),
             Path::new(RUNTIME_EXECUTABLE_PATH)
+        );
+        assert_eq!(
+            paths.runtime_source_manifest(),
+            Path::new(RUNTIME_SOURCE_MANIFEST_PATH)
         );
     }
 
@@ -1224,13 +1337,13 @@ mod tests {
             0o444,
         );
 
-        let mut manifest = serde_json::to_vec_pretty(&active_manifest()).unwrap();
+        let mut manifest = serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap();
         manifest.push(b'\n');
         replace_read_only(&fixture.paths.active_manifest, &manifest, 0o444);
         assert!(verify_activation_with(&fixture.paths).is_err());
         replace_read_only(
             &fixture.paths.active_manifest,
-            &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
+            &serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap(),
             0o444,
         );
 
@@ -1364,7 +1477,7 @@ mod tests {
         assert!(verify_activation_with(&fixture.paths).is_err());
         replace_read_only(
             &fixture.paths.active_manifest,
-            &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
+            &serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap(),
             0o444,
         );
 
@@ -1410,7 +1523,7 @@ mod tests {
         assert!(ensure_root(1).is_err());
         assert!(ensure_root(0).is_ok());
 
-        let mut manifest = active_manifest();
+        let mut manifest = active_manifest_for(&fixture.paths);
         manifest
             .as_object_mut()
             .unwrap()
@@ -1421,5 +1534,27 @@ mod tests {
             0o444,
         );
         assert!(build_activation_receipt_with(&fixture.paths, passing_canaries()).is_err());
+    }
+
+    #[test]
+    fn rejects_runtime_wrapper_source_and_image_binding_drift() {
+        let fixture = Fixture::new();
+        let mut source = source_manifest(&fixture.paths);
+        source["files"][0]["sha256"] = json!("d".repeat(64));
+        let source_bytes = serde_json::to_vec_pretty(&source).unwrap();
+        replace_read_only(&fixture.paths.runtime_source_manifest, &source_bytes, 0o444);
+        replace_read_only(
+            &fixture.paths.active_manifest,
+            &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_bytes))).unwrap(),
+            0o444,
+        );
+
+        let error = build_activation_receipt_with(&fixture.paths, passing_canaries())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime source manifest wrapper binding"),
+            "{error}"
+        );
     }
 }

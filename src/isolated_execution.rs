@@ -33,7 +33,7 @@ use crate::{
     launcher_protocol::{
         ExecuteRequest, LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS, LAUNCHER_CLEANUP_STEP_SECONDS,
         LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
-        OUTPUT_MAX_BYTES, ReasoningEffort,
+        OUTPUT_MAX_BYTES, ProtocolError, ReasoningEffort,
     },
     work_budget::{WorkBudget, WorkCancellation, run_blocking_with_process_watchdog},
 };
@@ -215,6 +215,8 @@ pub enum IsolatedExecutionError {
     Unavailable(#[source] anyhow::Error),
     #[error("isolated Codex execution failed internally")]
     Failed(#[source] anyhow::Error),
+    #[error("isolated Codex execution was cancelled")]
+    Cancelled,
 }
 
 #[cfg(target_os = "linux")]
@@ -317,7 +319,12 @@ pub async fn execute(
         move || prepare_execution(&request_for_preparation, source_uid, deadline),
     )
     .await
-    .map_err(IsolatedExecutionError::Failed)??;
+    .map_err(IsolatedExecutionError::Failed)?;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) if cancellation.is_cancelled() => return Err(IsolatedExecutionError::Cancelled),
+        Err(error) => return Err(error),
+    };
     let PreparedExecution { plan, workspace } = prepared;
     let execution = run_transient(plan, request, peer, cancellation, &workspace).await;
     let cleanup = run_blocking_with_process_watchdog(
@@ -330,16 +337,18 @@ pub async fn execute(
     )
     .await
     .and_then(|result| result);
-    finalise_execution(execution, cleanup)
+    finalise_execution(execution, cleanup, cancellation.is_cancelled())
 }
 
 #[cfg(target_os = "linux")]
 fn finalise_execution(
     execution: Result<IsolatedRunResult>,
     cleanup: Result<()>,
+    cancelled: bool,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
     match (execution, cleanup) {
         (Ok(result), Ok(())) => Ok(result),
+        (Err(_), Ok(())) if cancelled => Err(IsolatedExecutionError::Cancelled),
         (Err(error), Ok(())) => Err(IsolatedExecutionError::Failed(error)),
         (Ok(_), Err(error)) => Err(IsolatedExecutionError::Failed(
             error.context("failed to clean consumed runtime workspace"),
@@ -365,9 +374,11 @@ fn prepare_execution(
     deadline
         .check("isolated Codex preparation")
         .map_err(IsolatedExecutionError::Failed)?;
+    validate_execution_policy(request).map_err(|error| {
+        IsolatedExecutionError::Failed(anyhow!("isolated request policy is invalid: {error}"))
+    })?;
     ensure_activation_enabled_with_deadline(Some(deadline.clone()))
         .map_err(IsolatedExecutionError::Unavailable)?;
-    validate_execution_policy(request).map_err(IsolatedExecutionError::Failed)?;
     let paths = RuntimePaths::default();
     let expected_workspace = paths.input_root.join(&request.run_id);
     if request.workspace != expected_workspace {
@@ -443,15 +454,18 @@ fn boot_id_credential_path(directory: &OsStr) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_execution_policy(request: &ExecuteRequest) -> Result<()> {
-    request.validate().map_err(|error| anyhow!(error))?;
+pub fn validate_execution_policy(
+    request: &ExecuteRequest,
+) -> std::result::Result<(), ProtocolError> {
+    request.validate()?;
     if request.model.as_deref() != Some("gpt-5.5") {
-        return Err(anyhow!("runtime model is not allowlisted"));
+        return Err(ProtocolError::InvalidModel);
+    }
+    if request.workspace != Path::new(CODEX_INPUT_ROOT).join(&request.run_id) {
+        return Err(ProtocolError::InvalidWorkspace);
     }
     if !request.skip_git_repo_check {
-        return Err(anyhow!(
-            "isolated runtime requires the fixed Git repository bypass"
-        ));
+        return Err(ProtocolError::InvalidRequestJson);
     }
     Ok(())
 }
@@ -2101,9 +2115,26 @@ mod tests {
                 truncated: false,
             }),
             Err(anyhow!("cleanup failed")),
+            false,
         );
 
         assert!(matches!(result, Err(IsolatedExecutionError::Failed(_))));
+    }
+
+    #[test]
+    fn cancellation_is_successful_only_after_cleanup() {
+        let cancelled = finalise_execution(Err(anyhow!("cancelled")), Ok(()), true);
+        assert!(matches!(cancelled, Err(IsolatedExecutionError::Cancelled)));
+
+        let cleanup_failed = finalise_execution(
+            Err(anyhow!("cancelled")),
+            Err(anyhow!("cleanup failed")),
+            true,
+        );
+        assert!(matches!(
+            cleanup_failed,
+            Err(IsolatedExecutionError::Failed(_))
+        ));
     }
 
     fn install_test_access_acl(path: &Path) -> bool {

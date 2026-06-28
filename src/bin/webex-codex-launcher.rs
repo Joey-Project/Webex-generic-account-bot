@@ -65,8 +65,11 @@ async fn main() -> Result<()> {
         decode_request_frame(&packet.frame)
     };
     let response = match pre_dispatch_protocol_response(socket.get_ref().as_raw_fd())? {
-        Some(response) => response,
+        Some(response) => Some(response),
         None => response_for_request(request, &peer, &socket).await?,
+    };
+    let Some(response) = response else {
+        return Ok(());
     };
     peer.ensure_alive()?;
     write_response(&socket, &response).await
@@ -88,32 +91,56 @@ async fn response_for_request(
     >,
     peer: &AuthorisedPeer,
     socket: &AsyncFd<OwnedFd>,
-) -> Result<LauncherResponse> {
+) -> Result<Option<LauncherResponse>> {
     match request {
         Ok(request) => match request.request {
             LauncherRequestKind::Preflight(_) => match preflight_available(socket).await {
-                Ok(available) => Ok(LauncherResponse::ready(available)),
-                Err(_) => Ok(rejected(
+                Ok(Some(available)) => Ok(Some(LauncherResponse::ready(available))),
+                Ok(None) => Ok(None),
+                Err(_) => Ok(Some(rejected(
                     None,
                     RejectionCode::MalformedRequest,
                     "launcher connection violated the one-packet protocol",
-                )?),
+                )?)),
             },
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
+                if let Some(response) = execute_policy_rejection(&request)? {
+                    return Ok(Some(response));
+                }
                 let output_limit = request.output_char_limit;
                 match execute_until_disconnect(&request, peer, socket).await {
-                    Ok(result) => execution_response(run_id, output_limit, result),
-                    Err(error) => execute_error_response(run_id, error),
+                    Ok(ExecuteRequestOutcome::Response(result)) => {
+                        execution_response(run_id, output_limit, result).map(Some)
+                    }
+                    Ok(ExecuteRequestOutcome::Disconnected) => Ok(None),
+                    Err(ExecuteRequestError::DisconnectedFailure(error)) => Err(anyhow!(
+                        "isolated execution failed while draining a disconnected client: {error}"
+                    )),
+                    Err(error) => execute_error_response(run_id, error).map(Some),
                 }
             }
         },
-        Err(error) => Ok(rejected(
+        Err(error) => Ok(Some(rejected(
             None,
             protocol_rejection_code(error),
             "launcher request failed protocol validation",
-        )?),
+        )?)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_policy_rejection(
+    request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
+) -> Result<Option<LauncherResponse>> {
+    let Err(error) = isolated_execution::validate_execution_policy(request) else {
+        return Ok(None);
+    };
+    Ok(Some(rejected(
+        Some(request.run_id.clone()),
+        protocol_rejection_code(error),
+        "launcher execute request failed policy validation",
+    )?))
 }
 
 #[cfg(target_os = "linux")]
@@ -129,11 +156,19 @@ fn execute_error_response(run_id: String, error: ExecuteRequestError) -> Result<
             RejectionCode::InternalError,
             "isolated Codex execution failed internally",
         ),
+        ExecuteRequestError::Execution(IsolatedExecutionError::Cancelled) => rejected(
+            Some(run_id),
+            RejectionCode::InternalError,
+            "isolated Codex execution was cancelled unexpectedly",
+        ),
         ExecuteRequestError::Protocol => rejected(
             Some(run_id),
             RejectionCode::MalformedRequest,
             "launcher connection violated the one-packet protocol",
         ),
+        ExecuteRequestError::DisconnectedFailure(_) => {
+            Err(anyhow!("disconnected execution failure has no response"))
+        }
     }
 }
 
@@ -153,28 +188,28 @@ fn pre_dispatch_protocol_response(socket_fd: RawFd) -> Result<Option<LauncherRes
 }
 
 #[cfg(target_os = "linux")]
-async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<bool> {
+async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<Option<bool>> {
     let cancellation = ExecutionCancellation::new();
     let preflight = isolated_execution::preflight_bounded(&cancellation);
     tokio::pin!(preflight);
     tokio::select! {
         result = &mut preflight => {
             inspect_client_socket(socket.get_ref().as_raw_fd())?;
-            Ok(result.is_ok())
+            Ok(Some(result.is_ok()))
         },
         disconnect = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
-            let available = match timeout(
+            match timeout(
                 Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
                 &mut preflight,
             )
             .await
             {
-                Ok(result) => result.is_ok(),
+                Ok(_) => {}
                 Err(_) => terminate_stuck_launcher("cancelled preflight did not drain"),
-            };
+            }
             disconnect?;
-            Ok(available)
+            Ok(None)
         }
     }
 }
@@ -184,13 +219,15 @@ async fn execute_until_disconnect(
     request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
     peer: &AuthorisedPeer,
     socket: &AsyncFd<OwnedFd>,
-) -> std::result::Result<IsolatedRunResult, ExecuteRequestError> {
+) -> std::result::Result<ExecuteRequestOutcome, ExecuteRequestError> {
     let cancellation = ExecutionCancellation::new();
     let execution = isolated_execution::execute(request, peer, &cancellation);
     tokio::pin!(execution);
     tokio::select! {
         result = &mut execution => match inspect_client_socket(socket.get_ref().as_raw_fd()) {
-            Ok(_) => result.map_err(ExecuteRequestError::Execution),
+            Ok(_) => result
+                .map(ExecuteRequestOutcome::Response)
+                .map_err(ExecuteRequestError::Execution),
             Err(_) => Err(ExecuteRequestError::Protocol),
         },
         disconnect = wait_for_client_disconnect(socket) => {
@@ -205,10 +242,20 @@ async fn execute_until_disconnect(
                 Err(_) => terminate_stuck_launcher("cancelled execution did not drain"),
             };
             match disconnect {
-                Ok(()) => result.map_err(ExecuteRequestError::Execution),
+                Ok(()) => disconnected_execution_outcome(result),
                 Err(_) => Err(ExecuteRequestError::Protocol),
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disconnected_execution_outcome(
+    result: std::result::Result<IsolatedRunResult, IsolatedExecutionError>,
+) -> std::result::Result<ExecuteRequestOutcome, ExecuteRequestError> {
+    match result {
+        Ok(_) | Err(IsolatedExecutionError::Cancelled) => Ok(ExecuteRequestOutcome::Disconnected),
+        Err(error) => Err(ExecuteRequestError::DisconnectedFailure(error)),
     }
 }
 
@@ -217,6 +264,14 @@ async fn execute_until_disconnect(
 enum ExecuteRequestError {
     Execution(IsolatedExecutionError),
     Protocol,
+    DisconnectedFailure(IsolatedExecutionError),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ExecuteRequestOutcome {
+    Response(IsolatedRunResult),
+    Disconnected,
 }
 
 #[cfg(target_os = "linux")]
@@ -552,10 +607,13 @@ fn main() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::process::Command;
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use webex_generic_account_bot::launcher_protocol::{
-        LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
+        ExecuteRequest, LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
     };
 
     use super::*;
@@ -594,6 +652,17 @@ mod tests {
         assert_malformed_response(
             execute_error_response("run-1".to_owned(), ExecuteRequestError::Protocol).unwrap(),
         );
+
+        assert!(matches!(
+            disconnected_execution_outcome(Err(IsolatedExecutionError::Cancelled)),
+            Ok(ExecuteRequestOutcome::Disconnected)
+        ));
+        assert!(matches!(
+            disconnected_execution_outcome(Err(IsolatedExecutionError::Failed(anyhow!(
+                "cleanup failed"
+            )))),
+            Err(ExecuteRequestError::DisconnectedFailure(_))
+        ));
     }
 
     #[test]
@@ -611,6 +680,40 @@ mod tests {
                 if response.run_id.is_none()
                     && response.code == RejectionCode::MalformedRequest
         ));
+    }
+
+    #[test]
+    fn execute_policy_is_rejected_before_isolated_work() {
+        let mut request = ExecuteRequest {
+            run_id: "run-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            prompt: "diagnose the failure".to_owned(),
+            workspace: Path::new(webex_generic_account_bot::isolated_execution::CODEX_INPUT_ROOT)
+                .join("run-1"),
+            model: Some("gpt-5.5".to_owned()),
+            reasoning_effort: None,
+            timeout_seconds: 600,
+            output_char_limit: 100,
+            skip_git_repo_check: true,
+        };
+        assert!(execute_policy_rejection(&request).unwrap().is_none());
+
+        request.model = Some("gpt-4.1".to_owned());
+        assert_rejection_code(
+            execute_policy_rejection(&request).unwrap().unwrap(),
+            RejectionCode::InvalidModel,
+        );
+        request.model = Some("gpt-5.5".to_owned());
+        request.workspace = PathBuf::from("/tmp/wrong-workspace");
+        assert_rejection_code(
+            execute_policy_rejection(&request).unwrap().unwrap(),
+            RejectionCode::InvalidWorkspace,
+        );
+        request.workspace =
+            Path::new(webex_generic_account_bot::isolated_execution::CODEX_INPUT_ROOT)
+                .join("run-1");
+        request.skip_git_repo_check = false;
+        assert_malformed_response(execute_policy_rejection(&request).unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -719,10 +822,14 @@ mod tests {
     }
 
     fn assert_malformed_response(response: LauncherResponse) {
+        assert_rejection_code(response, RejectionCode::MalformedRequest);
+    }
+
+    fn assert_rejection_code(response: LauncherResponse, expected: RejectionCode) {
         let LauncherResponseKind::Rejected(response) = response.response else {
             panic!("protocol violation must be rejected");
         };
-        assert_eq!(response.code, RejectionCode::MalformedRequest);
+        assert_eq!(response.code, expected);
     }
 
     #[tokio::test]

@@ -60,7 +60,8 @@ superseded_by:
   current-user and ephemeral effective runner configurations, then rejects all
   ephemeral activation in this slice. PR 4c2 must remove that final gate only
   while adding bot access and minting the boot-scoped receipt after production
-  canaries pass; production config remains current-user until then.
+  canaries pass; 4c1c `--check-config` therefore stops at the activation gate,
+  and production config remains current-user until then.
   Preflight, evidence staging, and launcher preparation use explicit bounded
   budgets that are included in ephemeral attempt-lease validation. Blocking
   file workers check cooperative deadlines and launcher-socket cancellation;
@@ -306,6 +307,10 @@ superseded_by:
   timeout, launcher crash, bot crash, and host-reboot cleanup converge safely.
 - Install the minimum bot launcher-group and pending-path access only in the
   same activation that switches production away from current-user execution.
+- Run the real production image to prove the main process can write the bounded
+  final message, tool subprocesses cannot read auth/main-home/final-output
+  paths, and launcher stdout contains only the final message before minting the
+  receipt.
 - PR 4c2 activates only the runner. `/config pull`, `/config reload`, and
   `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
 
