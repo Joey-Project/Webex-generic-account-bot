@@ -268,7 +268,7 @@ fn main() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, process::Command};
 
     use webex_generic_account_bot::launcher_protocol::{
         ExecuteRequest, LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
@@ -363,6 +363,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inherited_connection_packet_is_bound_to_the_child_writer() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let authorised_peer = socket_peer_credentials(reader.get_ref().as_raw_fd()).unwrap();
+        make_fd_inheritable(writer.as_raw_fd());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::credentialled_packet_child_helper",
+                "--nocapture",
+            ])
+            .env(
+                "WEBEX_LAUNCHER_PACKET_TEST_FD",
+                writer.as_raw_fd().to_string(),
+            )
+            .spawn()
+            .unwrap();
+        drop(writer);
+
+        let packet = receive_request_packet(&reader).await.unwrap();
+        assert_eq!(packet.sender.pid, child.id());
+        assert!(!request_writer_is_authorised(
+            packet.sender,
+            authorised_peer
+        ));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn credentialled_packet_child_helper() {
+        let Ok(fd) = std::env::var("WEBEX_LAUNCHER_PACKET_TEST_FD") else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(fd.parse().unwrap(), &frame);
+    }
+
     #[test]
     fn request_writer_must_match_the_authorised_peer() {
         let peer = webex_generic_account_bot::codex_launcher::PeerCredentials {
@@ -421,5 +460,15 @@ mod tests {
         // SAFETY: packet is readable for the complete send call.
         let sent = unsafe { libc::send(fd, packet.as_ptr().cast(), packet.len(), 0) };
         assert_eq!(sent, packet.len() as isize);
+    }
+
+    fn make_fd_inheritable(fd: RawFd) {
+        // SAFETY: fcntl does not dereference userspace pointers for these operations.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
     }
 }

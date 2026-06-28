@@ -172,6 +172,10 @@ describe('Codex launcher systemd boundary', () => {
       fs.readFile(LAUNCHER_MODULE_PATH, 'utf8'),
     ]);
     const launcherSources = `${source}\n${launcherModule}`;
+    const productionSource = source.split(
+      '#[cfg(all(test, target_os = "linux"))]',
+      1,
+    )[0];
     const productionLauncherModule = launcherModule.split(
       '#[cfg(all(test, target_os = "linux"))]',
       1,
@@ -181,7 +185,10 @@ describe('Codex launcher systemd boundary', () => {
       launcherSources,
       /\b(?:systemd-run|sudo|pkexec)\b|PolicyKit|polkit/i,
     );
-    assert.doesNotMatch(source, /std::process::Command|tokio::process::Command/);
+    assert.doesNotMatch(
+      productionSource,
+      /std::process::Command|tokio::process::Command/,
+    );
     assert.match(
       launcherModule,
       /const SYSTEMCTL_PATH: &str = "\/usr\/bin\/systemctl";/,
