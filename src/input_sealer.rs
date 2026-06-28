@@ -76,7 +76,12 @@ struct Limits {
     entries: usize,
     depth: usize,
     bytes: u64,
+    #[cfg(test)]
+    mutation_hook: Option<FileMutationHook>,
 }
+
+#[cfg(test)]
+type FileMutationHook = fn(RawFd, &CStr) -> Result<()>;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -84,6 +89,8 @@ impl Default for Limits {
             entries: WORKSPACE_ENTRY_MAX,
             depth: WORKSPACE_DEPTH_MAX,
             bytes: WORKSPACE_TOTAL_BYTES_MAX,
+            #[cfg(test)]
+            mutation_hook: None,
         }
     }
 }
@@ -207,12 +214,12 @@ fn seal_workspace_with_limits(
         &run_name,
     )
     .context("failed to quarantine the pending workspace")?;
-    pending_root
-        .sync_all()
-        .context("failed to persist removal of the pending workspace")?;
     source_consumed_root
         .sync_all()
         .context("failed to persist the quarantined workspace")?;
+    pending_root
+        .sync_all()
+        .context("failed to persist removal of the pending workspace")?;
 
     let source = open_directory_at(source_consumed_root.as_raw_fd(), &run_name)
         .context("quarantined workspace is not a directory")?;
@@ -597,6 +604,10 @@ fn copy_file(
     let source = open_source_file(source_directory.as_raw_fd(), name)?;
     if stat_fd(source.as_raw_fd())? != *entry {
         bail!("pending workspace file changed before copy");
+    }
+    #[cfg(test)]
+    if let Some(hook) = state.limits.mutation_hook {
+        hook(source_directory.as_raw_fd(), name)?;
     }
     let size =
         u64::try_from(entry.size).map_err(|_| anyhow!("pending workspace file is invalid"))?;
@@ -1218,6 +1229,40 @@ mod tests {
             "size limit",
         );
         assert_quarantined_failure(&roots, "bytes");
+    }
+
+    #[test]
+    fn rejects_source_file_growth_during_copy_without_publishing() {
+        let roots = TestRoots::new();
+        let source = roots.source("growth");
+        roots.write_file(&source.join("payload"), b"original");
+
+        assert_error_contains(
+            roots.seal_with_limits(
+                "growth",
+                Limits {
+                    mutation_hook: Some(append_source_byte),
+                    ..Limits::default()
+                },
+            ),
+            "size changed during copy",
+        );
+        assert_quarantined_failure(&roots, "growth");
+    }
+
+    fn append_source_byte(directory_fd: RawFd, name: &CStr) -> Result<()> {
+        let flags =
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        // SAFETY: `directory_fd` and `name` identify the test-owned regular file.
+        let fd = unsafe { libc::openat(directory_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: a successful `openat` returns a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(b"+")?;
+        file.sync_all()?;
+        Ok(())
     }
 
     fn assert_quarantined_failure(roots: &TestRoots, run_id: &str) {
