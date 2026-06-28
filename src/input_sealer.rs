@@ -24,7 +24,7 @@ pub const CODEX_SOURCE_CONSUMED_INPUT_ROOT: &str =
     "/var/lib/webex-generic-account-bot/codex-input-staging/consumed";
 
 const STAGING_PREFIX: &str = ".seal-";
-const SOURCE_DIRECTORY_MODE: u32 = 0o2750;
+const SOURCE_DIRECTORY_MODE: u32 = 0o2770;
 const SOURCE_FILE_MODE: u32 = 0o640;
 const SEALED_DIRECTORY_MODE: u32 = 0o550;
 const SEALED_FILE_MODE: u32 = 0o440;
@@ -159,6 +159,50 @@ pub fn seal_workspace(run_id: &str, source_uid: u32) -> Result<PathBuf> {
     )
 }
 
+pub fn preflight() -> Result<()> {
+    let groups = production_codex_group_ids()?;
+    preflight_at(&SealPaths::production(), groups.launch, groups.input)
+}
+
+fn preflight_at(paths: &SealPaths, source_gid: u32, target_gid: u32) -> Result<()> {
+    validate_root_layout(paths)?;
+    let sealer_uid = required_sealer_uid()?;
+    let pending_root = open_absolute_directory(&paths.pending_root)
+        .context("failed to open the pending input root")?;
+    let source_consumed_root = open_absolute_directory(&paths.source_consumed_root)
+        .context("failed to open the source-consumed input root")?;
+    let input_root = open_absolute_directory(&paths.input_root)
+        .context("failed to open the sealed input root")?;
+    validate_root(
+        &pending_root,
+        sealer_uid,
+        Some(source_gid),
+        PENDING_ROOT_MODE,
+        "pending input root",
+    )?;
+    validate_root(
+        &source_consumed_root,
+        sealer_uid,
+        None,
+        PRIVATE_ROOT_MODE,
+        "source-consumed input root",
+    )?;
+    validate_root(
+        &input_root,
+        sealer_uid,
+        Some(target_gid),
+        SHARED_ROOT_MODE,
+        "sealed input root",
+    )?;
+    reject_same_root(&pending_root, &source_consumed_root)?;
+    reject_same_root(&pending_root, &input_root)?;
+    reject_same_root(&source_consumed_root, &input_root)?;
+    ensure_root_path_unchanged(&paths.pending_root, &pending_root)?;
+    ensure_root_path_unchanged(&paths.source_consumed_root, &source_consumed_root)?;
+    ensure_root_path_unchanged(&paths.input_root, &input_root)?;
+    Ok(())
+}
+
 fn seal_workspace_at(
     paths: &SealPaths,
     run_id: &str,
@@ -224,6 +268,8 @@ fn seal_workspace_with_limits(
     ensure_root_path_unchanged(&paths.input_root, &input_root)?;
 
     let run_name = c_string(OsStr::new(run_id))?;
+    let source_identity = stat_at(pending_root.as_raw_fd(), &run_name)
+        .context("failed to inspect the pending workspace")?;
     rename_noreplace(
         pending_root.as_raw_fd(),
         &run_name,
@@ -231,23 +277,29 @@ fn seal_workspace_with_limits(
         &run_name,
     )
     .context("failed to quarantine the pending workspace")?;
-    source_consumed_root
-        .sync_all()
-        .context("failed to persist the quarantined workspace")?;
-    pending_root
-        .sync_all()
-        .context("failed to persist removal of the pending workspace")?;
 
-    let source = open_directory_at(source_consumed_root.as_raw_fd(), &run_name)
-        .context("quarantined workspace is not a directory")?;
-    validate_source_directory(&stat_fd(source.as_raw_fd())?, source_uid, source_gid)
-        .context("quarantined workspace root metadata is invalid")?;
-
-    let staging_name = create_staging_directory(&input_root, sealer_uid, target_gid)?;
+    let mut staging_name = None;
     let mut published_by_us = false;
     let mut published_identity = None;
     let result = (|| {
-        let target = open_directory_at(input_root.as_raw_fd(), &staging_name)?;
+        source_consumed_root
+            .sync_all()
+            .context("failed to persist the quarantined workspace")?;
+        pending_root
+            .sync_all()
+            .context("failed to persist removal of the pending workspace")?;
+        let source = open_directory_at(source_consumed_root.as_raw_fd(), &run_name)
+            .context("quarantined workspace is not a directory")?;
+        let opened_source = stat_fd(source.as_raw_fd())?;
+        if !same_object(&opened_source, &source_identity) {
+            bail!("quarantined workspace identity changed");
+        }
+        validate_source_directory(&opened_source, source_uid, source_gid)
+            .context("quarantined workspace root metadata is invalid")?;
+
+        let generated_staging = create_staging_directory(&input_root, sealer_uid, target_gid)?;
+        staging_name = Some(generated_staging.clone());
+        let target = open_directory_at(input_root.as_raw_fd(), &generated_staging)?;
         let mut state = CopyState {
             entries: 0,
             bytes: 0,
@@ -283,7 +335,7 @@ fn seal_workspace_with_limits(
         ensure_root_path_unchanged(&paths.input_root, &input_root)?;
         rename_noreplace(
             input_root.as_raw_fd(),
-            &staging_name,
+            &generated_staging,
             input_root.as_raw_fd(),
             &run_name,
         )
@@ -301,29 +353,53 @@ fn seal_workspace_with_limits(
         Ok(paths.input_root.join(run_id))
     })();
 
+    let cleanup_source = || {
+        remove_owned_tree_at(
+            &source_consumed_root,
+            &run_name,
+            source_identity.device,
+            source_identity.inode,
+        )
+        .context("failed to clean the quarantined source workspace")
+    };
+    let cleanup_target = || -> Result<()> {
+        if published_by_us {
+            let expected = published_identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("published workspace identity is unavailable"))?;
+            remove_owned_tree_at(&input_root, &run_name, expected.device, expected.inode)
+                .context("failed to clean the published workspace")
+        } else if let Some(staging_name) = &staging_name {
+            remove_tree_at(input_root.as_raw_fd(), staging_name)
+                .map_err(::anyhow::Error::from)
+                .context("failed to clean the staged workspace")
+        } else {
+            Ok(())
+        }
+    };
+
     match result {
-        Ok(path) => Ok(path),
-        Err(error) => {
-            let cleanup = if published_by_us {
-                let expected = published_identity
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("published workspace identity is unavailable"));
-                expected.and_then(|expected| {
-                    let current = stat_at(input_root.as_raw_fd(), &run_name)?;
-                    if !same_object(&current, expected) {
-                        bail!("refusing to clean a changed published workspace");
-                    }
-                    remove_tree_at(input_root.as_raw_fd(), &run_name)?;
-                    Ok(())
-                })
-            } else {
-                remove_tree_at(input_root.as_raw_fd(), &staging_name).map_err(Into::into)
-            };
-            match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(anyhow!(
-                    "{error:#}; failed to clean rejected workspace: {cleanup_error:#}"
+        Ok(path) => match cleanup_source() {
+            Ok(()) => Ok(path),
+            Err(source_error) => match cleanup_target() {
+                Ok(()) => Err(source_error),
+                Err(target_error) => Err(anyhow!(
+                    "{source_error:#}; failed to roll back sealed workspace: {target_error:#}"
                 )),
+            },
+        },
+        Err(error) => {
+            let mut cleanup_errors = Vec::new();
+            if let Err(cleanup_error) = cleanup_target() {
+                cleanup_errors.push(format!("target cleanup failed: {cleanup_error:#}"));
+            }
+            if let Err(cleanup_error) = cleanup_source() {
+                cleanup_errors.push(format!("source cleanup failed: {cleanup_error:#}"));
+            }
+            if cleanup_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(anyhow!("{error:#}; {}", cleanup_errors.join("; ")))
             }
         }
     }
@@ -470,6 +546,20 @@ fn reject_same_root(left: &File, right: &File) -> Result<()> {
 
 fn same_object(left: &StatSnapshot, right: &StatSnapshot) -> bool {
     left.device == right.device && left.inode == right.inode
+}
+
+pub(crate) fn remove_owned_tree_at(
+    parent: &File,
+    name: &CStr,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<()> {
+    let current = stat_at(parent.as_raw_fd(), name)?;
+    if current.device != expected_device || current.inode != expected_inode {
+        bail!("refusing to clean a replaced workspace");
+    }
+    remove_tree_at(parent.as_raw_fd(), name)?;
+    Ok(())
 }
 
 fn ensure_root_path_unchanged(path: &Path, held: &File) -> Result<()> {
@@ -936,7 +1026,12 @@ fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> io::Result<()> {
         // Staging children may already have their final read-only mode.
         // SAFETY: `directory` is a live descriptor owned by this function.
         if unsafe { libc::fchmod(directory.as_raw_fd(), PRIVATE_ROOT_MODE) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EPERM)
+                || metadata.permissions() != SOURCE_DIRECTORY_MODE
+            {
+                return Err(error);
+            }
         }
         for child in
             list_directory(directory.as_raw_fd(), WORKSPACE_ENTRY_MAX).map_err(io::Error::other)?
@@ -1072,6 +1167,7 @@ mod tests {
     #[test]
     fn publishes_fresh_read_only_inodes() {
         let roots = TestRoots::new();
+        preflight_at(&roots.paths, roots.gid, roots.gid).unwrap();
         let source = roots.source("run-one");
         let nested = source.join("logs");
         fs::create_dir(&nested).unwrap();
@@ -1106,7 +1202,7 @@ mod tests {
             .unwrap();
         assert_eq!(contents, b"original evidence\n");
         assert!(!roots.paths.pending_root.join("run-one").exists());
-        assert!(roots.paths.source_consumed_root.join("run-one").exists());
+        assert!(!roots.paths.source_consumed_root.join("run-one").exists());
     }
 
     #[test]
@@ -1116,14 +1212,14 @@ mod tests {
         roots.write_file(&source.join("target"), b"data");
         symlink("target", source.join("link")).unwrap();
         assert_error_contains(roots.seal("symlink"), "symbolic link");
-        assert_quarantined_failure(&roots, "symlink");
+        assert_rejected_workspace_cleaned(&roots, "symlink");
 
         let roots = TestRoots::new();
         let source = roots.source("hardlink");
         roots.write_file(&source.join("first"), b"data");
         fs::hard_link(source.join("first"), source.join("second")).unwrap();
         assert_error_contains(roots.seal("hardlink"), "hard-linked");
-        assert_quarantined_failure(&roots, "hardlink");
+        assert_rejected_workspace_cleaned(&roots, "hardlink");
 
         let roots = TestRoots::new();
         let source = roots.source("special");
@@ -1132,7 +1228,7 @@ mod tests {
         let status = unsafe { libc::mkfifo(fifo.as_ptr(), SOURCE_FILE_MODE) };
         if status == 0 {
             assert_error_contains(roots.seal("special"), "special file");
-            assert_quarantined_failure(&roots, "special");
+            assert_rejected_workspace_cleaned(&roots, "special");
         } else {
             let error = io::Error::last_os_error();
             assert!(matches!(
@@ -1146,7 +1242,7 @@ mod tests {
             let source = roots.source("control");
             roots.write_file(&source.join(forbidden), b"control");
             assert_error_contains(roots.seal("control"), "forbidden control name");
-            assert_quarantined_failure(&roots, "control");
+            assert_rejected_workspace_cleaned(&roots, "control");
         }
     }
 
@@ -1195,7 +1291,7 @@ mod tests {
         roots.write_file(&source.join("mutable"), b"data");
         set_mode(&source.join("mutable"), 0o600);
         assert_error_contains(roots.seal("bad-mode"), "owner or mode");
-        assert_quarantined_failure(&roots, "bad-mode");
+        assert_rejected_workspace_cleaned(&roots, "bad-mode");
 
         let roots = TestRoots::new();
         let source = roots.source("bad-owner");
@@ -1205,7 +1301,7 @@ mod tests {
             seal_workspace_at(&roots.paths, "bad-owner", wrong_uid, roots.gid, roots.gid),
             "owner or mode",
         );
-        assert_quarantined_failure(&roots, "bad-owner");
+        assert_rejected_workspace_cleaned(&roots, "bad-owner");
 
         let roots = TestRoots::new();
         let source = roots.source("bad-group");
@@ -1297,7 +1393,7 @@ mod tests {
             ),
             "nesting",
         );
-        assert_quarantined_failure(&roots, "depth");
+        assert_rejected_workspace_cleaned(&roots, "depth");
 
         let roots = TestRoots::new();
         let source = roots.source("entries");
@@ -1313,7 +1409,7 @@ mod tests {
             ),
             "too many entries",
         );
-        assert_quarantined_failure(&roots, "entries");
+        assert_rejected_workspace_cleaned(&roots, "entries");
 
         let roots = TestRoots::new();
         let source = roots.source("bytes");
@@ -1328,7 +1424,7 @@ mod tests {
             ),
             "size limit",
         );
-        assert_quarantined_failure(&roots, "bytes");
+        assert_rejected_workspace_cleaned(&roots, "bytes");
     }
 
     #[test]
@@ -1347,7 +1443,7 @@ mod tests {
             ),
             "size changed during copy",
         );
-        assert_quarantined_failure(&roots, "growth");
+        assert_rejected_workspace_cleaned(&roots, "growth");
     }
 
     #[test]
@@ -1366,7 +1462,7 @@ mod tests {
             ),
             "contents changed during copy",
         );
-        assert_quarantined_failure(&roots, "same-size-change");
+        assert_rejected_workspace_cleaned(&roots, "same-size-change");
     }
 
     #[test]
@@ -1378,7 +1474,7 @@ mod tests {
         if install_test_acl(&evidence, b"system.posix_acl_access\0") {
             set_mode(&evidence, SOURCE_FILE_MODE);
             assert_error_contains(roots.seal("source-acl"), "POSIX ACL");
-            assert_quarantined_failure(&roots, "source-acl");
+            assert_rejected_workspace_cleaned(&roots, "source-acl");
         }
 
         let roots = TestRoots::new();
@@ -1462,9 +1558,9 @@ mod tests {
         false
     }
 
-    fn assert_quarantined_failure(roots: &TestRoots, run_id: &str) {
+    fn assert_rejected_workspace_cleaned(roots: &TestRoots, run_id: &str) {
         assert!(!roots.paths.pending_root.join(run_id).exists());
-        assert!(roots.paths.source_consumed_root.join(run_id).exists());
+        assert!(!roots.paths.source_consumed_root.join(run_id).exists());
         assert!(!roots.paths.input_root.join(run_id).exists());
         assert_staging_empty(roots);
     }

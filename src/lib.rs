@@ -8,9 +8,12 @@ pub mod config_status;
 #[cfg(target_os = "linux")]
 pub mod input_sealer;
 pub mod isolated_execution;
+pub mod launcher_client;
 pub mod launcher_protocol;
 pub mod policy;
 pub mod runner;
+#[cfg(target_os = "linux")]
+mod runner_input;
 pub mod webex;
 
 pub use config::{

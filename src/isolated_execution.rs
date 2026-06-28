@@ -1,10 +1,11 @@
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::{CStr, CString, OsString},
+    env,
+    ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::{fs::MetadataExt, io::AsRawFd},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -26,9 +27,13 @@ use tokio::{
 
 #[cfg(target_os = "linux")]
 use crate::{
+    activation::{self, ActivationPaths},
     codex_launcher::AuthorisedPeer,
-    input_sealer::ensure_posix_acl_absent,
-    launcher_protocol::{ExecuteRequest, OUTPUT_MAX_BYTES, ReasoningEffort},
+    input_sealer::{self, ensure_posix_acl_absent},
+    launcher_protocol::{
+        ExecuteRequest, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS, OUTPUT_MAX_BYTES,
+        ReasoningEffort,
+    },
 };
 
 pub const RUNTIME_ROOT: &str = "/opt/webex-generic-account-bot/runtime";
@@ -48,7 +53,11 @@ const CODEX_INPUT_GROUP: &str = "webex-codex-input";
 #[cfg(target_os = "linux")]
 const CODEX_LAUNCH_GROUP: &str = "webex-codex-launch";
 #[cfg(target_os = "linux")]
-const ISOLATED_EXECUTION_ACTIVATED: bool = false;
+const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+#[cfg(target_os = "linux")]
+const ACTIVATION_BOOT_ID_CREDENTIAL_NAME: &str = "activation-boot-id";
+#[cfg(target_os = "linux")]
+const SYSTEMD_CREDENTIAL_ROOT: &str = "/run/credentials";
 #[cfg(target_os = "linux")]
 const ACTIVE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -104,7 +113,29 @@ pub(crate) struct CodexGroupIds {
 struct VerifiedWorkspace {
     path: PathBuf,
     bind_source: String,
+    consumed_root: File,
+    consumed_name: CString,
+    expected_device: u64,
+    expected_inode: u64,
     _guard: File,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VerifiedWorkspace {
+    fn drop(&mut self) {
+        if let Err(error) = input_sealer::remove_owned_tree_at(
+            &self.consumed_root,
+            &self.consumed_name,
+            self.expected_device,
+            self.expected_inode,
+        ) {
+            tracing::warn!(
+                workspace = %self.path.display(),
+                error = %error,
+                "failed to clean a consumed runtime workspace"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -184,6 +215,7 @@ impl Default for RuntimePaths {
 #[cfg(target_os = "linux")]
 pub fn preflight() -> Result<VerifiedRuntime> {
     ensure_activation_enabled()?;
+    input_sealer::preflight()?;
     verify_runtime(&RuntimePaths::default(), 0)
 }
 
@@ -200,11 +232,53 @@ pub async fn execute(
     request: &ExecuteRequest,
     peer: &AuthorisedPeer,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
+    let request_for_preparation = request.clone();
+    let source_uid = peer.credentials().uid;
+    let prepared = tokio::time::timeout(
+        Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
+        tokio::task::spawn_blocking(move || {
+            prepare_execution(&request_for_preparation, source_uid)
+        }),
+    )
+    .await
+    .map_err(|_| IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation timed out")))?
+    .map_err(|error| {
+        IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation task failed: {error}"))
+    })??;
+    run_transient(prepared.plan, request, peer, prepared.workspace)
+        .await
+        .map_err(IsolatedExecutionError::Failed)
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedExecution {
+    plan: TransientRunPlan,
+    workspace: VerifiedWorkspace,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_execution(
+    request: &ExecuteRequest,
+    source_uid: u32,
+) -> std::result::Result<PreparedExecution, IsolatedExecutionError> {
     ensure_activation_enabled().map_err(IsolatedExecutionError::Unavailable)?;
     validate_execution_policy(request).map_err(IsolatedExecutionError::Failed)?;
     let paths = RuntimePaths::default();
+    let expected_workspace = paths.input_root.join(&request.run_id);
+    if request.workspace != expected_workspace {
+        return Err(IsolatedExecutionError::Failed(anyhow!(
+            "runtime workspace does not match the run identifier"
+        )));
+    }
     let runtime = verify_runtime(&paths, 0).map_err(IsolatedExecutionError::Unavailable)?;
     let launcher_unit = current_launcher_unit().map_err(IsolatedExecutionError::Failed)?;
+    let sealed_workspace = input_sealer::seal_workspace(&request.run_id, source_uid)
+        .map_err(IsolatedExecutionError::Failed)?;
+    if sealed_workspace != expected_workspace {
+        return Err(IsolatedExecutionError::Failed(anyhow!(
+            "sealed workspace path does not match the launcher request"
+        )));
+    }
     let workspace = verify_workspace(
         &paths.input_root,
         &paths.consumed_input_root,
@@ -220,19 +294,34 @@ pub async fn execute(
         &launcher_unit,
     )
     .map_err(IsolatedExecutionError::Failed)?;
-    run_transient(plan, request, peer, workspace)
-        .await
-        .map_err(IsolatedExecutionError::Failed)
+    Ok(PreparedExecution { plan, workspace })
 }
 
 #[cfg(target_os = "linux")]
 fn ensure_activation_enabled() -> Result<()> {
-    if !ISOLATED_EXECUTION_ACTIVATED {
-        return Err(anyhow!(
-            "isolated Codex execution awaits production capability canaries"
-        ));
+    let directory = env::var_os(CREDENTIALS_DIRECTORY_ENV)
+        .ok_or_else(|| anyhow!("launcher credential directory is unavailable"))?;
+    let boot_id = boot_id_credential_path(&directory)?;
+    let paths = ActivationPaths::production_with_boot_id(boot_id);
+    activation::verify_activation_with(&paths)
+        .map(|_| ())
+        .context("isolated Codex execution awaits current production capability canaries")
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id_credential_path(directory: &OsStr) -> Result<PathBuf> {
+    let directory = Path::new(directory);
+    let credential_root = Path::new(SYSTEMD_CREDENTIAL_ROOT);
+    if !directory.is_absolute()
+        || directory == credential_root
+        || !directory.starts_with(credential_root)
+        || directory
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(anyhow!("launcher credential directory is invalid"));
     }
-    Ok(())
+    Ok(directory.join(ACTIVATION_BOOT_ID_CREDENTIAL_NAME))
 }
 
 #[cfg(target_os = "linux")]
@@ -419,6 +508,10 @@ fn verify_workspace(
     Ok(VerifiedWorkspace {
         path: consumed_path,
         bind_source,
+        consumed_root: consumed_root_directory,
+        consumed_name,
+        expected_device: metadata.dev(),
+        expected_inode: metadata.ino(),
         _guard: guard,
     })
 }
@@ -685,7 +778,7 @@ fn build_transient_run_plan(
         "TimeoutStopSec=10s".to_owned(),
         "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=512M,mode=1777".to_owned(),
         "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=64M,mode=1777".to_owned(),
-        "InaccessiblePaths=-/run/systemd -/run/dbus -/run/webex-codex-launcher -/run/webex-config-pull"
+        "InaccessiblePaths=-/run/systemd -/run/dbus -/run/webex-codex-activation -/run/webex-codex-launcher -/run/webex-config-pull"
             .to_owned(),
         "BindReadOnlyPaths=/etc/resolv.conf".to_owned(),
         "BindReadOnlyPaths=/etc/hosts".to_owned(),
@@ -1386,6 +1479,21 @@ mod tests {
     #[test]
     fn activation_and_private_credentials_fail_closed() {
         assert!(ensure_activation_enabled().is_err());
+        assert_eq!(
+            boot_id_credential_path(OsStr::new(
+                "/run/credentials/webex-codex-launcher@1.service"
+            ))
+            .unwrap(),
+            Path::new("/run/credentials/webex-codex-launcher@1.service/activation-boot-id")
+        );
+        for invalid in [
+            "relative",
+            "/run/credentials",
+            "/run/credentials/../escape",
+            "/tmp/credentials/unit",
+        ] {
+            assert!(boot_id_credential_path(OsStr::new(invalid)).is_err());
+        }
         assert!(file_policy_mode_valid(FilePolicy::PrivateCredential, 0o400));
         assert!(file_policy_mode_valid(FilePolicy::PrivateCredential, 0o600));
         for mode in [0o200, 0o500, 0o640, 0o777] {
@@ -1518,6 +1626,39 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn verified_workspace_drop_removes_only_the_consumed_inode() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "webex-codex-drop-consumed-{}-{suffix}",
+            std::process::id()
+        ));
+        let consumed_root = base.join("consumed");
+        let workspace_path = consumed_root.join("run-one");
+        fs::create_dir_all(workspace_path.join("logs")).unwrap();
+        fs::write(workspace_path.join("logs/console.log"), b"evidence\n").unwrap();
+        let consumed_root_file = File::open(&consumed_root).unwrap();
+        let guard = File::open(&workspace_path).unwrap();
+        let metadata = guard.metadata().unwrap();
+
+        let workspace = VerifiedWorkspace {
+            path: workspace_path.clone(),
+            bind_source: "/proc/self/fd/test".to_owned(),
+            consumed_root: consumed_root_file,
+            consumed_name: CString::new("run-one").unwrap(),
+            expected_device: metadata.dev(),
+            expected_inode: metadata.ino(),
+            _guard: guard,
+        };
+        drop(workspace);
+
+        assert!(!workspace_path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
     fn install_test_access_acl(path: &Path) -> bool {
         let mut acl = Vec::new();
         acl.extend_from_slice(&2_u32.to_le_bytes());
@@ -1594,6 +1735,7 @@ mod tests {
             "--collect",
             "DynamicUser=yes",
             "BindReadOnlyPaths=/proc/123/fd/7:/workspace",
+            "LoadCredential=codex-auth.json:/etc/webex-generic-account-bot/codex-auth.json",
             "SupplementaryGroups=webex-codex-input",
             "CapabilityBoundingSet=",
             "NoNewPrivileges=yes",
@@ -1605,6 +1747,7 @@ mod tests {
             "SystemCallErrorNumber=EPERM",
             "LimitCORE=0",
             "RuntimeMaxSec=610s",
+            "InaccessiblePaths=-/run/systemd -/run/dbus -/run/webex-codex-activation -/run/webex-codex-launcher -/run/webex-config-pull",
             RUNTIME_EXECUTABLE_PATH,
             "gpt-5.5",
             "xhigh",
@@ -1613,6 +1756,7 @@ mod tests {
         }
         assert!(!args.iter().any(|value| value.contains(&request.prompt)));
         assert!(!args.iter().any(|value| value.contains(&request.message_id)));
+        assert!(!args.iter().any(|value| value.contains("-/run/credentials")));
         assert!(
             !args
                 .iter()

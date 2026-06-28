@@ -14,9 +14,9 @@ use webex_generic_account_bot::{
     },
     isolated_execution::{self, IsolatedExecutionError, IsolatedRunResult},
     launcher_protocol::{
-        CompletedResponse, FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse,
-        REQUEST_MAX_BYTES, RejectedResponse, RejectionCode, decode_request_frame,
-        encode_response_frame,
+        CompletedResponse, FRAME_HEADER_BYTES, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+        LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES, RejectedResponse, RejectionCode,
+        decode_request_frame, encode_response_frame,
     },
 };
 
@@ -85,9 +85,9 @@ async fn response_for_request(
 ) -> Result<LauncherResponse> {
     match request {
         Ok(request) => match request.request {
-            LauncherRequestKind::Preflight(_) => Ok(LauncherResponse::ready(
-                isolated_execution::preflight().is_ok(),
-            )),
+            LauncherRequestKind::Preflight(_) => {
+                Ok(LauncherResponse::ready(preflight_available().await))
+            }
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
                 let output_limit = request.output_char_limit;
@@ -112,6 +112,18 @@ async fn response_for_request(
             "launcher request failed protocol validation",
         )?),
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn preflight_available() -> bool {
+    matches!(
+        timeout(
+            Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
+            tokio::task::spawn_blocking(isolated_execution::preflight),
+        )
+        .await,
+        Ok(Ok(Ok(_)))
+    )
 }
 
 #[cfg(target_os = "linux")]

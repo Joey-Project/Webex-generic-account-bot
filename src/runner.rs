@@ -21,6 +21,8 @@ use tokio::{
 
 use crate::{
     config::{CodexConfig, IsolationMode},
+    launcher_client::LauncherClient,
+    launcher_protocol::{ExecuteRequest, ReasoningEffort},
     policy::trim_to_chars,
 };
 
@@ -39,6 +41,17 @@ pub trait CodexRunner: Send + Sync {
         prompt: &str,
         message_id: &str,
     ) -> Result<CodexRunOutput>;
+
+    async fn run_with_workspace(
+        &self,
+        config: &CodexConfig,
+        prompt: &str,
+        message_id: &str,
+        workspace_source: Option<&Path>,
+    ) -> Result<CodexRunOutput> {
+        let _ = workspace_source;
+        self.run(config, prompt, message_id).await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +59,7 @@ struct CodexInvocation<'a> {
     config: &'a CodexConfig,
     prompt: &'a str,
     message_id: &'a str,
+    workspace_source: Option<&'a Path>,
 }
 
 #[async_trait]
@@ -56,24 +70,32 @@ trait CodexExecutionBackend: Send + Sync {
 #[derive(Debug, Default)]
 struct CurrentUserExecBackend;
 
+#[derive(Debug, Default)]
+struct EphemeralLinuxUserBackend;
+
 #[derive(Debug, Clone, Default)]
 pub struct ExecCodexRunner;
 
 struct CodexBackendDispatcher<'a> {
     current_user_backend: &'a dyn CodexExecutionBackend,
+    ephemeral_linux_user_backend: &'a dyn CodexExecutionBackend,
 }
 
 impl<'a> CodexBackendDispatcher<'a> {
-    fn new(current_user_backend: &'a dyn CodexExecutionBackend) -> Self {
+    fn new(
+        current_user_backend: &'a dyn CodexExecutionBackend,
+        ephemeral_linux_user_backend: &'a dyn CodexExecutionBackend,
+    ) -> Self {
         Self {
             current_user_backend,
+            ephemeral_linux_user_backend,
         }
     }
 
-    fn backend_for(&self, mode: IsolationMode) -> Result<&dyn CodexExecutionBackend> {
+    fn backend_for(&self, mode: IsolationMode) -> &dyn CodexExecutionBackend {
         match mode {
-            IsolationMode::CurrentUser => Ok(self.current_user_backend),
-            IsolationMode::EphemeralLinuxUser => Err(ephemeral_backend_unavailable()),
+            IsolationMode::CurrentUser => self.current_user_backend,
+            IsolationMode::EphemeralLinuxUser => self.ephemeral_linux_user_backend,
         }
     }
 
@@ -82,15 +104,17 @@ impl<'a> CodexBackendDispatcher<'a> {
         config: &CodexConfig,
         prompt: &str,
         message_id: &str,
+        workspace_source: Option<&Path>,
     ) -> Result<CodexRunOutput> {
         config.validate()?;
         let invocation = CodexInvocation {
             config,
             prompt,
             message_id,
+            workspace_source,
         };
 
-        self.backend_for(config.isolation.mode)?
+        self.backend_for(config.isolation.mode)
             .execute(invocation)
             .await
     }
@@ -104,15 +128,23 @@ impl CodexRunner for ExecCodexRunner {
         prompt: &str,
         message_id: &str,
     ) -> Result<CodexRunOutput> {
-        let current_user_backend = CurrentUserExecBackend;
-        CodexBackendDispatcher::new(&current_user_backend)
-            .execute(config, prompt, message_id)
+        self.run_with_workspace(config, prompt, message_id, None)
             .await
     }
-}
 
-fn ephemeral_backend_unavailable() -> anyhow::Error {
-    anyhow!("ephemeral-linux-user Codex execution backend is unavailable")
+    async fn run_with_workspace(
+        &self,
+        config: &CodexConfig,
+        prompt: &str,
+        message_id: &str,
+        workspace_source: Option<&Path>,
+    ) -> Result<CodexRunOutput> {
+        let current_user_backend = CurrentUserExecBackend;
+        let ephemeral_linux_user_backend = EphemeralLinuxUserBackend;
+        CodexBackendDispatcher::new(&current_user_backend, &ephemeral_linux_user_backend)
+            .execute(config, prompt, message_id, workspace_source)
+            .await
+    }
 }
 
 #[async_trait]
@@ -122,6 +154,7 @@ impl CodexExecutionBackend for CurrentUserExecBackend {
             config,
             prompt,
             message_id,
+            workspace_source: _,
         } = invocation;
         let output_path = output_path(message_id).await?;
         let mut command = Command::new(&config.bin);
@@ -199,6 +232,107 @@ impl CodexExecutionBackend for CurrentUserExecBackend {
             stderr,
         })
     }
+}
+
+#[async_trait]
+impl CodexExecutionBackend for EphemeralLinuxUserBackend {
+    async fn execute(&self, invocation: CodexInvocation<'_>) -> Result<CodexRunOutput> {
+        #[cfg(target_os = "linux")]
+        {
+            let client = LauncherClient::fixed();
+            client
+                .preflight()
+                .await
+                .context("ephemeral Codex launcher preflight failed")?;
+            let pending = crate::runner_input::stage_workspace(
+                invocation.message_id,
+                invocation.workspace_source,
+            )
+            .await
+            .context("failed to stage the isolated Codex workspace")?;
+            let request = ephemeral_execute_request(
+                invocation.config,
+                invocation.prompt,
+                invocation.message_id,
+                pending.run_id(),
+            )?;
+            let completed = client
+                .execute(request)
+                .await
+                .context("ephemeral Codex launcher execution failed")?;
+            let final_message = normalize_launcher_message(
+                &completed.output,
+                completed.truncated,
+                invocation.config.output_limit_chars,
+            )?;
+            return Ok(CodexRunOutput {
+                final_message,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = invocation;
+            Err(anyhow!(
+                "ephemeral-linux-user Codex execution is supported only on Linux"
+            ))
+        }
+    }
+}
+
+fn ephemeral_execute_request(
+    config: &CodexConfig,
+    prompt: &str,
+    message_id: &str,
+    run_id: &str,
+) -> Result<ExecuteRequest> {
+    let reasoning_effort = config
+        .model_reasoning_effort
+        .as_deref()
+        .map(parse_reasoning_effort)
+        .transpose()?;
+    let request = ExecuteRequest {
+        run_id: run_id.to_owned(),
+        message_id: message_id.to_owned(),
+        prompt: prompt.to_owned(),
+        workspace: Path::new(crate::isolated_execution::CODEX_INPUT_ROOT).join(run_id),
+        model: config.model.clone(),
+        reasoning_effort,
+        timeout_seconds: config.timeout_secs,
+        output_char_limit: u64::try_from(config.output_limit_chars)
+            .context("codex.output_limit_chars does not fit the launcher protocol")?,
+        skip_git_repo_check: config.skip_git_repo_check,
+    };
+    request
+        .validate()
+        .context("ephemeral Codex launcher request failed validation")?;
+    Ok(request)
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    match value {
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        _ => Err(anyhow!("invalid Codex reasoning effort: {value}")),
+    }
+}
+
+fn normalize_launcher_message(value: &str, truncated: bool, max_chars: usize) -> Result<String> {
+    const TRUNCATED_SUFFIX: &str = "\n[truncated]";
+    if value.trim().is_empty() || !truncated || max_chars <= TRUNCATED_SUFFIX.chars().count() {
+        return normalize_final_message(value, max_chars);
+    }
+    let body = value
+        .trim()
+        .chars()
+        .take(max_chars.saturating_sub(TRUNCATED_SUFFIX.chars().count()))
+        .collect::<String>();
+    normalize_final_message(&format!("{body}{TRUNCATED_SUFFIX}"), max_chars)
 }
 
 async fn write_prompt_and_wait(
@@ -493,6 +627,7 @@ mod tests {
         expected_config_address: usize,
         expected_prompt: String,
         expected_message_id: String,
+        expected_workspace_source: Option<PathBuf>,
         calls: AtomicUsize,
     }
 
@@ -506,6 +641,10 @@ mod tests {
             );
             assert_eq!(invocation.prompt, self.expected_prompt);
             assert_eq!(invocation.message_id, self.expected_message_id);
+            assert_eq!(
+                invocation.workspace_source,
+                self.expected_workspace_source.as_deref()
+            );
             Ok(CodexRunOutput {
                 final_message: "dispatched output".to_owned(),
                 stdout: "dispatched stdout".to_owned(),
@@ -544,12 +683,14 @@ mod tests {
             expected_config_address: &config as *const CodexConfig as usize,
             expected_prompt: "exact prompt".to_owned(),
             expected_message_id: "message-exact".to_owned(),
+            expected_workspace_source: None,
             calls: AtomicUsize::new(0),
         });
-        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
+        let unused_ephemeral = Arc::new(CountingBackend::default());
+        let dispatcher = CodexBackendDispatcher::new(backend.as_ref(), unused_ephemeral.as_ref());
 
         let output = dispatcher
-            .execute(&config, "exact prompt", "message-exact")
+            .execute(&config, "exact prompt", "message-exact", None)
             .await
             .unwrap();
 
@@ -557,37 +698,85 @@ mod tests {
         assert_eq!(output.final_message, "dispatched output");
         assert_eq!(output.stdout, "dispatched stdout");
         assert_eq!(output.stderr, "dispatched stderr");
+        assert_eq!(unused_ephemeral.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn ephemeral_mode_is_rejected_by_config_before_current_user_backend() {
-        let mut config = CodexConfig::default();
-        config.isolation.mode = IsolationMode::EphemeralLinuxUser;
-        let backend = Arc::new(CountingBackend::default());
-        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
+    async fn ephemeral_dispatch_forwards_workspace_without_current_user_fallback() {
+        let config = valid_ephemeral_config();
+        let workspace = PathBuf::from("/tmp/explicit-evidence");
+        let current_user = Arc::new(CountingBackend::default());
+        let ephemeral = Arc::new(AssertingBackend {
+            expected_config_address: &config as *const CodexConfig as usize,
+            expected_prompt: "isolated prompt".to_owned(),
+            expected_message_id: "message-ephemeral".to_owned(),
+            expected_workspace_source: Some(workspace.clone()),
+            calls: AtomicUsize::new(0),
+        });
+        let dispatcher = CodexBackendDispatcher::new(current_user.as_ref(), ephemeral.as_ref());
 
-        let error = dispatcher
-            .execute(&config, "prompt", "message-ephemeral")
+        let output = dispatcher
+            .execute(
+                &config,
+                "isolated prompt",
+                "message-ephemeral",
+                Some(&workspace),
+            )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.to_string().contains("ephemeral-linux-user"));
-        assert!(error.to_string().contains("planned but not implemented"));
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(output.final_message, "dispatched output");
+        assert_eq!(ephemeral.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(current_user.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn unavailable_ephemeral_backend_never_falls_back_to_current_user() {
-        let backend = Arc::new(CountingBackend::default());
-        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
+    fn ephemeral_request_uses_only_the_fixed_launcher_contract() {
+        let mut config = valid_ephemeral_config();
+        config.model_reasoning_effort = Some("xhigh".to_owned());
 
-        let error = dispatcher
-            .backend_for(IsolationMode::EphemeralLinuxUser)
-            .err()
-            .expect("ephemeral backend must be unavailable");
+        let request = ephemeral_execute_request(
+            &config,
+            "inspect the evidence",
+            "message-ephemeral",
+            "run-0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
 
-        assert!(error.to_string().contains("backend is unavailable"));
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        assert_eq!(request.timeout_seconds, config.timeout_secs);
+        assert_eq!(request.output_char_limit, config.output_limit_chars as u64);
+        assert!(request.skip_git_repo_check);
+        assert_eq!(
+            request.workspace,
+            Path::new(crate::isolated_execution::CODEX_INPUT_ROOT).join(&request.run_id)
+        );
+    }
+
+    #[test]
+    fn ephemeral_truncated_output_remains_a_bounded_success() {
+        assert_eq!(
+            normalize_launcher_message("useful partial answer", true, 64).unwrap(),
+            "useful partial answer\n[truncated]"
+        );
+        assert_eq!(
+            normalize_launcher_message("complete answer", false, 64).unwrap(),
+            "complete answer"
+        );
+        assert!(normalize_launcher_message("", true, 64).is_err());
+    }
+
+    fn valid_ephemeral_config() -> CodexConfig {
+        CodexConfig {
+            model: Some("gpt-5.5".to_owned()),
+            skip_git_repo_check: true,
+            isolation: crate::config::IsolationConfig {
+                mode: IsolationMode::EphemeralLinuxUser,
+                trusted_prompt_authors: false,
+            },
+            ..CodexConfig::default()
+        }
     }
 
     #[test]

@@ -51,6 +51,19 @@ superseded_by:
   wiring, and PR 4c2 owns live canaries plus final activation. Bot socket
   groups and `/config pull`, `/config reload`, and `/config sync` remain
   disabled in PR 4c1a.
+- PR 4c1c wires the fixed launcher client, explicit Jenkins evidence staging,
+  root fresh-inode sealer, boot-ID systemd credential, and exact
+  `ephemeral-linux-user` dispatcher path. The bot receives only the launcher
+  group and pending-root write path; it never receives the sealed-input group.
+  Static config accepts only the fixed launcher contract, while
+  `--check-config` and live startup remain fail closed without a valid
+  boot-scoped activation receipt. PR 4c2 still owns the production canaries and
+  receipt minting; production config remains current-user until then.
+  Preflight, evidence staging, and launcher preparation use explicit bounded
+  budgets that are included in ephemeral attempt-lease validation. Normal
+  success, rejection, timeout, and cancellation remove both source quarantine
+  and consumed sealed trees by verified inode; tmpfiles remains the crash
+  fallback.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

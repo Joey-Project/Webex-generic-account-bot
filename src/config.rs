@@ -9,7 +9,12 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::config_commands::ConfigCommandsConfig;
+use crate::{
+    config_commands::ConfigCommandsConfig,
+    launcher_protocol::{
+        EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS, OUTPUT_CHAR_LIMIT_MAX, TIMEOUT_SECONDS_MAX,
+    },
+};
 
 const WEBEX_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const EVENT_HYDRATION_NOT_FOUND_RETRY_SECS: u64 = 5;
@@ -127,6 +132,12 @@ impl BotConfig {
             .as_ref()
             .map(|patch| patch.apply_to(&self.codex))
             .unwrap_or_else(|| self.codex.clone())
+    }
+
+    pub fn uses_ephemeral_linux_user(&self) -> bool {
+        self.codex_configs()
+            .into_iter()
+            .any(|(_, codex)| codex.isolation.mode == IsolationMode::EphemeralLinuxUser)
     }
 
     fn validate_room_ids(&self) -> Result<()> {
@@ -248,14 +259,20 @@ impl BotConfig {
         jenkins_prefetch_secs: u64,
         webex_requests: u64,
     ) -> Result<()> {
+        let isolation_overhead = if codex.isolation.mode == IsolationMode::EphemeralLinuxUser {
+            EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS
+        } else {
+            0
+        };
         let minimum_lease = codex
             .timeout_secs
+            .saturating_add(isolation_overhead)
             .saturating_add(jenkins_prefetch_secs)
             .saturating_add(EVENT_HYDRATION_NOT_FOUND_RETRY_SECS)
             .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(webex_requests));
         if minimum_lease >= self.server.attempt_lease_secs {
             return Err(anyhow!(
-                "server.attempt_lease_secs must be greater than codex.timeout_secs plus Jenkins prefetch time, hydration retry delay, and Webex request timeout margin for {name}"
+                "server.attempt_lease_secs must be greater than the Codex execution budget plus isolation overhead, Jenkins prefetch time, hydration retry delay, and Webex request timeout margin for {name}"
             ));
         }
         Ok(())
@@ -427,7 +444,40 @@ impl CodexConfig {
         if self.codex_home.as_os_str().is_empty() {
             return Err(anyhow!("codex.codex_home must not be empty"));
         }
-        self.isolation.validate()
+        self.isolation.validate()?;
+        if self.isolation.mode == IsolationMode::EphemeralLinuxUser {
+            if self.model.as_deref() != Some("gpt-5.5") {
+                return Err(anyhow!(
+                    "ephemeral-linux-user requires codex.model = \"gpt-5.5\""
+                ));
+            }
+            if self.profile.is_some() {
+                return Err(anyhow!(
+                    "ephemeral-linux-user does not accept codex.profile"
+                ));
+            }
+            if !self.skip_git_repo_check {
+                return Err(anyhow!(
+                    "ephemeral-linux-user requires codex.skip_git_repo_check = true"
+                ));
+            }
+            if !self.ephemeral {
+                return Err(anyhow!(
+                    "ephemeral-linux-user requires codex.ephemeral = true"
+                ));
+            }
+            if self.timeout_secs > TIMEOUT_SECONDS_MAX {
+                return Err(anyhow!(
+                    "ephemeral-linux-user codex.timeout_secs exceeds the launcher limit"
+                ));
+            }
+            if self.output_limit_chars as u64 > OUTPUT_CHAR_LIMIT_MAX {
+                return Err(anyhow!(
+                    "ephemeral-linux-user codex.output_limit_chars exceeds the launcher limit"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -518,8 +568,9 @@ impl IsolationConfig {
             IsolationMode::CurrentUser => Err(anyhow!(
                 "codex.isolation.trusted_prompt_authors must be true for current-user mode"
             )),
+            IsolationMode::EphemeralLinuxUser if !self.trusted_prompt_authors => Ok(()),
             IsolationMode::EphemeralLinuxUser => Err(anyhow!(
-                "codex.isolation.mode = \"ephemeral-linux-user\" is planned but not implemented in this MVP"
+                "codex.isolation.trusted_prompt_authors must be false for ephemeral-linux-user mode"
             )),
         }
     }
@@ -922,8 +973,6 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    const EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED: &str = "codex.isolation.mode = \"ephemeral-linux-user\" is planned but not implemented in this MVP";
-
     #[test]
     fn parses_minimal_config() {
         let config: BotConfig = toml::from_str(
@@ -1071,11 +1120,20 @@ prompt_template = "Follow up on {original_message_id}: {body}"
     }
 
     #[test]
-    fn rejects_ephemeral_user_until_runner_support_exists() {
+    fn accepts_ephemeral_user_with_the_fixed_runtime_contract() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 3000
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
 [codex.isolation]
 mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
 
 [[rooms]]
 room_id = "room-1"
@@ -1084,20 +1142,29 @@ allow_all_senders = true
         )
         .unwrap();
 
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+        config.validate().unwrap();
+        assert!(config.uses_ephemeral_linux_user());
     }
 
     #[test]
-    fn rejects_room_ephemeral_user_during_config_validation() {
+    fn accepts_room_ephemeral_user_during_config_validation() {
         let config: BotConfig = toml::from_str(
             r#"
+[server]
+attempt_lease_secs = 3000
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
 [[rooms]]
 room_id = "room-1"
 allow_all_senders = true
 
 [rooms.codex.isolation]
 mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
 "#,
         )
         .unwrap();
@@ -1111,13 +1178,12 @@ mode = "ephemeral-linux-user"
             IsolationMode::EphemeralLinuxUser
         );
 
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("invalid room room-1"));
-        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+        config.validate().unwrap();
+        assert!(config.uses_ephemeral_linux_user());
     }
 
     #[test]
-    fn load_rejects_ephemeral_user_before_config_check_can_succeed() {
+    fn load_accepts_ephemeral_user_before_host_preflight() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now()
@@ -1131,8 +1197,17 @@ mode = "ephemeral-linux-user"
         fs::write(
             &path,
             r#"
+[server]
+attempt_lease_secs = 3000
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
 [codex.isolation]
 mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
 
 [[rooms]]
 room_id = "room-1"
@@ -1141,11 +1216,47 @@ allow_all_senders = true
         )
         .unwrap();
 
-        let result = BotConfig::load(&path);
+        let result = BotConfig::load(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+        assert!(result.uses_ephemeral_linux_user());
+    }
+
+    #[test]
+    fn ephemeral_user_rejects_runtime_policy_downgrades() {
+        let base = CodexConfig {
+            model: Some("gpt-5.5".to_owned()),
+            skip_git_repo_check: true,
+            ephemeral: true,
+            isolation: IsolationConfig {
+                mode: IsolationMode::EphemeralLinuxUser,
+                trusted_prompt_authors: false,
+            },
+            ..CodexConfig::default()
+        };
+        base.validate().unwrap();
+
+        let mut invalid = base.clone();
+        invalid.model = Some("other".to_owned());
+        assert!(invalid.validate().is_err());
+        invalid = base.clone();
+        invalid.profile = Some("profile".to_owned());
+        assert!(invalid.validate().is_err());
+        invalid = base.clone();
+        invalid.skip_git_repo_check = false;
+        assert!(invalid.validate().is_err());
+        invalid = base.clone();
+        invalid.ephemeral = false;
+        assert!(invalid.validate().is_err());
+        invalid = base.clone();
+        invalid.timeout_secs = TIMEOUT_SECONDS_MAX + 1;
+        assert!(invalid.validate().is_err());
+        invalid = base.clone();
+        invalid.output_limit_chars = OUTPUT_CHAR_LIMIT_MAX as usize + 1;
+        assert!(invalid.validate().is_err());
+        invalid = base;
+        invalid.isolation.trusted_prompt_authors = true;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -1367,6 +1478,35 @@ allow_all_senders = true
                 .to_string()
                 .contains("Webex request timeout margin")
         );
+    }
+
+    #[test]
+    fn rejects_ephemeral_attempt_lease_without_isolation_overhead() {
+        let mut config: BotConfig = toml::from_str(
+            r#"
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+        config.server.attempt_lease_secs = config
+            .codex
+            .timeout_secs
+            .saturating_add(EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS)
+            .saturating_add(EVENT_HYDRATION_NOT_FOUND_RETRY_SECS)
+            .saturating_add(WEBEX_REQUEST_TIMEOUT_SECS.saturating_mul(WEBEX_REQUESTS_PER_ATTEMPT));
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("isolation overhead"), "{error}");
     }
 
     #[test]
