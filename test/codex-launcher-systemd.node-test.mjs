@@ -233,7 +233,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), [
       '/proc',
       '/run/systemd',
-      '/run/webex-codex-activation',
+      '-/run/webex-codex-activation',
     ]);
     assert.deepEqual(directiveValues(service, 'ReadWritePaths'), [
       '/var/lib/webex-generic-account-bot/codex-input-staging',

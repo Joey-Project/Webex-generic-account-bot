@@ -672,6 +672,9 @@ and the exact required production-canary result set. The active image's source
 manifest digest and `/usr/libexec/webex-codex-runtime` entry must match the
 fixed host runtime wrapper digest, size, source path, and mode. Unknown, missing, false,
 stale, oversized, linked, misowned, or modified-runtime receipts are rejected.
+The launcher unit treats the read-only activation bind mount as optional so a
+missing tmpfiles directory reaches the verifier and produces the same
+fail-closed activation error instead of failing during systemd namespace setup.
 
 This foundation does not call the verifier from config or execution paths and
 provides no command that can mint a receipt. Runner activation remains blocked

@@ -26,7 +26,7 @@ OOMPolicy=kill
 UMask=0077
 ReadOnlyPaths=/proc
 ReadOnlyPaths=/run/systemd
-ReadOnlyPaths=/run/webex-codex-activation
+ReadOnlyPaths=-/run/webex-codex-activation
 ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging
 ReadWritePaths=/var/lib/webex-codex-runtime-inputs
 
