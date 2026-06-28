@@ -63,6 +63,9 @@ superseded_by:
   budgets that are included in ephemeral attempt-lease validation. Blocking
   file workers check cooperative deadlines and launcher-socket cancellation;
   the launcher waits for their scoped cleanup instead of detaching them.
+  Configured request concurrency cannot exceed the socket's four accepted
+  connections, and the service runtime maximum stays above the protocol's
+  largest request plus preparation, cleanup, and response budget.
   Normal success, rejection, timeout, client disconnect, and cancellation
   remove ready, source-quarantine, and consumed sealed trees by verified inode;
   tmpfiles remains the crash fallback.

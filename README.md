@@ -611,8 +611,9 @@ the same owner/group and a single hard link. Symlinks, special files, more than
 static members, no numeric-GID alias, and no static user with that primary GID.
 The root launcher retains the supplementary input group after systemd starts
 it. PR 4c1b also adds `webex-codex-launch` solely so the capability-dropped
-launcher can read the pending source tree; the bot still belongs to neither
-group, and the launcher has no config-worker group membership. Its template
+launcher can read the pending source tree. In the PR 4c1b-only state, the bot
+still belongs to neither group; PR 4c1c later grants it only the launch group.
+The launcher has no config-worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
 cgroup identity check. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held
@@ -719,7 +720,10 @@ their blocking file work and launcher preparation use cooperative 9-minute
 deadlines plus response margins. Deadline and client-disconnect cancellation
 are checked between directory, copy, and hash operations, so blocking workers
 finish cleanup before their futures return. These fixed costs are included in
-ephemeral attempt-lease validation.
+ephemeral attempt-lease validation. Ephemeral configuration also caps
+`server.max_concurrent_requests` at the launcher's fixed four accepted
+connections. The launcher service runtime maximum is protocol-bound above the
+largest request, preparation, cleanup, and response budget.
 
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
@@ -734,10 +738,11 @@ receipt and fixed root-owned socket metadata, while the live bot additionally
 performs the caller-authorised launcher preflight before Webex startup.
 Source quarantine trees are removed immediately after sealing, and the
 inode-guarded consumed tree is removed when the transient run finishes, fails,
-times out, or is cancelled. Closing the bot's launcher socket cancels both
-preparation and a running transient unit even while the authorised bot process
-remains alive. One-day tmpfiles expiry remains only a crash or host-reboot
-fallback.
+times out, or is cancelled. Closing the bot's launcher socket cancels
+preflight, preparation, and a running transient unit even while the authorised
+bot process remains alive. A normal launcher response is emitted only after
+consumed-tree cleanup succeeds; one-day tmpfiles expiry remains only a crash or
+host-reboot fallback.
 
 PR 4c1c does not mint the receipt or activate production configuration. PR
 4c2 owns permission-capable production-image canaries and receipt creation.

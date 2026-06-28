@@ -45,6 +45,9 @@ const INPUT_SEALER_PATH = fileURLToPath(
 const RUNTIME_SOURCE_PATH = fileURLToPath(
   new URL('../src/bin/webex-codex-runtime.rs', import.meta.url),
 );
+const LAUNCHER_PROTOCOL_PATH = fileURLToPath(
+  new URL('../src/launcher_protocol.rs', import.meta.url),
+);
 const CARGO_TOML_PATH = fileURLToPath(new URL('../Cargo.toml', import.meta.url));
 
 describe('Codex launcher systemd boundary', () => {
@@ -55,10 +58,11 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('provisions only a root-owned group-gated accepted socket', async () => {
-    const [socket, sysusers, tmpfiles] = await Promise.all([
+    const [socket, sysusers, tmpfiles, protocol] = await Promise.all([
       fs.readFile(SOCKET_PATH, 'utf8'),
       fs.readFile(SYSUSERS_PATH, 'utf8'),
       fs.readFile(TMPFILES_PATH, 'utf8'),
+      fs.readFile(LAUNCHER_PROTOCOL_PATH, 'utf8'),
     ]);
 
     assert.deepEqual(directiveValues(socket, 'ListenSequentialPacket'), [
@@ -78,6 +82,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['8']);
     assert.deepEqual(directiveValues(socket, 'Backlog'), ['16']);
     assert.deepEqual(directiveValues(socket, 'MaxConnections'), ['4']);
+    assert.match(protocol, /pub const LAUNCHER_MAX_CONNECTIONS: usize = 4;/);
     assert.deepEqual(directiveValues(socket, 'ReceiveBuffer'), ['1M']);
     assert.deepEqual(directiveValues(socket, 'SendBuffer'), ['2M']);
     assert.deepEqual(directiveValues(socket, 'ConditionPathExists'), [
@@ -94,9 +99,10 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('pairs the accepted socket with a fixed root-owned launcher process', async () => {
-    const [socket, service] = await Promise.all([
+    const [socket, service, protocol] = await Promise.all([
       fs.readFile(SOCKET_PATH, 'utf8'),
       fs.readFile(SERVICE_PATH, 'utf8'),
+      fs.readFile(LAUNCHER_PROTOCOL_PATH, 'utf8'),
     ]);
 
     assert.equal(path.basename(SOCKET_PATH), 'webex-codex-launcher.socket');
@@ -126,7 +132,13 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'StandardError'), ['journal']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['15s']);
     assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);
-    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['4260s']);
+    const runtimeMaximum = protocol.match(
+      /pub const LAUNCHER_SERVICE_RUNTIME_MAX_SECONDS: u64 = ([\d_]+);/,
+    );
+    assert.ok(runtimeMaximum);
+    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), [
+      `${Number(runtimeMaximum[1].replaceAll('_', ''))}s`,
+    ]);
     assert.deepEqual(directiveValues(service, 'OOMPolicy'), ['kill']);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
@@ -352,7 +364,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(launcherModule, /PR_CAPBSET_DROP/);
     assert.match(launcherModule, /capability_bounding_set\(\)\?\.is_empty\(\)/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
-    assert.match(source, /isolated_execution::preflight_bounded\(\)\.await/);
+    assert.match(source, /isolated_execution::preflight_bounded\(&cancellation\)/);
     assert.match(source, /wait_for_client_disconnect\(socket\)/);
     assert.match(source, /ExecutionCancellation::new\(\)/);
     assert.match(source, /cancellation\.cancel\(\)/);

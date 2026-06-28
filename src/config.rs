@@ -12,7 +12,8 @@ use serde::Deserialize;
 use crate::{
     config_commands::ConfigCommandsConfig,
     launcher_protocol::{
-        EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS, OUTPUT_CHAR_LIMIT_MAX, TIMEOUT_SECONDS_MAX,
+        EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS, LAUNCHER_MAX_CONNECTIONS, OUTPUT_CHAR_LIMIT_MAX,
+        TIMEOUT_SECONDS_MAX,
     },
 };
 
@@ -99,6 +100,13 @@ impl BotConfig {
             codex
                 .validate()
                 .map_err(|error| anyhow!("invalid {name}: {error}"))?;
+        }
+        if self.uses_ephemeral_linux_user()
+            && self.server.max_concurrent_requests > LAUNCHER_MAX_CONNECTIONS
+        {
+            return Err(anyhow!(
+                "server.max_concurrent_requests must not exceed the fixed launcher connection limit ({LAUNCHER_MAX_CONNECTIONS}) when ephemeral-linux-user is enabled"
+            ));
         }
         self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
@@ -1144,6 +1152,35 @@ allow_all_senders = true
 
         config.validate().unwrap();
         assert!(config.uses_ephemeral_linux_user());
+    }
+
+    #[test]
+    fn ephemeral_user_rejects_request_concurrency_above_launcher_capacity() {
+        let mut config: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 3000
+max_concurrent_requests = 5
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+        config.server.max_concurrent_requests = LAUNCHER_MAX_CONNECTIONS;
+        config.validate().unwrap();
     }
 
     #[test]

@@ -87,7 +87,7 @@ async fn response_for_request(
     match request {
         Ok(request) => match request.request {
             LauncherRequestKind::Preflight(_) => {
-                Ok(LauncherResponse::ready(preflight_available().await))
+                Ok(LauncherResponse::ready(preflight_available(socket).await))
             }
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
@@ -116,8 +116,17 @@ async fn response_for_request(
 }
 
 #[cfg(target_os = "linux")]
-async fn preflight_available() -> bool {
-    isolated_execution::preflight_bounded().await.is_ok()
+async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> bool {
+    let cancellation = ExecutionCancellation::new();
+    let preflight = isolated_execution::preflight_bounded(&cancellation);
+    tokio::pin!(preflight);
+    tokio::select! {
+        result = &mut preflight => result.is_ok(),
+        _ = wait_for_client_disconnect(socket) => {
+            cancellation.cancel();
+            preflight.await.is_ok()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

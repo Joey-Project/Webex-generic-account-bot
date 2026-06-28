@@ -14,9 +14,11 @@
 - Configuration Space PR 2b2a adds the separate-identity durable pull-worker
   foundation. Bot socket-group access and deployable `/config pull` remain
   disabled until Codex runs use the isolated runner.
-- Runner PR 3 routes each current-user Codex invocation through a replaceable
-  backend with existing behaviour unchanged. `ephemeral-linux-user` remains
-  rejected by config validation and `--check-config`, with no fallback.
+- Runner PR 3 routed each current-user Codex invocation through a replaceable
+  backend with existing behaviour unchanged. At that stage,
+  `ephemeral-linux-user` remained rejected by config validation and
+  `--check-config`, with no fallback; PR 4c1c now accepts only the fixed
+  receipt-gated contract.
 - Runner PR 4a adds only the root-owned launcher
   protocol, caller-authorisation, and systemd socket foundation at
   `/run/webex-codex-launcher/launcher.sock`, backed by

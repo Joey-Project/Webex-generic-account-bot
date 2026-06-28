@@ -139,18 +139,33 @@ struct VerifiedWorkspace {
     consumed_name: CString,
     expected_device: u64,
     expected_inode: u64,
+    cleanup_armed: bool,
     _guard: File,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedWorkspace {
+    fn cleanup(&mut self) -> Result<()> {
+        if !self.cleanup_armed {
+            return Ok(());
+        }
+        input_sealer::remove_owned_tree_at(
+            &self.consumed_root,
+            &self.consumed_name,
+            self.expected_device,
+            self.expected_inode,
+        )?;
+        self.cleanup_armed = false;
+        self.consumed_root
+            .sync_all()
+            .context("failed to persist consumed runtime workspace cleanup")
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for VerifiedWorkspace {
     fn drop(&mut self) {
-        if let Err(error) = input_sealer::remove_owned_tree_at(
-            &self.consumed_root,
-            &self.consumed_name,
-            self.expected_device,
-            self.expected_inode,
-        ) {
+        if let Err(error) = self.cleanup() {
             tracing::warn!(
                 workspace = %self.path.display(),
                 error = %error,
@@ -240,10 +255,11 @@ pub fn preflight() -> Result<VerifiedRuntime> {
 }
 
 #[cfg(target_os = "linux")]
-pub async fn preflight_bounded() -> Result<VerifiedRuntime> {
-    let deadline = WorkBudget::after(Duration::from_secs(
-        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
-    ));
+pub async fn preflight_bounded(cancellation: &ExecutionCancellation) -> Result<VerifiedRuntime> {
+    let deadline = WorkBudget::with_cancellation(
+        Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
+        cancellation.inner.clone(),
+    );
     tokio::task::spawn_blocking(move || preflight_with_deadline(Some(deadline)))
         .await
         .context("isolated Codex preflight task failed")?
@@ -283,15 +299,30 @@ pub async fn execute(
     .map_err(|error| {
         IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation task failed: {error}"))
     })??;
-    run_transient(
-        prepared.plan,
-        request,
-        peer,
-        cancellation,
-        prepared.workspace,
-    )
-    .await
-    .map_err(IsolatedExecutionError::Failed)
+    let PreparedExecution {
+        plan,
+        mut workspace,
+    } = prepared;
+    let execution = run_transient(plan, request, peer, cancellation, &workspace).await;
+    let cleanup = workspace.cleanup();
+    finalise_execution(execution, cleanup)
+}
+
+#[cfg(target_os = "linux")]
+fn finalise_execution(
+    execution: Result<IsolatedRunResult>,
+    cleanup: Result<()>,
+) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
+    match (execution, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(IsolatedExecutionError::Failed(error)),
+        (Ok(_), Err(error)) => Err(IsolatedExecutionError::Failed(
+            error.context("failed to clean consumed runtime workspace"),
+        )),
+        (Err(execution_error), Err(cleanup_error)) => Err(IsolatedExecutionError::Failed(anyhow!(
+            "{execution_error:#}; failed to clean consumed runtime workspace: {cleanup_error:#}"
+        ))),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -583,6 +614,7 @@ fn verify_workspace(
         consumed_name: consumed_name.clone(),
         expected_device: metadata.dev(),
         expected_inode: metadata.ino(),
+        cleanup_armed: true,
         _guard: guard,
     };
     published_workspace.disarm();
@@ -923,7 +955,7 @@ async fn run_transient(
     request: &ExecuteRequest,
     peer: &AuthorisedPeer,
     cancellation: &ExecutionCancellation,
-    _workspace: VerifiedWorkspace,
+    _workspace: &VerifiedWorkspace,
 ) -> Result<IsolatedRunResult> {
     if cancellation.is_cancelled() {
         return Err(anyhow!(
@@ -1794,12 +1826,64 @@ mod tests {
             consumed_name: CString::new("run-one").unwrap(),
             expected_device: metadata.dev(),
             expected_inode: metadata.ino(),
+            cleanup_armed: true,
             _guard: guard,
         };
         drop(workspace);
 
         assert!(!workspace_path.exists());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn verified_workspace_explicit_cleanup_fails_on_inode_replacement() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "webex-codex-clean-consumed-{}-{suffix}",
+            std::process::id()
+        ));
+        let consumed_root = base.join("consumed");
+        let workspace_path = consumed_root.join("run-one");
+        let retained_path = consumed_root.join("retained");
+        fs::create_dir_all(&workspace_path).unwrap();
+        let consumed_root_file = File::open(&consumed_root).unwrap();
+        let guard = File::open(&workspace_path).unwrap();
+        let metadata = guard.metadata().unwrap();
+        fs::rename(&workspace_path, &retained_path).unwrap();
+        fs::create_dir(&workspace_path).unwrap();
+
+        let mut workspace = VerifiedWorkspace {
+            path: workspace_path.clone(),
+            bind_source: "/proc/self/fd/test".to_owned(),
+            consumed_root: consumed_root_file,
+            consumed_name: CString::new("run-one").unwrap(),
+            expected_device: metadata.dev(),
+            expected_inode: metadata.ino(),
+            cleanup_armed: true,
+            _guard: guard,
+        };
+        assert!(workspace.cleanup().is_err());
+        assert!(workspace_path.exists());
+        workspace.cleanup_armed = false;
+
+        drop(workspace);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failure_overrides_a_successful_execution_result() {
+        let result = finalise_execution(
+            Ok(IsolatedRunResult::Completed {
+                output: "done".to_owned(),
+                truncated: false,
+            }),
+            Err(anyhow!("cleanup failed")),
+        );
+
+        assert!(matches!(result, Err(IsolatedExecutionError::Failed(_))));
     }
 
     fn install_test_access_acl(path: &Path) -> bool {
