@@ -1,0 +1,18 @@
+[Unit]
+Description=Webex Codex launcher socket
+Documentation=man:systemd.socket(5)
+
+[Socket]
+ListenStream=/run/webex-codex-launcher/launcher.sock
+Accept=yes
+SocketUser=root
+SocketGroup=webex-codex-launch
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+FlushPending=yes
+Backlog=32
+MaxConnections=32
+
+[Install]
+WantedBy=sockets.target

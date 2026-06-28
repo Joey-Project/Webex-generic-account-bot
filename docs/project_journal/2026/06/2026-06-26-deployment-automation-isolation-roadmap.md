@@ -21,18 +21,24 @@ superseded_by:
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
   2b2a (separate-worker durable queue foundation), completed PR 3 (runner
-  backend abstraction), PR 4 (ephemeral-user isolation), PR 2b2b (`/config pull`
-  enablement), and PR 2b3 (recoverable activation plus `/config reload` and
-  `/config sync`). Mutating commands remain undeployable until their security
-  dependencies land.
+  backend abstraction), PR 4a (root-owned launcher foundation), PR 4b
+  (isolated execution), PR 4c (runner activation and production-image smoke
+  tests), PR 2b2b (`/config pull` enablement), and PR 2b3 (recoverable
+  activation plus `/config reload` and `/config sync`). Mutating commands
+  remain undeployable until their security dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
 - Bot PR #10 merged immutable staged preparation as
   `45d87b7d6fb59f7d751285a253b3cf7e21826563`.
 - Runner PR 3 routes each current-user invocation through a replaceable backend
   while preserving existing execution behaviour. Config validation and
   `--check-config` still reject `ephemeral-linux-user`, with no fallback.
-- PR 4 still owns the launcher and complete isolation boundary. The bot socket
-  group and `/config pull`, `/config reload`, and `/config sync` remain disabled.
+- PR 4a establishes the root-owned launcher protocol,
+  caller-authorisation, and systemd socket foundation, but remains fail-closed
+  and is not deployable. It does not grant bot group access, execute
+  `systemd-run`, enable `ephemeral-linux-user`, or enable any config command.
+- PRs 4b and 4c still own the complete execution boundary and runner
+  activation. The bot socket groups and `/config pull`, `/config reload`, and
+  `/config sync` remain disabled.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -116,8 +122,9 @@ superseded_by:
   current-user Codex children inherit the bot's supplementary groups.
 
 #### PR 2b2b: Pull Enablement After Runner Isolation
-- Merge PRs 3 and 4 first and prove prompt-controlled Codex subprocesses cannot
-  access the worker socket, bot/deployment secrets, or host `/run` paths.
+- Merge PRs 3, 4a, 4b, and 4c first and prove prompt-controlled Codex
+  subprocesses cannot access the worker socket, bot/deployment secrets, or host
+  `/run` paths.
 - Then grant the bot socket access and enable `/config pull` only after socket
   authorization, queue durability, duplicate-event, crash-recovery, fixed-argv,
   ownership, symlink, and isolated-child denial tests pass.
@@ -139,13 +146,47 @@ superseded_by:
   `ephemeral-linux-user`; it never becomes a runtime-only failure or silently
   falls back to current-user execution.
 
-### PR 4: Ephemeral Linux User Launcher
+### PR 4a: Root-Owned Launcher Protocol and Socket Foundation
 - Repository: `Joey-Project/Webex-generic-account-bot`.
-- Own the privileged launcher; cross-UID output and read-only input handling;
-  cgroup and process containment; credential brokerage; inherited file
-  descriptor and supplementary-group clearing; filesystem, network, and
-  resource isolation; and launcher preflight.
-- Implement the privileged isolation backend with a narrow root-owned launcher or `systemd-run DynamicUser`.
+- Status: completed on 2026-06-28; foundation only, fail-closed, and not
+  deployable.
+- Reserve the fixed socket path
+  `/run/webex-codex-launcher/launcher.sock` and fixed executable path
+  `/opt/webex-generic-account-bot/bin/webex-codex-launcher`.
+- Define a versioned, bounded, length-prefixed request/response protocol for
+  preflight and execution without accepting arbitrary executables, argv,
+  environment variables, unit properties, or paths outside validated fields.
+- Add root-owned systemd socket activation with one launcher service instance
+  per accepted connection and host-owned sysusers/tmpfiles definitions.
+- Authorise each connection from kernel `SO_PEERCRED`, but never by UID or
+  group alone. Require the peer PID to be the exact live `MainPID` of
+  `webex-generic-account-bot.service`, running the fixed root-owned bot binary
+  in the exact service cgroup; bind authorisation to a pidfd and stable process
+  snapshot so child callers, PID reuse, executable replacement, and caller
+  exit fail closed.
+- Retain only `CAP_SYS_PTRACE` in the root launcher service so it can inspect
+  the different-UID bot `MainPID`; expose no ambient capability, and never pass
+  this capability into a launcher-created Codex unit.
+- UID/group-only authorisation is insufficient because prompt-controlled Codex
+  descendants inherit the bot identity and supplementary groups.
+- PR 4a does not grant the bot membership in `webex-codex-launch` or any config
+  worker group, execute `systemd-run`, enable
+  `codex.isolation.mode = "ephemeral-linux-user"`, or enable `/config pull`,
+  `/config reload`, or `/config sync`.
+
+### PR 4b: Isolated DynamicUser Execution
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Build an immutable root-owned runtime image and execute each Codex run in a
+  transient `DynamicUser` unit through the narrow root-owned launcher.
+- `DynamicUser` alone is not the isolation boundary: the Codex main process and
+  prompt-controlled tool descendants share the same UID. Provide a
+  credential/model-access channel available to the Codex main process but not
+  reusable, readable, or reachable by same-UID tool descendants, and apply the
+  corresponding network boundary at process rather than UID granularity.
+- Own cross-UID output and read-only input handling; cgroup and process
+  containment; credential brokerage; inherited file descriptor and
+  supplementary-group clearing; filesystem, network, and resource isolation;
+  and launcher preflight.
 - Each Codex run must get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
 - Filesystem access must be deny-by-default with a mount/filesystem namespace, bind-mounted workspace and allowlisted inputs, private temporary storage, protected home paths, restricted `/proc`, `/run`, and device access, and negative tests for host canary files, symlink escapes, procfs/run leaks, and device paths.
 - The launcher must drop capabilities, set `no_new_privs`, clear ambient/bounding capability sets, and prevent setuid or capability-bearing binaries from escalating prompt-controlled subprocesses; include setuid and file-capability canary tests.
@@ -158,18 +199,41 @@ superseded_by:
 - Add tests showing one ephemeral run cannot read files, cache state, workspace data, or credentials from another simultaneous run, or left by another run after success, failure, timeout, bot crash, launcher crash, or host reboot cleanup paths.
 - Use crash/orphan cleanup or a UID/workspace non-reuse policy so stale prompt data, cache files, and credentials cannot be observed by later runs even when normal cleanup did not complete.
 - Add negative tests showing an ephemeral run cannot read its own Codex auth material, bot/deployment secrets such as Webex token files, Jenkins env files, persistent Codex home, or host-owned config and deployment metadata.
+
+### PR 4c: Runner Activation and Production-Image Smoke Tests
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Connect the `ephemeral-linux-user` runner backend to the fixed PR 4a launcher
+  only after the PR 4b boundary is present, then add only the minimum reviewed
+  bot group/drop-in access required to reach the launcher socket.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
-- Launcher integration must be covered by unit tests plus at least one permission-capable opt-in integration smoke test before the mode is considered deployable.
+- Run permission-capable opt-in integration smoke tests against the production
+  image, fixed executable/socket paths, systemd units, ownership, group, and
+  socket permissions before the mode is considered deployable.
+- Smoke tests must prove Codex model/auth access works for the main process;
+  prompt-controlled descendants cannot reuse the credential/model channel,
+  launcher socket, bot/config-worker sockets, or forbidden network paths; and
+  timeout, launcher crash, bot crash, and host-reboot cleanup converge safely.
+- PR 4c activates only the runner. `/config pull`, `/config reload`, and
+  `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.
-- Whether the privileged launcher should standardise on `systemd-run DynamicUser` first or ship a minimal root-owned helper first.
+- Which process-scoped credential/model and network mechanism PR 4b will use so
+  the Codex main process retains required model access while same-UID tool
+  descendants cannot reuse that channel.
 
 ## Resolved Decisions
 - Fixed Webex config commands use a dedicated top-level `[config_commands]`
   section, separate from ordinary room policies and with an explicit admin
   Space and sender allowlist.
+- PR 4 is split into 4a launcher protocol/caller-authorisation/socket
+  foundation, 4b isolated transient execution, and 4c runner activation plus
+  permission-capable production-image smoke tests.
+- `DynamicUser` alone cannot separate Codex main-process credentials or network
+  access from same-UID tool descendants, and UID/group-only launcher
+  authorisation cannot distinguish the trusted bot process from inherited
+  prompt-controlled descendants.
 
 ## Evidence
 - Main bot PR #6 merged as `b44e509`.

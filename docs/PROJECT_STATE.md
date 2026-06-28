@@ -17,6 +17,11 @@
 - Runner PR 3 routes each current-user Codex invocation through a replaceable
   backend with existing behaviour unchanged. `ephemeral-linux-user` remains
   rejected by config validation and `--check-config`, with no fallback.
+- Runner PR 4a adds only the root-owned launcher
+  protocol, caller-authorisation, and systemd socket foundation at
+  `/run/webex-codex-launcher/launcher.sock`, backed by
+  `/opt/webex-generic-account-bot/bin/webex-codex-launcher`. It remains
+  fail-closed and is not a deployable isolation backend.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -25,9 +30,15 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4 still owns the ephemeral Linux-user launcher and isolation boundary.
-  Until it lands, the bot socket group and `/config pull`, `/config reload`,
-  and `/config sync` remain disabled.
+- PR 4b must still provide the immutable root image, transient `DynamicUser`
+  execution, credential/model-channel separation, and crash cleanup; PR 4c
+  must activate the runner and pass permission-capable production-image smoke
+  tests. `DynamicUser` alone does not separate Codex main-process credentials
+  or network access from same-UID tool descendants, and UID/group-only launcher
+  authorisation does not distinguish those descendants.
+- PR 4a does not grant bot group access, execute `systemd-run`, enable
+  `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
+  `/config sync`.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.
