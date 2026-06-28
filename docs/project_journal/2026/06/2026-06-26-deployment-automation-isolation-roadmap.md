@@ -3,7 +3,7 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-06-27
+updated: 2026-06-28
 branch: codex/roadmap-deploy-isolation
 pr:
 supersedes: []
@@ -20,14 +20,19 @@ superseded_by:
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
-  2b2a (separate-worker durable queue foundation), PRs 3 and 4 (runner
-  abstraction and ephemeral-user isolation), PR 2b2b (`/config pull`
+  2b2a (separate-worker durable queue foundation), completed PR 3 (runner
+  backend abstraction), PR 4 (ephemeral-user isolation), PR 2b2b (`/config pull`
   enablement), and PR 2b3 (recoverable activation plus `/config reload` and
   `/config sync`). Mutating commands remain undeployable until their security
   dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
 - Bot PR #10 merged immutable staged preparation as
   `45d87b7d6fb59f7d751285a253b3cf7e21826563`.
+- Runner PR 3 routes each current-user invocation through a replaceable backend
+  while preserving existing execution behaviour. Config validation and
+  `--check-config` still reject `ephemeral-linux-user`, with no fallback.
+- PR 4 still owns the launcher and complete isolation boundary. The bot socket
+  group and `/config pull`, `/config reload`, and `/config sync` remain disabled.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -126,13 +131,20 @@ superseded_by:
 
 ### PR 3: Runner Backend Abstraction for Existing Isolation Config
 - Repository: `Joey-Project/Webex-generic-account-bot`.
-- Connect the existing `codex.isolation` configuration and `IsolationMode` model to an internal runner backend abstraction while keeping current-user execution as the default.
-- Do not add a second isolation schema; preserve the existing `current-user` and `ephemeral-linux-user` mode names.
-- Until PR 4 lands, deployable configs that set `ephemeral-linux-user` must continue to fail validation and `--check-config`; it must never become a runtime-only failure or silently fall back to current-user execution.
-- Keep existing Codex execution behaviour unchanged for current configs, but route execution through a replaceable backend that PR 4 can implement.
+- Status: completed on 2026-06-28.
+- The existing `codex.isolation` schema and `IsolationMode` names are unchanged.
+- Each current-user invocation now dispatches through a replaceable backend
+  while preserving existing execution behaviour.
+- Config validation and `--check-config` continue to reject
+  `ephemeral-linux-user`; it never becomes a runtime-only failure or silently
+  falls back to current-user execution.
 
 ### PR 4: Ephemeral Linux User Launcher
 - Repository: `Joey-Project/Webex-generic-account-bot`.
+- Own the privileged launcher; cross-UID output and read-only input handling;
+  cgroup and process containment; credential brokerage; inherited file
+  descriptor and supplementary-group clearing; filesystem, network, and
+  resource isolation; and launcher preflight.
 - Implement the privileged isolation backend with a narrow root-owned launcher or `systemd-run DynamicUser`.
 - Each Codex run must get an isolated temporary user/workspace, receive only allowlisted inputs, and clean up after success, failure, or timeout.
 - Filesystem access must be deny-by-default with a mount/filesystem namespace, bind-mounted workspace and allowlisted inputs, private temporary storage, protected home paths, restricted `/proc`, `/run`, and device access, and negative tests for host canary files, symlink escapes, procfs/run leaks, and device paths.

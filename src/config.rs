@@ -922,6 +922,8 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    const EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED: &str = "codex.isolation.mode = \"ephemeral-linux-user\" is planned but not implemented in this MVP";
+
     #[test]
     fn parses_minimal_config() {
         let config: BotConfig = toml::from_str(
@@ -1083,7 +1085,103 @@ allow_all_senders = true
         .unwrap();
 
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("not implemented"));
+        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+    }
+
+    #[test]
+    fn rejects_room_ephemeral_user_during_config_validation() {
+        let config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.codex.isolation]
+mode = "ephemeral-linux-user"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.codex.isolation.mode, IsolationMode::CurrentUser);
+        assert_eq!(
+            config
+                .codex_for_policy(config.policy_for_room("room-1").unwrap())
+                .isolation
+                .mode,
+            IsolationMode::EphemeralLinuxUser
+        );
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("invalid room room-1"));
+        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+    }
+
+    #[test]
+    fn load_rejects_ephemeral_user_before_config_check_can_succeed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "webex-bot-config-load-test-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+[codex.isolation]
+mode = "ephemeral-linux-user"
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        let result = BotConfig::load(&path);
+        fs::remove_file(&path).unwrap();
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(EPHEMERAL_LINUX_USER_NOT_IMPLEMENTED));
+    }
+
+    #[test]
+    fn current_user_remains_default_and_kebab_case_schema_name() {
+        let default_config: BotConfig = toml::from_str(
+            r#"
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_config.codex.isolation.mode,
+            IsolationMode::CurrentUser
+        );
+        assert!(default_config.codex.isolation.trusted_prompt_authors);
+
+        let explicit_config: BotConfig = toml::from_str(
+            r#"
+[codex.isolation]
+mode = "current-user"
+trusted_prompt_authors = true
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+        explicit_config.validate().unwrap();
+        assert_eq!(
+            explicit_config.codex.isolation.mode,
+            IsolationMode::CurrentUser
+        );
+        assert!(explicit_config.codex.isolation.trusted_prompt_authors);
     }
 
     #[test]
