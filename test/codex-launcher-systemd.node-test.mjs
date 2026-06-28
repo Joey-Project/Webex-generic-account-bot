@@ -95,6 +95,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'CollectMode'), ['inactive-or-failed']);
     assert.deepEqual(directiveValues(service, 'User'), ['root']);
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
+    assert.deepEqual(directiveValues(service, 'Slice'), ['system.slice']);
     assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), [
       'webex-codex-input',
     ]);

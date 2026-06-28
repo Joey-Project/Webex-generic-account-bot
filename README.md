@@ -602,7 +602,9 @@ the same owner/group and a single hard link. Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
 2 GiB plus 64 MiB are rejected.
 The root launcher has only this supplementary input group after systemd starts
-it; it has no bot, launcher-socket, or worker group membership. It opens the run
+it; it has no bot, launcher-socket, or worker group membership. Its template
+instances are pinned directly to `system.slice`, matching the launcher's strict
+cgroup identity check. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held
 inode through `/proc/<launcher-pid>/fd/<fd>`, preventing a path replacement
 between validation and transient-unit creation. Before starting the transient

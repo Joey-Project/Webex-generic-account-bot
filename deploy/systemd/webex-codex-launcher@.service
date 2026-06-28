@@ -10,6 +10,7 @@ CollectMode=inactive-or-failed
 Type=exec
 User=root
 Group=root
+Slice=system.slice
 SupplementaryGroups=webex-codex-input
 ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-launcher
 StandardInput=socket

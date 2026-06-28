@@ -183,6 +183,7 @@ pub async fn execute(
     validate_execution_policy(request).map_err(IsolatedExecutionError::Failed)?;
     let paths = RuntimePaths::default();
     let runtime = verify_runtime(&paths, 0).map_err(IsolatedExecutionError::Unavailable)?;
+    let launcher_unit = current_launcher_unit().map_err(IsolatedExecutionError::Failed)?;
     let workspace = verify_workspace(
         &paths.input_root,
         &paths.consumed_input_root,
@@ -190,7 +191,6 @@ pub async fn execute(
         runtime.input_gid,
     )
     .map_err(IsolatedExecutionError::Failed)?;
-    let launcher_unit = current_launcher_unit().map_err(IsolatedExecutionError::Failed)?;
     let plan = build_transient_run_plan(
         request,
         &runtime,
@@ -487,6 +487,11 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 #[cfg(target_os = "linux")]
 fn current_launcher_unit() -> Result<String> {
     let cgroup = fs::read_to_string("/proc/self/cgroup")?;
+    parse_launcher_unit(&cgroup)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_launcher_unit(cgroup: &str) -> Result<String> {
     if cgroup.len() > 4096 {
         return Err(anyhow!("launcher cgroup metadata is oversized"));
     }
@@ -1279,6 +1284,20 @@ mod tests {
         assert_eq!(first, transient_unit_name("message-sensitive-run-id"));
         assert_ne!(first, transient_unit_name("another-run-id"));
         assert!(!first.contains("sensitive"));
+    }
+
+    #[test]
+    fn launcher_cgroup_requires_the_explicit_system_slice_layout() {
+        assert_eq!(
+            parse_launcher_unit("0::/system.slice/webex-codex-launcher@42.service\n").unwrap(),
+            "webex-codex-launcher@42.service"
+        );
+        assert!(
+            parse_launcher_unit(
+                "0::/system.slice/system-webex\\x2dcodex\\x2dlauncher.slice/webex-codex-launcher@42.service\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
