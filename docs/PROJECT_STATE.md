@@ -14,6 +14,9 @@
 - Configuration Space PR 2b2a adds the separate-identity durable pull-worker
   foundation. Bot socket-group access and deployable `/config pull` remain
   disabled until Codex runs use the isolated runner.
+- Runner PR 3 routes each current-user Codex invocation through a replaceable
+  backend with existing behaviour unchanged. `ephemeral-linux-user` remains
+  rejected by config validation and `--check-config`, with no fallback.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -22,8 +25,9 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- `/config pull` enablement depends on the ephemeral Linux-user runner so
-  prompt-controlled Codex children cannot inherit the bot's worker-socket group.
+- PR 4 still owns the ephemeral Linux-user launcher and isolation boundary.
+  Until it lands, the bot socket group and `/config pull`, `/config reload`,
+  and `/config sync` remain disabled.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

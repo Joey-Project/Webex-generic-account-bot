@@ -17,6 +17,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 - Supports `mention`, `prefix`, `always`, and `never` room triggers.
 - Supports sender allowlists by Webex person ID and email.
 - Renders a per-room prompt template and runs `codex exec`.
+- Dispatches each current-user Codex invocation through a replaceable runner
+  backend without changing the existing execution behaviour.
 - Replies to the Webex message thread with the Codex result.
 - Reconciles ambiguous Webex reply creation failures with a stable reply marker
   before retrying, using the same bounded marker-page budget as the initial
@@ -299,7 +301,8 @@ unwind, and removes any socket already created before the process exits.
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no
 bot socket-group drop-in is shipped. A later enablement PR may allow `pull` only
-after `ephemeral-linux-user` runner isolation is deployable and verified.
+after `ephemeral-linux-user` runner isolation is deployable and verified;
+`reload` and `sync` require the later activation work as well.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
@@ -449,7 +452,7 @@ node ../Webex-headless-messenger/examples/sidecar-js/index.mjs
 
 ## Safety Model
 
-The default Codex runner uses:
+The current-user Codex runner uses:
 
 - `codex --ask-for-approval never exec`
 - `--sandbox read-only`
@@ -457,6 +460,11 @@ The default Codex runner uses:
 - `--ignore-user-config` and `--ignore-rules`
 - a scrubbed subprocess environment that does not forward Webex token variables
   or an inherited `CODEX_HOME`
+
+Each invocation dispatches through a replaceable runner backend. The
+current-user backend preserves the existing command, environment, output,
+timeout, and process-cleanup behaviour; the boundary only makes it possible for
+a later backend to replace execution for that invocation.
 
 The event and health endpoints both require the sidecar bearer token unless
 `server.allow_unauthenticated = true`; unauthenticated mode is restricted to a
@@ -474,16 +482,20 @@ explicit `allow_all_senders = true` escape hatch. Use `allow_all_senders` only
 for trusted Spaces; current-user isolation is not a strong secret boundary
 against allowed prompt authors.
 
-Temporary Linux user isolation is the right long-term boundary for untrusted
-chat-driven prompts. `codex.isolation.mode = "current-user"` is only a
+Temporary Linux user isolation is the intended boundary for untrusted
+chat-driven prompts. `codex.isolation.mode = "current-user"` remains only a
 trusted-prompt-author mode and requires
 `codex.isolation.trusted_prompt_authors = true`; it is not a secret-read
-boundary against allowed prompt authors. Creating and deleting OS users requires
-root or a privileged helper, so this MVP rejects
-`codex.isolation.mode = "ephemeral-linux-user"` until that helper is explicitly
-designed. Good follow-up shapes are `systemd-run --property=DynamicUser=yes`, a
-small root-owned worker launcher, or a pre-provisioned pool of locked-down worker
-users.
+boundary against allowed prompt authors. Configuration validation, including
+`--check-config`, still rejects the `ephemeral-linux-user` mode for
+`codex.isolation.mode`, with no fallback to current-user execution.
+
+PR 4 owns the privileged launcher, cross-UID output and read-only input
+handling, cgroup and process containment, credential brokerage, inherited file
+descriptor and supplementary-group clearing, filesystem/network/resource
+isolation, and launcher preflight. Until that work and the separate command
+enablement changes land, the bot has no worker-socket group access and
+`/config pull`, `/config reload`, and `/config sync` remain disabled.
 
 ## Development
 

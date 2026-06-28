@@ -7,6 +7,7 @@ use std::{
     fs::Permissions,
     path::{Path, PathBuf},
     process::{self, ExitStatus, Stdio},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +20,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::{config::CodexConfig, policy::trim_to_chars};
+use crate::{
+    config::{CodexConfig, IsolationMode},
+    policy::trim_to_chars,
+};
 
 #[derive(Debug, Clone)]
 pub struct CodexRunOutput {
@@ -38,8 +42,57 @@ pub trait CodexRunner: Send + Sync {
     ) -> Result<CodexRunOutput>;
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ExecCodexRunner;
+#[derive(Debug, Clone, Copy)]
+struct CodexInvocation<'a> {
+    config: &'a CodexConfig,
+    prompt: &'a str,
+    message_id: &'a str,
+}
+
+#[async_trait]
+trait CodexExecutionBackend: Send + Sync {
+    async fn execute(&self, invocation: CodexInvocation<'_>) -> Result<CodexRunOutput>;
+}
+
+#[derive(Debug, Default)]
+struct CurrentUserExecBackend;
+
+#[derive(Clone)]
+pub struct ExecCodexRunner {
+    current_user_backend: Arc<dyn CodexExecutionBackend>,
+}
+
+impl std::fmt::Debug for ExecCodexRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecCodexRunner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ExecCodexRunner {
+    fn default() -> Self {
+        Self {
+            current_user_backend: Arc::new(CurrentUserExecBackend),
+        }
+    }
+}
+
+impl ExecCodexRunner {
+    fn backend_for(&self, mode: IsolationMode) -> Result<&dyn CodexExecutionBackend> {
+        match mode {
+            IsolationMode::CurrentUser => Ok(self.current_user_backend.as_ref()),
+            IsolationMode::EphemeralLinuxUser => Err(ephemeral_backend_unavailable()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_current_user_backend(backend: Arc<dyn CodexExecutionBackend>) -> Self {
+        Self {
+            current_user_backend: backend,
+        }
+    }
+}
 
 #[async_trait]
 impl CodexRunner for ExecCodexRunner {
@@ -49,91 +102,107 @@ impl CodexRunner for ExecCodexRunner {
         prompt: &str,
         message_id: &str,
     ) -> Result<CodexRunOutput> {
-        run_codex_exec(config, prompt, message_id).await
+        config.validate()?;
+        let invocation = CodexInvocation {
+            config,
+            prompt,
+            message_id,
+        };
+
+        self.backend_for(config.isolation.mode)?
+            .execute(invocation)
+            .await
     }
 }
 
-async fn run_codex_exec(
-    config: &CodexConfig,
-    prompt: &str,
-    message_id: &str,
-) -> Result<CodexRunOutput> {
-    config.validate()?;
-    let output_path = output_path(message_id).await?;
-    let mut command = Command::new(&config.bin);
-    command.args(codex_exec_args(config, &output_path));
-    configure_child_process(&mut command);
-    apply_runner_env(&mut command, config);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+fn ephemeral_backend_unavailable() -> anyhow::Error {
+    anyhow!("ephemeral-linux-user Codex execution backend is unavailable")
+}
 
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to spawn codex executable {} in {}",
-            config.bin,
-            config.cwd.display()
+#[async_trait]
+impl CodexExecutionBackend for CurrentUserExecBackend {
+    async fn execute(&self, invocation: CodexInvocation<'_>) -> Result<CodexRunOutput> {
+        let CodexInvocation {
+            config,
+            prompt,
+            message_id,
+        } = invocation;
+        let output_path = output_path(message_id).await?;
+        let mut command = Command::new(&config.bin);
+        command.args(codex_exec_args(config, &output_path));
+        configure_child_process(&mut command);
+        apply_runner_env(&mut command, config);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn codex executable {} in {}",
+                config.bin,
+                config.cwd.display()
+            )
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open codex stdin"))?;
+
+        let capture_limit = capture_limit_bytes(config.output_limit_chars);
+        let stdout_task = read_pipe(child.stdout.take(), capture_limit);
+        let stderr_task = read_pipe(child.stderr.take(), capture_limit);
+        let status = match timeout(
+            config.timeout(),
+            write_prompt_and_wait(&mut child, stdin, prompt),
         )
-    })?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open codex stdin"))?;
-
-    let capture_limit = capture_limit_bytes(config.output_limit_chars);
-    let stdout_task = read_pipe(child.stdout.take(), capture_limit);
-    let stderr_task = read_pipe(child.stderr.take(), capture_limit);
-    let status = match timeout(
-        config.timeout(),
-        write_prompt_and_wait(&mut child, stdin, prompt),
-    )
-    .await
-    {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            terminate_child(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            let _ = fs::remove_file(&output_path).await;
-            return Err(error);
-        }
-        Err(_) => {
-            terminate_child(&mut child).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+        .await
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                terminate_child(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                let _ = fs::remove_file(&output_path).await;
+                return Err(error);
+            }
+            Err(_) => {
+                terminate_child(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                let _ = fs::remove_file(&output_path).await;
+                return Err(anyhow!(
+                    "codex exec timed out after {} seconds",
+                    config.timeout_secs.max(1)
+                ));
+            }
+        };
+        let stdout = stdout_task
+            .await
+            .context("failed to join codex stdout reader")??;
+        let stderr = stderr_task
+            .await
+            .context("failed to join codex stderr reader")??;
+        if !status.success() {
             let _ = fs::remove_file(&output_path).await;
             return Err(anyhow!(
-                "codex exec timed out after {} seconds",
-                config.timeout_secs.max(1)
+                "codex exec exited with status {status}; stderr: {}",
+                trim_to_chars(&stderr, 2_000)
             ));
         }
-    };
-    let stdout = stdout_task
-        .await
-        .context("failed to join codex stdout reader")??;
-    let stderr = stderr_task
-        .await
-        .context("failed to join codex stderr reader")??;
-    if !status.success() {
-        let _ = fs::remove_file(&output_path).await;
-        return Err(anyhow!(
-            "codex exec exited with status {status}; stderr: {}",
-            trim_to_chars(&stderr, 2_000)
-        ));
-    }
 
-    let final_message = read_limited_file(&output_path, capture_limit)
-        .await
-        .unwrap_or_else(|_| stdout.clone());
-    let _ = fs::remove_file(&output_path).await;
-    let final_message = normalize_final_message(&final_message, config.output_limit_chars)?;
-    Ok(CodexRunOutput {
-        final_message,
-        stdout,
-        stderr,
-    })
+        let final_message = read_limited_file(&output_path, capture_limit)
+            .await
+            .unwrap_or_else(|_| stdout.clone());
+        let _ = fs::remove_file(&output_path).await;
+        let final_message = normalize_final_message(&final_message, config.output_limit_chars)?;
+        Ok(CodexRunOutput {
+            final_message,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 async fn write_prompt_and_wait(
@@ -412,9 +481,52 @@ async fn brief_pause_for_kill() {
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{env, fs as std_fs, path::PathBuf, time::SystemTime};
+    use std::{
+        env, fs as std_fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::SystemTime,
+    };
 
     use super::*;
+
+    struct AssertingBackend {
+        expected_config_address: usize,
+        expected_prompt: String,
+        expected_message_id: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CodexExecutionBackend for AssertingBackend {
+        async fn execute(&self, invocation: CodexInvocation<'_>) -> Result<CodexRunOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                invocation.config as *const CodexConfig as usize,
+                self.expected_config_address
+            );
+            assert_eq!(invocation.prompt, self.expected_prompt);
+            assert_eq!(invocation.message_id, self.expected_message_id);
+            Ok(CodexRunOutput {
+                final_message: "dispatched output".to_owned(),
+                stdout: "dispatched stdout".to_owned(),
+                stderr: "dispatched stderr".to_owned(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingBackend {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CodexExecutionBackend for CountingBackend {
+        async fn execute(&self, _invocation: CodexInvocation<'_>) -> Result<CodexRunOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("unexpected current-user backend execution"))
+        }
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
@@ -424,6 +536,59 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[tokio::test]
+    async fn current_user_dispatch_forwards_exact_invocation() {
+        let config = CodexConfig::default();
+        let backend = Arc::new(AssertingBackend {
+            expected_config_address: &config as *const CodexConfig as usize,
+            expected_prompt: "exact prompt".to_owned(),
+            expected_message_id: "message-exact".to_owned(),
+            calls: AtomicUsize::new(0),
+        });
+        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+
+        let output = runner
+            .run(&config, "exact prompt", "message-exact")
+            .await
+            .unwrap();
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output.final_message, "dispatched output");
+        assert_eq!(output.stdout, "dispatched stdout");
+        assert_eq!(output.stderr, "dispatched stderr");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_mode_is_rejected_by_config_before_current_user_backend() {
+        let mut config = CodexConfig::default();
+        config.isolation.mode = IsolationMode::EphemeralLinuxUser;
+        let backend = Arc::new(CountingBackend::default());
+        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+
+        let error = runner
+            .run(&config, "prompt", "message-ephemeral")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ephemeral-linux-user"));
+        assert!(error.to_string().contains("planned but not implemented"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unavailable_ephemeral_backend_never_falls_back_to_current_user() {
+        let backend = Arc::new(CountingBackend::default());
+        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+
+        let error = runner
+            .backend_for(IsolationMode::EphemeralLinuxUser)
+            .err()
+            .expect("ephemeral backend must be unavailable");
+
+        assert!(error.to_string().contains("backend is unavailable"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -625,7 +790,9 @@ mod tests {
             timeout_secs: 1,
             ..CodexConfig::default()
         };
-        let result = run_codex_exec(&config, "prompt", "message-1").await;
+        let result = ExecCodexRunner::default()
+            .run(&config, "prompt", "message-1")
+            .await;
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
         let pid = std_fs::read_to_string(&pid_file)
@@ -655,7 +822,9 @@ mod tests {
             ..CodexConfig::default()
         };
         let prompt = "x".repeat(2_000_000);
-        let result = run_codex_exec(&config, &prompt, "message-stdin-timeout").await;
+        let result = ExecCodexRunner::default()
+            .run(&config, &prompt, "message-stdin-timeout")
+            .await;
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
 
@@ -692,7 +861,8 @@ printf 'final from fake codex\n' > "$out"
             timeout_secs: 5,
             ..CodexConfig::default()
         };
-        let result = run_codex_exec(&config, "prompt", "message-stdout-drain")
+        let result = ExecCodexRunner::default()
+            .run(&config, "prompt", "message-stdout-drain")
             .await
             .unwrap();
 
