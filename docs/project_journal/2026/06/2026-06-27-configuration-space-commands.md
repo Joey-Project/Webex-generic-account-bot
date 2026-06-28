@@ -57,6 +57,10 @@ superseded_by:
   deployment child without granting cgroup delegation or write access.
 - Serialise the worker's single-use startup and shutdown path, including a
   bounded, abortable stale-socket probe.
+- Hold the root-provisioned `config-pull-worker.lock` flock from before any
+  durable recovery through the complete worker lifetime. Keep it separate from
+  `deploy-config.lock` so a same-UID second instance cannot mutate action state
+  before discovering the first worker's active socket.
 - Keep `/config pull` configuration-invalid and do not grant the bot the socket
   group because current-user Codex children inherit its supplementary groups.
 

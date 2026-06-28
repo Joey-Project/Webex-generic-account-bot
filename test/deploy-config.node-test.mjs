@@ -315,6 +315,7 @@ describe('deploy-config lock policy', () => {
 
     assert.deepEqual(servicePaths, [
       'ReadOnlyPaths=/run/webex-config-deploy',
+      'ReadWritePaths=/run/webex-config-deploy/config-pull-worker.lock',
       'ReadWritePaths=/run/webex-config-deploy/deploy-config.lock',
       'ReadWritePaths=/run/webex-config-pull',
       'ReadWritePaths=/var/lib/webex-generic-account-bot/config-actions',
@@ -323,13 +324,18 @@ describe('deploy-config lock policy', () => {
       'ReadOnlyPaths=-/var/lib/webex-generic-account-bot/rendered',
     ]);
     assert.match(service, /^ConditionPathExists=\/sys\/fs\/cgroup\/cgroup\.controllers$/m);
+    assert.doesNotMatch(service, /^ReadWritePaths=\/run\/webex-config-deploy\/?$/m);
     assert.doesNotMatch(service, /ReadWritePaths=.*\/config-checkout$/m);
     assert.doesNotMatch(service, /^RuntimeDirectory=/m);
     assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
+    assert.doesNotMatch(service, /^Group=webex-generic-account-bot$/m);
+    assert.doesNotMatch(service, /^SupplementaryGroups=.*webex-generic-account-bot/m);
     assert.match(service, /^KillMode=control-group$/m);
     assert.doesNotMatch(service, /^Delegate=/m);
-    assert.deepEqual(tmpfiles.trim().split('\n'), [
+    const tmpfilesLines = tmpfiles.trim().split('\n');
+    assert.deepEqual(tmpfilesLines, [
       'd /run/webex-config-deploy 0750 root webex-config-pull -',
+      'f /run/webex-config-deploy/config-pull-worker.lock 0660 root webex-config-pull -',
       'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
       'd /run/webex-config-pull 0750 webex-config-deploy webex-config-pull -',
       'd /var/lib/webex-generic-account-bot 0755 root root -',
@@ -339,6 +345,14 @@ describe('deploy-config lock policy', () => {
       'd /var/lib/webex-generic-account-bot/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -',
       'd /var/lib/webex-generic-account-bot/config-staging 0700 webex-config-deploy webex-config-pull -',
     ]);
+    const sharedLockRecords = tmpfilesLines.filter(
+      (line) => line.startsWith('f /run/webex-config-deploy/'),
+    );
+    assert.deepEqual(sharedLockRecords, [
+      'f /run/webex-config-deploy/config-pull-worker.lock 0660 root webex-config-pull -',
+      'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
+    ]);
+    assert.doesNotMatch(sharedLockRecords.join('\n'), /\swebex-generic-account-bot\s/);
     assert.doesNotMatch(tmpfiles, /\/config-checkout /);
   });
 });

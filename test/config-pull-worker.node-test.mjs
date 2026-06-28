@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 import {
   ConfigPullWorker,
   DEFAULTS,
+  LIFETIME_LOCK_COMMAND,
   MAX_REQUEST_BYTES,
   PREPARE_CLOSE_GRACE_MS,
   PREPARE_COMMAND,
@@ -549,7 +550,7 @@ describe('config pull worker socket protocol', () => {
     assert.equal(publicStatus.state, 'succeeded');
   });
 
-  it('republishes durable public status before acknowledging a duplicate retry', async (context) => {
+  it('republishes durable public status before acknowledging a duplicate after fatal restart', async (context) => {
     const layout = await createLayout(context);
     let failFirstPublicStatusWrite = true;
     const fsApi = new Proxy(fs, {
@@ -587,7 +588,24 @@ describe('config pull worker socket protocol', () => {
     );
     assert.equal((await readActionState(layout.stateDir, actionId)).status, 'queued');
     await assert.rejects(fs.stat(layout.publicStatusFile), { code: 'ENOENT' });
+    assert.equal((await worker.waitForFatal()).message, 'injected public status write failure');
+    await worker.stop();
 
+    const retryScheduled = deferred();
+    const restartedWorker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => {
+        throw new WorkerFailure('prepare_lock_busy');
+      },
+      setTimeoutImpl: () => {
+        const timer = { unref() {} };
+        retryScheduled.resolve(timer);
+        return timer;
+      },
+      clearTimeoutImpl: () => {},
+    });
+    context.after(async () => restartedWorker.stop());
+    await restartedWorker.start();
     const retry = await sendRequest(layout.socketPath, request);
     assert.deepEqual(retry, {
       version: 1,
@@ -595,6 +613,7 @@ describe('config pull worker socket protocol', () => {
       action: 'pull',
       action_id: actionId,
     });
+    await retryScheduled.promise;
     const publicStatus = JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8'));
     assert.equal(publicStatus.action_id, actionId);
     assert.equal(publicStatus.state, 'queued');
@@ -761,6 +780,207 @@ describe('config pull worker socket protocol', () => {
 });
 
 describe('config pull worker lifecycle', () => {
+  it('holds a singleton flock before durable recovery and releases it on stop', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const publication = await publishRequestRecord({
+      queueDir: layout.queueDir,
+      request: { version: 1, message_id: 'singleton-recovery-race', action: 'pull' },
+      enqueueSequence: 1,
+    });
+    await writeActionState({
+      stateDir: layout.stateDir,
+      state: actionState(
+        publication.actionId,
+        1,
+        'running',
+        '2026-06-27T12:01:29.000Z',
+      ),
+    });
+    await stagePreparedResult(layout, publication.actionId);
+
+    const recoveryReached = deferred();
+    const releaseRecovery = deferred();
+    let blocked = false;
+    const firstFsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'readdir') return target[property];
+        return async (directory, ...args) => {
+          if (directory === layout.stateRoot && !blocked) {
+            blocked = true;
+            recoveryReached.resolve();
+            await releaseRecovery.promise;
+          }
+          return target.readdir(directory, ...args);
+        };
+      },
+    });
+    const first = new ConfigPullWorker({
+      ...layout,
+      fsApi: firstFsApi,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    const second = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => {
+      releaseRecovery.resolve();
+      await Promise.allSettled([first.stop(), second.stop()]);
+    });
+
+    const firstStart = first.start();
+    await recoveryReached.promise;
+    const before = await durableLayoutSnapshot(layout);
+
+    await assert.rejects(
+      second.start(),
+      (error) => error instanceof WorkerFailure && error.code === 'worker_lock_busy',
+    );
+    assert.deepEqual(await durableLayoutSnapshot(layout), before);
+    await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
+
+    releaseRecovery.resolve();
+    await firstStart;
+    assert.equal((await readActionState(layout.stateDir, publication.actionId)).status, 'succeeded');
+    await first.stop();
+
+    const replacement = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => replacement.stop());
+    await replacement.start();
+  });
+
+  it('releases the singleton flock when startup fails after acquisition', async (context) => {
+    const layout = await createLayout(context);
+    await fs.writeFile(layout.socketPath, 'not a socket');
+    const failedWorker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => failedWorker.stop());
+
+    await assert.rejects(failedWorker.start(), /socket path is not a socket/);
+    await fs.unlink(layout.socketPath);
+
+    const replacement = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => replacement.stop());
+    await replacement.start();
+  });
+
+  it('fails closed on untrusted lifetime lock provisioning before storage creation', async (context) => {
+    const scenarios = [
+      {
+        name: 'misowned parent',
+        prepare: async (layout) => ({
+          fsApi: metadataOverridingFsApi(path.dirname(layout.lifetimeLockPath), {
+            uid: process.getuid() + 1,
+          }),
+          expected: /worker lifetime lock parent metadata is not trusted/,
+        }),
+      },
+      {
+        name: 'misowned file',
+        prepare: async (layout) => ({
+          fsApi: metadataOverridingFsApi(layout.lifetimeLockPath, {
+            uid: process.getuid() + 1,
+          }),
+          expected: /worker lifetime lock metadata is not trusted/,
+        }),
+      },
+      {
+        name: 'wrong file group',
+        prepare: async (layout) => ({
+          fsApi: metadataOverridingFsApi(layout.lifetimeLockPath, {
+            gid: process.getgid() + 1,
+          }),
+          expected: /worker lifetime lock metadata is not trusted/,
+        }),
+      },
+      {
+        name: 'parent mode',
+        prepare: async (layout) => {
+          await fs.chmod(path.dirname(layout.lifetimeLockPath), 0o750);
+          return { expected: /worker lifetime lock parent metadata is not trusted/ };
+        },
+      },
+      {
+        name: 'file mode',
+        prepare: async (layout) => {
+          await fs.chmod(layout.lifetimeLockPath, 0o640);
+          return { expected: /worker lifetime lock metadata is not trusted/ };
+        },
+      },
+      {
+        name: 'symlink file',
+        prepare: async (layout) => {
+          const target = path.join(layout.root, 'lock-target');
+          await fs.writeFile(target, '', { mode: 0o600 });
+          await fs.unlink(layout.lifetimeLockPath);
+          await fs.symlink(target, layout.lifetimeLockPath);
+          return { expected: /path contains a symlink/ };
+        },
+      },
+      {
+        name: 'symlink parent',
+        prepare: async (layout) => {
+          const parent = path.dirname(layout.lifetimeLockPath);
+          const target = path.join(layout.root, 'lock-parent-target');
+          await fs.mkdir(target, { mode: 0o700 });
+          await fs.writeFile(path.join(target, path.basename(layout.lifetimeLockPath)), '', {
+            mode: 0o600,
+          });
+          await fs.rm(parent, { recursive: true });
+          await fs.symlink(target, parent);
+          return { expected: /path contains a symlink/ };
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      await context.test(scenario.name, async (subcontext) => {
+        const layout = await createLayout(subcontext);
+        const { fsApi, expected } = await scenario.prepare(layout);
+        const worker = new ConfigPullWorker({
+          ...layout,
+          fsApi,
+          prepareRunner: async () => PREPARED_PROJECTION,
+        });
+        subcontext.after(async () => worker.stop());
+
+        await assert.rejects(worker.start(), expected);
+        await assertPrivateStorageDoesNotExist(layout);
+        await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
+      });
+    }
+  });
+
+  it('does not expose a CLI lifetime lock path override', async () => {
+    let calls = 0;
+    const stderr = [];
+    const worker = {
+      start: () => {
+        calls += 1;
+      },
+      stop: () => {
+        calls += 1;
+      },
+    };
+
+    assert.equal(await runCli({
+      argv: ['--lifetime-lock', '/tmp/override.lock'],
+      worker,
+      stderr: { write: (message) => stderr.push(message) },
+    }), 2);
+    assert.equal(calls, 0);
+    assert.deepEqual(stderr, ['config pull worker does not accept command-line arguments\n']);
+  });
+
   it('waits for an aborted startup and removes a socket that started listening', async (context) => {
     const layout = await createLayout(context);
     const socketChmodStarted = deferred();
@@ -2166,6 +2386,7 @@ describe('config pull worker systemd boundary', () => {
       '-/var/lib/webex-generic-account-bot/rendered',
     ]);
     assert.deepEqual(unitDirectiveValues(unit, 'ReadWritePaths'), [
+      '/run/webex-config-deploy/config-pull-worker.lock',
       '/run/webex-config-deploy/deploy-config.lock',
       '/run/webex-config-pull',
       '/var/lib/webex-generic-account-bot/config-actions',
@@ -2182,7 +2403,13 @@ describe('config pull worker systemd boundary', () => {
     assert.doesNotMatch(unit, /^SupplementaryGroups=.*webex-generic-account-bot/m);
 
     const plan = buildDeployPlan(parseArgs(['--prepare']));
+    assert.equal(DEFAULTS.lifetimeLockPath, '/run/webex-config-deploy/config-pull-worker.lock');
+    assert.deepEqual(LIFETIME_LOCK_COMMAND, {
+      bin: '/usr/bin/flock',
+      args: ['--exclusive', '--nonblock', '3'],
+    });
     assert.equal(plan.lockDir, '/run/webex-config-deploy/deploy-config.lock');
+    assert.notEqual(DEFAULTS.lifetimeLockPath, plan.lockDir);
     assert.equal(path.dirname(DEFAULTS.socketPath), '/run/webex-config-pull');
     assert.notEqual(path.dirname(plan.lockDir), path.dirname(DEFAULTS.socketPath));
     assert.equal(plan.stagedConfig, PREPARED_RESULT.staged_config);
@@ -2217,6 +2444,14 @@ describe('config pull worker systemd boundary', () => {
     const tmpfilesRecords = tmpfiles.trim().split('\n').map((line) => line.split(/\s+/));
     assert.deepEqual(tmpfilesRecords, [
       ['d', '/run/webex-config-deploy', '0750', 'root', 'webex-config-pull', '-'],
+      [
+        'f',
+        '/run/webex-config-deploy/config-pull-worker.lock',
+        '0660',
+        'root',
+        'webex-config-pull',
+        '-',
+      ],
       [
         'f',
         '/run/webex-config-deploy/deploy-config.lock',
@@ -2274,9 +2509,14 @@ async function createLayout(context) {
     await fs.rm(root, { recursive: true, force: true });
   });
   const stagingDir = path.join(root, 'config-staging');
+  const lifetimeLockDir = path.join(root, 'worker-lock');
   await fs.mkdir(stagingDir, { mode: 0o700 });
+  await fs.mkdir(lifetimeLockDir, { mode: 0o700 });
+  const lifetimeLockPath = path.join(lifetimeLockDir, 'config-pull-worker.lock');
+  await fs.writeFile(lifetimeLockPath, '', { mode: 0o600 });
   return {
     root,
+    lifetimeLockPath,
     socketPath: path.join(root, 'config-pull.sock'),
     stateRoot,
     queueDir: path.join(stateRoot, 'queue'),
@@ -2307,6 +2547,43 @@ function metadataOverridingFsApi(targetPath, metadata) {
       };
     },
   });
+}
+
+async function durableLayoutSnapshot(layout) {
+  const roots = [
+    layout.stateRoot,
+    path.dirname(layout.stagedConfigFile),
+  ];
+  const snapshot = [];
+  for (const root of roots) await snapshotTree(root, root, snapshot);
+  return snapshot;
+}
+
+async function snapshotTree(root, candidate, snapshot) {
+  const stat = await fs.lstat(candidate, { bigint: true });
+  const relative = path.relative(root, candidate) || '.';
+  const entry = {
+    root,
+    relative,
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    mode: stat.mode.toString(),
+    uid: stat.uid.toString(),
+    gid: stat.gid.toString(),
+    size: stat.size.toString(),
+    mtimeNs: stat.mtimeNs.toString(),
+    ctimeNs: stat.ctimeNs.toString(),
+  };
+  if (stat.isDirectory()) {
+    entry.children = (await fs.readdir(candidate)).sort();
+    snapshot.push(entry);
+    for (const child of entry.children) {
+      await snapshotTree(root, path.join(candidate, child), snapshot);
+    }
+  } else {
+    entry.contents = (await fs.readFile(candidate)).toString('base64');
+    snapshot.push(entry);
+  }
 }
 
 async function assertPrivateStorageDoesNotExist(layout) {

@@ -221,12 +221,14 @@ configuration Space allowlist. The service keeps `UMask=0077`; worker code
 explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
 public status file after creation.
 
-The socket parent and deployment lock parent are deliberately separate. The
-shared socket parent is mode `0750` at `/run/webex-config-pull`; the global
-deployment lock is the preprovisioned root-owned
-`/run/webex-config-deploy/deploy-config.lock`, shared by non-root prepare and a
-future root activation through one kernel flock without giving the worker write
-access to the lock parent.
+The socket parent and lock parent are deliberately separate. The shared socket
+parent is mode `0750` at `/run/webex-config-pull`. The root-owned
+`/run/webex-config-deploy` parent contains two distinct mode `0660`,
+`root:webex-config-pull` files: `config-pull-worker.lock` is the worker lifetime
+singleton, while `deploy-config.lock` serialises non-root prepare with a future
+root activation. The unit grants write access to those exact files without
+giving the worker write access to their parent. The lifetime lock does not
+replace the deployment transaction lock.
 Lock contention is reported by the fixed deployment entrypoint as a structured
 retryable status. The worker durably moves that oldest action back to `queued`,
 waits one second, and retries without allowing newer actions to pass it. A
@@ -277,9 +279,14 @@ shell. A response is sent only after the immutable request, private queued
 state, and public status are durable. A lost response converges through the
 same message-derived action ID; running actions recover after restart, and
 terminal actions are not executed again.
-Worker startup and shutdown are single-use and serialised. A stop signal aborts
-the bounded stale-socket probe, waits for partial startup to unwind, and removes
-any socket already created before the process exits.
+Worker startup and shutdown are single-use and serialised. Before any durable
+queue or action-state recovery, the worker acquires a non-blocking kernel flock
+on `config-pull-worker.lock` and retains it for the entire worker lifetime,
+including shutdown cleanup. A second process under the same UID therefore
+fails on the singleton lock before it can change durable state, rather than
+changing state and only then discovering the first worker's active socket. A
+stop signal aborts the bounded stale-socket probe, waits for partial startup to
+unwind, and removes any socket already created before the process exits.
 
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no

@@ -11,6 +11,7 @@ import { TextDecoder } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 export const DEFAULTS = Object.freeze({
+  lifetimeLockPath: '/run/webex-config-deploy/config-pull-worker.lock',
   socketPath: '/run/webex-config-pull/config-pull.sock',
   stateRoot: '/var/lib/webex-generic-account-bot/config-actions',
   queueDir: '/var/lib/webex-generic-account-bot/config-actions/queue',
@@ -25,6 +26,17 @@ export const DEFAULTS = Object.freeze({
   outputLimitBytes: 64 * 1024,
   retryDelayMs: 1_000,
   socketProbeTimeoutMs: 1_000,
+});
+
+export const LIFETIME_LOCK_COMMAND = Object.freeze({
+  bin: '/usr/bin/flock',
+  args: Object.freeze(['--exclusive', '--nonblock', '3']),
+});
+
+const LIFETIME_LOCK_ENV = Object.freeze({
+  PATH: '/usr/bin:/bin',
+  LANG: 'C.UTF-8',
+  LC_ALL: 'C.UTF-8',
 });
 
 export const PREPARE_COMMAND = Object.freeze({
@@ -62,6 +74,10 @@ const MAX_STAGED_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BOUNDED_DELAY_MS = 60_000;
 const SOCKET_MODE = 0o660;
 const SHARED_DIRECTORY_MODE = 0o750;
+const PRODUCTION_LOCK_FILE_MODE = 0o660;
+const PRODUCTION_LOCK_PARENT_MODE = 0o750;
+const PRIVATE_LOCK_FILE_MODE = 0o600;
+const PRIVATE_LOCK_PARENT_MODE = 0o700;
 const PUBLIC_STATE_ROOT_MODE = 0o755;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -635,6 +651,7 @@ export class ConfigPullWorker {
     this.clearTimeoutImpl = options.clearTimeoutImpl || clearTimeout;
     this.server = null;
     this.socketIdentity = null;
+    this.lifetimeLockHandle = null;
     this.connections = new Set();
     this.enqueueTail = Promise.resolve();
     this.nextEnqueueSequence = null;
@@ -668,17 +685,28 @@ export class ConfigPullWorker {
   }
 
   async #start() {
-    await prepareStorage({ ...this.options, fsApi: this.fsApi });
-    this.#throwIfStopping();
-    await this.#cleanStaleTemporaryFiles();
-    this.#throwIfStopping();
-    await this.#recoverQueue();
-    this.#throwIfStopping();
-    await this.#listen();
-    this.#throwIfStopping();
-    this.started = true;
-    setImmediate(() => this.#kickDrain());
-    return this;
+    this.lifetimeLockHandle = await acquireWorkerLifetimeLock({
+      lockPath: this.options.lifetimeLockPath,
+      productionProvisioning: this.options.productionLifetimeLock,
+      fsApi: this.fsApi,
+    });
+    try {
+      this.#throwIfStopping();
+      await prepareStorage({ ...this.options, fsApi: this.fsApi });
+      this.#throwIfStopping();
+      await this.#cleanStaleTemporaryFiles();
+      this.#throwIfStopping();
+      await this.#recoverQueue();
+      this.#throwIfStopping();
+      await this.#listen();
+      this.#throwIfStopping();
+      this.started = true;
+      setImmediate(() => this.#kickDrain());
+      return this;
+    } catch (error) {
+      await this.#releaseLifetimeLock();
+      throw error;
+    }
   }
 
   stop() {
@@ -692,15 +720,25 @@ export class ConfigPullWorker {
   }
 
   async #stop() {
-    await this.startPromise?.catch(() => {});
-    this.#clearRetryTimer();
-    for (const connection of this.connections) connection.destroy();
-    await this.#closeServer();
-    await this.enqueueTail.catch(() => {});
-    await this.drainPromise?.catch(() => {});
-    await this.publicStatusTail.catch(() => {});
-    await this.#removeOwnedSocket();
-    this.started = false;
+    try {
+      await this.startPromise?.catch(() => {});
+      this.#clearRetryTimer();
+      for (const connection of this.connections) connection.destroy();
+      await this.#closeServer();
+      await this.enqueueTail.catch(() => {});
+      await this.drainPromise?.catch(() => {});
+      await this.publicStatusTail.catch(() => {});
+      await this.#removeOwnedSocket();
+    } finally {
+      this.started = false;
+      await this.#releaseLifetimeLock();
+    }
+  }
+
+  async #releaseLifetimeLock() {
+    const handle = this.lifetimeLockHandle;
+    this.lifetimeLockHandle = null;
+    await handle?.close();
   }
 
   async waitForIdle() {
@@ -1159,6 +1197,7 @@ export class ConfigPullWorker {
     this.fatalError = fatalError;
     this.#clearRetryTimer();
     this.resolveFatal(this.fatalError);
+    this.stop().catch(() => {});
   }
 }
 
@@ -1486,9 +1525,165 @@ async function syncDirectory(directory, fsApi) {
   }
 }
 
+export async function acquireWorkerLifetimeLock({
+  lockPath = DEFAULTS.lifetimeLockPath,
+  productionProvisioning = lockPath === DEFAULTS.lifetimeLockPath,
+  fsApi = fs,
+}) {
+  if (!path.isAbsolute(lockPath)) {
+    throw new Error(`worker lifetime lock path must be absolute: ${lockPath}`);
+  }
+  const resolvedLockPath = path.resolve(lockPath);
+  const parent = path.dirname(resolvedLockPath);
+  const expectedUid = productionProvisioning ? 0 : currentUid(-1);
+  const expectedGid = currentGid(-1);
+  const expectedParentMode = productionProvisioning
+    ? PRODUCTION_LOCK_PARENT_MODE
+    : PRIVATE_LOCK_PARENT_MODE;
+  const expectedFileMode = productionProvisioning
+    ? PRODUCTION_LOCK_FILE_MODE
+    : PRIVATE_LOCK_FILE_MODE;
+  let handle = null;
+
+  try {
+    await assertNoSymlinkComponents(resolvedLockPath, fsApi);
+    const parentStat = await fsApi.lstat(parent);
+    assertWorkerLifetimeLockParent(
+      parentStat,
+      parent,
+      expectedUid,
+      expectedGid,
+      expectedParentMode,
+    );
+    const pathStat = await fsApi.lstat(resolvedLockPath);
+    assertWorkerLifetimeLockFile(
+      pathStat,
+      resolvedLockPath,
+      expectedUid,
+      expectedGid,
+      expectedFileMode,
+    );
+
+    const flags = fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0);
+    handle = await fsApi.open(resolvedLockPath, flags);
+    const handleStat = await handle.stat();
+    assertWorkerLifetimeLockFile(
+      handleStat,
+      resolvedLockPath,
+      expectedUid,
+      expectedGid,
+      expectedFileMode,
+    );
+    if (!sameFileIdentity(pathStat, handleStat)) {
+      throw new Error(`worker lifetime lock changed while opening: ${resolvedLockPath}`);
+    }
+
+    await takeKernelFlock(handle);
+
+    const [currentParentStat, currentPathStat] = await Promise.all([
+      fsApi.lstat(parent),
+      fsApi.lstat(resolvedLockPath),
+    ]);
+    assertWorkerLifetimeLockParent(
+      currentParentStat,
+      parent,
+      expectedUid,
+      expectedGid,
+      expectedParentMode,
+    );
+    assertWorkerLifetimeLockFile(
+      currentPathStat,
+      resolvedLockPath,
+      expectedUid,
+      expectedGid,
+      expectedFileMode,
+    );
+    if (
+      !sameFileIdentity(parentStat, currentParentStat)
+      || !sameFileIdentity(handleStat, currentPathStat)
+    ) {
+      throw new Error(`worker lifetime lock provisioning changed: ${resolvedLockPath}`);
+    }
+    return handle;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function takeKernelFlock(handle) {
+  await new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(
+        LIFETIME_LOCK_COMMAND.bin,
+        LIFETIME_LOCK_COMMAND.args,
+        {
+          cwd: '/',
+          env: { ...LIFETIME_LOCK_ENV },
+          shell: false,
+          stdio: ['ignore', 'ignore', 'ignore', handle.fd],
+        },
+      );
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const settle = (error = null) => {
+      if (settled) return;
+      settled = true;
+      child.off('error', onError);
+      child.off('close', onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error) => settle(error);
+    const onClose = (code) => {
+      if (code === 0) {
+        settle();
+      } else if (code === 1) {
+        settle(new WorkerFailure('worker_lock_busy'));
+      } else {
+        settle(new WorkerFailure('worker_lock_failed'));
+      }
+    };
+    child.once('error', onError);
+    child.once('close', onClose);
+  });
+}
+
+function assertWorkerLifetimeLockParent(stat, parent, expectedUid, expectedGid, expectedMode) {
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || stat.uid !== expectedUid
+    || stat.gid !== expectedGid
+    || (stat.mode & 0o7777) !== expectedMode
+  ) {
+    throw new Error(`worker lifetime lock parent metadata is not trusted: ${parent}`);
+  }
+}
+
+function assertWorkerLifetimeLockFile(stat, lockPath, expectedUid, expectedGid, expectedMode) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.uid !== expectedUid
+    || stat.gid !== expectedGid
+    || (stat.mode & 0o7777) !== expectedMode
+  ) {
+    throw new Error(`worker lifetime lock metadata is not trusted: ${lockPath}`);
+  }
+}
+
 function resolveWorkerOptions(options) {
   const stateRoot = path.resolve(options.stateRoot || DEFAULTS.stateRoot);
+  const lifetimeLockPath = path.resolve(options.lifetimeLockPath || DEFAULTS.lifetimeLockPath);
+  const productionLifetimeLock = lifetimeLockPath === DEFAULTS.lifetimeLockPath;
   const resolved = {
+    lifetimeLockPath,
+    productionLifetimeLock,
     socketPath: path.resolve(options.socketPath || DEFAULTS.socketPath),
     stateRoot,
     queueDir: path.resolve(options.queueDir || path.join(stateRoot, 'queue')),
