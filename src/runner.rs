@@ -7,7 +7,6 @@ use std::{
     fs::Permissions,
     path::{Path, PathBuf},
     process::{self, ExitStatus, Stdio},
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -57,46 +56,28 @@ trait CodexExecutionBackend: Send + Sync {
 #[derive(Debug, Default)]
 struct CurrentUserExecBackend;
 
-#[derive(Clone)]
-pub struct ExecCodexRunner {
-    current_user_backend: Arc<dyn CodexExecutionBackend>,
+#[derive(Debug, Clone, Default)]
+pub struct ExecCodexRunner;
+
+struct CodexBackendDispatcher<'a> {
+    current_user_backend: &'a dyn CodexExecutionBackend,
 }
 
-impl std::fmt::Debug for ExecCodexRunner {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExecCodexRunner")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for ExecCodexRunner {
-    fn default() -> Self {
+impl<'a> CodexBackendDispatcher<'a> {
+    fn new(current_user_backend: &'a dyn CodexExecutionBackend) -> Self {
         Self {
-            current_user_backend: Arc::new(CurrentUserExecBackend),
+            current_user_backend,
         }
     }
-}
 
-impl ExecCodexRunner {
     fn backend_for(&self, mode: IsolationMode) -> Result<&dyn CodexExecutionBackend> {
         match mode {
-            IsolationMode::CurrentUser => Ok(self.current_user_backend.as_ref()),
+            IsolationMode::CurrentUser => Ok(self.current_user_backend),
             IsolationMode::EphemeralLinuxUser => Err(ephemeral_backend_unavailable()),
         }
     }
 
-    #[cfg(test)]
-    fn with_current_user_backend(backend: Arc<dyn CodexExecutionBackend>) -> Self {
-        Self {
-            current_user_backend: backend,
-        }
-    }
-}
-
-#[async_trait]
-impl CodexRunner for ExecCodexRunner {
-    async fn run(
+    async fn execute(
         &self,
         config: &CodexConfig,
         prompt: &str,
@@ -111,6 +92,21 @@ impl CodexRunner for ExecCodexRunner {
 
         self.backend_for(config.isolation.mode)?
             .execute(invocation)
+            .await
+    }
+}
+
+#[async_trait]
+impl CodexRunner for ExecCodexRunner {
+    async fn run(
+        &self,
+        config: &CodexConfig,
+        prompt: &str,
+        message_id: &str,
+    ) -> Result<CodexRunOutput> {
+        let current_user_backend = CurrentUserExecBackend;
+        CodexBackendDispatcher::new(&current_user_backend)
+            .execute(config, prompt, message_id)
             .await
     }
 }
@@ -484,7 +480,10 @@ mod tests {
     use std::{
         env, fs as std_fs,
         path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::SystemTime,
     };
 
@@ -547,10 +546,10 @@ mod tests {
             expected_message_id: "message-exact".to_owned(),
             calls: AtomicUsize::new(0),
         });
-        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
 
-        let output = runner
-            .run(&config, "exact prompt", "message-exact")
+        let output = dispatcher
+            .execute(&config, "exact prompt", "message-exact")
             .await
             .unwrap();
 
@@ -565,10 +564,10 @@ mod tests {
         let mut config = CodexConfig::default();
         config.isolation.mode = IsolationMode::EphemeralLinuxUser;
         let backend = Arc::new(CountingBackend::default());
-        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
 
-        let error = runner
-            .run(&config, "prompt", "message-ephemeral")
+        let error = dispatcher
+            .execute(&config, "prompt", "message-ephemeral")
             .await
             .unwrap_err();
 
@@ -580,9 +579,9 @@ mod tests {
     #[test]
     fn unavailable_ephemeral_backend_never_falls_back_to_current_user() {
         let backend = Arc::new(CountingBackend::default());
-        let runner = ExecCodexRunner::with_current_user_backend(backend.clone());
+        let dispatcher = CodexBackendDispatcher::new(backend.as_ref());
 
-        let error = runner
+        let error = dispatcher
             .backend_for(IsolationMode::EphemeralLinuxUser)
             .err()
             .expect("ephemeral backend must be unavailable");
@@ -790,9 +789,7 @@ mod tests {
             timeout_secs: 1,
             ..CodexConfig::default()
         };
-        let result = ExecCodexRunner::default()
-            .run(&config, "prompt", "message-1")
-            .await;
+        let result = ExecCodexRunner.run(&config, "prompt", "message-1").await;
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
         let pid = std_fs::read_to_string(&pid_file)
@@ -822,7 +819,7 @@ mod tests {
             ..CodexConfig::default()
         };
         let prompt = "x".repeat(2_000_000);
-        let result = ExecCodexRunner::default()
+        let result = ExecCodexRunner
             .run(&config, &prompt, "message-stdin-timeout")
             .await;
 
@@ -861,7 +858,7 @@ printf 'final from fake codex\n' > "$out"
             timeout_secs: 5,
             ..CodexConfig::default()
         };
-        let result = ExecCodexRunner::default()
+        let result = ExecCodexRunner
             .run(&config, "prompt", "message-stdout-drain")
             .await
             .unwrap();

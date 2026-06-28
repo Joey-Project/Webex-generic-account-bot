@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
         self_person_id,
         webex,
         state: Mutex::new(state_store),
-        runner: Arc::new(ExecCodexRunner::default()),
+        runner: Arc::new(ExecCodexRunner),
         config_status: Arc::new(FileConfigStatusProvider::default()),
         config_actions: Arc::new(UnixConfigActionClient::default()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
