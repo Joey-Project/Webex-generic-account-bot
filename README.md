@@ -302,7 +302,8 @@ unwind, and removes any socket already created before the process exits.
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no
 config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
-only the Codex launcher group drop-in. A later enablement PR may allow `pull`
+only the receipt-gated Codex launcher client path; PR 4c2 owns the bot launcher
+group drop-in when it removes the current-user path. A later enablement PR may allow `pull`
 only after `ephemeral-linux-user` runner isolation is deployable and verified;
 `reload` and `sync` require the later activation work as well.
 
@@ -613,7 +614,8 @@ static members, no numeric-GID alias, and no static user with that primary GID.
 The root launcher retains the supplementary input group after systemd starts
 it. PR 4c1b also adds `webex-codex-launch` solely so the capability-dropped
 launcher can read the pending source tree. In the PR 4c1b-only state, the bot
-still belongs to neither group; PR 4c1c later grants it only the launch group.
+still belongs to neither group; PR 4c2 later grants it only the launch group
+while activating ephemeral execution.
 The launcher has no config-worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
 cgroup identity check. It opens the run
@@ -641,10 +643,12 @@ resets process dumpability: the transient unit denies the `@debug` syscall group
 access calls, and core dumps, while PR 4c2 must still prove that the inner tool
 PID/filesystem sandbox cannot inspect the Codex main process after `exec`.
 
-The bot receives only the launcher-socket group and pending-staging write path;
-it never receives the sealed-input group or worker-socket access. `/config
-pull`, `/config reload`, and `/config sync` remain disabled until their
-separate command-enablement changes land.
+PR 4c1c does not grant the bot a launcher group or pending-staging write path,
+because current-user Codex children would inherit either permission. PR 4c2
+must grant only the launcher group and pending path in the same activation that
+removes current-user execution; the bot never receives the sealed-input group
+or worker-socket access. `/config pull`, `/config reload`, and `/config sync`
+remain disabled until their separate command-enablement changes land.
 
 ### PR 4c1a Activation Receipt Foundation (Not Activated)
 
@@ -676,9 +680,9 @@ per-run tree
 inside it is owned by the future bot caller with group `webex-codex-launch`,
 using mode `2770` for directories and `0640` for files. The launch group write
 bit permits the capability-dropped sealer to remove the source after quarantine.
-Only the fixed bot and launcher identities receive the launch group, and the
-unpredictable run ID prevents callers outside that boundary from selecting a
-run. The sealer first moves
+The launcher receives the launch group now; the fixed bot receives it only
+when PR 4c2 atomically activates ephemeral execution. The unpredictable run ID
+prevents callers outside that boundary from selecting a run. The sealer first moves
 that pathname into a root-only consumed-source
 quarantine, recursively validates it through no-follow descriptor-relative
 operations, and copies only regular files and directories into fresh
@@ -711,10 +715,12 @@ remains undeployable until PR 4c1c wires the gated path.
 
 ### PR 4c1c Gated Runner Wiring (Receipt-Gated)
 
-PR 4c1c adds the fixed `SOCK_SEQPACKET` launcher client, the minimum bot
-service drop-in, and explicit evidence staging. The bot can write only
-`codex-input-staging/pending` and can connect only through
-`webex-codex-launch`; it is not a member of `webex-codex-input`. The runner
+PR 4c1c adds the fixed `SOCK_SEQPACKET` launcher client and explicit evidence
+staging, but deliberately ships no bot service drop-in. Granting the launch
+group while production still uses current-user execution would also grant it
+to prompt-controlled Codex children. PR 4c2 must add the launcher group and
+pending-path write access only while activating ephemeral execution; the bot
+is never a member of `webex-codex-input`. The runner
 copies only the evidence root supplied by the Jenkins prefetch path, rejects
 links, special files, control directories, metadata/content races, and the
 existing depth, entry, and byte limits, then identifies the run with an

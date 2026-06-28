@@ -280,10 +280,10 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });
 
-  it('grants the bot only launcher access and pending staging writes', async () => {
-    const [botDropIn, ...launcherFiles] = await Promise.all(
+  it('keeps bot launcher access disabled until isolated activation', async () => {
+    await assert.rejects(fs.stat(BOT_DROP_IN_PATH), { code: 'ENOENT' });
+    const launcherFiles = await Promise.all(
       [
-        BOT_DROP_IN_PATH,
         SOCKET_PATH,
         SERVICE_PATH,
         SYSUSERS_PATH,
@@ -295,39 +295,6 @@ describe('Codex launcher systemd boundary', () => {
         fs.readFile(file, 'utf8'),
       ),
     );
-
-    assert.equal(
-      botDropIn,
-      [
-        '[Service]',
-        'SupplementaryGroups=webex-codex-launch',
-        'ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending',
-        '',
-      ].join('\n'),
-    );
-    assert.deepEqual(directiveValues(botDropIn, 'SupplementaryGroups'), [
-      'webex-codex-launch',
-    ]);
-    assert.deepEqual(directiveValues(botDropIn, 'ReadWritePaths'), [
-      '/var/lib/webex-generic-account-bot/codex-input-staging/pending',
-    ]);
-    for (const directive of [
-      'ReadOnlyPaths',
-      'BindPaths',
-      'BindReadOnlyPaths',
-      'Requires',
-      'Wants',
-      'After',
-      'Before',
-      'BindsTo',
-      'PartOf',
-    ]) {
-      assert.deepEqual(directiveValues(botDropIn, directive), [], directive);
-    }
-    assert.doesNotMatch(botDropIn, /webex-codex-input/);
-    assert.doesNotMatch(botDropIn, /codex-input-staging\/consumed/);
-    assert.doesNotMatch(botDropIn, /webex-codex-activation|\/run\/credentials/);
-    assert.doesNotMatch(botDropIn, /webex-config-(?:deploy|pull)|config-(?:actions|staging)/);
 
     for (const contents of launcherFiles) {
       assert.doesNotMatch(contents, /\b(?:sudo|pkexec)\b|polkit|PolicyKit/i);

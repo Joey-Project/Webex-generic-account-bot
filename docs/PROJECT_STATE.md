@@ -41,13 +41,14 @@
   bot drop-in, client, runtime call site, or activation-receipt read, so it
   remains unused and fail closed.
 - Runner PR 4c1c wires the fixed launcher client, explicit evidence staging,
-  receipt-gated runner dispatch, and minimum bot socket/pending-root access.
+  and receipt-gated runner dispatch, but grants no bot socket/pending-root
+  access while production still uses current-user execution.
   Cooperative work deadlines and launcher-socket disconnect cancellation
   clean inode-verified ready and consumed trees before returning. Independent
   process watchdogs hard-stop stuck staging and preparation syscalls before
   their lease budgets expire. Production configuration remains on
   `current-user` until PR 4c2 mints a receipt after live capability canaries
-  pass.
+  pass and atomically installs the minimum launcher/pending-path access.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

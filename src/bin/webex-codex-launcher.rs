@@ -220,16 +220,23 @@ enum ClientSocketState {
 #[cfg(target_os = "linux")]
 fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState> {
     let mut byte = 0_u8;
-    // SAFETY: byte is valid writable storage and the socket descriptor remains live.
-    let received = unsafe {
-        libc::recv(
-            socket_fd,
-            (&mut byte as *mut u8).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
+    let mut iovec = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
     };
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    // SAFETY: message references initialized byte and iovec storage for this call.
+    let received =
+        unsafe { libc::recvmsg(socket_fd, &mut message, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
     if received == 0 {
+        if message.msg_flags & libc::MSG_EOR != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client sent an empty extra request packet",
+            ));
+        }
         return Ok(ClientSocketState::Closed);
     }
     if received > 0 {
@@ -556,6 +563,24 @@ mod tests {
         send_packet(writer.as_raw_fd(), &frame);
         receive_request_packet(&reader).await.unwrap();
         send_packet(writer.as_raw_fd(), &frame);
+
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn an_empty_second_packet_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        // SAFETY: the writer descriptor is live; a null pointer is valid for a zero-byte send.
+        assert_eq!(
+            unsafe { libc::send(writer.as_raw_fd(), std::ptr::null(), 0, libc::MSG_NOSIGNAL,) },
+            0
+        );
 
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

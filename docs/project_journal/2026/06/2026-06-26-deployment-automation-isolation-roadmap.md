@@ -53,8 +53,10 @@ superseded_by:
   disabled in PR 4c1a.
 - PR 4c1c wires the fixed launcher client, explicit Jenkins evidence staging,
   root fresh-inode sealer, boot-ID systemd credential, and exact
-  `ephemeral-linux-user` dispatcher path. The bot receives only the launcher
-  group and pending-root write path; it never receives the sealed-input group.
+  `ephemeral-linux-user` dispatcher path. It grants no bot launcher group or
+  pending-root path while current-user children could inherit them; PR 4c2
+  owns that access as part of atomic ephemeral activation. The bot never
+  receives the sealed-input group.
   Static config accepts only the fixed launcher contract, while
   `--check-config` and live startup remain fail closed without a valid
   boot-scoped activation receipt. PR 4c2 still owns the production canaries and
@@ -283,8 +285,8 @@ superseded_by:
 ### PR 4c1c: Gated Runner Wiring
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Connect the `ephemeral-linux-user` runner backend to the fixed PR 4a launcher
-  only after the PR 4b boundary is present, then add only the minimum reviewed
-  bot group/drop-in access required to reach the launcher socket.
+  only after the PR 4b boundary is present. Do not add a bot group/drop-in
+  while current-user Codex children could inherit launcher access.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
 - Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
@@ -301,6 +303,8 @@ superseded_by:
   prompt-controlled descendants cannot reuse the credential/model channel,
   launcher socket, bot/config-worker sockets, or forbidden network paths; and
   timeout, launcher crash, bot crash, and host-reboot cleanup converge safely.
+- Install the minimum bot launcher-group and pending-path access only in the
+  same activation that switches production away from current-user execution.
 - PR 4c2 activates only the runner. `/config pull`, `/config reload`, and
   `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
 
