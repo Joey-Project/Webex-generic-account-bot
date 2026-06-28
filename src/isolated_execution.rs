@@ -1030,7 +1030,7 @@ fn trusted_input_root(path: &Path, input_gid: u32) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn input_root_mode_valid(mode: u32) -> bool {
-    mode & 0o1777 == 0o1730
+    mode & 0o7777 == 0o1730
 }
 
 #[cfg(target_os = "linux")]
@@ -1258,7 +1258,7 @@ mod tests {
     #[test]
     fn input_root_requires_sticky_group_write_without_group_read() {
         assert!(input_root_mode_valid(0o1730));
-        for mode in [0o730, 0o1700, 0o1750, 0o1770, 0o1732] {
+        for mode in [0o730, 0o1700, 0o1750, 0o1770, 0o1732, 0o3730, 0o5730] {
             assert!(!input_root_mode_valid(mode), "accepted mode {mode:o}");
         }
     }

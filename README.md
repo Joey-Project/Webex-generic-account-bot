@@ -604,8 +604,10 @@ the same owner/group and a single hard link. Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
 2 GiB plus 64 MiB are rejected. The host group database entry must have no
 static members, no numeric-GID alias, and no static user with that primary GID.
-The root launcher has only this supplementary input group after systemd starts
-it; it has no bot, launcher-socket, or worker group membership. Its template
+The root launcher retains the supplementary input group after systemd starts
+it. PR 4c1b also adds `webex-codex-launch` solely so the capability-dropped
+launcher can read the pending source tree; the bot still belongs to neither
+group, and the launcher has no config-worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
 cgroup identity check. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held

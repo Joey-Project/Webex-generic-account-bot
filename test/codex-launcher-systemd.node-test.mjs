@@ -34,6 +34,9 @@ const LAUNCHER_MODULE_PATH = fileURLToPath(
 const ISOLATED_EXECUTION_PATH = fileURLToPath(
   new URL('../src/isolated_execution.rs', import.meta.url),
 );
+const INPUT_SEALER_PATH = fileURLToPath(
+  new URL('../src/input_sealer.rs', import.meta.url),
+);
 const RUNTIME_SOURCE_PATH = fileURLToPath(
   new URL('../src/bin/webex-codex-runtime.rs', import.meta.url),
 );
@@ -158,7 +161,10 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('keeps systemd and process verification visible without writable host paths', async () => {
-    const service = await fs.readFile(SERVICE_PATH, 'utf8');
+    const [service, inputSealer] = await Promise.all([
+      fs.readFile(SERVICE_PATH, 'utf8'),
+      fs.readFile(INPUT_SEALER_PATH, 'utf8'),
+    ]);
 
     const requiredHardening = {
       NoNewPrivileges: 'true',
@@ -212,7 +218,13 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'CPUQuota'), ['100%']);
     assert.deepEqual(directiveValues(service, 'LimitNOFILE'), ['128']);
     assert.deepEqual(directiveValues(service, 'LimitNPROC'), ['64']);
-    assert.deepEqual(directiveValues(service, 'LimitFSIZE'), ['1M']);
+    const workspaceMiB = inputSealer.match(
+      /^const WORKSPACE_TOTAL_MIB: u64 = ([\d_]+);$/m,
+    );
+    assert(workspaceMiB, 'workspace MiB limit must remain explicit');
+    assert.deepEqual(directiveValues(service, 'LimitFSIZE'), [
+      `${Number(workspaceMiB[1].replaceAll('_', ''))}M`,
+    ]);
     assert.deepEqual(directiveValues(service, 'MemoryMax'), ['256M']);
     assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });

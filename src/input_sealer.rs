@@ -31,7 +31,8 @@ const SHARED_ROOT_MODE: u32 = 0o1730;
 const PRIVATE_ROOT_MODE: u32 = 0o700;
 const WORKSPACE_ENTRY_MAX: usize = 8_192;
 const WORKSPACE_DEPTH_MAX: usize = 32;
-const WORKSPACE_TOTAL_BYTES_MAX: u64 = 2 * 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+const WORKSPACE_TOTAL_MIB: u64 = 2_112;
+const WORKSPACE_TOTAL_BYTES_MAX: u64 = WORKSPACE_TOTAL_MIB * 1024 * 1024;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -206,6 +207,9 @@ fn seal_workspace_with_limits(
         &run_name,
     )
     .context("failed to quarantine the pending workspace")?;
+    pending_root
+        .sync_all()
+        .context("failed to persist removal of the pending workspace")?;
     source_consumed_root
         .sync_all()
         .context("failed to persist the quarantined workspace")?;

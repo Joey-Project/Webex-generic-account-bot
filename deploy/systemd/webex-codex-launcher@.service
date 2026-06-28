@@ -58,6 +58,6 @@ TasksMax=64
 CPUQuota=100%
 LimitNOFILE=128
 LimitNPROC=64
-LimitFSIZE=1M
+LimitFSIZE=2112M
 MemoryMax=256M
 MemorySwapMax=0
