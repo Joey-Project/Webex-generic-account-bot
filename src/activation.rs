@@ -219,6 +219,71 @@ struct ActiveRuntimeManifest {
     mksquashfs_argv_sha256: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceManifest {
+    version: u16,
+    codex_version: String,
+    codex_target: String,
+    codex_layout_version: u16,
+    files: Vec<RuntimeSourceFile>,
+    symlinks: Vec<RuntimeSourceSymlink>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceFile {
+    source: String,
+    destination: String,
+    size: u64,
+    sha256: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceSymlink {
+    destination: String,
+    target: String,
+}
+
+const EXPECTED_RUNTIME_SOURCE_FILES: &[(&str, &str, &str)] = &[
+    (
+        "/bin/busybox",
+        "/opt/webex-generic-account-bot/runtime-sources/busybox",
+        "0555",
+    ),
+    (
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "0444",
+    ),
+    (
+        "/opt/codex/bin/codex",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/bin/codex",
+        "0555",
+    ),
+    (
+        "/opt/codex/codex-path/rg",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/codex-path/rg",
+        "0555",
+    ),
+    (
+        "/opt/codex/codex-resources/bwrap",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/codex-resources/bwrap",
+        "0555",
+    ),
+];
+
+const EXPECTED_RUNTIME_SOURCE_SYMLINKS: &[(&str, &str)] = &[
+    ("/bin/sh", "busybox"),
+    ("/bin/cat", "busybox"),
+    ("/bin/find", "busybox"),
+    ("/bin/ls", "busybox"),
+    ("/bin/sed", "busybox"),
+    ("/bin/wc", "busybox"),
+];
+
 #[derive(Debug)]
 struct ActivationBinding {
     boot_id: String,
@@ -462,50 +527,66 @@ fn validate_runtime_source_binding(
             "runtime source manifest digest does not match the active image"
         ));
     }
-    let source: serde_json::Value =
+    let source: RuntimeSourceManifest =
         serde_json::from_slice(source_bytes).context("runtime source manifest is invalid JSON")?;
     let runtime_source = paths
         .runtime_executable
         .to_str()
         .ok_or_else(|| anyhow!("runtime executable path is not UTF-8"))?;
-    if source.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-        || source
-            .get("codex_version")
-            .and_then(serde_json::Value::as_str)
-            != Some(active.codex_version.as_str())
-        || source
-            .get("codex_target")
-            .and_then(serde_json::Value::as_str)
-            != Some(active.codex_target.as_str())
-        || source
-            .get("codex_layout_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(u64::from(active.codex_layout_version))
+    if source.version != 1
+        || source.codex_version != active.codex_version
+        || source.codex_target != active.codex_target
+        || source.codex_layout_version != active.codex_layout_version
+        || source.files.len() != EXPECTED_RUNTIME_SOURCE_FILES.len() + 1
+        || source.symlinks.len() != EXPECTED_RUNTIME_SOURCE_SYMLINKS.len()
     {
         return Err(anyhow!(
             "runtime source manifest policy does not match the active image"
         ));
     }
-    let files = source
-        .get("files")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow!("runtime source manifest files are unavailable"))?;
-    let mut entries = files.iter().filter(|entry| {
-        entry.get("destination").and_then(serde_json::Value::as_str)
-            == Some("/usr/libexec/webex-codex-runtime")
-    });
-    let entry = entries
-        .next()
+    let mut files = BTreeMap::new();
+    for entry in &source.files {
+        if entry.size == 0
+            || entry.size > RUNTIME_IMAGE_MAX_BYTES
+            || !valid_digest(&entry.sha256)
+            || files.insert(entry.destination.as_str(), entry).is_some()
+        {
+            return Err(anyhow!("runtime source manifest file entry is invalid"));
+        }
+    }
+    for (destination, expected_source, expected_mode) in EXPECTED_RUNTIME_SOURCE_FILES {
+        let entry = files
+            .get(destination)
+            .ok_or_else(|| anyhow!("runtime source manifest is missing a required file"))?;
+        if entry.source != *expected_source || entry.mode != *expected_mode {
+            return Err(anyhow!("runtime source manifest file policy is invalid"));
+        }
+    }
+    let runtime_entry = files
+        .get("/usr/libexec/webex-codex-runtime")
         .ok_or_else(|| anyhow!("runtime source manifest is missing the runtime wrapper"))?;
-    if entries.next().is_some()
-        || entry.get("source").and_then(serde_json::Value::as_str) != Some(runtime_source)
-        || entry.get("mode").and_then(serde_json::Value::as_str) != Some("0555")
-        || entry.get("sha256").and_then(serde_json::Value::as_str) != Some(runtime.digest.as_str())
-        || entry.get("size").and_then(serde_json::Value::as_u64) != Some(runtime.identity.length)
+    if runtime_entry.source != runtime_source
+        || runtime_entry.mode != "0555"
+        || runtime_entry.sha256 != runtime.digest
+        || runtime_entry.size != runtime.identity.length
     {
         return Err(anyhow!(
             "runtime source manifest wrapper binding is invalid"
         ));
+    }
+    let mut symlinks = BTreeMap::new();
+    for entry in &source.symlinks {
+        if symlinks
+            .insert(entry.destination.as_str(), entry.target.as_str())
+            .is_some()
+        {
+            return Err(anyhow!("runtime source manifest symlink is duplicated"));
+        }
+    }
+    for (destination, expected_target) in EXPECTED_RUNTIME_SOURCE_SYMLINKS {
+        if symlinks.get(destination).copied() != Some(*expected_target) {
+            return Err(anyhow!("runtime source manifest symlink policy is invalid"));
+        }
     }
     Ok(())
 }
@@ -1163,24 +1244,55 @@ mod tests {
     }
 
     fn source_manifest(paths: &ActivationPaths) -> serde_json::Value {
+        let mut files = EXPECTED_RUNTIME_SOURCE_FILES
+            .iter()
+            .map(|(destination, source, mode)| {
+                json!({
+                    "source": source,
+                    "destination": destination,
+                    "size": 1,
+                    "sha256": "a".repeat(64),
+                    "mode": mode
+                })
+            })
+            .collect::<Vec<_>>();
+        files.push(json!({
+            "source": paths.runtime_executable.to_string_lossy(),
+            "destination": "/usr/libexec/webex-codex-runtime",
+            "size": RUNTIME_EXECUTABLE.len(),
+            "sha256": sha256(RUNTIME_EXECUTABLE),
+            "mode": "0555"
+        }));
+        let symlinks = EXPECTED_RUNTIME_SOURCE_SYMLINKS
+            .iter()
+            .map(|(destination, target)| json!({ "destination": destination, "target": target }))
+            .collect::<Vec<_>>();
         json!({
             "version": 1,
             "codex_version": SUPPORTED_CODEX_VERSION,
             "codex_target": SUPPORTED_CODEX_TARGET,
             "codex_layout_version": SUPPORTED_CODEX_LAYOUT_VERSION,
-            "files": [{
-                "source": paths.runtime_executable.to_string_lossy(),
-                "destination": "/usr/libexec/webex-codex-runtime",
-                "size": RUNTIME_EXECUTABLE.len(),
-                "sha256": sha256(RUNTIME_EXECUTABLE),
-                "mode": "0555"
-            }],
-            "symlinks": []
+            "files": files,
+            "symlinks": symlinks
         })
     }
 
     fn active_manifest_for(paths: &ActivationPaths) -> serde_json::Value {
         active_manifest(&sha256(&fs::read(&paths.runtime_source_manifest).unwrap()))
+    }
+
+    fn assert_source_manifest_rejected(mutator: impl FnOnce(&mut serde_json::Value)) {
+        let fixture = Fixture::new();
+        let mut source = source_manifest(&fixture.paths);
+        mutator(&mut source);
+        let source_bytes = serde_json::to_vec_pretty(&source).unwrap();
+        replace_read_only(&fixture.paths.runtime_source_manifest, &source_bytes, 0o444);
+        replace_read_only(
+            &fixture.paths.active_manifest,
+            &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_bytes))).unwrap(),
+            0o444,
+        );
+        assert!(build_activation_receipt_with(&fixture.paths, passing_canaries()).is_err());
     }
 
     fn runtime_image_path(paths: &ActivationPaths) -> PathBuf {
@@ -1538,23 +1650,35 @@ mod tests {
 
     #[test]
     fn rejects_runtime_wrapper_source_and_image_binding_drift() {
-        let fixture = Fixture::new();
-        let mut source = source_manifest(&fixture.paths);
-        source["files"][0]["sha256"] = json!("d".repeat(64));
-        let source_bytes = serde_json::to_vec_pretty(&source).unwrap();
-        replace_read_only(&fixture.paths.runtime_source_manifest, &source_bytes, 0o444);
-        replace_read_only(
-            &fixture.paths.active_manifest,
-            &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_bytes))).unwrap(),
-            0o444,
-        );
-
-        let error = build_activation_receipt_with(&fixture.paths, passing_canaries())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("runtime source manifest wrapper binding"),
-            "{error}"
-        );
+        assert_source_manifest_rejected(|source| {
+            source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["sha256"] = json!("d".repeat(64));
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["mode"] = json!("0444");
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"].as_array_mut().unwrap().pop();
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"].as_array_mut().unwrap().push(json!({
+                "source": "/tmp/extra",
+                "destination": "/tmp/extra",
+                "size": 1,
+                "sha256": "e".repeat(64),
+                "mode": "0444"
+            }));
+        });
+        assert_source_manifest_rejected(|source| {
+            source["symlinks"].as_array_mut().unwrap().push(json!({
+                "destination": "/bin/extra",
+                "target": "busybox"
+            }));
+        });
+        assert_source_manifest_rejected(|source| {
+            source
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".to_owned(), json!(true));
+        });
     }
 }

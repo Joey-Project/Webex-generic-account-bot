@@ -30,7 +30,7 @@ use crate::{
     work_budget::{WorkBudget, run_blocking_with_process_watchdog},
 };
 
-const PENDING_ROOT_MODE: u32 = 0o2770;
+const PENDING_ROOT_MODE: u32 = 0o2730;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o2700;
 const SOURCE_DIRECTORY_MODE: u32 = 0o2770;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -81,6 +81,7 @@ impl Drop for PendingWorkspace {
         }
         if let Err(error) = remove_owned_workspace(
             &self.pending_root,
+            &self.workspace,
             &self.workspace_name,
             &self.workspace_identity,
             true,
@@ -242,7 +243,7 @@ fn stage_workspace_at(
     if let Some(deadline) = limits.deadline.as_ref() {
         deadline.check("pending workspace staging")?;
     }
-    let pending_root = open_path_directory(pending_root_path, true)
+    let pending_root = open_path_directory(pending_root_path, false)
         .context("failed to open the pending input root")?;
     validate_pending_root(
         &pending_root,
@@ -310,7 +311,7 @@ fn stage_workspace_at(
             launch_gid,
             SOURCE_DIRECTORY_MODE,
         )?;
-        sync_checked(&pending_root)
+        sync_filesystem(&workspace)
             .context("failed to persist the pending workspace publication")?;
         Ok(())
     })();
@@ -318,6 +319,7 @@ fn stage_workspace_at(
     if let Err(error) = result {
         return match remove_owned_workspace(
             &pending_root,
+            &workspace,
             &workspace_name,
             &workspace_identity,
             false,
@@ -816,6 +818,7 @@ fn list_directory(directory_fd: RawFd, max_entries: usize) -> Result<Vec<OsStrin
 
 fn remove_owned_workspace(
     pending_root: &File,
+    workspace: &File,
     workspace_name: &CStr,
     expected: &ObjectIdentity,
     missing_ok: bool,
@@ -831,7 +834,15 @@ fn remove_owned_workspace(
         bail!("refusing to clean a replaced pending workspace");
     }
     remove_tree_at(pending_root.as_raw_fd(), workspace_name)?;
-    sync_checked(pending_root).context("failed to persist pending workspace cleanup")
+    sync_filesystem(workspace).context("failed to persist pending workspace cleanup")
+}
+
+fn sync_filesystem(file: &File) -> Result<()> {
+    // SAFETY: syncfs uses only the live descriptor to identify its filesystem.
+    if unsafe { libc::syncfs(file.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error()).context("failed to sync workspace filesystem");
+    }
+    Ok(())
 }
 
 fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {

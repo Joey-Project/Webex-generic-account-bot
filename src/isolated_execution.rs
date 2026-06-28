@@ -35,7 +35,9 @@ use crate::{
         LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
         OUTPUT_MAX_BYTES, ProtocolError, ReasoningEffort,
     },
-    work_budget::{WorkBudget, WorkCancellation, run_blocking_with_process_watchdog},
+    work_budget::{
+        WorkBudget, WorkBudgetError, WorkCancellation, run_blocking_with_process_watchdog,
+    },
 };
 
 pub const RUNTIME_ROOT: &str = "/opt/webex-generic-account-bot/runtime";
@@ -322,7 +324,9 @@ pub async fn execute(
     .map_err(IsolatedExecutionError::Failed)?;
     let prepared = match prepared {
         Ok(prepared) => prepared,
-        Err(_) if cancellation.is_cancelled() => return Err(IsolatedExecutionError::Cancelled),
+        Err(IsolatedExecutionError::Failed(error)) if is_cancellation_error(&error) => {
+            return Err(IsolatedExecutionError::Cancelled);
+        }
         Err(error) => return Err(error),
     };
     let PreparedExecution { plan, workspace } = prepared;
@@ -337,18 +341,19 @@ pub async fn execute(
     )
     .await
     .and_then(|result| result);
-    finalise_execution(execution, cleanup, cancellation.is_cancelled())
+    finalise_execution(execution, cleanup)
 }
 
 #[cfg(target_os = "linux")]
 fn finalise_execution(
     execution: Result<IsolatedRunResult>,
     cleanup: Result<()>,
-    cancelled: bool,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
     match (execution, cleanup) {
         (Ok(result), Ok(())) => Ok(result),
-        (Err(_), Ok(())) if cancelled => Err(IsolatedExecutionError::Cancelled),
+        (Err(error), Ok(())) if is_cancellation_error(&error) => {
+            Err(IsolatedExecutionError::Cancelled)
+        }
         (Err(error), Ok(())) => Err(IsolatedExecutionError::Failed(error)),
         (Ok(_), Err(error)) => Err(IsolatedExecutionError::Failed(
             error.context("failed to clean consumed runtime workspace"),
@@ -357,6 +362,16 @@ fn finalise_execution(
             "{execution_error:#}; failed to clean consumed runtime workspace: {cleanup_error:#}"
         ))),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn is_cancellation_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<WorkBudgetError>(),
+            Some(WorkBudgetError::Cancelled { .. })
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -373,7 +388,7 @@ fn prepare_execution(
 ) -> std::result::Result<PreparedExecution, IsolatedExecutionError> {
     deadline
         .check("isolated Codex preparation")
-        .map_err(IsolatedExecutionError::Failed)?;
+        .map_err(|error| IsolatedExecutionError::Failed(error.into()))?;
     validate_execution_policy(request).map_err(|error| {
         IsolatedExecutionError::Failed(anyhow!("isolated request policy is invalid: {error}"))
     })?;
@@ -1139,9 +1154,7 @@ async fn run_transient(
     _workspace: &VerifiedWorkspace,
 ) -> Result<IsolatedRunResult> {
     if cancellation.is_cancelled() {
-        return Err(anyhow!(
-            "launcher client disconnected before Codex execution"
-        ));
+        return Err(WorkBudgetError::cancelled("isolated Codex execution before start").into());
     }
     peer.ensure_alive()
         .context("authorised bot caller exited before Codex execution")?;
@@ -1216,9 +1229,7 @@ async fn run_transient(
         PromptWriteOutcome::Cancelled => {
             terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
                 .await?;
-            return Err(anyhow!(
-                "launcher client disconnected during Codex prompt delivery"
-            ));
+            return Err(WorkBudgetError::cancelled("isolated Codex prompt delivery").into());
         }
         PromptWriteOutcome::TimedOut => {
             terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
@@ -1251,7 +1262,7 @@ async fn run_transient(
                         stderr_task,
                     )
                     .await?;
-                    return Err(anyhow!("launcher client disconnected during Codex execution"));
+                    return Err(WorkBudgetError::cancelled("isolated Codex execution").into());
                 }
                 if peer.ensure_alive().is_err() {
                     terminate_and_discard_captures(
@@ -2115,7 +2126,6 @@ mod tests {
                 truncated: false,
             }),
             Err(anyhow!("cleanup failed")),
-            false,
         );
 
         assert!(matches!(result, Err(IsolatedExecutionError::Failed(_))));
@@ -2123,13 +2133,15 @@ mod tests {
 
     #[test]
     fn cancellation_is_successful_only_after_cleanup() {
-        let cancelled = finalise_execution(Err(anyhow!("cancelled")), Ok(()), true);
+        let cancelled = finalise_execution(
+            Err(WorkBudgetError::cancelled("test execution").into()),
+            Ok(()),
+        );
         assert!(matches!(cancelled, Err(IsolatedExecutionError::Cancelled)));
 
         let cleanup_failed = finalise_execution(
-            Err(anyhow!("cancelled")),
+            Err(WorkBudgetError::cancelled("test execution").into()),
             Err(anyhow!("cleanup failed")),
-            true,
         );
         assert!(matches!(
             cleanup_failed,

@@ -8,9 +8,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 const STUCK_WORK_EXIT_CODE: i32 = 70;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkBudgetError {
+    #[error("{operation} was cancelled")]
+    Cancelled { operation: String },
+    #[error("{operation} exceeded its work deadline")]
+    Deadline { operation: String },
+}
+
+impl WorkBudgetError {
+    pub(crate) fn cancelled(operation: impl Into<String>) -> Self {
+        Self::Cancelled {
+            operation: operation.into(),
+        }
+    }
+}
 
 pub(crate) async fn run_blocking_with_process_watchdog<F, T>(
     operation: &'static str,
@@ -86,12 +102,16 @@ impl WorkBudget {
         }
     }
 
-    pub(crate) fn check(&self, operation: &str) -> Result<()> {
+    pub(crate) fn check(&self, operation: &str) -> std::result::Result<(), WorkBudgetError> {
         if self.cancellation.is_cancelled() {
-            bail!("{operation} was cancelled");
+            return Err(WorkBudgetError::Cancelled {
+                operation: operation.to_owned(),
+            });
         }
         if Instant::now() >= self.deadline {
-            bail!("{operation} exceeded its work deadline");
+            return Err(WorkBudgetError::Deadline {
+                operation: operation.to_owned(),
+            });
         }
         Ok(())
     }

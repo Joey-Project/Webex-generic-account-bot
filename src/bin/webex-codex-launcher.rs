@@ -194,8 +194,10 @@ async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<Optio
     tokio::pin!(preflight);
     tokio::select! {
         result = &mut preflight => {
-            inspect_client_socket(socket.get_ref().as_raw_fd())?;
-            Ok(Some(result.is_ok()))
+            match inspect_client_socket(socket.get_ref().as_raw_fd())? {
+                ClientSocketState::Open => Ok(Some(result.is_ok())),
+                ClientSocketState::Closed => Ok(None),
+            }
         },
         disconnect = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
@@ -225,9 +227,10 @@ async fn execute_until_disconnect(
     tokio::pin!(execution);
     tokio::select! {
         result = &mut execution => match inspect_client_socket(socket.get_ref().as_raw_fd()) {
-            Ok(_) => result
+            Ok(ClientSocketState::Open) => result
                 .map(ExecuteRequestOutcome::Response)
                 .map_err(ExecuteRequestError::Execution),
+            Ok(ClientSocketState::Closed) => disconnected_execution_outcome(result),
             Err(_) => Err(ExecuteRequestError::Protocol),
         },
         disconnect = wait_for_client_disconnect(socket) => {
@@ -753,6 +756,17 @@ mod tests {
         .await
         .expect("disconnect monitor must observe peer closure")
         .unwrap();
+        assert_eq!(
+            inspect_client_socket(reader.get_ref().as_raw_fd()).unwrap(),
+            ClientSocketState::Closed
+        );
+        assert!(matches!(
+            disconnected_execution_outcome(Ok(IsolatedRunResult::Completed {
+                output: "done".to_owned(),
+                truncated: false,
+            })),
+            Ok(ExecuteRequestOutcome::Disconnected)
+        ));
     }
 
     #[tokio::test]

@@ -74,8 +74,9 @@ superseded_by:
   protocol's 110-second cleanup allowance after at most 50 seconds of
   transient-unit cleanup. Socket trigger capacity includes
   startup preflight and both per-run launcher connections.
-  Pending workspace publication and bot-side removal also fsync their parent
-  directory before returning.
+  Pending workspace publication and bot-side removal use `syncfs` through the
+  held workspace fd before returning, preserving a non-enumerable `2730`
+  pending root.
   Configured request concurrency cannot exceed the socket's four accepted
   connections, and the service runtime maximum stays above the protocol's
   largest request plus preparation, cleanup, and response budget.

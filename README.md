@@ -686,9 +686,10 @@ activation.
 ### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
 
 PR 4c1b adds the root-only input sealer and its host staging layout. PR 4c1c
-sets the pending root to `root:webex-codex-launch` mode `2770` so the bot can
-hold a real directory descriptor and durably fsync publication/removal; each
-per-run tree
+sets the pending root to non-enumerable `root:webex-codex-launch` mode `2730`.
+The bot uses `O_PATH` descriptor-relative operations and `syncfs` on the held
+workspace fd to persist publication/removal without gaining directory-list
+permission. Each per-run tree
 inside it is owned by the future bot caller with group `webex-codex-launch`,
 using mode `2770` for directories and `0640` for files. The launch group write
 bit permits the capability-dropped sealer to remove the source after quarantine.
@@ -757,9 +758,10 @@ connections per concurrent run. The launcher service runtime maximum is
 protocol-bound above the largest request, preparation, cleanup, and response
 budget.
 
-Pending workspace publication and removal fsync the pending parent directory;
-the launcher likewise fsyncs source-quarantine removal before it can consume a
-sealed run.
+Pending workspace publication and removal use `syncfs` through the held
+workspace descriptor so the non-enumerable pending root need not be opened for
+listing; the launcher likewise fsyncs source-quarantine removal before it can
+consume a sealed run.
 
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd

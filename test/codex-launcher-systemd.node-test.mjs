@@ -178,7 +178,7 @@ describe('Codex launcher systemd boundary', () => {
       stagingTmpfiles,
       [
         'd /var/lib/webex-generic-account-bot/codex-input-staging 0550 root webex-codex-launch -',
-        'd /var/lib/webex-generic-account-bot/codex-input-staging/pending 2770 root webex-codex-launch 1d',
+        'd /var/lib/webex-generic-account-bot/codex-input-staging/pending 2730 root webex-codex-launch 1d',
         'd /var/lib/webex-generic-account-bot/codex-input-staging/consumed 0700 root root 1d',
         '',
       ].join('\n'),
@@ -371,6 +371,8 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(runnerInput, /run_blocking_with_process_watchdog/);
     assert.match(workBudget, /completion\.recv_timeout\(/);
     assert.match(workBudget, /std::process::exit\(STUCK_WORK_EXIT_CODE\)/);
+    assert.match(runnerInput, /const PENDING_ROOT_MODE: u32 = 0o2730;/);
+    assert.match(runnerInput, /libc::syncfs\(file\.as_raw_fd\(\)\)/);
     assert.match(
       isolatedExecution,
       /const SYSTEMD_RUN_PATH: &str = "\/usr\/bin\/systemd-run";/,
