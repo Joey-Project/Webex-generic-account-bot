@@ -57,11 +57,10 @@ superseded_by:
   pending-root path while current-user children could inherit them; PR 4c2
   owns that access as part of atomic ephemeral activation. The bot never
   receives the sealed-input group. Config validation rejects mixed
-  current-user and ephemeral effective runner configurations.
-  Static config accepts only the fixed launcher contract, while
-  `--check-config` and live startup remain fail closed without a valid
-  boot-scoped activation receipt. PR 4c2 still owns the production canaries and
-  receipt minting; production config remains current-user until then.
+  current-user and ephemeral effective runner configurations, then rejects all
+  ephemeral activation in this slice. PR 4c2 must remove that final gate only
+  while adding bot access and minting the boot-scoped receipt after production
+  canaries pass; production config remains current-user until then.
   Preflight, evidence staging, and launcher preparation use explicit bounded
   budgets that are included in ephemeral attempt-lease validation. Blocking
   file workers check cooperative deadlines and launcher-socket cancellation;

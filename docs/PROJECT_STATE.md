@@ -17,8 +17,8 @@
 - Runner PR 3 routed each current-user Codex invocation through a replaceable
   backend with existing behaviour unchanged. At that stage,
   `ephemeral-linux-user` remained rejected by config validation and
-  `--check-config`, with no fallback; PR 4c1c now accepts only the fixed
-  receipt-gated contract.
+  `--check-config`, with no fallback. PR 4c1c validates the fixed
+  receipt-gated contract but still rejects activation.
 - Runner PR 4a adds only the root-owned launcher
   protocol, caller-authorisation, and systemd socket foundation at
   `/run/webex-codex-launcher/launcher.sock`, backed by
@@ -44,7 +44,8 @@
   and receipt-gated runner dispatch, but grants no bot socket/pending-root
   access while production still uses current-user execution.
   Configuration validation rejects mixed current-user and ephemeral backends
-  before the later launcher permission can be activated.
+  and then rejects all ephemeral activation until PR 4c2 installs the required
+  permissions in the same change that removes that final gate.
   Cooperative work deadlines and launcher-socket disconnect cancellation
   clean inode-verified ready and consumed trees before returning. Independent
   process watchdogs hard-stop stuck staging and preparation syscalls before

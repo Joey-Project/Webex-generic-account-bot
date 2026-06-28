@@ -218,6 +218,14 @@ enum ClientSocketState {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientReadSideState {
+    Open,
+    HalfClosed,
+    Closed,
+}
+
+#[cfg(target_os = "linux")]
 fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState> {
     let mut byte = 0_u8;
     let mut control = ControlBuffer([0_u8; CONTROL_BUFFER_BYTES]);
@@ -243,16 +251,23 @@ fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState>
         // socket. EOF carries no packet metadata and must also report read-side HUP.
         // MSG_EOR is not reliable for distinguishing an empty SEQPACKET record.
         let has_packet_metadata = unsafe { !libc::CMSG_FIRSTHDR(&message).is_null() };
-        if has_packet_metadata
-            || message.msg_flags & libc::MSG_CTRUNC != 0
-            || !client_read_side_closed(socket_fd)?
-        {
+        if has_packet_metadata || message.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "launcher client sent an empty extra request packet",
             ));
         }
-        return Ok(ClientSocketState::Closed);
+        return match client_read_side_state(socket_fd)? {
+            ClientReadSideState::Closed => Ok(ClientSocketState::Closed),
+            ClientReadSideState::HalfClosed => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client half-closed the request stream",
+            )),
+            ClientReadSideState::Open => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client sent an empty extra request packet",
+            )),
+        };
     }
     if received > 0 {
         return Err(std::io::Error::new(
@@ -269,7 +284,7 @@ fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState>
 }
 
 #[cfg(target_os = "linux")]
-fn client_read_side_closed(socket_fd: RawFd) -> std::io::Result<bool> {
+fn client_read_side_state(socket_fd: RawFd) -> std::io::Result<ClientReadSideState> {
     let mut descriptor = libc::pollfd {
         fd: socket_fd,
         events: libc::POLLIN | libc::POLLRDHUP,
@@ -283,13 +298,20 @@ fn client_read_side_closed(socket_fd: RawFd) -> std::io::Result<bool> {
     if descriptor.revents & libc::POLLNVAL != 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EBADF));
     }
-    let closed = descriptor.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0;
-    if descriptor.revents & libc::POLLERR != 0 && !closed {
+    let hung_up = descriptor.revents & libc::POLLHUP != 0;
+    let read_half_closed = descriptor.revents & libc::POLLRDHUP != 0;
+    if descriptor.revents & libc::POLLERR != 0 && !hung_up {
         return Err(std::io::Error::other(
             "launcher client socket reported a read error",
         ));
     }
-    Ok(closed)
+    Ok(if hung_up {
+        ClientReadSideState::Closed
+    } else if read_half_closed {
+        ClientReadSideState::HalfClosed
+    } else {
+        ClientReadSideState::Open
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -621,6 +643,24 @@ mod tests {
             0
         );
         drop(writer);
+
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_write_half_close_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        // SAFETY: the writer descriptor is live and owned by this test.
+        assert_eq!(
+            unsafe { libc::shutdown(writer.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
 
         let error = wait_for_client_disconnect(&reader).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

@@ -119,6 +119,11 @@ impl BotConfig {
         }
         self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
+        if self.uses_ephemeral_linux_user() {
+            return Err(anyhow!(
+                "ephemeral-linux-user remains disabled until atomic launcher permission activation"
+            ));
+        }
         Ok(())
     }
 
@@ -1137,7 +1142,7 @@ prompt_template = "Follow up on {original_message_id}: {body}"
     }
 
     #[test]
-    fn accepts_ephemeral_user_with_the_fixed_runtime_contract() {
+    fn rejects_ephemeral_user_until_atomic_permission_activation() {
         let config: BotConfig = toml::from_str(
             r#"
 [server]
@@ -1159,7 +1164,13 @@ allow_all_senders = true
         )
         .unwrap();
 
-        config.validate().unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("remains disabled until atomic launcher permission activation")
+        );
         assert!(config.uses_ephemeral_linux_user());
     }
 
@@ -1189,7 +1200,13 @@ allow_all_senders = true
 
         assert!(config.validate().is_err());
         config.server.max_concurrent_requests = LAUNCHER_MAX_CONNECTIONS;
-        config.validate().unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("remains disabled until atomic launcher permission activation")
+        );
     }
 
     #[test]
@@ -1272,7 +1289,7 @@ trusted_prompt_authors = true
     }
 
     #[test]
-    fn load_accepts_ephemeral_user_before_host_preflight() {
+    fn load_rejects_ephemeral_user_before_host_preflight() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now()
@@ -1305,10 +1322,13 @@ allow_all_senders = true
         )
         .unwrap();
 
-        let result = BotConfig::load(&path).unwrap();
+        let error = BotConfig::load(&path).unwrap_err().to_string();
         fs::remove_file(&path).unwrap();
 
-        assert!(result.uses_ephemeral_linux_user());
+        assert!(
+            error.contains("remains disabled until atomic launcher permission activation"),
+            "{error}"
+        );
     }
 
     #[test]

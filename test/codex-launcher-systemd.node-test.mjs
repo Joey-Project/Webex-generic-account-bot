@@ -7,11 +7,11 @@ import { fileURLToPath } from 'node:url';
 const SYSTEMD_ROOT = fileURLToPath(new URL('../deploy/systemd/', import.meta.url));
 const SOCKET_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.socket');
 const SERVICE_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher@.service');
-const BOT_DROP_IN_PATH = path.join(
+const BOT_DROP_IN_ROOT = path.join(
   SYSTEMD_ROOT,
   'webex-generic-account-bot.service.d',
-  '10-codex-launcher.conf',
 );
+const BOT_DROP_IN_PATH = path.join(BOT_DROP_IN_ROOT, '10-codex-launcher.conf');
 const SYSUSERS_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.sysusers.conf');
 const TMPFILES_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.tmpfiles.conf');
 const ACTIVATION_TMPFILES_PATH = path.join(
@@ -282,19 +282,28 @@ describe('Codex launcher systemd boundary', () => {
 
   it('keeps bot launcher access disabled until isolated activation', async () => {
     await assert.rejects(fs.stat(BOT_DROP_IN_PATH), { code: 'ENOENT' });
-    const launcherFiles = await Promise.all(
-      [
-        SOCKET_PATH,
-        SERVICE_PATH,
-        SYSUSERS_PATH,
-        TMPFILES_PATH,
-        RUNTIME_SYSUSERS_PATH,
-        RUNTIME_TMPFILES_PATH,
-        INPUT_STAGING_TMPFILES_PATH,
-      ].map((file) =>
-        fs.readFile(file, 'utf8'),
+    const [launcherFiles, botDropIns] = await Promise.all([
+      Promise.all(
+        [
+          SOCKET_PATH,
+          SERVICE_PATH,
+          SYSUSERS_PATH,
+          TMPFILES_PATH,
+          RUNTIME_SYSUSERS_PATH,
+          RUNTIME_TMPFILES_PATH,
+          INPUT_STAGING_TMPFILES_PATH,
+        ].map((file) => fs.readFile(file, 'utf8')),
       ),
-    );
+      readTextFilesRecursively(BOT_DROP_IN_ROOT),
+    ]);
+
+    for (const { file, contents } of botDropIns) {
+      assert.doesNotMatch(
+        contents,
+        /webex-codex-(?:launch|input)|codex-input-staging|webex-codex-activation|webex-codex-launcher|\/run\/credentials/,
+        file,
+      );
+    }
 
     for (const contents of launcherFiles) {
       assert.doesNotMatch(contents, /\b(?:sudo|pkexec)\b|polkit|PolicyKit/i);
@@ -439,4 +448,32 @@ function directiveValues(unit, directive) {
     .split('\n')
     .filter((line) => line.startsWith(prefix))
     .map((line) => line.slice(prefix.length));
+}
+
+async function readTextFilesRecursively(root) {
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await readTextFilesRecursively(entryPath)));
+      continue;
+    }
+    assert.equal(
+      entry.isFile(),
+      true,
+      `unexpected bot drop-in entry: ${entryPath}`,
+    );
+    files.push({ file: entryPath, contents: await fs.readFile(entryPath, 'utf8') });
+  }
+  return files;
 }

@@ -722,7 +722,9 @@ to prompt-controlled Codex children. PR 4c2 must add the launcher group and
 pending-path write access only while activating ephemeral execution; the bot
 is never a member of `webex-codex-input`. Configuration validation rejects any
 mix of current-user and ephemeral execution whenever ephemeral execution is
-present, so no current-user child can inherit the later launcher permission. The runner
+present, then rejects ephemeral activation entirely in this slice. PR 4c2 must
+remove that final gate in the same change that installs the bot permission, so
+no current-user child can inherit launcher access. The runner
 copies only the evidence root supplied by the Jenkins prefetch path, rejects
 links, special files, control directories, metadata/content races, and the
 existing depth, entry, and byte limits, then identifies the run with an
