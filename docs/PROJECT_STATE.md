@@ -34,9 +34,10 @@
   path calls it and no receipt-minting command or bot group access is added.
 - Runner PR 4c1b adds the root fresh-inode input sealer, root-only source
   quarantine, trusted named-group resolution, POSIX-ACL rejection, and
-  no-replace durable runtime consumption plus the launcher-side staging
-  group/path contract. It adds no bot drop-in, client, runtime call site, or
-  activation-receipt read, so it remains unused and fail closed.
+  double-read content verification, same-mount no-replace durable runtime
+  consumption plus the launcher-side staging group/path contract. It adds no
+  bot drop-in, client, runtime call site, or activation-receipt read, so it
+  remains unused and fail closed.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

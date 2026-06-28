@@ -26,7 +26,7 @@ UMask=0077
 ReadOnlyPaths=/proc
 ReadOnlyPaths=/run/systemd
 ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging
-ReadWritePaths=/var/lib/webex-codex-inputs /var/lib/webex-codex-inputs-consumed
+ReadWritePaths=/var/lib/webex-codex-runtime-inputs
 
 NoNewPrivileges=true
 ProtectSystem=strict

@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     ffi::{CStr, CString, OsStr, OsString},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -14,15 +14,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use ring::digest::{Context as DigestContext, SHA256};
 
-use crate::isolated_execution::production_codex_group_ids;
+use crate::isolated_execution::{CODEX_INPUT_ROOT, production_codex_group_ids};
 
 pub const CODEX_PENDING_INPUT_ROOT: &str =
     "/var/lib/webex-generic-account-bot/codex-input-staging/pending";
 pub const CODEX_SOURCE_CONSUMED_INPUT_ROOT: &str =
     "/var/lib/webex-generic-account-bot/codex-input-staging/consumed";
 
-const CODEX_INPUT_ROOT: &str = "/var/lib/webex-codex-inputs";
 const STAGING_PREFIX: &str = ".seal-";
 const SOURCE_DIRECTORY_MODE: u32 = 0o2750;
 const SOURCE_FILE_MODE: u32 = 0o640;
@@ -80,6 +80,8 @@ struct Limits {
     bytes: u64,
     #[cfg(test)]
     mutation_hook: Option<FileMutationHook>,
+    #[cfg(test)]
+    post_copy_mutation_hook: Option<FileMutationHook>,
 }
 
 #[cfg(test)]
@@ -93,6 +95,8 @@ impl Default for Limits {
             bytes: WORKSPACE_TOTAL_BYTES_MAX,
             #[cfg(test)]
             mutation_hook: None,
+            #[cfg(test)]
+            post_copy_mutation_hook: None,
         }
     }
 }
@@ -617,7 +621,7 @@ fn copy_file(
     state: &mut CopyState,
 ) -> Result<()> {
     validate_source_file(entry, source_uid, source_gid)?;
-    let source = open_source_file(source_directory.as_raw_fd(), name)?;
+    let mut source = open_source_file(source_directory.as_raw_fd(), name)?;
     if stat_fd(source.as_raw_fd())? != *entry {
         bail!("pending workspace file changed before copy");
     }
@@ -638,16 +642,16 @@ fn copy_file(
 
     let mut target = create_target_file(target_directory.as_raw_fd(), name)?;
     set_owner_and_mode(target.as_raw_fd(), sealer_uid, target_gid, SOURCE_FILE_MODE)?;
-    let mut bounded_source = source.take(size);
-    let copied = io::copy(&mut bounded_source, &mut target)?;
+    let first_digest = copy_exact_with_digest(&mut source, &mut target, size)?;
     target.flush()?;
-    if copied != size {
-        bail!("pending workspace file size changed during copy");
+    #[cfg(test)]
+    if let Some(hook) = state.limits.post_copy_mutation_hook {
+        hook(source_directory.as_raw_fd(), name)?;
     }
-    let mut source = bounded_source.into_inner();
-    let mut growth_probe = [0_u8; 1];
-    if source.read(&mut growth_probe)? != 0 {
-        bail!("pending workspace file size changed during copy");
+    source.seek(SeekFrom::Start(0))?;
+    let second_digest = hash_exact_source(&mut source, size)?;
+    if first_digest.as_ref() != second_digest.as_ref() {
+        bail!("pending workspace file contents changed during copy");
     }
     if stat_fd(source.as_raw_fd())? != *entry
         || stat_at(source_directory.as_raw_fd(), name)? != *entry
@@ -667,6 +671,55 @@ fn copy_file(
         bail!("sealed workspace file metadata is invalid");
     }
     ensure_posix_acl_absent(&target, "sealed workspace file")?;
+    Ok(())
+}
+
+fn copy_exact_with_digest(
+    source: &mut File,
+    target: &mut File,
+    size: u64,
+) -> Result<ring::digest::Digest> {
+    let mut digest = DigestContext::new(&SHA256);
+    let mut remaining = size;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded copy chunk fits usize");
+        let read = source.read(&mut buffer[..limit])?;
+        if read == 0 {
+            bail!("pending workspace file size changed during copy");
+        }
+        target.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    reject_source_growth(source)?;
+    Ok(digest.finish())
+}
+
+fn hash_exact_source(source: &mut File, size: u64) -> Result<ring::digest::Digest> {
+    let mut digest = DigestContext::new(&SHA256);
+    let mut remaining = size;
+    let mut buffer = [0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded hash chunk fits usize");
+        let read = source.read(&mut buffer[..limit])?;
+        if read == 0 {
+            bail!("pending workspace file size changed during verification");
+        }
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    reject_source_growth(source)?;
+    Ok(digest.finish())
+}
+
+fn reject_source_growth(source: &mut File) -> Result<()> {
+    let mut growth_probe = [0_u8; 1];
+    if source.read(&mut growth_probe)? != 0 {
+        bail!("pending workspace file size changed during copy");
+    }
     Ok(())
 }
 
@@ -1298,6 +1351,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_same_size_source_changes_between_copy_passes() {
+        let roots = TestRoots::new();
+        let source = roots.source("same-size-change");
+        roots.write_file(&source.join("payload"), b"original");
+
+        assert_error_contains(
+            roots.seal_with_limits(
+                "same-size-change",
+                Limits {
+                    post_copy_mutation_hook: Some(overwrite_source_same_size),
+                    ..Limits::default()
+                },
+            ),
+            "contents changed during copy",
+        );
+        assert_quarantined_failure(&roots, "same-size-change");
+    }
+
+    #[test]
     fn rejects_posix_acls_on_roots_and_source_entries() {
         let roots = TestRoots::new();
         let source = roots.source("source-acl");
@@ -1331,6 +1403,20 @@ mod tests {
         // SAFETY: a successful `openat` returns a new owned descriptor.
         let mut file = unsafe { File::from_raw_fd(fd) };
         file.write_all(b"+")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn overwrite_source_same_size(directory_fd: RawFd, name: &CStr) -> Result<()> {
+        let flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        // SAFETY: `directory_fd` and `name` identify the test-owned regular file.
+        let fd = unsafe { libc::openat(directory_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: a successful `openat` returns a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(b"modified")?;
         file.sync_all()?;
         Ok(())
     }

@@ -34,8 +34,9 @@ use crate::{
 pub const RUNTIME_ROOT: &str = "/opt/webex-generic-account-bot/runtime";
 pub const RUNTIME_ACTIVE_MANIFEST_PATH: &str = "/opt/webex-generic-account-bot/runtime/active.json";
 pub const CODEX_AUTH_CREDENTIAL_PATH: &str = "/etc/webex-generic-account-bot/codex-auth.json";
-pub const CODEX_INPUT_ROOT: &str = "/var/lib/webex-codex-inputs";
-pub const CODEX_CONSUMED_INPUT_ROOT: &str = "/var/lib/webex-codex-inputs-consumed";
+pub const CODEX_INPUT_STORE_ROOT: &str = "/var/lib/webex-codex-runtime-inputs";
+pub const CODEX_INPUT_ROOT: &str = "/var/lib/webex-codex-runtime-inputs/ready";
+pub const CODEX_CONSUMED_INPUT_ROOT: &str = "/var/lib/webex-codex-runtime-inputs/consumed";
 pub const RUNTIME_EXECUTABLE_PATH: &str = "/usr/libexec/webex-codex-runtime";
 
 #[cfg(target_os = "linux")]
@@ -1246,7 +1247,7 @@ mod tests {
             run_id: "run-1".to_owned(),
             message_id: "message-1".to_owned(),
             prompt: "Inspect the isolated input".to_owned(),
-            workspace: PathBuf::from("/var/lib/webex-codex-inputs/run-1"),
+            workspace: PathBuf::from("/var/lib/webex-codex-runtime-inputs/ready/run-1"),
             model: Some("gpt-5.5".to_owned()),
             reasoning_effort: Some(ReasoningEffort::Xhigh),
             timeout_seconds: 600,
@@ -1675,7 +1676,7 @@ mod tests {
                 &request,
                 &runtime(),
                 &request.workspace,
-                "/var/lib/webex-codex-inputs/run-1",
+                "/var/lib/webex-codex-runtime-inputs/ready/run-1",
                 "webex-codex-launcher@42.service"
             )
             .is_err()

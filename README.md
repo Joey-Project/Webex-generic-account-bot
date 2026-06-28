@@ -596,7 +596,7 @@ repository-check bypass. The wrapper keeps Codex progress off stdout, asks
 `codex exec` to write its final response into the tool-denied main home, then
 validates and emits only that bounded UTF-8 file.
 
-Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
+Input workspaces live below `/var/lib/webex-codex-runtime-inputs/ready`. The host provisions
 that root as sticky `root:webex-codex-input` mode `1730`; each run must be
 sealed by a root-owned broker before launch. The run root and every nested directory must
 be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
@@ -614,7 +614,9 @@ directory with `O_PATH|O_NOFOLLOW` and binds the held
 inode through `/proc/<launcher-pid>/fd/<fd>`, preventing a path replacement
 between validation and transient-unit creation. Before starting the transient
 unit it atomically moves the pathname into the root-only
-`/var/lib/webex-codex-inputs-consumed` quarantine. The open inode remains the
+`/var/lib/webex-codex-runtime-inputs/consumed` quarantine. Both directories
+share one non-writable parent and one systemd writable mount so the no-replace
+rename cannot cross mount points. The open inode remains the
 unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
 does not add the bot to it or provide the privileged sealing broker.
@@ -676,6 +678,9 @@ host group policy used by runtime verification. Both privileged groups reject
 static primary-GID users. Runtime consumption preserves the verified inode
 through its `O_PATH` guard, moves it with no-replace semantics, and fsyncs the
 consumed and public parent directories before launch.
+Each source file is copied and SHA-256 hashed, then rewound and hashed again;
+same-size writes through retained source descriptors are rejected before the
+fresh target inode can be published.
 
 The staging parent is traversable only by `webex-codex-launch`; the sticky
 sealed-input root prevents non-root input-group members from replacing

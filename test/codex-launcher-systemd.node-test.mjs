@@ -137,8 +137,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.equal(
       tmpfiles,
       [
-        'd /var/lib/webex-codex-inputs 1730 root webex-codex-input 1d',
-        'd /var/lib/webex-codex-inputs-consumed 0700 root root 1d',
+        'd /var/lib/webex-codex-runtime-inputs 0550 root webex-codex-input -',
+        'd /var/lib/webex-codex-runtime-inputs/ready 1730 root webex-codex-input 1d',
+        'd /var/lib/webex-codex-runtime-inputs/consumed 0700 root root 1d',
         '',
       ].join('\n'),
     );
@@ -201,7 +202,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), ['/proc', '/run/systemd']);
     assert.deepEqual(directiveValues(service, 'ReadWritePaths'), [
       '/var/lib/webex-generic-account-bot/codex-input-staging',
-      '/var/lib/webex-codex-inputs /var/lib/webex-codex-inputs-consumed',
+      '/var/lib/webex-codex-runtime-inputs',
     ]);
     assert.deepEqual(directiveValues(service, 'BindPaths'), []);
     assert.doesNotMatch(service, /^InaccessiblePaths=.*(?:\/proc|\/run\/systemd)/m);
