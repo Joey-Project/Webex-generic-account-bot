@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const FRAME_HEADER_BYTES: usize = size_of::<u32>();
+pub const FRAME_HEADER_BYTES: usize = std::mem::size_of::<u32>();
 pub const REQUEST_MAX_BYTES: usize = 512 * 1024;
 pub const RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -93,6 +93,9 @@ impl ExecuteRequest {
         if let Some(model) = &self.model {
             validate_model(model)?;
         }
+        if self.reasoning_effort == Some(ReasoningEffort::Unknown) {
+            return Err(ProtocolError::InvalidReasoningEffort);
+        }
         validate_timeout_seconds(self.timeout_seconds)?;
         validate_output_char_limit(self.output_char_limit)?;
         Ok(())
@@ -107,6 +110,9 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    #[doc(hidden)]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,6 +301,8 @@ pub enum ProtocolError {
     InvalidWorkspace,
     #[error("launcher model is invalid")]
     InvalidModel,
+    #[error("launcher reasoning effort is invalid")]
+    InvalidReasoningEffort,
     #[error("launcher timeout is outside the protocol limits")]
     InvalidTimeout,
     #[error("launcher output character limit is outside the protocol limits")]
@@ -701,6 +709,13 @@ mod tests {
             request.model = Some(model.to_owned());
             assert_eq!(request.validate(), Err(ProtocolError::InvalidModel));
         }
+
+        let mut value = serde_json::to_value(LauncherRequest::execute(execute_request())).unwrap();
+        value["request"]["reasoning_effort"] = json!("ultra");
+        assert_eq!(
+            decode_request_frame(&frame_json(value)),
+            Err(ProtocolError::InvalidReasoningEffort)
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::{
+    fd::{AsRawFd, FromRawFd, RawFd},
+    unix::net::UnixStream as StdUnixStream,
+};
 
 use anyhow::{Result, anyhow};
 #[cfg(target_os = "linux")]
@@ -29,16 +32,19 @@ async fn main() -> Result<()> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
     validate_socket_stdio(stdin_fd, stdout_fd)?;
+    let mut socket = duplicate_launcher_socket(stdin_fd)?;
 
     let peer = socket_peer_credentials(stdin_fd)?;
     let peer = authorise_bot_peer(peer).await?;
     peer.ensure_alive()?;
 
-    let frame = read_request_frame().await?;
+    let frame = timeout(IO_TIMEOUT, read_request_frame_from(&mut socket))
+        .await
+        .map_err(|_| anyhow!("launcher request read timed out"))??;
     peer.ensure_alive()?;
     let response = response_for_request(decode_request_frame(&frame))?;
     peer.ensure_alive()?;
-    write_response(&response).await
+    write_response(&mut socket, &response).await
 }
 
 #[cfg(target_os = "linux")]
@@ -68,11 +74,16 @@ fn response_for_request(
 }
 
 #[cfg(target_os = "linux")]
-async fn read_request_frame() -> Result<Vec<u8>> {
-    let mut input = tokio::io::stdin();
-    timeout(IO_TIMEOUT, read_request_frame_from(&mut input))
-        .await
-        .map_err(|_| anyhow!("launcher request read timed out"))?
+fn duplicate_launcher_socket(fd: RawFd) -> Result<tokio::net::UnixStream> {
+    // SAFETY: fcntl does not dereference userspace pointers for F_DUPFD_CLOEXEC.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this process.
+    let socket = unsafe { StdUnixStream::from_raw_fd(duplicate) };
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::UnixStream::from_std(socket)?)
 }
 
 #[cfg(target_os = "linux")]
@@ -97,10 +108,12 @@ where
 }
 
 #[cfg(target_os = "linux")]
-async fn write_response(response: &LauncherResponse) -> Result<()> {
+async fn write_response<W>(output: &mut W, response: &LauncherResponse) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let frame = encode_response_frame(response)?;
     timeout(IO_TIMEOUT, async {
-        let mut output = tokio::io::stdout();
         output.write_all(&frame).await?;
         output.shutdown().await
     })
@@ -123,6 +136,7 @@ fn protocol_rejection_code(
         ProtocolError::InvalidPrompt => RejectionCode::InvalidPrompt,
         ProtocolError::InvalidWorkspace => RejectionCode::InvalidWorkspace,
         ProtocolError::InvalidModel => RejectionCode::InvalidModel,
+        ProtocolError::InvalidReasoningEffort => RejectionCode::InvalidReasoningEffort,
         ProtocolError::InvalidTimeout => RejectionCode::InvalidTimeout,
         ProtocolError::InvalidOutputLimit => RejectionCode::InvalidOutputLimit,
         _ => RejectionCode::MalformedRequest,

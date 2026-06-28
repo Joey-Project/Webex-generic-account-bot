@@ -153,6 +153,8 @@ describe('Codex launcher systemd boundary', () => {
 
     assert.doesNotMatch(source, /\b(?:systemd-run|sudo|pkexec)\b|PolicyKit|polkit/i);
     assert.doesNotMatch(source, /std::process::Command|tokio::process::Command/);
+    assert.doesNotMatch(source, /tokio::io::(?:stdin|stdout)/);
+    assert.match(source, /tokio::net::UnixStream::from_std/);
     assert.match(source, /ExecutionUnavailable/);
     assert.match(source, /LauncherResponse::ready\(false\)/);
   });
