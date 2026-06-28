@@ -344,7 +344,7 @@ fn verify_workspace(
     if !metadata.is_dir()
         || metadata.uid() != 0
         || metadata.gid() != input_gid
-        || metadata.mode() & 0o777 != 0o550
+        || !sealed_directory_mode_valid(metadata.mode())
     {
         return Err(anyhow!("runtime workspace metadata is invalid"));
     }
@@ -431,7 +431,7 @@ fn validate_workspace_directory(
         }
         use std::os::unix::fs::OpenOptionsExt;
         if metadata.is_dir() {
-            if metadata.mode() & 0o777 != 0o550 {
+            if !sealed_directory_mode_valid(metadata.mode()) {
                 return Err(anyhow!("runtime workspace directory mode is invalid"));
             }
             let child = OpenOptions::new()
@@ -450,7 +450,7 @@ fn validate_workspace_directory(
                 total_bytes,
             )?;
         } else if metadata.is_file() {
-            if metadata.mode() & 0o777 != 0o440 || metadata.nlink() != 1 {
+            if !sealed_file_mode_valid(metadata.mode()) || metadata.nlink() != 1 {
                 return Err(anyhow!("runtime workspace file metadata is invalid"));
             }
             let file = OpenOptions::new()
@@ -472,6 +472,16 @@ fn validate_workspace_directory(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_directory_mode_valid(mode: u32) -> bool {
+    mode & 0o7777 == 0o550
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_file_mode_valid(mode: u32) -> bool {
+    mode & 0o7777 == 0o440
 }
 
 #[cfg(target_os = "linux")]
@@ -1260,6 +1270,18 @@ mod tests {
         assert!(input_root_mode_valid(0o1730));
         for mode in [0o730, 0o1700, 0o1750, 0o1770, 0o1732, 0o3730, 0o5730] {
             assert!(!input_root_mode_valid(mode), "accepted mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn sealed_workspace_modes_reject_special_bits() {
+        assert!(sealed_directory_mode_valid(0o550));
+        assert!(sealed_file_mode_valid(0o440));
+        for mode in [0o1550, 0o2550, 0o4550] {
+            assert!(!sealed_directory_mode_valid(mode));
+        }
+        for mode in [0o1440, 0o2440, 0o4440] {
+            assert!(!sealed_file_mode_valid(mode));
         }
     }
 

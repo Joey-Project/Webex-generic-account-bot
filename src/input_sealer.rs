@@ -277,19 +277,32 @@ fn seal_workspace_with_limits(
         Ok(paths.input_root.join(run_id))
     })();
 
-    if result.is_err() {
-        if published_by_us {
-            if published_identity.as_ref().is_some_and(|expected| {
-                stat_at(input_root.as_raw_fd(), &run_name)
-                    .is_ok_and(|current| same_object(&current, expected))
-            }) {
-                let _ = remove_tree_at(input_root.as_raw_fd(), &run_name);
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let cleanup = if published_by_us {
+                let expected = published_identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("published workspace identity is unavailable"));
+                expected.and_then(|expected| {
+                    let current = stat_at(input_root.as_raw_fd(), &run_name)?;
+                    if !same_object(&current, expected) {
+                        bail!("refusing to clean a changed published workspace");
+                    }
+                    remove_tree_at(input_root.as_raw_fd(), &run_name)?;
+                    Ok(())
+                })
+            } else {
+                remove_tree_at(input_root.as_raw_fd(), &staging_name).map_err(Into::into)
+            };
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(anyhow!(
+                    "{error:#}; failed to clean rejected workspace: {cleanup_error:#}"
+                )),
             }
-        } else {
-            let _ = remove_tree_at(input_root.as_raw_fd(), &staging_name);
         }
     }
-    result
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -597,13 +610,17 @@ fn copy_file(
 
     let mut target = create_target_file(target_directory.as_raw_fd(), name)?;
     set_owner_and_mode(target.as_raw_fd(), sealer_uid, target_gid, SOURCE_FILE_MODE)?;
-    let mut bounded_source = source.take(size.saturating_add(1));
+    let mut bounded_source = source.take(size);
     let copied = io::copy(&mut bounded_source, &mut target)?;
     target.flush()?;
     if copied != size {
         bail!("pending workspace file size changed during copy");
     }
-    let source = bounded_source.into_inner();
+    let mut source = bounded_source.into_inner();
+    let mut growth_probe = [0_u8; 1];
+    if source.read(&mut growth_probe)? != 0 {
+        bail!("pending workspace file size changed during copy");
+    }
     if stat_fd(source.as_raw_fd())? != *entry
         || stat_at(source_directory.as_raw_fd(), name)? != *entry
     {
@@ -816,6 +833,7 @@ fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> io::Result<()> {
             let child = c_string(&child).map_err(io::Error::other)?;
             remove_tree_at(directory.as_raw_fd(), &child)?;
         }
+        sync_fd(directory.as_raw_fd())?;
         // SAFETY: the parent descriptor and child component are valid for `unlinkat`.
         if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
             return Err(io::Error::last_os_error());
@@ -825,6 +843,14 @@ fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> io::Result<()> {
         if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
+    }
+    sync_fd(parent_fd)
+}
+
+fn sync_fd(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a live file or directory descriptor owned by the caller.
+    if unsafe { libc::fsync(fd) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

@@ -660,10 +660,11 @@ activation.
 
 ### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
 
-PR 4c1b adds the root-only input sealer and its host staging layout. A pending
-workspace must be a single setgid `root:webex-codex-launch` tree whose
-directories and files are owned by the future bot caller with modes `2750` and
-`0640`. The sealer first moves that pathname into a root-only consumed-source
+PR 4c1b adds the root-only input sealer and its host staging layout. The
+pending root is setgid `root:webex-codex-launch` mode `2730`; each per-run tree
+inside it is owned by the future bot caller with group `webex-codex-launch`,
+using mode `2750` for directories and `0640` for files. The sealer first moves
+that pathname into a root-only consumed-source
 quarantine, recursively validates it through no-follow descriptor-relative
 operations, and copies only regular files and directories into fresh
 `root:webex-codex-input` inodes. It rejects links, special files, control
