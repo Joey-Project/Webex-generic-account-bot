@@ -3,7 +3,7 @@ id: 20260627-configuration-space-commands
 title: Configuration Space Commands
 status: active
 created: 2026-06-27
-updated: 2026-06-27
+updated: 2026-06-28
 branch: codex/config-pull-worker
 pr:
 supersedes: []
