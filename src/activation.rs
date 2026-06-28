@@ -120,9 +120,13 @@ impl ActivationPaths {
     }
 
     pub fn production() -> Self {
+        Self::production_with_boot_id(BOOT_ID_PATH)
+    }
+
+    pub fn production_with_boot_id(boot_id: impl Into<PathBuf>) -> Self {
         Self::new(
             ACTIVATION_RECEIPT_PATH,
-            BOOT_ID_PATH,
+            boot_id,
             ACTIVE_RUNTIME_MANIFEST_PATH,
             BOT_EXECUTABLE_PATH,
             LAUNCHER_EXECUTABLE_PATH,
@@ -219,6 +223,7 @@ struct FileIdentity {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
+    volatile_timestamps: bool,
 }
 
 impl FileIdentity {
@@ -235,7 +240,29 @@ impl FileIdentity {
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+            volatile_timestamps: false,
         }
+    }
+
+    fn from_file_metadata(metadata: &fs::Metadata, kind: TrustedFileKind) -> Self {
+        let mut identity = Self::from_metadata(metadata);
+        identity.volatile_timestamps = matches!(kind, TrustedFileKind::BootId);
+        identity
+    }
+
+    fn matches(&self, actual: &Self) -> bool {
+        self.device == actual.device
+            && self.inode == actual.inode
+            && self.mode == actual.mode
+            && self.uid == actual.uid
+            && self.gid == actual.gid
+            && self.links == actual.links
+            && self.length == actual.length
+            && (self.volatile_timestamps
+                || (self.modified_seconds == actual.modified_seconds
+                    && self.modified_nanoseconds == actual.modified_nanoseconds
+                    && self.changed_seconds == actual.changed_seconds
+                    && self.changed_nanoseconds == actual.changed_nanoseconds))
     }
 }
 
@@ -590,13 +617,16 @@ fn open_trusted_file(
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("trusted activation path is unavailable: {}", path.display()))?;
     validate_file_metadata(paths, &metadata, kind, max_bytes)?;
-    let expected = FileIdentity::from_metadata(&metadata);
+    let expected = FileIdentity::from_file_metadata(&metadata, kind);
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("failed to open trusted activation path: {}", path.display()))?;
     ensure_open_file_identity(&file, &expected)?;
+    if matches!(kind, TrustedFileKind::Executable) {
+        ensure_xattr_absent(&file, b"security.capability\0", "file capability")?;
+    }
     Ok((file, expected))
 }
 
@@ -608,7 +638,8 @@ fn validate_file_metadata(
 ) -> Result<()> {
     let permissions = metadata.mode() & 0o7777;
     let valid_mode = match kind {
-        TrustedFileKind::BootId | TrustedFileKind::ReadOnlyData => permissions == 0o444,
+        TrustedFileKind::BootId => matches!(permissions, 0o400 | 0o444),
+        TrustedFileKind::ReadOnlyData => permissions == 0o444,
         TrustedFileKind::Executable => matches!(permissions, 0o555 | 0o755),
     };
     if !metadata.is_file()
@@ -673,7 +704,7 @@ fn validate_absolute_normal_path(path: &Path) -> Result<()> {
 
 fn ensure_open_file_identity(file: &File, expected: &FileIdentity) -> Result<()> {
     let actual = FileIdentity::from_metadata(&file.metadata()?);
-    if &actual != expected {
+    if !expected.matches(&actual) {
         return Err(anyhow!("trusted activation file changed while open"));
     }
     Ok(())
@@ -686,12 +717,39 @@ fn ensure_path_identity(
 ) -> Result<()> {
     validate_trusted_ancestors(paths, path)?;
     let actual = FileIdentity::from_metadata(&fs::symlink_metadata(path)?);
-    if &actual != expected {
+    if !expected.matches(&actual) {
         return Err(anyhow!(
             "trusted activation path changed during verification"
         ));
     }
     Ok(())
+}
+
+fn ensure_xattr_absent(file: &File, name: &[u8], description: &str) -> Result<()> {
+    if name.last() != Some(&0) || name[..name.len() - 1].contains(&0) {
+        return Err(anyhow!("invalid extended attribute name"));
+    }
+    // SAFETY: name is checked to be a single NUL-terminated byte string, the
+    // descriptor is owned for this call, and a null value pointer requests only
+    // the attribute size.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Err(anyhow!(
+            "trusted executable has an unexpected {description}"
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(error).with_context(|| format!("failed to inspect executable {description}")),
+    }
 }
 
 fn read_bounded(file: &mut File, output: &mut Vec<u8>, max_bytes: u64) -> Result<()> {
@@ -973,6 +1031,77 @@ mod tests {
             .parent()
             .unwrap()
             .join(format!("images/{}.squashfs", sha256(RUNTIME_IMAGE)))
+    }
+
+    #[test]
+    fn production_paths_can_use_a_systemd_boot_id_credential() {
+        let boot_id = PathBuf::from("/run/credentials/webex-codex-launcher/activation-boot-id");
+        let paths = ActivationPaths::production_with_boot_id(&boot_id);
+
+        assert_eq!(paths.boot_id(), boot_id);
+        assert_eq!(paths.receipt(), Path::new(ACTIVATION_RECEIPT_PATH));
+        assert_eq!(
+            paths.runtime_executable(),
+            Path::new(RUNTIME_EXECUTABLE_PATH)
+        );
+    }
+
+    #[test]
+    fn virtual_boot_id_identity_ignores_only_timestamp_churn() {
+        let fixture = Fixture::new();
+        let metadata = fs::metadata(&fixture.paths.boot_id).unwrap();
+        let expected = FileIdentity::from_file_metadata(&metadata, TrustedFileKind::BootId);
+        let mut actual = FileIdentity::from_metadata(&metadata);
+
+        actual.modified_seconds += 1;
+        actual.changed_nanoseconds += 1;
+        assert!(expected.matches(&actual));
+
+        actual.length += 1;
+        assert!(!expected.matches(&actual));
+
+        let stable = FileIdentity::from_file_metadata(&metadata, TrustedFileKind::ReadOnlyData);
+        let mut changed = FileIdentity::from_metadata(&metadata);
+        changed.modified_seconds += 1;
+        assert!(!stable.matches(&changed));
+    }
+
+    #[test]
+    fn extended_attribute_probe_rejects_present_attributes() {
+        let fixture = Fixture::new();
+        fs::set_permissions(
+            &fixture.paths.bot_executable,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.paths.bot_executable)
+            .unwrap();
+        let name = b"user.webex-activation-test\0";
+        // SAFETY: name and value are valid byte buffers for the duration of the call.
+        let result = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr().cast(),
+                b"present".as_ptr().cast(),
+                b"present".len(),
+                0,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+            return;
+        }
+
+        fs::set_permissions(
+            &fixture.paths.bot_executable,
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        assert!(ensure_xattr_absent(&file, name, "test attribute").is_err());
     }
 
     fn passing_canaries() -> BTreeMap<String, bool> {

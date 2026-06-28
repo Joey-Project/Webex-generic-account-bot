@@ -244,6 +244,9 @@ superseded_by:
   bot group/drop-in access required to reach the launcher socket.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
+- Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
+  with a root-owned systemd credential and verify activation through
+  `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
 
 ### PR 4c2: Production-Image Smoke Tests and Final Activation
 - Repository: `Joey-Project/Webex-generic-account-bot`, with a matching config
