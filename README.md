@@ -597,8 +597,8 @@ repository-check bypass. The wrapper keeps Codex progress off stdout, asks
 validates and emits only that bounded UTF-8 file.
 
 Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
-that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a
-root-owned broker before launch. The run root and every nested directory must
+that root as sticky `root:webex-codex-input` mode `1730`; each run must be
+sealed by a root-owned broker before launch. The run root and every nested directory must
 be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
 the same owner/group and a single hard link. Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
@@ -655,6 +655,32 @@ ID with a root-owned systemd credential and pass that fixed credential path to
 procfs boundary. Executable verification also rejects Linux file capabilities
 so a canary-approved binary cannot gain ambient privilege without invalidating
 activation.
+
+### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
+
+PR 4c1b adds the root-only input sealer and its host staging layout. A pending
+workspace must be a single setgid `root:webex-codex-launch` tree whose
+directories and files are owned by the future bot caller with modes `2750` and
+`0640`. The sealer first moves that pathname into a root-only consumed-source
+quarantine, recursively validates it through no-follow descriptor-relative
+operations, and copies only regular files and directories into fresh
+`root:webex-codex-input` inodes. It rejects links, special files, control
+directories, owner/mode changes, duplicate publication, and the PR 4b depth,
+entry, and byte limits before publishing a read-only tree.
+
+The staging parent is traversable only by `webex-codex-launch`; the sticky
+sealed-input root prevents non-root input-group members from replacing
+root-owned entries; and tmpfiles
+expires abandoned pending, consumed-source, hidden sealed-staging, and
+unconsumed final entries after one day. The launcher receives only the
+supplementary groups and two writable staging roots needed after its capability
+drop. The namespace exposes their common parent as writable so quarantine
+rename stays on one mount, while parent mode `0550` prevents the launcher from
+creating or replacing sibling entries.
+This slice adds no bot service drop-in, no launcher client or runtime
+call site, no activation-receipt read, and no config enablement. The bot still
+cannot reach the launcher socket or pending root, so the isolation backend
+remains undeployable until PR 4c1c wires the gated path.
 
 ## Development
 

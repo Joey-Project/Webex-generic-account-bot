@@ -13,6 +13,10 @@ const ACTIVATION_TMPFILES_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-codex-activation.tmpfiles.conf',
 );
+const INPUT_STAGING_TMPFILES_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-codex-input-staging.tmpfiles.conf',
+);
 const RUNTIME_SYSUSERS_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-codex-runtime.sysusers.conf',
@@ -101,7 +105,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
     assert.deepEqual(directiveValues(service, 'Slice'), ['system.slice']);
     assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), [
-      'webex-codex-input',
+      'webex-codex-input webex-codex-launch',
     ]);
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
       '/opt/webex-generic-account-bot/bin/webex-codex-launcher',
@@ -119,9 +123,10 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('provisions a separate input-only group without bot membership', async () => {
-    const [sysusers, tmpfiles] = await Promise.all([
+    const [sysusers, tmpfiles, stagingTmpfiles] = await Promise.all([
       fs.readFile(RUNTIME_SYSUSERS_PATH, 'utf8'),
       fs.readFile(RUNTIME_TMPFILES_PATH, 'utf8'),
+      fs.readFile(INPUT_STAGING_TMPFILES_PATH, 'utf8'),
     ]);
 
     assert.equal(sysusers, 'g webex-codex-input -\n');
@@ -129,8 +134,17 @@ describe('Codex launcher systemd boundary', () => {
     assert.equal(
       tmpfiles,
       [
-        'd /var/lib/webex-codex-inputs 0730 root webex-codex-input -',
+        'd /var/lib/webex-codex-inputs 1730 root webex-codex-input 1d',
         'd /var/lib/webex-codex-inputs-consumed 0700 root root 1d',
+        '',
+      ].join('\n'),
+    );
+    assert.equal(
+      stagingTmpfiles,
+      [
+        'd /var/lib/webex-generic-account-bot/codex-input-staging 0550 root webex-codex-launch -',
+        'd /var/lib/webex-generic-account-bot/codex-input-staging/pending 2730 root webex-codex-launch 1d',
+        'd /var/lib/webex-generic-account-bot/codex-input-staging/consumed 0700 root root 1d',
         '',
       ].join('\n'),
     );
@@ -180,6 +194,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'ProcSubset'), ['pid']);
     assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), ['/proc', '/run/systemd']);
     assert.deepEqual(directiveValues(service, 'ReadWritePaths'), [
+      '/var/lib/webex-generic-account-bot/codex-input-staging',
       '/var/lib/webex-codex-inputs /var/lib/webex-codex-inputs-consumed',
     ]);
     assert.deepEqual(directiveValues(service, 'BindPaths'), []);
@@ -211,6 +226,7 @@ describe('Codex launcher systemd boundary', () => {
         TMPFILES_PATH,
         RUNTIME_SYSUSERS_PATH,
         RUNTIME_TMPFILES_PATH,
+        INPUT_STAGING_TMPFILES_PATH,
       ].map((file) =>
         fs.readFile(file, 'utf8'),
       ),
@@ -226,9 +242,9 @@ describe('Codex launcher systemd boundary', () => {
     }
     for (const contents of launcherFiles) {
       assert.doesNotMatch(contents, /\b(?:sudo|pkexec)\b|polkit|PolicyKit/i);
-      assert.doesNotMatch(contents, /^SupplementaryGroups=(?!webex-codex-input$)/m);
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-launch$/m);
       assert.doesNotMatch(contents, /^m\s+webex-codex-launch\s+webex-generic-account-bot$/m);
+      assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-input$/m);
     }
   });
 

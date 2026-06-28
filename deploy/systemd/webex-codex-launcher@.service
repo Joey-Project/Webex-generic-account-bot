@@ -11,7 +11,7 @@ Type=exec
 User=root
 Group=root
 Slice=system.slice
-SupplementaryGroups=webex-codex-input
+SupplementaryGroups=webex-codex-input webex-codex-launch
 ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-launcher
 StandardInput=socket
 StandardOutput=socket
@@ -25,6 +25,7 @@ OOMPolicy=kill
 UMask=0077
 ReadOnlyPaths=/proc
 ReadOnlyPaths=/run/systemd
+ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging
 ReadWritePaths=/var/lib/webex-codex-inputs /var/lib/webex-codex-inputs-consumed
 
 NoNewPrivileges=true

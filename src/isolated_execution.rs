@@ -1021,11 +1021,16 @@ fn trusted_input_root(path: &Path, input_gid: u32) -> Result<()> {
         || metadata.file_type().is_symlink()
         || metadata.uid() != 0
         || metadata.gid() != input_gid
-        || metadata.mode() & 0o777 != 0o730
+        || !input_root_mode_valid(metadata.mode())
     {
         return Err(anyhow!("runtime input root metadata is invalid"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn input_root_mode_valid(mode: u32) -> bool {
+    mode & 0o1777 == 0o1730
 }
 
 #[cfg(target_os = "linux")]
@@ -1247,6 +1252,14 @@ mod tests {
         assert!(file_policy_mode_valid(FilePolicy::PrivateCredential, 0o600));
         for mode in [0o200, 0o500, 0o640, 0o777] {
             assert!(!file_policy_mode_valid(FilePolicy::PrivateCredential, mode));
+        }
+    }
+
+    #[test]
+    fn input_root_requires_sticky_group_write_without_group_read() {
+        assert!(input_root_mode_valid(0o1730));
+        for mode in [0o730, 0o1700, 0o1750, 0o1770, 0o1732] {
+            assert!(!input_root_mode_valid(mode), "accepted mode {mode:o}");
         }
     }
 

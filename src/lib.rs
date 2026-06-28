@@ -5,6 +5,8 @@ pub mod config;
 pub mod config_actions;
 pub mod config_commands;
 pub mod config_status;
+#[cfg(target_os = "linux")]
+pub mod input_sealer;
 pub mod isolated_execution;
 pub mod launcher_protocol;
 pub mod policy;
