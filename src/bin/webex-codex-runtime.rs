@@ -4,12 +4,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, DirBuilder, OpenOptions},
     io::{Read, Write},
-    os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 #[cfg(target_os = "linux")]
@@ -17,6 +14,8 @@ use anyhow::Context;
 use anyhow::{Result, anyhow};
 #[cfg(target_os = "linux")]
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "linux")]
+use webex_generic_account_bot::launcher_protocol::OUTPUT_MAX_BYTES;
 
 #[cfg(target_os = "linux")]
 const CODEX_PATH: &str = "/opt/codex/bin/codex";
@@ -33,7 +32,11 @@ const TOOL_HOME: &str = "/tmp/webex-codex-tool-home";
 #[cfg(target_os = "linux")]
 const TOOL_TMP: &str = "/tmp/webex-codex-tool-tmp";
 #[cfg(target_os = "linux")]
+const FINAL_OUTPUT_PATH: &str = "/tmp/webex-codex-main/final-message.txt";
+#[cfg(target_os = "linux")]
 const AUTH_MAX_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const FINAL_OUTPUT_MAX_BYTES: u64 = OUTPUT_MAX_BYTES as u64;
 #[cfg(target_os = "linux")]
 const MAIN_PATH: &str = "/opt/codex/codex-resources:/opt/codex/codex-path:/bin";
 #[cfg(target_os = "linux")]
@@ -123,7 +126,31 @@ fn main() -> Result<()> {
         .env("LANG", "C.UTF-8")
         .env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
 
-    Err(command.exec()).context("failed to execute the fixed Codex runtime")
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let output = run_codex(&mut command, Path::new(FINAL_OUTPUT_PATH))?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&output)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_codex(command: &mut Command, output_path: &Path) -> Result<Vec<u8>> {
+    match fs::symlink_metadata(output_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(anyhow!("final Codex message path already exists")),
+        Err(error) => return Err(error.into()),
+    }
+    let status = command
+        .status()
+        .context("failed to start the fixed Codex runtime")?;
+    if !status.success() {
+        return Err(anyhow!("fixed Codex runtime failed: {status}"));
+    }
+    read_final_output(output_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -245,6 +272,30 @@ fn close_nonstandard_descriptors() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_final_output(path: &Path) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .context("failed to open the final Codex message")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        // SAFETY: geteuid has no arguments and only returns process metadata.
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() == 0
+        || metadata.len() > FINAL_OUTPUT_MAX_BYTES
+    {
+        return Err(anyhow!("final Codex message metadata is invalid"));
+    }
+    let mut output = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut output)?;
+    std::str::from_utf8(&output).context("final Codex message is not UTF-8")?;
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
 fn codex_args(cli: &Cli) -> Vec<OsString> {
     let mut args = vec![
         "--ask-for-approval".into(),
@@ -292,6 +343,8 @@ fn codex_args(cli: &Cli) -> Vec<OsString> {
         "--cd".into(),
         cli.workspace.as_os_str().into(),
         "--skip-git-repo-check".into(),
+        "--output-last-message".into(),
+        FINAL_OUTPUT_PATH.into(),
     ];
     if let Some(reasoning_effort) = cli.reasoning_effort {
         args.push("-c".into());
@@ -354,6 +407,8 @@ mod tests {
             "features.shell_snapshot=false",
             "--ephemeral",
             "--skip-git-repo-check",
+            "--output-last-message",
+            FINAL_OUTPUT_PATH,
         ] {
             assert!(rendered.iter().any(|value| value == required), "{required}");
         }
@@ -366,8 +421,13 @@ mod tests {
             .iter()
             .position(|value| value == "--skip-git-repo-check")
             .unwrap();
+        let final_output = rendered
+            .iter()
+            .position(|value| value == "--output-last-message")
+            .unwrap();
         assert!(strict_config < exec);
         assert!(skip_git > exec);
+        assert!(final_output > exec);
         assert!(PERMISSION_PROFILE.contains("/tmp/webex-codex-main\"=\"deny"));
         assert!(PERMISSION_PROFILE.contains("/run/credentials\"=\"deny"));
         assert!(PERMISSION_PROFILE.contains("/opt/codex/codex-resources\"=\"deny"));
@@ -386,5 +446,49 @@ mod tests {
             args.iter()
                 .any(|value| value == "model_reasoning_effort=\"xhigh\"")
         );
+    }
+
+    #[test]
+    fn final_output_must_be_private_bounded_utf8() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "webex-codex-final-output-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&path, b"final response\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_final_output(&path).unwrap(), b"final response\n");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_final_output(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn supervisor_returns_only_the_final_output_file() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "webex-codex-supervised-output-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "umask 077; printf 'final response\\n' > \"$1\"; printf 'progress noise\\n'",
+                "webex-codex-test",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert_eq!(run_codex(&mut command, &path).unwrap(), b"final response\n");
+        fs::remove_file(path).unwrap();
     }
 }

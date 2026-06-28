@@ -575,6 +575,9 @@ fn build_transient_run_plan(
         "RestrictRealtime=yes".to_owned(),
         "LockPersonality=yes".to_owned(),
         "MemoryDenyWriteExecute=yes".to_owned(),
+        "SystemCallFilter=~@debug process_vm_readv process_vm_writev process_madvise kcmp"
+            .to_owned(),
+        "SystemCallErrorNumber=EPERM".to_owned(),
         "SystemCallArchitectures=native".to_owned(),
         "DevicePolicy=closed".to_owned(),
         "KeyringMode=private".to_owned(),
@@ -589,6 +592,7 @@ fn build_transient_run_plan(
         "LimitNOFILE=256".to_owned(),
         "LimitNPROC=128".to_owned(),
         "LimitFSIZE=256M".to_owned(),
+        "LimitCORE=0".to_owned(),
         format!("RuntimeMaxSec={timeout}"),
         "TimeoutStopSec=10s".to_owned(),
         "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=512M,mode=1777".to_owned(),
@@ -1035,7 +1039,7 @@ fn parse_group_gid(contents: &str, expected_name: &str) -> Result<u32> {
         if fields.first().copied() != Some(expected_name) {
             continue;
         }
-        if fields.len() != 4 || result.is_some() {
+        if fields.len() != 4 || !fields[3].is_empty() || result.is_some() {
             return Err(anyhow!("Codex input group database entry is invalid"));
         }
         let gid = fields[2]
@@ -1165,6 +1169,13 @@ mod tests {
         assert!(parse_group_gid("webex-codex-input:x:0:\n", CODEX_INPUT_GROUP).is_err());
         assert!(
             parse_group_gid(
+                "webex-codex-input:x:4321:webex-generic-account-bot\n",
+                CODEX_INPUT_GROUP
+            )
+            .is_err()
+        );
+        assert!(
+            parse_group_gid(
                 "webex-codex-input:x:4321:\nwebex-codex-input:x:4322:\n",
                 CODEX_INPUT_GROUP
             )
@@ -1262,6 +1273,9 @@ mod tests {
             "TasksMax=128",
             "MemoryMax=2G",
             "MemorySwapMax=0",
+            "SystemCallFilter=~@debug process_vm_readv process_vm_writev process_madvise kcmp",
+            "SystemCallErrorNumber=EPERM",
+            "LimitCORE=0",
             "RuntimeMaxSec=610s",
             RUNTIME_EXECUTABLE_PATH,
             "gpt-5.5",

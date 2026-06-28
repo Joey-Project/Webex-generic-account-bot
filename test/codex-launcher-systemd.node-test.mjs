@@ -284,11 +284,19 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(isolatedExecution, /failed to consume the verified runtime workspace/);
     assert.match(isolatedExecution, /LoadCredential=codex-auth\.json/);
     assert.match(isolatedExecution, /CapabilityBoundingSet=/);
+    assert.match(
+      isolatedExecution,
+      /SystemCallFilter=~@debug process_vm_readv process_vm_writev process_madvise kcmp/,
+    );
+    assert.match(isolatedExecution, /SystemCallErrorNumber=EPERM/);
+    assert.match(isolatedExecution, /LimitCORE=0/);
     assert.match(isolatedExecution, /MemoryMax=2G/);
     assert.match(isolatedExecution, /TasksMax=128/);
     assert.doesNotMatch(isolatedExecution, /\b(?:sudo|pkexec)\b|PolicyKit|polkit/i);
     assert.match(runtimeSource, /PR_SET_DUMPABLE/);
     assert.match(runtimeSource, /PR_SET_NO_NEW_PRIVS/);
+    assert.match(runtimeSource, /--output-last-message/);
+    assert.match(runtimeSource, /FINAL_OUTPUT_PATH/);
     assert.match(runtimeSource, /SYS_close_range/);
     assert.match(runtimeSource, /shell_environment_policy\.inherit=\\"none\\"/);
     assert.match(runtimeSource, /permissions\.webex-isolated\.network\.enabled=false/);

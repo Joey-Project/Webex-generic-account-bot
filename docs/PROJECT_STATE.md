@@ -37,12 +37,12 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4c must still prove the inner Codex/bwrap credential, `/proc`, inherited
-  descriptor, and network boundaries against the production image and host
-  kernel policy before activating the runner. Static PR 4b preflight is not a
-  substitute for those canaries. It must also deliver the narrow root-owned
-  broker that converts bot-produced inputs into the recursively validated
-  sealed workspace tree.
+- PR 4c must still prove the inner Codex/bwrap credential, post-exec process
+  memory and `/proc`, inherited descriptor, and network boundaries against the
+  production image and host kernel policy before activating the runner. Static
+  PR 4b preflight is not a substitute for those canaries. It must also deliver
+  the narrow root-owned broker that converts bot-produced inputs into the
+  recursively validated sealed workspace tree.
 - PRs 4a and 4b do not grant bot group access, enable
   `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
   `/config sync`.

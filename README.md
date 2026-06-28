@@ -592,7 +592,9 @@ disables tool network access, and always uses `--skip-git-repo-check` because a
 sealed evidence workspace cannot contain a `.git` control directory. The
 launcher validates the complete request policy before consuming the sealed
 workspace pathname and rejects requests that do not opt into that fixed
-repository-check bypass.
+repository-check bypass. The wrapper keeps Codex progress off stdout, asks
+`codex exec` to write its final response into the tool-denied main home, then
+validates and emits only that bounded UTF-8 file.
 
 Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
 that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a
@@ -600,7 +602,8 @@ root-owned broker before launch. The run root and every nested directory must
 be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
 the same owner/group and a single hard link. Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
-2 GiB plus 64 MiB are rejected.
+2 GiB plus 64 MiB are rejected. The host group database entry must have no
+static members.
 The root launcher has only this supplementary input group after systemd starts
 it; it has no bot, launcher-socket, or worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
@@ -623,7 +626,10 @@ sealer, and remove PR 4b's compile-time activation gate before granting either
 input-group or launcher-socket access. Until then launcher preflight and execute
 requests both fail closed even if an operator installs every PR 4b asset. If
 any canary fails, configuration continues to reject `ephemeral-linux-user` with
-no current-user fallback.
+no current-user fallback. In particular, ordinary `exec` resets process
+dumpability: the transient unit denies the `@debug` syscall group, process-VM
+access calls, and core dumps, while PR 4c must still prove that the inner tool
+PID/filesystem sandbox cannot inspect the Codex main process after `exec`.
 
 Until PR 4c and the separate command-enablement changes land, the bot has no
 launcher-, input-, or worker-socket group access and `/config pull`,
