@@ -622,6 +622,7 @@ export class ConfigPullWorker {
     this.abortController = new AbortController();
     this.stopping = false;
     this.started = false;
+    this.startAttempted = false;
     this.fatalError = null;
     this.fatalPromise = new Promise((resolve) => {
       this.resolveFatal = resolve;
@@ -630,6 +631,10 @@ export class ConfigPullWorker {
 
   async start() {
     if (this.started) throw new Error('worker is already started');
+    if (this.startAttempted || this.stopping) {
+      throw new Error('worker cannot be restarted');
+    }
+    this.startAttempted = true;
     await prepareStorage({ ...this.options, fsApi: this.fsApi });
     await this.#cleanStaleTemporaryFiles();
     await this.#recoverQueue();

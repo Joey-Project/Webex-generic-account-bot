@@ -642,6 +642,21 @@ describe('config pull worker socket protocol', () => {
 
     assert.equal(response.toString('utf8'), '{"version":1}\n');
   });
+
+  it('rejects restarting the same worker instance after stop', async (context) => {
+    const layout = await createLayout(context);
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => worker.stop());
+
+    await worker.start();
+    await worker.stop();
+
+    await assert.rejects(worker.start(), /worker cannot be restarted/);
+    await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
+  });
 });
 
 describe('config pull worker recovery', () => {
