@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::OsString,
+    ffi::{CStr, CString, OsString},
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::{fs::MetadataExt, io::AsRawFd},
@@ -346,13 +346,21 @@ fn verify_workspace(
     input_gid: u32,
 ) -> Result<VerifiedWorkspace> {
     trusted_input_root(input_root, input_gid)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let input_root_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(input_root)?;
+    let consumed_root_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(consumed_input_root)?;
     let expected = input_root.join(&request.run_id);
     if request.workspace != expected {
         return Err(anyhow!(
             "runtime workspace does not match the run identifier"
         ));
     }
-    use std::os::unix::fs::OpenOptionsExt;
     let guard = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -392,9 +400,17 @@ fn verify_workspace(
     if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
         return Err(anyhow!("runtime workspace changed during verification"));
     }
-    let consumed_path = consumed_input_root.join(transient_unit_name(&request.run_id));
-    fs::rename(&request.workspace, &consumed_path)
-        .context("failed to consume the verified runtime workspace")?;
+    let source_name = CString::new(request.run_id.as_bytes())
+        .map_err(|_| anyhow!("runtime run identifier contains a NUL byte"))?;
+    let consumed_name = CString::new(transient_unit_name(&request.run_id))
+        .expect("validated run identifiers produce NUL-free unit names");
+    consume_workspace(
+        &input_root_directory,
+        &source_name,
+        &consumed_root_directory,
+        &consumed_name,
+    )?;
+    let consumed_path = consumed_input_root.join(consumed_name.to_string_lossy().as_ref());
     let consumed = fs::symlink_metadata(&consumed_path)?;
     if consumed.dev() != metadata.dev() || consumed.ino() != metadata.ino() {
         return Err(anyhow!("consumed runtime workspace identity changed"));
@@ -404,6 +420,37 @@ fn verify_workspace(
         bind_source,
         _guard: guard,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn consume_workspace(
+    input_root: &File,
+    source_name: &CStr,
+    consumed_root: &File,
+    consumed_name: &CStr,
+) -> Result<()> {
+    // SAFETY: both directory descriptors and NUL-terminated names remain live
+    // for the syscall; RENAME_NOREPLACE preserves any stale consumed entry.
+    if unsafe {
+        libc::renameat2(
+            input_root.as_raw_fd(),
+            source_name.as_ptr(),
+            consumed_root.as_raw_fd(),
+            consumed_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to consume the verified runtime workspace");
+    }
+    consumed_root
+        .sync_all()
+        .context("failed to persist the consumed runtime workspace")?;
+    input_root
+        .sync_all()
+        .context("failed to persist removal of the public runtime workspace")?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1084,6 +1131,7 @@ fn resolve_codex_group_ids(group_file: &Path, passwd_file: &Path) -> Result<Code
     if launch == input {
         return Err(anyhow!("Codex launch and input groups must be distinct"));
     }
+    reject_primary_gid_users(passwd_file, launch)?;
     reject_primary_gid_users(passwd_file, input)?;
     Ok(CodexGroupIds { launch, input })
 }
@@ -1281,6 +1329,15 @@ mod tests {
                 input: 4321,
             }
         );
+        for privileged_gid in [4320, 4321] {
+            fs::write(
+                &passwd_file,
+                format!("root:x:0:0:root:/root:/bin/sh\nuser:x:1000:{privileged_gid}:user:/tmp:/bin/false\n"),
+            )
+            .unwrap();
+            assert!(resolve_codex_group_ids(&group_file, &passwd_file).is_err());
+        }
+        fs::write(&passwd_file, b"root:x:0:0:root:/root:/bin/sh\n").unwrap();
         fs::write(
             &group_file,
             b"webex-codex-launch:x:4321:\nwebex-codex-input:x:4321:\n",
@@ -1413,6 +1470,51 @@ mod tests {
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o750)).unwrap();
         fs::set_permissions(&evidence, fs::Permissions::from_mode(0o640)).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_consumption_is_durable_and_does_not_replace() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "webex-codex-consume-{}-{suffix}",
+            std::process::id()
+        ));
+        let input = base.join("input");
+        let consumed = base.join("consumed");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir(&consumed).unwrap();
+        let input_directory = File::open(&input).unwrap();
+        let consumed_directory = File::open(&consumed).unwrap();
+
+        fs::create_dir(input.join("first")).unwrap();
+        consume_workspace(
+            &input_directory,
+            c"first",
+            &consumed_directory,
+            c"first-consumed",
+        )
+        .unwrap();
+        assert!(!input.join("first").exists());
+        assert!(consumed.join("first-consumed").is_dir());
+
+        fs::create_dir(input.join("duplicate")).unwrap();
+        fs::create_dir(consumed.join("already-there")).unwrap();
+        assert!(
+            consume_workspace(
+                &input_directory,
+                c"duplicate",
+                &consumed_directory,
+                c"already-there",
+            )
+            .is_err()
+        );
+        assert!(input.join("duplicate").is_dir());
+        assert!(consumed.join("already-there").is_dir());
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn install_test_access_acl(path: &Path) -> bool {

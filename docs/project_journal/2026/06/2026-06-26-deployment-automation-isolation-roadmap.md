@@ -243,6 +243,9 @@ superseded_by:
 - Resolve the fixed launch/input groups through one trusted host policy and
   reject access or default POSIX ACLs on roots, source entries, sealed entries,
   and runtime re-verification so mode-bit checks cannot be bypassed.
+- Reject static primary-GID users for both privileged groups, then consume a
+  verified workspace with descriptor-relative no-replace rename and fsync both
+  parent directories before launch.
 - Provision the pending/source-consumed/staging roots and give only the root
   launcher the supplementary groups and writable paths needed after its
   capability drop. Do not add a bot drop-in, launcher client, runtime call
