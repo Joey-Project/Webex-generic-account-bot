@@ -1,0 +1,26 @@
+[Unit]
+Description=Webex Codex launcher socket
+Documentation=man:systemd.socket(5)
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+
+[Socket]
+ListenSequentialPacket=/run/webex-codex-launcher/launcher.sock
+Accept=yes
+PassCredentials=yes
+SocketUser=root
+SocketGroup=webex-codex-launch
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+FlushPending=yes
+Backlog=32
+MaxConnections=32
+ReceiveBuffer=1M
+SendBuffer=2M
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=64
+PollLimitIntervalSec=2s
+PollLimitBurst=32
+
+[Install]
+WantedBy=sockets.target

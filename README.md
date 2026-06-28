@@ -490,12 +490,56 @@ boundary against allowed prompt authors. Configuration validation, including
 `--check-config`, still rejects the `ephemeral-linux-user` mode for
 `codex.isolation.mode`, with no fallback to current-user execution.
 
-PR 4 owns the privileged launcher, cross-UID output and read-only input
-handling, cgroup and process containment, credential brokerage, inherited file
-descriptor and supplementary-group clearing, filesystem/network/resource
-isolation, and launcher preflight. Until that work and the separate command
-enablement changes land, the bot has no worker-socket group access and
-`/config pull`, `/config reload`, and `/config sync` remain disabled.
+PR 4 is split into three fail-closed slices: PR 4a establishes the root-owned
+launcher protocol, caller authorisation, and systemd socket foundation; PR 4b
+adds the immutable root image, transient `DynamicUser` execution,
+credential/model-channel separation, containment, and crash cleanup; PR 4c
+activates the runner and adds permission-capable production-image smoke tests.
+`DynamicUser` alone is insufficient because the Codex main process and its
+tool descendants otherwise share a UID and can share the same credentials and
+network access. UID/group-only launcher authorisation is also insufficient
+because prompt-controlled descendants inherit those identities.
+
+### PR 4a Launcher Foundation (Not Deployable)
+
+The fixed launcher paths are:
+
+- socket: `/run/webex-codex-launcher/launcher.sock`
+- executable: `/opt/webex-generic-account-bot/bin/webex-codex-launcher`
+
+The socket unit owns the runtime directory and credentialled
+`SOCK_SEQPACKET` socket and uses `Accept=yes` to start one root-owned
+`webex-codex-launcher@.service` instance per connection. The launcher protocol
+is versioned, length-prefixed JSON with one bounded request or response per
+packet. Caller authorisation uses `SO_PEERCRED` and an atomic `SO_PEERPIDFD`;
+the request packet's `SCM_CREDENTIALS` must identify that same peer. The peer
+must also be the exact live `MainPID` of
+`webex-generic-account-bot.service`, running the fixed root-owned bot
+executable in the exact service cgroup; a pidfd and repeated process snapshot
+close PID-reuse and caller-exit races. The launcher units explicitly require
+Linux cgroup v2, detected through `/sys/fs/cgroup/cgroup.controllers`, and a
+kernel that supports `SO_PEERPIDFD`; an unsupported kernel fails closed before
+reading a request packet.
+The root launcher service starts with only `CAP_SYS_PTRACE` for different-UID
+bot inspection and `CAP_SETPCAP` for the subsequent irreversible drop; it has
+no ambient capabilities. Immediately after caller authorisation and before
+reading the untrusted request packet, the launcher removes both capabilities
+from its bounding, effective, permitted, and inheritable sets. Neither
+capability is exposed to Codex runs, whose capability sets remain part of PR
+4b's deny-by-default transient-unit boundary.
+
+PR 4a is only a foundation and must remain fail closed. It does not add the bot
+to `webex-codex-launch`, execute `systemd-run`, enable
+`codex.isolation.mode = "ephemeral-linux-user"`, or enable `/config pull`,
+`/config reload`, or `/config sync`. Operators must not treat the PR 4a units
+as a deployable isolation backend. The launcher executable must remain at the
+fixed path, root-owned, and not writable by the bot or launcher socket group;
+the socket path must be created by the reviewed systemd/tmpfiles assets rather
+than by the bot.
+
+Until PRs 4b and 4c and the separate command-enablement changes land, the bot
+has no launcher- or worker-socket group access and `/config pull`,
+`/config reload`, and `/config sync` remain disabled.
 
 ## Development
 
