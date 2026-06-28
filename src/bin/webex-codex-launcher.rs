@@ -88,9 +88,14 @@ async fn response_for_request(
 ) -> Result<LauncherResponse> {
     match request {
         Ok(request) => match request.request {
-            LauncherRequestKind::Preflight(_) => {
-                Ok(LauncherResponse::ready(preflight_available(socket).await))
-            }
+            LauncherRequestKind::Preflight(_) => match preflight_available(socket).await {
+                Ok(available) => Ok(LauncherResponse::ready(available)),
+                Err(_) => Ok(rejected(
+                    None,
+                    RejectionCode::MalformedRequest,
+                    "launcher connection violated the one-packet protocol",
+                )?),
+            },
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
                 let output_limit = request.output_char_limit;
@@ -118,15 +123,18 @@ async fn response_for_request(
 }
 
 #[cfg(target_os = "linux")]
-async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> bool {
+async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<bool> {
     let cancellation = ExecutionCancellation::new();
     let preflight = isolated_execution::preflight_bounded(&cancellation);
     tokio::pin!(preflight);
     tokio::select! {
-        result = &mut preflight => result.is_ok(),
-        _ = wait_for_client_disconnect(socket) => {
+        result = &mut preflight => {
+            inspect_client_socket(socket.get_ref().as_raw_fd())?;
+            Ok(result.is_ok())
+        },
+        disconnect = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
-            match timeout(
+            let available = match timeout(
                 Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
                 &mut preflight,
             )
@@ -134,7 +142,9 @@ async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> bool {
             {
                 Ok(result) => result.is_ok(),
                 Err(_) => terminate_stuck_launcher("cancelled preflight did not drain"),
-            }
+            };
+            disconnect?;
+            Ok(available)
         }
     }
 }
@@ -149,10 +159,15 @@ async fn execute_until_disconnect(
     let execution = isolated_execution::execute(request, peer, &cancellation);
     tokio::pin!(execution);
     tokio::select! {
-        result = &mut execution => result,
-        _ = wait_for_client_disconnect(socket) => {
+        result = &mut execution => match inspect_client_socket(socket.get_ref().as_raw_fd()) {
+            Ok(_) => result,
+            Err(error) => Err(IsolatedExecutionError::Failed(anyhow!(
+                "launcher connection violated the one-packet protocol: {error}"
+            ))),
+        },
+        disconnect = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
-            match timeout(
+            let result = match timeout(
                 Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
                 &mut execution,
             )
@@ -160,6 +175,12 @@ async fn execute_until_disconnect(
             {
                 Ok(result) => result,
                 Err(_) => terminate_stuck_launcher("cancelled execution did not drain"),
+            };
+            match disconnect {
+                Ok(()) => result,
+                Err(error) => Err(IsolatedExecutionError::Failed(anyhow!(
+                    "launcher connection violated the one-packet protocol: {error}"
+                ))),
             }
         }
     }
@@ -175,31 +196,53 @@ fn terminate_stuck_launcher(reason: &'static str) -> ! {
 async fn wait_for_client_disconnect(socket: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
     loop {
         let mut guard = socket.readable().await?;
-        match guard.try_io(|socket| {
-            let mut byte = 0_u8;
-            // SAFETY: byte is valid writable storage and the socket descriptor remains live.
-            let received = unsafe {
-                libc::recv(
-                    socket.get_ref().as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            if received == 0 {
-                return Ok(());
-            }
-            if received > 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "launcher client sent more than one request packet",
-                ));
-            }
-            Err(std::io::Error::last_os_error())
-        }) {
+        match guard.try_io(
+            |socket| match inspect_client_socket(socket.get_ref().as_raw_fd())? {
+                ClientSocketState::Closed => Ok(()),
+                ClientSocketState::Open => {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            },
+        ) {
             Ok(result) => return result,
             Err(_) => continue,
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientSocketState {
+    Open,
+    Closed,
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState> {
+    let mut byte = 0_u8;
+    // SAFETY: byte is valid writable storage and the socket descriptor remains live.
+    let received = unsafe {
+        libc::recv(
+            socket_fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if received == 0 {
+        return Ok(ClientSocketState::Closed);
+    }
+    if received > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launcher client sent more than one request packet",
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(ClientSocketState::Open)
+    } else {
+        Err(error)
     }
 }
 
@@ -502,6 +545,20 @@ mod tests {
         .await
         .expect("disconnect monitor must observe peer closure")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_packet_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

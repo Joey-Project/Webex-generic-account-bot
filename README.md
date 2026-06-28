@@ -669,13 +669,16 @@ activation.
 
 ### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
 
-PR 4c1b adds the root-only input sealer and its host staging layout. The
-pending root is setgid `root:webex-codex-launch` mode `2730`; each per-run tree
+PR 4c1b adds the root-only input sealer and its host staging layout. PR 4c1c
+sets the pending root to `root:webex-codex-launch` mode `2770` so the bot can
+hold a real directory descriptor and durably fsync publication/removal; each
+per-run tree
 inside it is owned by the future bot caller with group `webex-codex-launch`,
 using mode `2770` for directories and `0640` for files. The launch group write
-bit permits the capability-dropped sealer to remove the source after quarantine;
-the non-listable pending root and unpredictable run ID keep unrelated callers
-from discovering another run. The sealer first moves
+bit permits the capability-dropped sealer to remove the source after quarantine.
+Only the fixed bot and launcher identities receive the launch group, and the
+unpredictable run ID prevents callers outside that boundary from selecting a
+run. The sealer first moves
 that pathname into a root-only consumed-source
 quarantine, recursively validates it through no-follow descriptor-relative
 operations, and copies only regular files and directories into fresh

@@ -31,7 +31,7 @@ const SOURCE_DIRECTORY_MODE: u32 = 0o2770;
 const SOURCE_FILE_MODE: u32 = 0o640;
 const SEALED_DIRECTORY_MODE: u32 = 0o550;
 const SEALED_FILE_MODE: u32 = 0o440;
-const PENDING_ROOT_MODE: u32 = 0o2730;
+const PENDING_ROOT_MODE: u32 = 0o2770;
 const SHARED_ROOT_MODE: u32 = 0o1730;
 const PRIVATE_ROOT_MODE: u32 = 0o700;
 const WORKSPACE_ENTRY_MAX: usize = 8_192;
@@ -57,16 +57,22 @@ impl PublishedWorkspace {
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        remove_owned_tree_at(&self.input_root, &self.run_name, self.device, self.inode)?;
+        self.armed = false;
+        self.input_root
+            .sync_all()
+            .context("failed to persist published runtime workspace cleanup")
+    }
 }
 
 impl Drop for PublishedWorkspace {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Err(error) =
-            remove_owned_tree_at(&self.input_root, &self.run_name, self.device, self.inode)
-        {
+        if let Err(error) = self.cleanup() {
             tracing::warn!(
                 workspace = %self.path.display(),
                 error = %error,

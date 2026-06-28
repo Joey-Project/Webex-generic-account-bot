@@ -30,7 +30,7 @@ use crate::{
     work_budget::{WorkBudget, run_blocking_with_process_watchdog},
 };
 
-const PENDING_ROOT_MODE: u32 = 0o2730;
+const PENDING_ROOT_MODE: u32 = 0o2770;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o2700;
 const SOURCE_DIRECTORY_MODE: u32 = 0o2770;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -242,7 +242,7 @@ fn stage_workspace_at(
     if let Some(deadline) = limits.deadline.as_ref() {
         deadline.check("pending workspace staging")?;
     }
-    let pending_root = open_path_directory(pending_root_path, false)
+    let pending_root = open_path_directory(pending_root_path, true)
         .context("failed to open the pending input root")?;
     validate_pending_root(
         &pending_root,
@@ -285,7 +285,7 @@ fn stage_workspace_at(
 
         set_mode(workspace.as_raw_fd(), SOURCE_DIRECTORY_MODE)?;
         validate_destination_directory(&workspace, source_uid, launch_gid, SOURCE_DIRECTORY_MODE)?;
-        sync_best_effort(&workspace).context("failed to persist the pending workspace")?;
+        sync_checked(&workspace).context("failed to persist the pending workspace")?;
 
         let reopened = open_path_directory(pending_root_path, false)
             .context("failed to re-open the pending input root")?;
@@ -310,7 +310,7 @@ fn stage_workspace_at(
             launch_gid,
             SOURCE_DIRECTORY_MODE,
         )?;
-        sync_best_effort(&pending_root)
+        sync_checked(&pending_root)
             .context("failed to persist the pending workspace publication")?;
         Ok(())
     })();
@@ -486,7 +486,7 @@ fn copy_directory(source: &File, target: &File, depth: usize, state: &mut CopySt
                     state.launch_gid,
                     SOURCE_DIRECTORY_MODE,
                 )?;
-                sync_best_effort(&target_child)
+                sync_checked(&target_child)
                     .context("failed to persist a pending workspace directory")?;
             }
             libc::S_IFREG => copy_file(source, target, &c_name, &entry, state)?,
@@ -562,7 +562,7 @@ fn copy_file(
     }
 
     set_mode(target.as_raw_fd(), SOURCE_FILE_MODE)?;
-    sync_best_effort(&target).context("failed to persist a pending workspace file")?;
+    sync_checked(&target).context("failed to persist a pending workspace file")?;
     validate_destination_file(
         &target,
         state.source_uid,
@@ -831,7 +831,7 @@ fn remove_owned_workspace(
         bail!("refusing to clean a replaced pending workspace");
     }
     remove_tree_at(pending_root.as_raw_fd(), workspace_name)?;
-    sync_best_effort(pending_root).context("failed to persist pending workspace cleanup")
+    sync_checked(pending_root).context("failed to persist pending workspace cleanup")
 }
 
 fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {
@@ -845,7 +845,7 @@ fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {
             let child = c_string(&child)?;
             remove_tree_at(directory.as_raw_fd(), &child)?;
         }
-        sync_best_effort(&directory)?;
+        sync_checked(&directory)?;
         unlink_at(parent_fd, name, libc::AT_REMOVEDIR)?;
     } else {
         unlink_at(parent_fd, name, 0)?;
@@ -877,24 +877,8 @@ fn set_mode(fd: RawFd, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn sync_best_effort(file: &File) -> Result<()> {
-    match file.sync_all() {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EBADF)
-                    | Some(libc::EINVAL)
-                    | Some(libc::ENOTSUP)
-                    | Some(libc::EROFS)
-                    | Some(libc::EACCES)
-                    | Some(libc::EPERM)
-            ) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
+fn sync_checked(file: &File) -> Result<()> {
+    file.sync_all().map_err(Into::into)
 }
 
 fn stat_fd(fd: RawFd) -> io::Result<StatSnapshot> {
