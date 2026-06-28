@@ -47,6 +47,13 @@ superseded_by:
 - Bind the worker action ID into staged metadata so a crash after prepare commit
   recovers without resolving a different config revision.
 - Publish only a strict, non-secret action status projection for `/config status`.
+- Preserve queue order across deployment-lock contention by durably requeueing
+  and retrying the oldest action instead of recording a terminal failure.
+- Treat an uncontained deployment process tree as a worker integrity failure;
+  leave the action recoverable and exit so systemd kills the complete worker
+  cgroup before restart.
+- Serialise the worker's single-use startup and shutdown path, including a
+  bounded, abortable stale-socket probe.
 - Keep `/config pull` configuration-invalid and do not grant the bot the socket
   group because current-user Codex children inherit its supplementary groups.
 

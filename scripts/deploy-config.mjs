@@ -108,6 +108,47 @@ const GIT_SAFE_CONFIG = [
 ];
 const GIT_NO_LAZY_FETCH_ENV = Object.freeze({ GIT_NO_LAZY_FETCH: '1' });
 
+export const DEPLOY_EXIT_PROCESS_TREE_UNCONTAINED = 70;
+export const DEPLOY_EXIT_LOCK_BUSY = 75;
+
+class DeploymentStatusError extends Error {
+  constructor(message, exitStatus, { cause = null } = {}) {
+    super(message);
+    this.name = new.target.name;
+    this.exitStatus = exitStatus;
+    if (cause) {
+      this.cause = cause;
+    }
+  }
+}
+
+export class DeploymentLockBusyError extends DeploymentStatusError {
+  constructor(message, options) {
+    super(message, DEPLOY_EXIT_LOCK_BUSY, options);
+  }
+}
+
+export class ProcessTreeUncontainedError extends DeploymentStatusError {
+  constructor(message, options) {
+    super(message, DEPLOY_EXIT_PROCESS_TREE_UNCONTAINED, options);
+  }
+}
+
+function combineCleanupError(primaryError, cleanupError, label) {
+  const reason = primaryError
+    ? `${primaryError.message}; ${label}: ${cleanupError.message}`
+    : `${label}: ${cleanupError.message}`;
+  const classifiedError = primaryError instanceof DeploymentStatusError
+    ? primaryError
+    : cleanupError instanceof DeploymentStatusError
+      ? cleanupError
+      : null;
+  if (classifiedError) {
+    return new classifiedError.constructor(reason, { cause: classifiedError });
+  }
+  return new Error(reason);
+}
+
 class UsageError extends Error {
   constructor(message) {
     super(message);
@@ -534,7 +575,11 @@ export async function runCli({
     writeStatus(stdout, result, options.json);
     return 0;
   } catch (error) {
-    const status = error instanceof UsageError ? 2 : 1;
+    const status = error instanceof UsageError
+      ? 2
+      : error instanceof DeploymentStatusError
+        ? error.exitStatus
+        : 1;
     stderr.write(`${redact(String(error.message))}\n`);
     if (error instanceof UsageError) {
       stderr.write('\n');
@@ -626,10 +671,7 @@ export async function executePreparePlan({
       cleanupError ??= error;
     }
     if (cleanupError) {
-      const reason = primaryError
-        ? `${primaryError.message}; prepare cleanup failed: ${cleanupError.message}`
-        : `prepare cleanup failed: ${cleanupError.message}`;
-      throw new Error(reason);
+      throw combineCleanupError(primaryError, cleanupError, 'prepare cleanup failed');
     }
   }
 }
@@ -854,6 +896,9 @@ export async function executePlan({
           : closeReason;
     }
     if (combinedReason) {
+      if (primaryError instanceof DeploymentStatusError) {
+        throw new primaryError.constructor(combinedReason, { cause: primaryError });
+      }
       throw new Error(combinedReason);
     }
   }
@@ -1136,7 +1181,9 @@ async function acquireKernelFlock(handle, lockFile) {
       if (code === 0) {
         finish();
       } else if (code === 1) {
-        finish(new Error(`deployment already in progress: ${lockFile}`));
+        finish(new DeploymentLockBusyError(
+          `deployment already in progress: ${lockFile}`,
+        ));
       } else {
         finish(new Error(
           `${FLOCK_BIN} failed with code ${code}: ${truncate(redact(stderr), 1000)}`,
@@ -1307,7 +1354,7 @@ export async function runCommand(commandSpec, env, signal = null) {
           child.stdout.destroy();
           child.stderr.destroy();
           child.unref();
-          rejectOnce(new Error(
+          rejectOnce(new ProcessTreeUncontainedError(
             `${terminationError.message}; child did not close after SIGKILL`,
           ));
         }, commandSpec.closeGraceMs ?? CHILD_CLOSE_GRACE_MS);

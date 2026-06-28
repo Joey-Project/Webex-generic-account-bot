@@ -13,6 +13,7 @@ ExecStart=/usr/bin/node /opt/webex-generic-account-bot/code/scripts/config-pull-
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
+KillMode=control-group
 ReadOnlyPaths=/run/webex-config-deploy
 ReadWritePaths=/run/webex-config-deploy/deploy-config.lock
 ReadWritePaths=/run/webex-config-pull

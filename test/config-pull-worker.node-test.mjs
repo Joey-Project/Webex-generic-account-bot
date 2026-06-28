@@ -15,6 +15,8 @@ import {
   PREPARE_CLOSE_GRACE_MS,
   PREPARE_COMMAND,
   PREPARE_ENV,
+  PREPARE_EXIT_LOCK_BUSY,
+  PREPARE_EXIT_PROCESS_TREE_UNCONTAINED,
   PREPARE_TERMINATION_GRACE_MS,
   WorkerFailure,
   actionIdForMessageId,
@@ -22,7 +24,9 @@ import {
   prepareStorage,
   publishRequestRecord,
   readActionState,
+  runCli,
   runPrepareCommand,
+  socketAcceptsConnections,
   writeActionState,
   writeSocketResponse,
 } from '../scripts/config-pull-worker.mjs';
@@ -657,9 +661,223 @@ describe('config pull worker socket protocol', () => {
     await assert.rejects(worker.start(), /worker cannot be restarted/);
     await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
   });
+
+  it('requeues lock contention without letting newer work pass', async (context) => {
+    const layout = await createLayout(context);
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const retryScheduled = deferred();
+    const requests = ['lock-busy-first', 'lock-busy-second'].map((messageId) => ({
+      version: 1,
+      message_id: messageId,
+      action: 'pull',
+    }));
+    const actionIds = requests.map((request) => actionIdForMessageId(request.message_id));
+    const attempts = [];
+    let firstAttempts = 0;
+    const worker = new ConfigPullWorker({
+      ...layout,
+      retryDelayMs: 17,
+      setTimeoutImpl: (callback, delayMs) => {
+        const timer = { callback, delayMs };
+        retryScheduled.resolve(timer);
+        return timer;
+      },
+      clearTimeoutImpl: () => {},
+      prepareRunner: async ({ actionId }) => {
+        attempts.push(actionId);
+        if (actionId === actionIds[0] && firstAttempts++ === 0) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+          throw new WorkerFailure('prepare_lock_busy');
+        }
+        return PREPARED_PROJECTION;
+      },
+    });
+    context.after(async () => {
+      releaseFirst.resolve();
+      await worker.stop();
+    });
+    await worker.start();
+
+    await sendRequest(layout.socketPath, requests[0]);
+    await firstStarted.promise;
+    await sendRequest(layout.socketPath, requests[1]);
+    releaseFirst.resolve();
+    const timer = await retryScheduled.promise;
+
+    assert.equal(timer.delayMs, 17);
+    assert.deepEqual(attempts, [actionIds[0]]);
+    assert.equal((await readActionState(layout.stateDir, actionIds[0])).status, 'queued');
+    assert.equal((await readActionState(layout.stateDir, actionIds[1])).status, 'queued');
+
+    timer.callback();
+    await worker.waitForIdle();
+
+    assert.deepEqual(attempts, [actionIds[0], actionIds[0], actionIds[1]]);
+    assert.equal((await readActionState(layout.stateDir, actionIds[0])).status, 'succeeded');
+    assert.equal((await readActionState(layout.stateDir, actionIds[1])).status, 'succeeded');
+  });
+
+  it('clears a pending lock retry when stop begins', async (context) => {
+    const layout = await createLayout(context);
+    const retryScheduled = deferred();
+    const clearedTimers = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      retryDelayMs: 23,
+      setTimeoutImpl: (callback, delayMs) => {
+        const timer = { callback, delayMs };
+        retryScheduled.resolve(timer);
+        return timer;
+      },
+      clearTimeoutImpl: (timer) => clearedTimers.push(timer),
+      prepareRunner: async () => {
+        throw new WorkerFailure('prepare_lock_busy');
+      },
+    });
+    context.after(async () => worker.stop());
+    await worker.start();
+
+    const response = await sendRequest(layout.socketPath, {
+      version: 1,
+      message_id: 'lock-busy-stop',
+      action: 'pull',
+    });
+    const timer = await retryScheduled.promise;
+    const firstStop = worker.stop();
+    const secondStop = worker.stop();
+
+    assert.equal(firstStop, secondStop);
+    await firstStop;
+    assert.deepEqual(clearedTimers, [timer]);
+    assert.equal((await readActionState(layout.stateDir, response.action_id)).status, 'queued');
+    assert.equal(
+      JSON.parse(await fs.readFile(layout.publicStatusFile, 'utf8')).state,
+      'queued',
+    );
+    await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
+  });
+});
+
+describe('config pull worker lifecycle', () => {
+  it('waits for an aborted startup and removes a socket that started listening', async (context) => {
+    const layout = await createLayout(context);
+    const socketChmodStarted = deferred();
+    const releaseSocketChmod = deferred();
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'chmod') return target[property];
+        return async (file, mode) => {
+          if (file === layout.socketPath) {
+            socketChmodStarted.resolve();
+            await releaseSocketChmod.promise;
+          }
+          return target.chmod(file, mode);
+        };
+      },
+    });
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi,
+      prepareRunner: async () => PREPARED_PROJECTION,
+    });
+    context.after(async () => {
+      releaseSocketChmod.resolve();
+      await worker.stop();
+    });
+
+    const startPromise = worker.start();
+    await socketChmodStarted.promise;
+    const stopPromise = worker.stop();
+    let stopSettled = false;
+    stopPromise.then(() => {
+      stopSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(stopSettled, false);
+    releaseSocketChmod.resolve();
+    await assert.rejects(
+      startPromise,
+      (error) => error instanceof WorkerFailure && error.code === 'worker_stopping',
+    );
+    await stopPromise;
+    await assert.rejects(fs.stat(layout.socketPath), { code: 'ENOENT' });
+  });
+
+  it('starts stop immediately when a CLI signal arrives during startup', async () => {
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      const processApi = new EventEmitter();
+      const startup = deferred();
+      const stopStarted = deferred();
+      let stopCalls = 0;
+      const worker = {
+        start: () => startup.promise,
+        stop: () => {
+          stopCalls += 1;
+          stopStarted.resolve();
+          startup.reject(new WorkerFailure('worker_stopping'));
+          return Promise.resolve();
+        },
+        waitForFatal: () => new Promise(() => {}),
+      };
+      const stderr = { write: () => {} };
+
+      const result = runCli({ processApi, worker, stderr });
+      processApi.emit(signal);
+      await stopStarted.promise;
+
+      assert.equal(await result, 0);
+      assert.equal(stopCalls, 1);
+    }
+  });
 });
 
 describe('config pull worker recovery', () => {
+  it('keeps integrity-fatal work recoverable and stops before newer records', async (context) => {
+    const layout = await createLayout(context);
+    await prepareStorage(layout);
+    const publications = [];
+    for (const [index, messageId] of ['fatal-first', 'fatal-second'].entries()) {
+      publications.push(await publishRequestRecord({
+        queueDir: layout.queueDir,
+        request: { version: 1, message_id: messageId, action: 'pull' },
+        enqueueSequence: index + 1,
+      }));
+    }
+    const attempts = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      prepareRunner: async ({ actionId }) => {
+        attempts.push(actionId);
+        throw new WorkerFailure('prepare_process_tree_uncontained');
+      },
+    });
+    const stderr = [];
+
+    const exitCode = await runCli({
+      worker,
+      processApi: new EventEmitter(),
+      stderr: { write: (message) => stderr.push(message) },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.deepEqual(attempts, [publications[0].actionId]);
+    assert.equal(
+      (await readActionState(layout.stateDir, publications[0].actionId)).status,
+      'running',
+    );
+    assert.equal(
+      (await readActionState(layout.stateDir, publications[1].actionId)).status,
+      'queued',
+    );
+    assert.deepEqual(stderr, []);
+    const fatal = await worker.waitForFatal();
+    assert(fatal instanceof WorkerFailure);
+    assert.equal(fatal.code, 'prepare_process_tree_uncontained');
+  });
+
   it('cleans a stale trusted temporary and recovers its durable request without state', async (context) => {
     const layout = await createLayout(context);
     await prepareStorage(layout);
@@ -1336,6 +1554,38 @@ describe('config pull worker recovery', () => {
 });
 
 describe('config pull worker execution boundary', () => {
+  it('maps structured deploy exits to worker failure codes', async () => {
+    const deploySource = await fs.readFile(
+      new URL('../scripts/deploy-config.mjs', import.meta.url),
+      'utf8',
+    );
+    assert.equal(
+      PREPARE_EXIT_LOCK_BUSY,
+      sourceIntegerConstant(deploySource, 'DEPLOY_EXIT_LOCK_BUSY'),
+    );
+    assert.equal(
+      PREPARE_EXIT_PROCESS_TREE_UNCONTAINED,
+      sourceIntegerConstant(deploySource, 'DEPLOY_EXIT_PROCESS_TREE_UNCONTAINED'),
+    );
+    for (const { exitCode, failureCode } of [
+      { exitCode: PREPARE_EXIT_LOCK_BUSY, failureCode: 'prepare_lock_busy' },
+      {
+        exitCode: PREPARE_EXIT_PROCESS_TREE_UNCONTAINED,
+        failureCode: 'prepare_process_tree_uncontained',
+      },
+      { exitCode: 1, failureCode: 'prepare_failed' },
+    ]) {
+      await assert.rejects(
+        runPrepareCommand({
+          actionId: PREPARE_ACTION_ID,
+          spawnImpl: () => exitedChild(exitCode),
+          timeoutMs: 1_000,
+        }),
+        (error) => error instanceof WorkerFailure && error.code === failureCode,
+      );
+    }
+  });
+
   it('uses only the fixed argv, scrubbed environment, root cwd, and no shell', async () => {
     let invocation;
     const spawnImpl = (bin, args, options) => {
@@ -1451,6 +1701,68 @@ describe('config pull worker execution boundary', () => {
       (error) => error instanceof WorkerFailure && error.code === 'prepare_timeout',
     );
     assert.deepEqual(signals, ['SIGTERM']);
+  });
+
+  it('fails closed when a stale socket probe times out or is aborted', async () => {
+    await assert.rejects(
+      socketAcceptsConnections('/tmp/stale.sock', {
+        timeoutMs: 19,
+        createConnection: () => {
+          const socket = new EventEmitter();
+          socket.destroy = () => {};
+          return socket;
+        },
+        setTimeoutImpl: (callback, delayMs) => {
+          assert.equal(delayMs, 19);
+          queueMicrotask(callback);
+          return 1;
+        },
+        clearTimeoutImpl: () => {},
+      }),
+      /socket probe timed out/,
+    );
+
+    const abortController = new AbortController();
+    const socket = new EventEmitter();
+    let destroyed = false;
+    let timerCleared = false;
+    socket.destroy = () => {
+      destroyed = true;
+    };
+    const probe = socketAcceptsConnections('/tmp/stale.sock', {
+      timeoutMs: 31,
+      signal: abortController.signal,
+      createConnection: () => socket,
+      setTimeoutImpl: () => 2,
+      clearTimeoutImpl: (timer) => {
+        assert.equal(timer, 2);
+        timerCleared = true;
+      },
+    });
+
+    abortController.abort();
+    await assert.rejects(
+      probe,
+      (error) => error instanceof WorkerFailure && error.code === 'worker_stopping',
+    );
+    assert.equal(destroyed, true);
+    assert.equal(timerCleared, true);
+  });
+
+  it('strictly bounds retry and socket probe timing options', async (context) => {
+    const layout = await createLayout(context);
+    assert.equal(DEFAULTS.retryDelayMs, 1_000);
+    assert.equal(DEFAULTS.socketProbeTimeoutMs, 1_000);
+    assert.throws(() => new ConfigPullWorker({ ...layout, retryDelayMs: 0 }), /retry delay/);
+    assert.throws(() => new ConfigPullWorker({ ...layout, retryDelayMs: 60_001 }), /retry delay/);
+    assert.throws(
+      () => new ConfigPullWorker({ ...layout, socketProbeTimeoutMs: 0 }),
+      /socket probe timeout/,
+    );
+    assert.throws(
+      () => new ConfigPullWorker({ ...layout, socketProbeTimeoutMs: 60_001 }),
+      /socket probe timeout/,
+    );
   });
 });
 
@@ -1785,17 +2097,19 @@ function unitDirectiveValues(unit, directive) {
 }
 
 function sourceIntegerConstant(source, name) {
-  const match = source.match(new RegExp(`^const ${name} = ([0-9_]+);$`, 'm'));
+  const match = source.match(new RegExp(`^(?:export )?const ${name} = ([0-9_]+);$`, 'm'));
   assert(match, `missing integer constant ${name}`);
   return Number(match[1].replaceAll('_', ''));
 }
 
 function deferred() {
   let resolve;
-  const promise = new Promise((settle) => {
+  let reject;
+  const promise = new Promise((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 async function stagePreparedResult(layout, actionId) {
@@ -1912,6 +2226,20 @@ function successfulChild(result) {
     child.stdout.end(`${JSON.stringify(result)}\n`);
     child.stderr.end('ignored child stderr containing token=secret');
     child.emit('close', 0, null);
+  });
+  return child;
+}
+
+function exitedChild(exitCode) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 4_000_003;
+  child.kill = () => {};
+  queueMicrotask(() => {
+    child.stdout.end();
+    child.stderr.end();
+    child.emit('close', exitCode, null);
   });
   return child;
 }

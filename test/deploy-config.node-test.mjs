@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 
 import {
   buildDeployPlan,
+  ProcessTreeUncontainedError,
   executePlan,
   executePreparePlan,
   installProcessSignalHandlers,
@@ -310,6 +311,8 @@ describe('deploy-config lock policy', () => {
     assert.doesNotMatch(service, /ReadWritePaths=.*\/config-checkout$/m);
     assert.doesNotMatch(service, /^RuntimeDirectory=/m);
     assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
+    assert.match(service, /^KillMode=control-group$/m);
+    assert.doesNotMatch(service, /^Delegate=/m);
     assert.deepEqual(tmpfiles.trim().split('\n'), [
       'd /run/webex-config-deploy 0750 root webex-config-pull -',
       'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
@@ -1955,6 +1958,120 @@ describe('deploy-config CLI and execution', () => {
     scope.cleanup();
     assert.equal(processApi.listenerCount('SIGINT'), 0);
     assert.equal(processApi.listenerCount('SIGTERM'), 0);
+  });
+
+  it('returns exit 75 when the deployment flock is busy', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-lock-busy-test-'));
+    const lockFile = path.join(temp, 'run', 'deploy.lock');
+    const readyFile = path.join(temp, 'lock-holder.ready');
+    await fs.mkdir(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+    await fs.writeFile(lockFile, '', { mode: 0o600 });
+    const lockHolder = spawn(
+      '/usr/bin/flock',
+      [
+        '--exclusive',
+        lockFile,
+        '/usr/bin/python3',
+        '-c',
+        'import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text("ready"); time.sleep(30)',
+        readyFile,
+      ],
+      { detached: true, stdio: 'ignore' },
+    );
+    let stderr = '';
+
+    try {
+      await waitForFile(readyFile);
+      const status = await runCli({
+        argv: prepareTestArgs(temp, lockFile),
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+      });
+
+      assert.equal(status, 75);
+      assert.match(stderr, /deployment already in progress/);
+    } finally {
+      await stopDetachedChild(lockHolder);
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('returns exit 70 for an uncontained command process tree', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const fsApi = await protectPrepareLiveDirectories(renderedConfig, metadataFile);
+    let stderr = '';
+
+    try {
+      const status = await runCli({
+        argv: prepareTestArgs(temp),
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+        fsApi,
+        runner: async () => {
+          throw new ProcessTreeUncontainedError('command process tree was not reaped');
+        },
+      });
+
+      assert.equal(status, 70);
+      assert.match(stderr, /command process tree was not reaped/);
+    } finally {
+      await removeProtectedPrepareTemp(temp, renderedConfig);
+    }
+  });
+
+  it('preserves process-tree classification across prepare cleanup failure', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const plan = buildDeployPlan(parseArgsAllow(prepareTestArgs(temp)));
+    let commandFailed = false;
+    const baseFsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (commandFailed && file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+    const fsApi = await protectPrepareLiveDirectories(
+      renderedConfig,
+      metadataFile,
+      baseFsApi,
+    );
+
+    try {
+      await assert.rejects(
+        () => executePreparePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandFailed = true;
+            throw new ProcessTreeUncontainedError('command process tree was not reaped');
+          },
+        }),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(
+            error.message,
+            /command process tree was not reaped; prepare cleanup failed: candidate cleanup failed/,
+          );
+          return true;
+        },
+      );
+      await assertLockReleased(plan.lockDir);
+    } finally {
+      await removeProtectedPrepareTemp(temp, renderedConfig);
+    }
   });
 
   it('dry-run prints a plan without executing commands', async () => {
@@ -5037,6 +5154,8 @@ describe('deploy-config CLI and execution', () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const pidFile = path.join(temp, 'escaped.pid');
     const script = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 30' &\nwait`;
+    let escapedPid = null;
+    let escapedDescendantKilled = false;
     try {
       await assert.rejects(
         () => runCommand(
@@ -5050,17 +5169,96 @@ describe('deploy-config CLI and execution', () => {
           },
           scrubEnv(),
         ),
-        /did not close after SIGKILL/,
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, /did not close after SIGKILL/);
+          return true;
+        },
       );
+      escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      assert.equal(process.kill(-escapedPid, 0), true);
     } finally {
       try {
-        const escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
-        process.kill(-escapedPid, 'SIGKILL');
+        escapedPid ??= Number((await fs.readFile(pidFile, 'utf8')).trim());
+        escapedDescendantKilled = process.kill(-escapedPid, 'SIGKILL');
       } catch (_) {}
       await fs.rm(temp, { recursive: true, force: true });
     }
+    assert.equal(escapedDescendantKilled, true);
   });
 });
+
+function prepareTestArgs(temp, lockFile = path.join(temp, 'run', 'deploy.lock')) {
+  const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+  return [
+    '--prepare',
+    '--checkout-dir',
+    path.join(temp, 'checkout'),
+    '--staging-dir',
+    path.join(temp, 'staging'),
+    '--rendered-config',
+    renderedConfig,
+    '--metadata-file',
+    path.join(path.dirname(renderedConfig), 'deploy-status.json'),
+    '--lock-dir',
+    lockFile,
+    '--bot-code-dir',
+    path.join(temp, 'bot-code'),
+    '--bot-bin',
+    '/usr/bin/true',
+  ];
+}
+
+async function waitForFile(file, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await fs.stat(file);
+      return;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for file: ${file}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function stopDetachedChild(child) {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') {
+      throw error;
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    await new Promise((resolve) => child.once('close', resolve));
+  }
+}
+
+async function removeProtectedPrepareTemp(temp, renderedConfig) {
+  for (const directory of [
+    path.dirname(renderedConfig),
+    path.dirname(path.dirname(renderedConfig)),
+  ]) {
+    try {
+      await fs.chmod(directory, 0o755);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+  await fs.rm(temp, { recursive: true, force: true });
+}
 
 async function assertLockReleased(lockFile) {
   const metadata = await fs.stat(lockFile);

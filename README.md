@@ -227,6 +227,13 @@ deployment lock is the preprovisioned root-owned
 `/run/webex-config-deploy/deploy-config.lock`, shared by non-root prepare and a
 future root activation through one kernel flock without giving the worker write
 access to the lock parent.
+Lock contention is reported by the fixed deployment entrypoint as a structured
+retryable status. The worker durably moves that oldest action back to `queued`,
+waits one second, and retries without allowing newer actions to pass it. A
+deployment child tree that cannot be fully reaped is instead an integrity
+failure: the worker leaves the action recoverable, exits non-zero, and relies on
+the unit's explicit `KillMode=control-group` to remove every process in the
+worker cgroup before systemd restarts it.
 The prepare checkout and prepared candidate, staged config, and staged metadata
 files are confined to worker-owned mode `0700` directories. The worker unit
 mounts the live `rendered` directory read-only and does not provision or own it,
@@ -263,6 +270,9 @@ shell. A response is sent only after the immutable request, private queued
 state, and public status are durable. A lost response converges through the
 same message-derived action ID; running actions recover after restart, and
 terminal actions are not executed again.
+Worker startup and shutdown are single-use and serialised. A stop signal aborts
+the bounded stale-socket probe, waits for partial startup to unwind, and removes
+any socket already created before the process exits.
 
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no

@@ -23,6 +23,8 @@ export const DEFAULTS = Object.freeze({
   requestTimeoutMs: 5_000,
   commandTimeoutMs: 900_000,
   outputLimitBytes: 64 * 1024,
+  retryDelayMs: 1_000,
+  socketProbeTimeoutMs: 1_000,
 });
 
 export const PREPARE_COMMAND = Object.freeze({
@@ -51,10 +53,13 @@ export const MAX_MESSAGE_ID_BYTES = 256;
 // Must exceed deploy-config's 5s SIGTERM + 1s pipe-close cleanup window.
 export const PREPARE_TERMINATION_GRACE_MS = 10_000;
 export const PREPARE_CLOSE_GRACE_MS = 1_000;
+export const PREPARE_EXIT_PROCESS_TREE_UNCONTAINED = 70;
+export const PREPARE_EXIT_LOCK_BUSY = 75;
 
 const MAX_REQUEST_RECORD_BYTES = 1024;
 const MAX_STATE_RECORD_BYTES = 2048;
 const MAX_STAGED_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_BOUNDED_DELAY_MS = 60_000;
 const SOCKET_MODE = 0o660;
 const SHARED_DIRECTORY_MODE = 0o750;
 const PUBLIC_STATE_ROOT_MODE = 0o755;
@@ -561,7 +566,12 @@ export async function runPrepareCommand({
         return;
       }
       if (code !== 0 || closeSignal) {
-        reject(new WorkerFailure('prepare_failed'));
+        const failureCode = code === PREPARE_EXIT_LOCK_BUSY
+          ? 'prepare_lock_busy'
+          : code === PREPARE_EXIT_PROCESS_TREE_UNCONTAINED
+            ? 'prepare_process_tree_uncontained'
+            : 'prepare_failed';
+        reject(new WorkerFailure(failureCode));
         return;
       }
       try {
@@ -610,6 +620,10 @@ export class ConfigPullWorker {
       outputLimitBytes: this.options.outputLimitBytes,
       signal,
     }));
+    this.createSocketConnection = options.createSocketConnection
+      || ((socketPath) => net.createConnection(socketPath));
+    this.setTimeoutImpl = options.setTimeoutImpl || setTimeout;
+    this.clearTimeoutImpl = options.clearTimeoutImpl || clearTimeout;
     this.server = null;
     this.socketIdentity = null;
     this.connections = new Set();
@@ -619,39 +633,60 @@ export class ConfigPullWorker {
     this.latestPublicState = null;
     this.drainPromise = null;
     this.drainRequested = false;
+    this.retryTimer = null;
+    this.retryTimerPromise = null;
+    this.resolveRetryTimer = null;
     this.abortController = new AbortController();
     this.stopping = false;
     this.started = false;
     this.startAttempted = false;
+    this.startPromise = null;
+    this.stopPromise = null;
     this.fatalError = null;
     this.fatalPromise = new Promise((resolve) => {
       this.resolveFatal = resolve;
     });
   }
 
-  async start() {
-    if (this.started) throw new Error('worker is already started');
+  start() {
+    if (this.started) return Promise.reject(new Error('worker is already started'));
     if (this.startAttempted || this.stopping) {
-      throw new Error('worker cannot be restarted');
+      return Promise.reject(new Error('worker cannot be restarted'));
     }
     this.startAttempted = true;
+    this.startPromise = this.#start();
+    return this.startPromise;
+  }
+
+  async #start() {
     await prepareStorage({ ...this.options, fsApi: this.fsApi });
+    this.#throwIfStopping();
     await this.#cleanStaleTemporaryFiles();
+    this.#throwIfStopping();
     await this.#recoverQueue();
+    this.#throwIfStopping();
     await this.#listen();
+    this.#throwIfStopping();
     this.started = true;
     setImmediate(() => this.#kickDrain());
     return this;
   }
 
-  async stop() {
-    if (this.stopping) return;
+  stop() {
+    if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
     this.abortController.abort();
+    this.#clearRetryTimer();
     for (const connection of this.connections) connection.destroy();
-    if (this.server) {
-      await new Promise((resolve) => this.server.close(() => resolve()));
-    }
+    this.stopPromise = this.#stop();
+    return this.stopPromise;
+  }
+
+  async #stop() {
+    await this.startPromise?.catch(() => {});
+    this.#clearRetryTimer();
+    for (const connection of this.connections) connection.destroy();
+    await this.#closeServer();
     await this.enqueueTail.catch(() => {});
     await this.drainPromise?.catch(() => {});
     await this.publicStatusTail.catch(() => {});
@@ -662,8 +697,12 @@ export class ConfigPullWorker {
   async waitForIdle() {
     await new Promise((resolve) => setImmediate(resolve));
     await this.enqueueTail;
-    while (this.drainPromise || this.drainRequested) {
-      await this.drainPromise;
+    while (this.drainPromise || this.drainRequested || this.retryTimerPromise) {
+      if (this.drainPromise) {
+        await this.drainPromise;
+      } else if (this.retryTimerPromise) {
+        await this.retryTimerPromise;
+      }
       await new Promise((resolve) => setImmediate(resolve));
     }
     if (this.fatalError) throw this.fatalError;
@@ -673,6 +712,21 @@ export class ConfigPullWorker {
     return this.fatalPromise;
   }
 
+  #throwIfStopping() {
+    if (this.stopping || this.abortController.signal.aborted) {
+      throw new WorkerFailure('worker_stopping');
+    }
+  }
+
+  async #closeServer() {
+    const server = this.server;
+    if (!server) return;
+    if (server.listening) {
+      await new Promise((resolve) => server.close(() => resolve()));
+    }
+    if (this.server === server) this.server = null;
+  }
+
   async #listen() {
     await ensureTrustedDirectory(
       path.dirname(this.options.socketPath),
@@ -680,6 +734,7 @@ export class ConfigPullWorker {
       this.fsApi,
     );
     await this.#removeStaleSocket();
+    this.#throwIfStopping();
     const server = net.createServer({ allowHalfOpen: true }, (socket) => {
       this.connections.add(socket);
       socket.once('close', () => this.connections.delete(socket));
@@ -699,8 +754,16 @@ export class ConfigPullWorker {
         resolve();
       });
     });
+    const initialSocketStat = await this.fsApi.lstat(this.options.socketPath);
+    if (!initialSocketStat.isSocket() || initialSocketStat.isSymbolicLink()) {
+      throw new Error(`socket metadata is not trusted: ${this.options.socketPath}`);
+    }
+    this.socketIdentity = initialSocketStat;
     await this.fsApi.chmod(this.options.socketPath, SOCKET_MODE);
     const socketStat = await this.fsApi.lstat(this.options.socketPath);
+    if (!sameFileIdentity(initialSocketStat, socketStat)) {
+      throw new Error(`socket path changed during startup: ${this.options.socketPath}`);
+    }
     assertSocketMetadata(socketStat, this.options.socketPath);
     this.socketIdentity = socketStat;
     await syncDirectory(path.dirname(this.options.socketPath), this.fsApi);
@@ -791,7 +854,7 @@ export class ConfigPullWorker {
   }
 
   #kickDrain() {
-    if (this.stopping || this.fatalError) return;
+    if (this.stopping || this.fatalError || this.retryTimer !== null) return;
     if (this.drainPromise) {
       this.drainRequested = true;
       return;
@@ -802,7 +865,9 @@ export class ConfigPullWorker {
       .catch((error) => this.#fail(error))
       .finally(() => {
         this.drainPromise = null;
-        if (this.drainRequested) setImmediate(() => this.#kickDrain());
+        if (this.drainRequested && this.retryTimer === null) {
+          setImmediate(() => this.#kickDrain());
+        }
       });
   }
 
@@ -833,7 +898,7 @@ export class ConfigPullWorker {
       if (state.status !== 'queued') {
         throw new Error(`request state cannot be drained: ${record.action_id}`);
       }
-      await this.#processRecord(record);
+      if (!await this.#processRecord(record)) return;
     }
   }
 
@@ -848,11 +913,59 @@ export class ConfigPullWorker {
       validatePreparedProjection(prepared);
     } catch (error) {
       if (this.stopping || this.abortController.signal.aborted) return;
+      if (
+        error instanceof WorkerFailure
+        && error.code === 'prepare_process_tree_uncontained'
+      ) {
+        throw error;
+      }
+      if (error instanceof WorkerFailure && error.code === 'prepare_lock_busy') {
+        await this.#persistState(this.#makeState(record, 'queued'));
+        this.#scheduleRetry();
+        return false;
+      }
       const failureCode = error instanceof WorkerFailure ? error.code : 'prepare_failed';
       await this.#persistState(this.#makeState(record, 'failed', { failureCode }));
-      return;
+      return true;
     }
     await this.#persistState(this.#makeState(record, 'succeeded', prepared));
+    return true;
+  }
+
+  #scheduleRetry() {
+    if (this.stopping || this.fatalError || this.retryTimer !== null) return;
+    const retryTimerPromise = new Promise((resolve) => {
+      this.resolveRetryTimer = resolve;
+    });
+    this.retryTimerPromise = retryTimerPromise;
+    try {
+      const retryTimer = this.setTimeoutImpl(() => {
+        this.retryTimer = null;
+        this.retryTimerPromise = null;
+        const resolve = this.resolveRetryTimer;
+        this.resolveRetryTimer = null;
+        resolve?.();
+        this.#kickDrain();
+      }, this.options.retryDelayMs);
+      retryTimer?.unref?.();
+      if (this.retryTimerPromise === retryTimerPromise) this.retryTimer = retryTimer;
+    } catch (error) {
+      this.retryTimerPromise = null;
+      const resolve = this.resolveRetryTimer;
+      this.resolveRetryTimer = null;
+      resolve?.();
+      throw error;
+    }
+  }
+
+  #clearRetryTimer() {
+    if (this.retryTimer === null && !this.retryTimerPromise) return;
+    if (this.retryTimer !== null) this.clearTimeoutImpl(this.retryTimer);
+    this.retryTimer = null;
+    this.retryTimerPromise = null;
+    const resolve = this.resolveRetryTimer;
+    this.resolveRetryTimer = null;
+    resolve?.();
   }
 
   async #persistState(state) {
@@ -970,7 +1083,13 @@ export class ConfigPullWorker {
     if (!stat.isSocket() || stat.isSymbolicLink()) {
       throw new Error(`socket path is not a socket: ${this.options.socketPath}`);
     }
-    if (await socketAcceptsConnections(this.options.socketPath)) {
+    if (await socketAcceptsConnections(this.options.socketPath, {
+      timeoutMs: this.options.socketProbeTimeoutMs,
+      signal: this.abortController.signal,
+      createConnection: this.createSocketConnection,
+      setTimeoutImpl: this.setTimeoutImpl,
+      clearTimeoutImpl: this.clearTimeoutImpl,
+    })) {
       throw new Error(`socket path is already active: ${this.options.socketPath}`);
     }
     const current = await this.fsApi.lstat(this.options.socketPath);
@@ -1006,6 +1125,7 @@ export class ConfigPullWorker {
   #fail(error) {
     if (this.fatalError || this.stopping) return;
     this.fatalError = error instanceof Error ? error : new Error('worker failed');
+    this.#clearRetryTimer();
     this.resolveFatal(this.fatalError);
   }
 }
@@ -1025,21 +1145,69 @@ export async function runCli({
   const signalPromise = new Promise((resolve) => {
     resolveSignal = resolve;
   });
-  const onSignal = () => resolveSignal(null);
+  let signalReceived = false;
+  let stopPromise = null;
+  const beginStop = () => {
+    if (stopPromise) return stopPromise;
+    try {
+      stopPromise = Promise.resolve(activeWorker.stop());
+    } catch (error) {
+      stopPromise = Promise.reject(error);
+    }
+    return stopPromise;
+  };
+  const onSignal = () => {
+    if (signalReceived) return;
+    signalReceived = true;
+    resolveSignal({ type: 'signal' });
+    beginStop().catch(() => {});
+  };
   processApi.once('SIGINT', onSignal);
   processApi.once('SIGTERM', onSignal);
+  let exitCode = 1;
   try {
-    await activeWorker.start();
-    const fatal = await Promise.race([signalPromise, activeWorker.waitForFatal()]);
-    return fatal ? 1 : 0;
+    const startup = Promise.resolve(activeWorker.start()).then(
+      () => ({ type: 'started' }),
+      (error) => ({ type: 'startup_failed', error }),
+    );
+    const startupResult = await Promise.race([startup, signalPromise]);
+    if (startupResult.type === 'signal') {
+      await beginStop();
+      exitCode = 0;
+    } else if (startupResult.type === 'startup_failed') {
+      if (signalReceived && startupResult.error instanceof WorkerFailure
+        && startupResult.error.code === 'worker_stopping') {
+        await beginStop();
+        exitCode = 0;
+      } else {
+        throw startupResult.error;
+      }
+    } else {
+      const outcome = await Promise.race([
+        signalPromise,
+        activeWorker.waitForFatal().then((error) => ({ type: 'fatal', error })),
+      ]);
+      if (outcome.type === 'signal') {
+        await beginStop();
+        exitCode = 0;
+      } else {
+        exitCode = 1;
+      }
+    }
   } catch (_) {
     stderr.write('config pull worker failed\n');
-    return 1;
+    exitCode = 1;
   } finally {
     processApi.off('SIGINT', onSignal);
     processApi.off('SIGTERM', onSignal);
-    await activeWorker.stop().catch(() => {});
+    try {
+      await beginStop();
+    } catch (_) {
+      if (exitCode === 0) stderr.write('config pull worker failed\n');
+      exitCode = 1;
+    }
   }
+  return exitCode;
 }
 
 async function readSocketRequest(socket, timeoutMs) {
@@ -1296,6 +1464,16 @@ function resolveWorkerOptions(options) {
     requestTimeoutMs: options.requestTimeoutMs || DEFAULTS.requestTimeoutMs,
     commandTimeoutMs: options.commandTimeoutMs || DEFAULTS.commandTimeoutMs,
     outputLimitBytes: options.outputLimitBytes || DEFAULTS.outputLimitBytes,
+    retryDelayMs: boundedDelayOption(
+      options.retryDelayMs,
+      DEFAULTS.retryDelayMs,
+      'retry delay',
+    ),
+    socketProbeTimeoutMs: boundedDelayOption(
+      options.socketProbeTimeoutMs,
+      DEFAULTS.socketProbeTimeoutMs,
+      'socket probe timeout',
+    ),
   };
   for (const [label, candidate] of [
     ['queue directory', resolved.queueDir],
@@ -1310,6 +1488,14 @@ function resolveWorkerOptions(options) {
     throw new Error('queue and state directories must be separate');
   }
   return Object.freeze(resolved);
+}
+
+function boundedDelayOption(candidate, fallback, label) {
+  const value = candidate ?? fallback;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_BOUNDED_DELAY_MS) {
+    throw new Error(`${label} must be an integer between 1 and ${MAX_BOUNDED_DELAY_MS}`);
+  }
+  return value;
 }
 
 function validateMessageId(messageId) {
@@ -1567,6 +1753,7 @@ function shouldPublishPublicState(candidate, current) {
   if (candidate.action_id !== current.action_id) return false;
   if (candidate.status === current.status) return true;
   if (TERMINAL_STATES.has(current.status)) return false;
+  if (candidate.status === 'queued' && current.status === 'running') return true;
   return STATE_PROGRESS[candidate.status] > STATE_PROGRESS[current.status];
 }
 
@@ -1595,21 +1782,64 @@ function killChild(child, signal, killImpl) {
   } catch (_) {}
 }
 
-async function socketAcceptsConnections(socketPath) {
+export async function socketAcceptsConnections(socketPath, {
+  timeoutMs = DEFAULTS.socketProbeTimeoutMs,
+  signal = null,
+  createConnection = (candidate) => net.createConnection(candidate),
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
+  boundedDelayOption(timeoutMs, DEFAULTS.socketProbeTimeoutMs, 'socket probe timeout');
+  if (signal?.aborted) throw new WorkerFailure('worker_stopping');
+
   return await new Promise((resolve, reject) => {
-    const client = net.createConnection(socketPath);
-    client.once('connect', () => {
-      client.destroy();
-      resolve(true);
-    });
-    client.once('error', (error) => {
-      client.destroy();
+    let client;
+    let timer = null;
+    let settled = false;
+    const cleanup = () => {
+      if (timer !== null) clearTimeoutImpl(timer);
+      signal?.removeEventListener('abort', onAbort);
+      client?.off('connect', onConnect);
+      client?.off('error', onError);
+    };
+    const settle = (value, error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        client?.destroy();
+      } catch (_) {}
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onConnect = () => settle(true);
+    const onError = (error) => {
       if (error?.code === 'ECONNREFUSED' || error?.code === 'ENOENT') {
-        resolve(false);
+        settle(false);
       } else {
-        reject(error);
+        settle(null, error);
       }
-    });
+    };
+    const onAbort = () => settle(null, new WorkerFailure('worker_stopping'));
+
+    try {
+      client = createConnection(socketPath);
+      client.once('connect', onConnect);
+      client.once('error', onError);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      const scheduledTimer = setTimeoutImpl(
+        () => settle(null, new Error(`socket probe timed out: ${socketPath}`)),
+        timeoutMs,
+      );
+      if (settled) clearTimeoutImpl(scheduledTimer);
+      else timer = scheduledTimer;
+    } catch (error) {
+      settle(null, error);
+    }
   });
 }
 
