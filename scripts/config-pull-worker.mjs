@@ -530,7 +530,7 @@ export async function runPrepareCommand({
         closeTimer = setTimeout(() => {
           child.stdout.destroy();
           child.stderr.destroy();
-          rejectOnce(failure);
+          rejectOnce(new WorkerFailure('prepare_process_tree_uncontained'));
         }, PREPARE_CLOSE_GRACE_MS);
       }, PREPARE_TERMINATION_GRACE_MS);
     };
@@ -561,6 +561,10 @@ export async function runPrepareCommand({
       if (settled) return;
       settled = true;
       cleanup();
+      if (code === PREPARE_EXIT_PROCESS_TREE_UNCONTAINED) {
+        reject(new WorkerFailure('prepare_process_tree_uncontained'));
+        return;
+      }
       if (failure) {
         reject(failure);
         return;
@@ -568,9 +572,7 @@ export async function runPrepareCommand({
       if (code !== 0 || closeSignal) {
         const failureCode = code === PREPARE_EXIT_LOCK_BUSY
           ? 'prepare_lock_busy'
-          : code === PREPARE_EXIT_PROCESS_TREE_UNCONTAINED
-            ? 'prepare_process_tree_uncontained'
-            : 'prepare_failed';
+          : 'prepare_failed';
         reject(new WorkerFailure(failureCode));
         return;
       }
@@ -923,6 +925,19 @@ export class ConfigPullWorker {
         await this.#persistState(this.#makeState(record, 'queued'));
         this.#scheduleRetry();
         return false;
+      }
+      let stagedPrepared = null;
+      try {
+        stagedPrepared = await readDurablePreparedResultForAction({
+          stagedConfigFile: this.options.stagedConfigFile,
+          stagedMetadataFile: this.options.stagedMetadataFile,
+          actionId: record.action_id,
+          fsApi: this.fsApi,
+        });
+      } catch (_) {}
+      if (stagedPrepared) {
+        await this.#persistState(this.#makeState(record, 'succeeded', stagedPrepared));
+        return true;
       }
       const failureCode = error instanceof WorkerFailure ? error.code : 'prepare_failed';
       await this.#persistState(this.#makeState(record, 'failed', { failureCode }));

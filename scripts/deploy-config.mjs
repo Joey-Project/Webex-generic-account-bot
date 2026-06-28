@@ -138,15 +138,33 @@ function combineCleanupError(primaryError, cleanupError, label) {
   const reason = primaryError
     ? `${primaryError.message}; ${label}: ${cleanupError.message}`
     : `${label}: ${cleanupError.message}`;
-  const classifiedError = primaryError instanceof DeploymentStatusError
-    ? primaryError
-    : cleanupError instanceof DeploymentStatusError
-      ? cleanupError
-      : null;
+  return errorPreservingDeploymentStatus(primaryError, reason, cleanupError);
+}
+
+function errorPreservingDeploymentStatus(primaryError, message, secondaryError = null) {
+  const classifiedError = findDeploymentStatusError(primaryError)
+    ?? findDeploymentStatusError(secondaryError);
   if (classifiedError) {
-    return new classifiedError.constructor(reason, { cause: classifiedError });
+    return new classifiedError.constructor(message, { cause: classifiedError });
   }
-  return new Error(reason);
+  const error = new Error(message);
+  if (primaryError || secondaryError) {
+    error.cause = primaryError ?? secondaryError;
+  }
+  return error;
+}
+
+function findDeploymentStatusError(error) {
+  const seen = new Set();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    if (current instanceof DeploymentStatusError) {
+      return current;
+    }
+    seen.add(current);
+    current = current.cause;
+  }
+  return null;
 }
 
 class UsageError extends Error {
@@ -701,6 +719,7 @@ export async function executePlan({
     status,
     reason,
     configRevision = captures.configRevision || null,
+    primaryFailure = null,
   ) => {
     recordedFailureStatus = status;
     recordedFailureConfigRevision = configRevision;
@@ -709,7 +728,11 @@ export async function executePlan({
       failureMetadataWritten = true;
     } catch (error) {
       failureMetadataError = error;
-      throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
+      throw errorPreservingDeploymentStatus(
+        primaryFailure,
+        `${reason}; failed to write deployment failure metadata: ${error.message}`,
+        error,
+      );
     }
   };
   try {
@@ -755,11 +778,18 @@ export async function executePlan({
           rollbackError = restoreError;
         }
         if (rollbackError) {
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; failed to restore previous config: ${rollbackError.message}`,
+            rollbackError,
+          );
           await recordFailure(
             'failed_restart_rollback_failed',
-            `${error.message}; failed to restore previous config: ${rollbackError.message}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(`${error.message}; failed to restore previous config: ${rollbackError.message}`);
+          throw failure;
         }
         try {
           await runServiceRollback(plan, rollbackState, runner, parentEnv);
@@ -770,31 +800,51 @@ export async function executePlan({
           const durabilityFailure = rollbackDurabilityError
             ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
             : '';
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
+            restoreError,
+          );
           await recordFailure(
             'failed_restart_rollback_restart_failed',
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
-          );
+          throw failure;
         }
         if (rollbackDurabilityError) {
           const reason = `${error.message}; restored previous config and service but failed to make config rollback durable: ${rollbackDurabilityError.message}`;
-          await recordFailure('failed_restart_rollback_failed', reason);
-          throw new Error(reason);
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            reason,
+            rollbackDurabilityError,
+          );
+          await recordFailure(
+            'failed_restart_rollback_failed',
+            reason,
+            undefined,
+            failure,
+          );
+          throw failure;
         }
-        await recordFailure('failed_restart_rolled_back', error.message);
+        await recordFailure('failed_restart_rolled_back', error.message, undefined, error);
         try {
           await clearInstallTransaction(plan, fsApi);
           await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
         } catch (restoreError) {
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
+            restoreError,
+          );
           await recordFailure(
             'failed_restart_rollback_failed',
-            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(
-            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
-          );
+          throw failure;
         }
         throw error;
       }
@@ -825,11 +875,17 @@ export async function executePlan({
     primaryError = error;
     if (outputDirectoriesTrusted && !failureMetadataWritten && !failureMetadataError) {
       const recoveredCommit = error instanceof CommittedRecoveryError;
-      await recordFailure(
-        commitReached || recoveredCommit ? 'failed_after_commit' : 'failed_apply',
-        error.message,
-        recoveredCommit ? error.configRevision : captures.configRevision || null,
-      );
+      try {
+        await recordFailure(
+          commitReached || recoveredCommit ? 'failed_after_commit' : 'failed_apply',
+          error.message,
+          recoveredCommit ? error.configRevision : captures.configRevision || null,
+          error,
+        );
+      } catch (metadataError) {
+        primaryError = metadataError;
+        throw metadataError;
+      }
     }
     throw error;
   } finally {
@@ -896,10 +952,7 @@ export async function executePlan({
           : closeReason;
     }
     if (combinedReason) {
-      if (primaryError instanceof DeploymentStatusError) {
-        throw new primaryError.constructor(combinedReason, { cause: primaryError });
-      }
-      throw new Error(combinedReason);
+      throw errorPreservingDeploymentStatus(primaryError, combinedReason, cleanupError);
     }
   }
 }
@@ -1296,18 +1349,236 @@ function gitEnvForRepo(options) {
   };
 }
 
-export async function runCommand(commandSpec, env, signal = null) {
+export function createLinuxCgroupV2MembershipInspector({
+  fsApi = fs,
+  platform = process.platform,
+  procRoot = '/proc',
+  cgroupRoot = '/sys/fs/cgroup',
+  selfPid = process.pid,
+} = {}) {
+  const baselineMarker = Symbol('linux-cgroup-v2-baseline');
+  const resolvedProcRoot = path.resolve(procRoot);
+  const resolvedCgroupRoot = path.resolve(cgroupRoot);
+
+  const readSnapshot = async () => {
+    if (platform !== 'linux') {
+      throw new Error(`Linux cgroup v2 inspection is unavailable on ${platform}`);
+    }
+    if (!Number.isSafeInteger(selfPid) || selfPid <= 0) {
+      throw new Error('current process PID is invalid');
+    }
+
+    const cgroupPath = await readUnifiedCgroupPath(fsApi, resolvedProcRoot);
+    const cgroupDir = resolveCgroupDirectory(resolvedCgroupRoot, cgroupPath);
+    const membershipFile = path.join(cgroupDir, 'cgroup.procs');
+    const firstPids = await readCgroupPids(fsApi, membershipFile);
+    const firstIdentities = await readProcessIdentities(fsApi, resolvedProcRoot, firstPids);
+
+    const confirmedCgroupPath = await readUnifiedCgroupPath(fsApi, resolvedProcRoot);
+    if (confirmedCgroupPath !== cgroupPath) {
+      throw new Error('current process changed cgroup during membership inspection');
+    }
+    const confirmedPids = await readCgroupPids(fsApi, membershipFile);
+    if (!sameNumberArray(firstPids, confirmedPids)) {
+      throw new Error('cgroup membership changed during membership inspection');
+    }
+    const identities = await readProcessIdentities(fsApi, resolvedProcRoot, confirmedPids);
+    for (const pid of confirmedPids) {
+      if (firstIdentities.get(pid)?.key !== identities.get(pid)?.key) {
+        throw new Error(`process identity changed during membership inspection: ${pid}`);
+      }
+    }
+
+    const selfIdentity = identities.get(selfPid);
+    if (!selfIdentity || !selfIdentity.live) {
+      throw new Error('current process is not a live member of its cgroup');
+    }
+    return { cgroupPath, cgroupDir, identities, selfIdentity };
+  };
+
+  return Object.freeze({
+    async captureBaseline() {
+      const snapshot = await readSnapshot();
+      return Object.freeze({
+        marker: baselineMarker,
+        cgroupPath: snapshot.cgroupPath,
+        cgroupDir: snapshot.cgroupDir,
+        selfIdentityKey: snapshot.selfIdentity.key,
+        identityKeys: new Set(
+          [...snapshot.identities.values()].map((identity) => identity.key),
+        ),
+      });
+    },
+
+    async assertContained(baseline) {
+      if (baseline?.marker !== baselineMarker || !(baseline.identityKeys instanceof Set)) {
+        throw new Error('cgroup membership baseline is invalid');
+      }
+      const snapshot = await readSnapshot();
+      if (
+        snapshot.cgroupPath !== baseline.cgroupPath
+        || snapshot.cgroupDir !== baseline.cgroupDir
+        || snapshot.selfIdentity.key !== baseline.selfIdentityKey
+      ) {
+        throw new Error('current process cgroup identity changed after command execution');
+      }
+      const unexpected = [...snapshot.identities.values()]
+        .filter((identity) => identity.live && !baseline.identityKeys.has(identity.key))
+        .map((identity) => identity.key);
+      if (unexpected.length > 0) {
+        throw new ProcessTreeUncontainedError(
+          `command left live cgroup members outside its PID identity baseline: ${unexpected.join(', ')}`,
+        );
+      }
+    },
+  });
+}
+
+async function readUnifiedCgroupPath(fsApi, procRoot) {
+  const contents = await fsApi.readFile(path.join(procRoot, 'self', 'cgroup'), 'utf8');
+  const matches = String(contents)
+    .split('\n')
+    .filter((line) => line.startsWith('0::'));
+  if (matches.length !== 1) {
+    throw new Error('current process does not have exactly one unified cgroup v2 membership');
+  }
+  const cgroupPath = matches[0].slice(3);
+  if (
+    !cgroupPath.startsWith('/')
+    || cgroupPath.includes('\0')
+    || path.posix.normalize(cgroupPath) !== cgroupPath
+  ) {
+    throw new Error('current process has an invalid unified cgroup path');
+  }
+  return cgroupPath;
+}
+
+function resolveCgroupDirectory(cgroupRoot, cgroupPath) {
+  const cgroupDir = path.resolve(cgroupRoot, `.${cgroupPath}`);
+  if (!isPathWithin(cgroupRoot, cgroupDir)) {
+    throw new Error('current process cgroup path escapes the cgroup v2 mount');
+  }
+  return cgroupDir;
+}
+
+async function readCgroupPids(fsApi, membershipFile) {
+  const contents = await fsApi.readFile(membershipFile, 'utf8');
+  const lines = String(contents).split('\n').filter((line) => line.length > 0);
+  const pids = lines.map((line) => {
+    if (!/^[1-9][0-9]*$/.test(line)) {
+      throw new Error(`cgroup contains an invalid PID entry: ${JSON.stringify(line)}`);
+    }
+    const pid = Number(line);
+    if (!Number.isSafeInteger(pid)) {
+      throw new Error(`cgroup PID is outside the safe integer range: ${line}`);
+    }
+    return pid;
+  }).sort((left, right) => left - right);
+  if (new Set(pids).size !== pids.length) {
+    throw new Error('cgroup contains duplicate PID entries');
+  }
+  return pids;
+}
+
+async function readProcessIdentities(fsApi, procRoot, pids) {
+  const identities = await Promise.all(pids.map(async (pid) => {
+    const contents = await fsApi.readFile(path.join(procRoot, String(pid), 'stat'), 'utf8');
+    return parseProcessIdentity(pid, String(contents));
+  }));
+  return new Map(identities.map((identity) => [identity.pid, identity]));
+}
+
+function parseProcessIdentity(expectedPid, statContents) {
+  const commEnd = statContents.lastIndexOf(') ');
+  const commStart = statContents.indexOf(' (');
+  if (commStart <= 0 || commEnd <= commStart) {
+    throw new Error(`process stat is malformed for PID ${expectedPid}`);
+  }
+  const pidText = statContents.slice(0, commStart);
+  const fields = statContents.slice(commEnd + 2).trim().split(/\s+/);
+  if (pidText !== String(expectedPid) || fields.length < 20) {
+    throw new Error(`process stat identity is malformed for PID ${expectedPid}`);
+  }
+  const state = fields[0];
+  const startTicks = fields[19];
+  if (!/^[A-Za-z]$/.test(state) || !/^[0-9]+$/.test(startTicks)) {
+    throw new Error(`process stat identity is invalid for PID ${expectedPid}`);
+  }
+  return Object.freeze({
+    pid: expectedPid,
+    startTicks,
+    key: `${expectedPid}:${startTicks}`,
+    live: !['X', 'Z'].includes(state.toUpperCase()),
+  });
+}
+
+function sameNumberArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+const DEFAULT_PROCESS_TREE_INSPECTOR = createLinuxCgroupV2MembershipInspector();
+
+async function captureProcessTreeBaseline(inspector) {
+  if (
+    !inspector
+    || typeof inspector.captureBaseline !== 'function'
+    || typeof inspector.assertContained !== 'function'
+  ) {
+    throw new ProcessTreeUncontainedError('command process-tree inspector is invalid');
+  }
+  try {
+    return await inspector.captureBaseline();
+  } catch (error) {
+    throw processTreeInspectionError(error, 'before command spawn');
+  }
+}
+
+async function assertCommandProcessTreeContained(inspector, baseline) {
+  try {
+    await inspector.assertContained(baseline);
+  } catch (error) {
+    throw processTreeInspectionError(error, 'after command close');
+  }
+}
+
+function processTreeInspectionError(error, phase) {
+  if (error instanceof ProcessTreeUncontainedError) {
+    return error;
+  }
+  return new ProcessTreeUncontainedError(
+    `cannot reliably inspect command process tree ${phase}: ${error.message}`,
+    { cause: error },
+  );
+}
+
+export async function runCommand(
+  commandSpec,
+  env,
+  signal = null,
+  processTreeInspector = DEFAULT_PROCESS_TREE_INSPECTOR,
+) {
+  throwIfAborted(signal);
+  const processTreeBaseline = await captureProcessTreeBaseline(processTreeInspector);
   throwIfAborted(signal);
   return await new Promise((resolve, reject) => {
     const detached = process.platform !== 'win32';
     const invocation = commandInvocation(commandSpec);
-    const child = spawn(invocation.bin, invocation.args, {
-      cwd: commandSpec.cwd || TRUSTED_CHILD_CWD,
-      env,
-      detached,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    let child;
+    try {
+      child = spawn(invocation.bin, invocation.args, {
+        cwd: commandSpec.cwd || TRUSTED_CHILD_CWD,
+        env,
+        detached,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      void assertCommandProcessTreeContained(
+        processTreeInspector,
+        processTreeBaseline,
+      ).then(() => reject(error), reject);
+      return;
+    }
     let stdout = '';
     let stderr = '';
     const stdoutCapture = outputCapture(commandSpec.outputLimitBytes);
@@ -1315,6 +1586,9 @@ export async function runCommand(commandSpec, env, signal = null) {
     let terminationError = null;
     let killTimer = null;
     let closeTimer = null;
+    let forcedCloseError = null;
+    let spawnError = null;
+    let containmentCheck = null;
     let settled = false;
     const clearTimers = () => {
       clearTimeout(timeoutTimer);
@@ -1342,6 +1616,13 @@ export async function runCommand(commandSpec, env, signal = null) {
       clearTimers();
       resolve(result);
     };
+    const verifyContainment = () => {
+      containmentCheck ??= assertCommandProcessTreeContained(
+        processTreeInspector,
+        processTreeBaseline,
+      );
+      return containmentCheck;
+    };
     const beginTermination = (error) => {
       if (settled || terminationError) {
         return;
@@ -1351,12 +1632,16 @@ export async function runCommand(commandSpec, env, signal = null) {
       killTimer = setTimeout(() => {
         killChildProcess(child, detached, 'SIGKILL');
         closeTimer = setTimeout(() => {
+          forcedCloseError = new ProcessTreeUncontainedError(
+            `${terminationError.message}; child did not close after SIGKILL`,
+          );
           child.stdout.destroy();
           child.stderr.destroy();
           child.unref();
-          rejectOnce(new ProcessTreeUncontainedError(
-            `${terminationError.message}; child did not close after SIGKILL`,
-          ));
+          void verifyContainment().then(
+            () => rejectOnce(forcedCloseError),
+            (inspectionError) => rejectOnce(inspectionError),
+          );
         }, commandSpec.closeGraceMs ?? CHILD_CLOSE_GRACE_MS);
         closeTimer.unref?.();
       }, commandSpec.terminationGraceMs ?? CHILD_TERMINATION_GRACE_MS);
@@ -1382,32 +1667,42 @@ export async function runCommand(commandSpec, env, signal = null) {
       stderr = stderrCapture.append(stderr, chunk);
     });
     child.on('error', (error) => {
-      rejectOnce(error);
+      spawnError = error;
     });
     child.on('close', (code) => {
-      if (terminationError) {
-        rejectOnce(terminationError);
-        return;
-      }
-      if (code === 0 || commandSpec.optional) {
-        const result = {
-          stdout,
-          stderr,
-          code,
-          stdoutTruncated: stdoutCapture.truncated,
-          stderrTruncated: stderrCapture.truncated,
-        };
-        try {
-          validateCommandResult(commandSpec, result);
-        } catch (error) {
-          rejectOnce(error);
+      void verifyContainment().then(() => {
+        if (forcedCloseError) {
+          rejectOnce(forcedCloseError);
           return;
         }
-        resolveOnce(result);
-        return;
-      }
-      const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
-      rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
+        if (terminationError) {
+          rejectOnce(terminationError);
+          return;
+        }
+        if (spawnError) {
+          rejectOnce(spawnError);
+          return;
+        }
+        if (code === 0 || commandSpec.optional) {
+          const result = {
+            stdout,
+            stderr,
+            code,
+            stdoutTruncated: stdoutCapture.truncated,
+            stderrTruncated: stderrCapture.truncated,
+          };
+          try {
+            validateCommandResult(commandSpec, result);
+          } catch (error) {
+            rejectOnce(error);
+            return;
+          }
+          resolveOnce(result);
+          return;
+        }
+        const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
+        rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
+      }, rejectOnce);
     });
   });
 }
@@ -2016,8 +2311,10 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     try {
       await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
     } catch (cleanupError) {
-      throw new Error(
+      throw errorPreservingDeploymentStatus(
+        error,
         `${error.message}; failed to remove incomplete staged metadata: ${cleanupError.message}`,
+        cleanupError,
       );
     }
     throw error;
@@ -2073,8 +2370,10 @@ async function installCandidateConfig(plan, configRevision, fsApi) {
       try {
         await rollbackCandidateConfig(plan, installState, fsApi);
       } catch (rollbackError) {
-        throw new Error(
+        throw errorPreservingDeploymentStatus(
+          error,
           `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
+          rollbackError,
         );
       }
     }
@@ -2099,8 +2398,10 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
       await runServiceRollback(plan, installState, runner, parentEnv);
     } catch (error) {
       if (durabilityError) {
-        throw new Error(
+        throw errorPreservingDeploymentStatus(
+          error,
           `${error.message}; config rollback durability also failed: ${durabilityError.message}`,
+          durabilityError,
         );
       }
       throw error;

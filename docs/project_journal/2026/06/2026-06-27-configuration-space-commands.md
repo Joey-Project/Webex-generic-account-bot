@@ -52,6 +52,8 @@ superseded_by:
 - Treat an uncontained deployment process tree as a worker integrity failure;
   leave the action recoverable and exit so systemd kills the complete worker
   cgroup before restart.
+- Require cgroup v2 and verify PID/start-time membership around every fixed
+  deployment child without granting cgroup delegation or write access.
 - Serialise the worker's single-use startup and shutdown path, including a
   bounded, abortable stale-socket probe.
 - Keep `/config pull` configuration-invalid and do not grant the bot the socket

@@ -3,6 +3,7 @@ Description=Webex config pull worker
 Documentation=man:systemd.service(5)
 Wants=network-online.target
 After=network-online.target
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 
 [Service]
 Type=simple

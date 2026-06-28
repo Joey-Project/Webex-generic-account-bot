@@ -851,6 +851,7 @@ describe('config pull worker recovery', () => {
       ...layout,
       prepareRunner: async ({ actionId }) => {
         attempts.push(actionId);
+        await stagePreparedResult(layout, actionId);
         throw new WorkerFailure('prepare_process_tree_uncontained');
       },
     });
@@ -876,6 +877,86 @@ describe('config pull worker recovery', () => {
     const fatal = await worker.waitForFatal();
     assert(fatal instanceof WorkerFailure);
     assert.equal(fatal.code, 'prepare_process_tree_uncontained');
+  });
+
+  it('commits a matching staged result when prepare fails after publication', async (context) => {
+    const layout = await createLayout(context);
+    const messageId = 'prepared-before-runner-failure';
+    const actionId = actionIdForMessageId(messageId);
+    const durabilityEvents = [];
+    const worker = new ConfigPullWorker({
+      ...layout,
+      fsApi: durabilityRecordingFsApi(layout, actionId, durabilityEvents),
+      prepareRunner: async ({ actionId: runnerActionId }) => {
+        await stagePreparedResult(layout, runnerActionId);
+        throw new WorkerFailure('prepare_failed');
+      },
+    });
+    context.after(async () => worker.stop());
+    await worker.start();
+
+    await sendRequest(layout.socketPath, {
+      version: 1,
+      message_id: messageId,
+      action: 'pull',
+    });
+    await worker.waitForIdle();
+
+    const state = await readActionState(layout.stateDir, actionId);
+    assert.equal(state.status, 'succeeded');
+    assert.equal(state.config_revision, CONFIG_REVISION);
+    assert.equal(state.config_sha256, CONFIG_SHA256);
+    assert.equal(state.failure_code, null);
+    assert.deepEqual(durabilityEvents.slice(-4), [
+      'staged-config-sync',
+      'staged-metadata-sync',
+      'staging-directory-sync',
+      'state-write',
+    ]);
+  });
+
+  it('does not recover mismatched or invalid staged results after prepare failure', async (context) => {
+    for (const scenario of [
+      {
+        name: 'request ID mismatch',
+        stage: async (layout) => {
+          await stagePreparedResult(layout, PREPARE_ACTION_ID);
+        },
+      },
+      {
+        name: 'config digest mismatch',
+        stage: async (layout, actionId) => {
+          await stagePreparedResult(layout, actionId);
+          await fs.writeFile(layout.stagedConfigFile, 'tampered config\n', { mode: 0o600 });
+        },
+      },
+    ]) {
+      await context.test(scenario.name, async (subcontext) => {
+        const layout = await createLayout(subcontext);
+        const messageId = `failed-staged-${scenario.name.replaceAll(' ', '-')}`;
+        const actionId = actionIdForMessageId(messageId);
+        const worker = new ConfigPullWorker({
+          ...layout,
+          prepareRunner: async () => {
+            await scenario.stage(layout, actionId);
+            throw new WorkerFailure('prepare_failed');
+          },
+        });
+        subcontext.after(async () => worker.stop());
+        await worker.start();
+
+        await sendRequest(layout.socketPath, {
+          version: 1,
+          message_id: messageId,
+          action: 'pull',
+        });
+        await worker.waitForIdle();
+
+        const state = await readActionState(layout.stateDir, actionId);
+        assert.equal(state.status, 'failed');
+        assert.equal(state.failure_code, 'prepare_failed');
+      });
+    }
   });
 
   it('cleans a stale trusted temporary and recovers its durable request without state', async (context) => {
@@ -1701,6 +1782,64 @@ describe('config pull worker execution boundary', () => {
       (error) => error instanceof WorkerFailure && error.code === 'prepare_timeout',
     );
     assert.deepEqual(signals, ['SIGTERM']);
+  });
+
+  it('reports an uncontained process tree when outer SIGKILL does not close the child', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const signals = [];
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 4_000_004;
+    child.kill = () => {
+      throw new Error('process-group signaling should succeed');
+    };
+    const result = runPrepareCommand({
+      actionId: PREPARE_ACTION_ID,
+      spawnImpl: () => child,
+      timeoutMs: 100,
+      killImpl: (_pid, signal) => signals.push(signal),
+    });
+    const rejection = assert.rejects(
+      result,
+      (error) => error instanceof WorkerFailure
+        && error.code === 'prepare_process_tree_uncontained',
+    );
+
+    context.mock.timers.tick(100);
+    context.mock.timers.tick(PREPARE_TERMINATION_GRACE_MS);
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+    context.mock.timers.tick(PREPARE_CLOSE_GRACE_MS);
+
+    await rejection;
+  });
+
+  it('prefers a final uncontained exit over an earlier outer timeout', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const signals = [];
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 4_000_005;
+    child.kill = () => {
+      throw new Error('process-group signaling should succeed');
+    };
+    const result = runPrepareCommand({
+      actionId: PREPARE_ACTION_ID,
+      spawnImpl: () => child,
+      timeoutMs: 100,
+      killImpl: (_pid, signal) => signals.push(signal),
+    });
+
+    context.mock.timers.tick(100);
+    assert.deepEqual(signals, ['SIGTERM']);
+    child.emit('close', PREPARE_EXIT_PROCESS_TREE_UNCONTAINED, null);
+
+    await assert.rejects(
+      result,
+      (error) => error instanceof WorkerFailure
+        && error.code === 'prepare_process_tree_uncontained',
+    );
   });
 
   it('fails closed when a stale socket probe times out or is aborted', async () => {

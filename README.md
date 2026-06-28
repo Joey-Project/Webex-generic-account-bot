@@ -234,6 +234,11 @@ deployment child tree that cannot be fully reaped is instead an integrity
 failure: the worker leaves the action recoverable, exits non-zero, and relies on
 the unit's explicit `KillMode=control-group` to remove every process in the
 worker cgroup before systemd restarts it.
+The unit requires Linux cgroup v2. Each fixed deployment command records the
+unit cgroup's PID and process-start-time identities before spawn and verifies
+the same membership after the direct child closes. A new live identity, or an
+inability to prove membership, is the same integrity failure. The worker never
+receives cgroup write or delegation access.
 The prepare checkout and prepared candidate, staged config, and staged metadata
 files are confined to worker-owned mode `0700` directories. The worker unit
 mounts the live `rendered` directory read-only and does not provision or own it,

@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 
 import {
   buildDeployPlan,
+  createLinuxCgroupV2MembershipInspector,
   ProcessTreeUncontainedError,
   executePlan,
   executePreparePlan,
@@ -42,6 +43,19 @@ import {
   loadJenkinsConfig,
   redactedConsoleLinesFromText,
 } from '../scripts/jenkins-readonly.mjs';
+
+const CONTAINED_PROCESS_TREE_INSPECTOR = Object.freeze({
+  async captureBaseline() {
+    return 'contained-test-baseline';
+  },
+  async assertContained(baseline) {
+    assert.equal(baseline, 'contained-test-baseline');
+  },
+});
+
+function runContainedCommand(commandSpec, env, signal = null) {
+  return runCommand(commandSpec, env, signal, CONTAINED_PROCESS_TREE_INSPECTOR);
+}
 
 describe('deploy-config argument parsing', () => {
   it('defaults to dry-run-safe host deployment paths', () => {
@@ -308,6 +322,7 @@ describe('deploy-config lock policy', () => {
       'ReadWritePaths=/var/lib/webex-generic-account-bot/config-staging',
       'ReadOnlyPaths=-/var/lib/webex-generic-account-bot/rendered',
     ]);
+    assert.match(service, /^ConditionPathExists=\/sys\/fs\/cgroup\/cgroup\.controllers$/m);
     assert.doesNotMatch(service, /ReadWritePaths=.*\/config-checkout$/m);
     assert.doesNotMatch(service, /^RuntimeDirectory=/m);
     assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
@@ -2071,6 +2086,77 @@ describe('deploy-config CLI and execution', () => {
       await assertLockReleased(plan.lockDir);
     } finally {
       await removeProtectedPrepareTemp(temp, renderedConfig);
+    }
+  });
+
+  it('preserves exit 70 across apply metadata and cleanup failures', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const argv = [
+      '--apply',
+      '--skip-restart',
+      '--checkout-dir',
+      path.join(temp, 'checkout'),
+      '--staging-dir',
+      path.join(temp, 'staging'),
+      '--rendered-config',
+      path.join(temp, 'rendered', 'production.toml'),
+      '--metadata-file',
+      path.join(temp, 'rendered', 'deploy-status.json'),
+      '--lock-dir',
+      path.join(temp, 'run', 'deploy.lock'),
+      '--bot-code-dir',
+      path.join(temp, 'bot-code'),
+      '--bot-bin',
+      '/usr/bin/true',
+    ];
+    const plan = buildDeployPlan(parseArgsAllow(argv));
+    let commandFailed = false;
+    let stderr = '';
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (commandFailed && target === plan.metadataFile) {
+          throw new Error('metadata persistence failed');
+        }
+        return fs.rename(source, target);
+      },
+      async rm(file, ...args) {
+        if (commandFailed && file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+
+    try {
+      const status = await runCli({
+        argv,
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            commandFailed = true;
+            throw new ProcessTreeUncontainedError('apply command tree was not contained');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'7'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      });
+
+      assert.equal(status, 70);
+      assert.match(stderr, /apply command tree was not contained/);
+      assert.match(stderr, /failed to write deployment failure metadata: metadata persistence failed/);
+      assert.match(stderr, /deployment cleanup failed: candidate cleanup failed/);
+      assert.match(stderr, /failed to record cleanup state: metadata persistence failed/);
+      await assertLockReleased(plan.lockDir);
+    } finally {
+      await fs.rm(temp, { recursive: true, force: true });
     }
   });
 
@@ -4546,6 +4632,74 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('preserves process-tree classification when restart rollback also fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let restartFailed = false;
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (
+          restartFailed
+          && source === plan.candidateConfig
+          && target === plan.renderedConfig
+        ) {
+          throw new Error('rollback rename failed');
+        }
+        return fs.rename(source, target);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartFailed = true;
+            throw new ProcessTreeUncontainedError('restart command tree was not contained');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      (error) => {
+        assert(error instanceof ProcessTreeUncontainedError);
+        assert.equal(error.exitStatus, 70);
+        assert.match(
+          error.message,
+          /restart command tree was not contained; failed to restore previous config: rollback rename failed/,
+        );
+        return true;
+      },
+    );
+
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('restores the old service when config rollback directory fsync fails', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const plan = buildDeployPlan(
@@ -5031,8 +5185,85 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.config_revision, 'd'.repeat(40));
   });
 
-  it('bounds child output captured by runCommand', async () => {
+  it('runs the injected process-tree inspector before spawn and after close', async () => {
+    const events = [];
+    const baseline = Object.freeze({ test: 'baseline' });
+    const inspector = {
+      async captureBaseline() {
+        events.push('before');
+        return baseline;
+      },
+      async assertContained(actualBaseline) {
+        events.push('after');
+        assert.equal(actualBaseline, baseline);
+      },
+    };
+
     const result = await runCommand(
+      {
+        bin: '/usr/bin/printf',
+        args: ['contained'],
+        timeoutMs: 5_000,
+        outputLimitBytes: 100,
+      },
+      scrubEnv(),
+      null,
+      inspector,
+    );
+
+    assert.equal(result.stdout, 'contained');
+    assert.deepEqual(events, ['before', 'after']);
+  });
+
+  it('fails closed when process-tree inspection cannot establish containment', async () => {
+    for (const [phase, inspector, expected] of [
+      [
+        'before',
+        {
+          async captureBaseline() {
+            throw new Error('baseline unavailable');
+          },
+          async assertContained() {},
+        },
+        /before command spawn: baseline unavailable/,
+      ],
+      [
+        'after',
+        {
+          async captureBaseline() {
+            return 'baseline';
+          },
+          async assertContained() {
+            throw new Error('membership unavailable');
+          },
+        },
+        /after command close: membership unavailable/,
+      ],
+    ]) {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/usr/bin/true',
+            args: [],
+            timeoutMs: 5_000,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+          null,
+          inspector,
+        ),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError, phase);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, expected);
+          return true;
+        },
+      );
+    }
+  });
+
+  it('bounds child output captured by runCommand', async () => {
+    const result = await runContainedCommand(
       {
         bin: '/usr/bin/python3',
         args: ['-c', 'import sys; sys.stdout.write("x" * 20); sys.stderr.write("y" * 20)'],
@@ -5049,7 +5280,7 @@ describe('deploy-config CLI and execution', () => {
   });
 
   it('executes resource-limited commands through the fixed prlimit wrapper', async () => {
-    const result = await runCommand(
+    const result = await runContainedCommand(
       {
         bin: '/usr/bin/python3',
         args: ['-c', 'print("limited")'],
@@ -5065,7 +5296,7 @@ describe('deploy-config CLI and execution', () => {
 
   it('fails closed when a command tree manifest does not pass validation', async () => {
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: '/usr/bin/python3',
           args: ['-c', 'print("not a tree manifest")'],
@@ -5080,7 +5311,7 @@ describe('deploy-config CLI and execution', () => {
   });
 
   it('accepts only ready or authenticated bot health responses', async () => {
-    const ready = await runCommand(
+    const ready = await runContainedCommand(
       {
         bin: '/usr/bin/printf',
         args: ['401'],
@@ -5093,7 +5324,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(ready.stdout, '401');
 
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: '/usr/bin/printf',
           args: ['503'],
@@ -5109,7 +5340,7 @@ describe('deploy-config CLI and execution', () => {
 
   it('times out child processes', async () => {
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: process.execPath,
           args: [
@@ -5133,7 +5364,7 @@ describe('deploy-config CLI and execution', () => {
     );
     try {
       await assert.rejects(
-        () => runCommand(
+        () => runContainedCommand(
           {
             bin: '/usr/bin/python3',
             args: ['-c', 'import time; time.sleep(30)'],
@@ -5158,7 +5389,7 @@ describe('deploy-config CLI and execution', () => {
     let escapedDescendantKilled = false;
     try {
       await assert.rejects(
-        () => runCommand(
+        () => runContainedCommand(
           {
             bin: '/bin/sh',
             args: ['-c', script],
@@ -5186,6 +5417,52 @@ describe('deploy-config CLI and execution', () => {
       await fs.rm(temp, { recursive: true, force: true });
     }
     assert.equal(escapedDescendantKilled, true);
+  });
+
+  it('detects a live setsid descendant after the direct child closes its pipes', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-cgroup-test-'));
+    const pidFile = path.join(temp, 'escaped.pid');
+    const script = [
+      `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; exec /bin/sleep 30' </dev/null >/dev/null 2>&1 &`,
+      `while [ ! -s ${pidFile} ]; do /bin/sleep 0.01; done`,
+    ].join('\n');
+    const inspector = namespaceVisibleCgroupInspector(pidFile);
+    let escapedPid = null;
+
+    try {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/bin/sh',
+            args: ['-c', script],
+            timeoutMs: 5_000,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+          null,
+          inspector,
+        ),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, /live cgroup members outside its PID identity baseline/);
+          return true;
+        },
+      );
+      escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      assert.equal(process.kill(-escapedPid, 0), true);
+    } finally {
+      try {
+        escapedPid ??= Number((await fs.readFile(pidFile, 'utf8')).trim());
+        process.kill(-escapedPid, 'SIGKILL');
+        await waitForProcessExit(escapedPid);
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') {
+          throw error;
+        }
+      }
+      await fs.rm(temp, { recursive: true, force: true });
+    }
   });
 });
 
@@ -5223,6 +5500,49 @@ async function waitForFile(file, timeoutMs = 5_000) {
     }
     if (Date.now() >= deadline) {
       throw new Error(`timed out waiting for file: ${file}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function namespaceVisibleCgroupInspector(pidFile) {
+  const fsApi = {
+    ...fs,
+    async readFile(file, ...args) {
+      const contents = await fs.readFile(file, ...args);
+      if (path.basename(String(file)) !== 'cgroup.procs') {
+        return contents;
+      }
+      const allowedPids = new Set([process.pid]);
+      try {
+        allowedPids.add(Number((await fs.readFile(pidFile, 'utf8')).trim()));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+      return String(contents)
+        .split('\n')
+        .filter((line) => allowedPids.has(Number(line)))
+        .join('\n');
+    },
+  };
+  return createLinuxCgroupV2MembershipInspector({ fsApi });
+}
+
+async function waitForProcessExit(pid, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === 'ESRCH') {
+        return;
+      }
+      throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for process exit: ${pid}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
