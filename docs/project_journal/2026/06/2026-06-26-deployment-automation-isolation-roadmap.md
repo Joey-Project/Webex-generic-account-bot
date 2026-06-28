@@ -236,6 +236,21 @@ superseded_by:
 - Add the narrow root-owned input sealer required to convert bot output into
   the recursively immutable PR 4b workspace contract without relabelling
   bot-owned inodes in place.
+- Quarantine the pending source before inspection, copy through no-follow
+  descriptor-relative operations, enforce the existing depth/entry/byte
+  limits, and publish with no-replace semantics only after recursive metadata
+  validation and durability checks.
+- Resolve the fixed launch/input groups through one trusted host policy and
+  reject access or default POSIX ACLs on roots, source entries, sealed entries,
+  and runtime re-verification so mode-bit checks cannot be bypassed.
+- Reject static primary-GID users for both privileged groups, then consume a
+  verified workspace with descriptor-relative same-mount no-replace rename and
+  fsync both parent directories before launch. Hash each source while copying
+  and compare a second full read before publication to reject same-size races.
+- Provision the pending/source-consumed/staging roots and give only the root
+  launcher the supplementary groups and writable paths needed after its
+  capability drop. Do not add a bot drop-in, launcher client, runtime call
+  site, or activation-receipt access in this slice.
 
 ### PR 4c1c: Gated Runner Wiring
 - Repository: `Joey-Project/Webex-generic-account-bot`.

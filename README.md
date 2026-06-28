@@ -596,23 +596,27 @@ repository-check bypass. The wrapper keeps Codex progress off stdout, asks
 `codex exec` to write its final response into the tool-denied main home, then
 validates and emits only that bounded UTF-8 file.
 
-Input workspaces live below `/var/lib/webex-codex-inputs`. The host provisions
-that root as `root:webex-codex-input` mode `0730`; each run must be sealed by a
-root-owned broker before launch. The run root and every nested directory must
+Input workspaces live below `/var/lib/webex-codex-runtime-inputs/ready`. The host provisions
+that root as sticky `root:webex-codex-input` mode `1730`; each run must be
+sealed by a root-owned broker before launch. The run root and every nested directory must
 be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
 the same owner/group and a single hard link. Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
 2 GiB plus 64 MiB are rejected. The host group database entry must have no
 static members, no numeric-GID alias, and no static user with that primary GID.
-The root launcher has only this supplementary input group after systemd starts
-it; it has no bot, launcher-socket, or worker group membership. Its template
+The root launcher retains the supplementary input group after systemd starts
+it. PR 4c1b also adds `webex-codex-launch` solely so the capability-dropped
+launcher can read the pending source tree; the bot still belongs to neither
+group, and the launcher has no config-worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
 cgroup identity check. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held
 inode through `/proc/<launcher-pid>/fd/<fd>`, preventing a path replacement
 between validation and transient-unit creation. Before starting the transient
 unit it atomically moves the pathname into the root-only
-`/var/lib/webex-codex-inputs-consumed` quarantine. The open inode remains the
+`/var/lib/webex-codex-runtime-inputs/consumed` quarantine. Both directories
+share one non-writable parent and one systemd writable mount so the no-replace
+rename cannot cross mount points. The open inode remains the
 unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
 does not add the bot to it or provide the privileged sealing broker.
@@ -655,6 +659,42 @@ ID with a root-owned systemd credential and pass that fixed credential path to
 procfs boundary. Executable verification also rejects Linux file capabilities
 so a canary-approved binary cannot gain ambient privilege without invalidating
 activation.
+
+### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
+
+PR 4c1b adds the root-only input sealer and its host staging layout. The
+pending root is setgid `root:webex-codex-launch` mode `2730`; each per-run tree
+inside it is owned by the future bot caller with group `webex-codex-launch`,
+using mode `2750` for directories and `0640` for files. The sealer first moves
+that pathname into a root-only consumed-source
+quarantine, recursively validates it through no-follow descriptor-relative
+operations, and copies only regular files and directories into fresh
+`root:webex-codex-input` inodes. It rejects links, special files, control
+directories, POSIX ACLs, owner/mode changes, duplicate publication, and the PR
+4b depth, entry, and byte limits before publishing a read-only tree. The public
+sealer entrypoint accepts only the authorised source UID; it resolves the fixed
+`webex-codex-launch` and `webex-codex-input` groups through the same trusted
+host group policy used by runtime verification. Both privileged groups reject
+static primary-GID users. Runtime consumption preserves the verified inode
+through its `O_PATH` guard, moves it with no-replace semantics, and fsyncs the
+consumed and public parent directories before launch.
+Each source file is copied and SHA-256 hashed, then rewound and hashed again;
+same-size writes through retained source descriptors are rejected before the
+fresh target inode can be published.
+
+The staging parent is traversable only by `webex-codex-launch`; the sticky
+sealed-input root prevents non-root input-group members from replacing
+root-owned entries; and tmpfiles
+expires abandoned pending, consumed-source, hidden sealed-staging, and
+unconsumed final entries after one day. The launcher receives only the
+supplementary groups and two writable staging roots needed after its capability
+drop. The namespace exposes their common parent as writable so quarantine
+rename stays on one mount, while parent mode `0550` prevents the launcher from
+creating or replacing sibling entries.
+This slice adds no bot service drop-in, no launcher client or runtime
+call site, no activation-receipt read, and no config enablement. The bot still
+cannot reach the launcher socket or pending root, so the isolation backend
+remains undeployable until PR 4c1c wires the gated path.
 
 ## Development
 

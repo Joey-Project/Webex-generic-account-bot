@@ -15,8 +15,10 @@
   cleanup.
 - [completed] Add PR 4c1a's boot-scoped activation receipt foundation without
   wiring it into config or execution paths.
-- [pending] Implement PR 4c1b's root fresh-inode input sealer, PR 4c1c's gated
-  runner wiring, and PR 4c2's permission-capable production-image smoke tests;
+- [completed] Implement PR 4c1b's root fresh-inode input sealer and inactive
+  launcher-side staging contract.
+- [pending] Implement PR 4c1c's gated runner wiring and PR 4c2's
+  permission-capable production-image smoke tests;
   then separately grant config-worker socket access and enable `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
