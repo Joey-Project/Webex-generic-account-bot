@@ -164,9 +164,13 @@ superseded_by:
   in the exact service cgroup; bind authorisation to a pidfd and stable process
   snapshot so child callers, PID reuse, executable replacement, and caller
   exit fail closed.
-- Retain only `CAP_SYS_PTRACE` in the root launcher service so it can inspect
-  the different-UID bot `MainPID`; expose no ambient capability, and never pass
-  this capability into a launcher-created Codex unit.
+- Require Linux cgroup v2 explicitly through
+  `/sys/fs/cgroup/cgroup.controllers`.
+- Start the root launcher service with only `CAP_SYS_PTRACE` so it can inspect
+  the different-UID bot `MainPID`; expose no ambient capability, permanently
+  drop the capability after caller authorisation and before reading the
+  untrusted request frame, and never pass it into a launcher-created Codex
+  unit.
 - UID/group-only authorisation is insufficient because prompt-controlled Codex
   descendants inherit the bot identity and supplementary groups.
 - PR 4a does not grant the bot membership in `webex-codex-launch` or any config

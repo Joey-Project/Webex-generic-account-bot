@@ -30,6 +30,10 @@ const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+#[cfg(target_os = "linux")]
+const CAP_SYS_PTRACE_NUMBER: u32 = 19;
+#[cfg(target_os = "linux")]
 const SYSTEMCTL_MAIN_PID_ARGS: [&str; 5] = [
     "show",
     "--property=MainPID",
@@ -172,6 +176,63 @@ pub fn socket_peer_credentials(fd: RawFd) -> Result<PeerCredentials> {
 #[cfg(target_os = "linux")]
 pub async fn authorise_bot_peer(peer: PeerCredentials) -> Result<AuthorisedPeer> {
     authorise_bot_peer_with(peer, &SystemHostProbe).await
+}
+
+#[cfg(target_os = "linux")]
+pub fn drop_peer_inspection_capability() -> Result<()> {
+    let mut header = LinuxCapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [LinuxCapabilityData::default(); 2];
+    // SAFETY: header and data point to initialized buffers matching Linux capability v3.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut LinuxCapabilityHeader,
+            data.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read launcher capabilities");
+    }
+    if !capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER) {
+        return Err(anyhow!("launcher has an unexpected capability"));
+    }
+    clear_capability(&mut data, CAP_SYS_PTRACE_NUMBER);
+    // SAFETY: header and data retain the layout required by capset.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut LinuxCapabilityHeader,
+            data.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to drop launcher peer-inspection capability");
+    }
+
+    let mut verify = [LinuxCapabilityData::default(); 2];
+    // SAFETY: header and verify point to initialized buffers matching Linux capability v3.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut LinuxCapabilityHeader,
+            verify.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to verify launcher capabilities");
+    }
+    if !capability_sets_are_empty(&verify) {
+        return Err(anyhow!(
+            "launcher capability set remained populated after drop"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -362,6 +423,51 @@ fn pidfd_is_alive(pidfd: RawFd) -> Result<()> {
         return Err(anyhow!("launcher caller exited during request"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxCapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxCapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn clear_capability(data: &mut [LinuxCapabilityData; 2], capability: u32) {
+    let index = (capability / 32) as usize;
+    let mask = !(1_u32 << (capability % 32));
+    data[index].effective &= mask;
+    data[index].permitted &= mask;
+    data[index].inheritable &= mask;
+}
+
+#[cfg(target_os = "linux")]
+fn capability_sets_only_allow(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
+    let allowed_index = (capability / 32) as usize;
+    let allowed_mask = 1_u32 << (capability % 32);
+    data.iter().enumerate().all(|(index, set)| {
+        let mask = if index == allowed_index {
+            allowed_mask
+        } else {
+            0
+        };
+        set.effective & !mask == 0 && set.permitted & !mask == 0 && set.inheritable & !mask == 0
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn capability_sets_are_empty(data: &[LinuxCapabilityData; 2]) -> bool {
+    data.iter()
+        .all(|set| set.effective == 0 && set.permitted == 0 && set.inheritable == 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -689,5 +795,23 @@ mod tests {
         let pidfd = open_pidfd(std::process::id()).unwrap();
 
         pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn permits_only_peer_inspection_and_clears_all_thread_capability_sets() {
+        let mut data = [LinuxCapabilityData::default(); 2];
+        let mask = 1_u32 << CAP_SYS_PTRACE_NUMBER;
+        data[0] = LinuxCapabilityData {
+            effective: mask,
+            permitted: mask,
+            inheritable: mask,
+        };
+
+        assert!(capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER));
+        clear_capability(&mut data, CAP_SYS_PTRACE_NUMBER);
+        assert!(capability_sets_are_empty(&data));
+
+        data[0].permitted = 1_u32 << (CAP_SYS_PTRACE_NUMBER - 1);
+        assert!(!capability_sets_only_allow(&data, CAP_SYS_PTRACE_NUMBER));
     }
 }

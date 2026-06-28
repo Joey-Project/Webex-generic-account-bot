@@ -12,6 +12,9 @@ const TMPFILES_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.tmpfiles.con
 const LAUNCHER_SOURCE_PATH = fileURLToPath(
   new URL('../src/bin/webex-codex-launcher.rs', import.meta.url),
 );
+const LAUNCHER_MODULE_PATH = fileURLToPath(
+  new URL('../src/codex_launcher.rs', import.meta.url),
+);
 
 describe('Codex launcher systemd boundary', () => {
   it('provisions only a root-owned group-gated accepted socket', async () => {
@@ -34,6 +37,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), ['64']);
     assert.deepEqual(directiveValues(socket, 'PollLimitIntervalSec'), ['2s']);
     assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['32']);
+    assert.deepEqual(directiveValues(socket, 'ConditionPathExists'), [
+      '/sys/fs/cgroup/cgroup.controllers',
+    ]);
     assert.deepEqual(directiveValues(socket, 'WantedBy'), ['sockets.target']);
 
     assert.equal(sysusers, 'g webex-codex-launch -\n');
@@ -56,6 +62,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'Service'), []);
     assert.deepEqual(directiveValues(service, 'Requires'), ['webex-codex-launcher.socket']);
     assert.deepEqual(directiveValues(service, 'After'), ['webex-codex-launcher.socket']);
+    assert.deepEqual(directiveValues(service, 'ConditionPathExists'), [
+      '/sys/fs/cgroup/cgroup.controllers',
+    ]);
     assert.deepEqual(directiveValues(service, 'CollectMode'), ['inactive-or-failed']);
     assert.deepEqual(directiveValues(service, 'User'), ['root']);
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
@@ -154,15 +163,34 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('keeps the foundation binary free of transient execution primitives', async () => {
-    const source = await fs.readFile(LAUNCHER_SOURCE_PATH, 'utf8');
+    const [source, launcherModule] = await Promise.all([
+      fs.readFile(LAUNCHER_SOURCE_PATH, 'utf8'),
+      fs.readFile(LAUNCHER_MODULE_PATH, 'utf8'),
+    ]);
+    const launcherSources = `${source}\n${launcherModule}`;
 
-    assert.doesNotMatch(source, /\b(?:systemd-run|sudo|pkexec)\b|PolicyKit|polkit/i);
+    assert.doesNotMatch(
+      launcherSources,
+      /\b(?:systemd-run|sudo|pkexec)\b|PolicyKit|polkit/i,
+    );
     assert.doesNotMatch(source, /std::process::Command|tokio::process::Command/);
+    assert.match(
+      launcherModule,
+      /const SYSTEMCTL_PATH: &str = "\/usr\/bin\/systemctl";/,
+    );
+    assert.match(launcherModule, /Command::new\(SYSTEMCTL_PATH\)/);
+    assert.equal((launcherModule.match(/Command::new\(/g) ?? []).length, 1);
     assert.doesNotMatch(source, /tokio::io::(?:stdin|stdout)/);
     assert.match(source, /tokio::net::UnixStream::from_std/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
     assert.match(source, /ExecutionUnavailable/);
     assert.match(source, /LauncherResponse::ready\(false\)/);
+
+    const dropCapability = source.indexOf('drop_peer_inspection_capability()?;');
+    const readRequest = source.indexOf('read_request_frame_from(&mut socket)');
+    assert.notEqual(dropCapability, -1);
+    assert.notEqual(readRequest, -1);
+    assert.ok(dropCapability < readRequest);
   });
 });
 

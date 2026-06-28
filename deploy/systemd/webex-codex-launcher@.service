@@ -1,6 +1,7 @@
 [Unit]
 Description=Webex Codex launcher connection
 Documentation=man:systemd.service(5)
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 Requires=webex-codex-launcher.socket
 After=webex-codex-launcher.socket
 CollectMode=inactive-or-failed

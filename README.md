@@ -514,11 +514,14 @@ and response frames. Caller authorisation starts with `SO_PEERCRED`, but also
 requires the peer to be the exact live `MainPID` of
 `webex-generic-account-bot.service`, running the fixed root-owned bot
 executable in the exact service cgroup; a pidfd and repeated process snapshot
-close PID-reuse and caller-exit races.
-The root launcher service retains only `CAP_SYS_PTRACE` so it can inspect the
-different-UID bot `MainPID`; it has no ambient capabilities. This capability is
-not exposed to Codex runs, whose capability sets remain part of PR 4b's
-deny-by-default transient-unit boundary.
+close PID-reuse and caller-exit races. The launcher units explicitly require
+Linux cgroup v2, detected through `/sys/fs/cgroup/cgroup.controllers`.
+The root launcher service starts with only `CAP_SYS_PTRACE` so it can inspect
+the different-UID bot `MainPID`; it has no ambient capabilities. The launcher
+permanently drops that capability immediately after caller authorisation and
+before reading the untrusted request frame. This capability is not exposed to
+Codex runs, whose capability sets remain part of PR 4b's deny-by-default
+transient-unit boundary.
 
 PR 4a is only a foundation and must remain fail closed. It does not add the bot
 to `webex-codex-launch`, execute `systemd-run`, enable

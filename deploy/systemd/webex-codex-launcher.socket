@@ -1,6 +1,7 @@
 [Unit]
 Description=Webex Codex launcher socket
 Documentation=man:systemd.socket(5)
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 
 [Socket]
 ListenStream=/run/webex-codex-launcher/launcher.sock

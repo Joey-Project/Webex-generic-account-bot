@@ -13,8 +13,8 @@ use tokio::{
 #[cfg(target_os = "linux")]
 use webex_generic_account_bot::{
     codex_launcher::{
-        authorise_bot_peer, socket_peer_credentials, validate_launcher_process,
-        validate_socket_stdio,
+        authorise_bot_peer, drop_peer_inspection_capability, socket_peer_credentials,
+        validate_launcher_process, validate_socket_stdio,
     },
     launcher_protocol::{
         FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES,
@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
 
     let peer = socket_peer_credentials(stdin_fd)?;
     let peer = authorise_bot_peer(peer).await?;
+    drop_peer_inspection_capability()?;
     peer.ensure_alive()?;
 
     let frame = timeout(IO_TIMEOUT, read_request_frame_from(&mut socket))
