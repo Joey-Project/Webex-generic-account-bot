@@ -30,6 +30,10 @@ const DEPLOY_STATUS_FILE: &str = "/var/lib/webex-generic-account-bot/rendered/de
 const DEPLOY_TRANSACTION_FILE: &str =
     "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
 #[cfg(target_os = "linux")]
+const DEPLOY_TRANSACTION_OWNER: (u32, u32) = (0, 0);
+#[cfg(target_os = "linux")]
+const DEPLOY_TRANSACTION_MODE: u32 = 0o644;
+#[cfg(target_os = "linux")]
 const CONFIG_ACTION_STATUS_FILE: &str =
     "/var/lib/webex-generic-account-bot/config-actions/public-status.json";
 #[cfg(target_os = "linux")]
@@ -168,6 +172,8 @@ pub struct FileConfigStatusProvider {
     #[cfg(target_os = "linux")]
     transaction_file: PathBuf,
     #[cfg(target_os = "linux")]
+    transaction_owner: (u32, u32),
+    #[cfg(target_os = "linux")]
     action_status_file: PathBuf,
 }
 
@@ -178,6 +184,8 @@ impl Default for FileConfigStatusProvider {
             status_file: PathBuf::from(DEPLOY_STATUS_FILE),
             #[cfg(target_os = "linux")]
             transaction_file: PathBuf::from(DEPLOY_TRANSACTION_FILE),
+            #[cfg(target_os = "linux")]
+            transaction_owner: DEPLOY_TRANSACTION_OWNER,
             #[cfg(target_os = "linux")]
             action_status_file: PathBuf::from(CONFIG_ACTION_STATUS_FILE),
         }
@@ -191,8 +199,8 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
         let mut snapshot = match read_optional_bounded_file(
             &self.transaction_file,
             TRANSACTION_FILE_MAX_BYTES,
-            Some(0o600),
-            true,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(self.transaction_owner),
         )
         .await
         {
@@ -203,7 +211,7 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
                 &self.status_file,
                 STATUS_FILE_MAX_BYTES,
                 None,
-                false,
+                None,
             )
             .await?
             {
@@ -215,7 +223,7 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
             &self.action_status_file,
             CONFIG_ACTION_STATUS_MAX_BYTES,
             Some(0o644),
-            false,
+            None,
         )
         .await
         .and_then(|contents| {
@@ -246,7 +254,7 @@ async fn read_optional_bounded_file(
     path: &Path,
     max_bytes: u64,
     required_mode: Option<u32>,
-    require_trusted_owner: bool,
+    expected_owner: Option<(u32, u32)>,
 ) -> Result<Option<Vec<u8>>> {
     let open_path = path.to_path_buf();
     let file = match timeout(
@@ -272,20 +280,13 @@ async fn read_optional_bounded_file(
     if !metadata.is_file() {
         return Err(anyhow!("status input must be a regular file"));
     }
-    if required_mode.is_some_and(|mode| metadata.mode() & 0o7777 != mode) {
-        return Err(anyhow!("status input mode is invalid"));
-    }
-    if require_trusted_owner {
-        // SAFETY: these libc calls take no pointers and return the process credentials.
-        let (effective_uid, effective_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        if metadata.uid() != effective_uid
-            || metadata.gid() != effective_gid
-            || metadata.mode() & 0o7777 != 0o600
-        {
-            return Err(anyhow!(
-                "deployment transaction ownership or mode is not trusted"
-            ));
-        }
+    if !file_metadata_matches_policy(
+        (metadata.uid(), metadata.gid()),
+        metadata.mode(),
+        required_mode,
+        expected_owner,
+    ) {
+        return Err(anyhow!("status input ownership or mode is not trusted"));
     }
     if metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(anyhow!("status input size is invalid"));
@@ -302,6 +303,17 @@ async fn read_optional_bounded_file(
         return Err(anyhow!("status input exceeded the size limit"));
     }
     Ok(Some(contents))
+}
+
+#[cfg(target_os = "linux")]
+fn file_metadata_matches_policy(
+    owner: (u32, u32),
+    mode: u32,
+    required_mode: Option<u32>,
+    expected_owner: Option<(u32, u32)>,
+) -> bool {
+    required_mode.is_none_or(|required| mode & 0o7777 == required)
+        && expected_owner.is_none_or(|expected| owner == expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -660,6 +672,43 @@ mod tests {
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn production_transaction_metadata_policy_is_reader_independent_and_fail_closed() {
+        let provider = FileConfigStatusProvider::default();
+        let non_root_reader = (1000, 1000);
+
+        assert_eq!(
+            provider.transaction_file,
+            PathBuf::from(DEPLOY_TRANSACTION_FILE)
+        );
+        assert_eq!(provider.transaction_owner, DEPLOY_TRANSACTION_OWNER);
+        assert_ne!(non_root_reader, DEPLOY_TRANSACTION_OWNER);
+        assert!(file_metadata_matches_policy(
+            DEPLOY_TRANSACTION_OWNER,
+            0o100644,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner),
+        ));
+        assert!(!file_metadata_matches_policy(
+            (1, 0),
+            0o100644,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner),
+        ));
+        assert!(!file_metadata_matches_policy(
+            (0, 1),
+            0o100644,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner),
+        ));
+        assert!(!file_metadata_matches_policy(
+            DEPLOY_TRANSACTION_OWNER,
+            0o100600,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner),
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn reads_allowlisted_status_fields() {
@@ -751,7 +800,11 @@ mod tests {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
-        write_transaction(&provider, b"secret transaction details", 0o600);
+        write_transaction(
+            &provider,
+            b"secret transaction details",
+            DEPLOY_TRANSACTION_MODE,
+        );
 
         let snapshot = provider.status().await.unwrap();
 
@@ -772,7 +825,7 @@ mod tests {
             b"{not valid json".to_vec(),
             vec![b'x'; TRANSACTION_FILE_MAX_BYTES as usize + 1],
         ] {
-            write_transaction(&provider, &contents, 0o600);
+            write_transaction(&provider, &contents, DEPLOY_TRANSACTION_MODE);
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -788,7 +841,11 @@ mod tests {
         non_normal_path["bot_code_dir"] =
             Value::String("/opt//webex-generic-account-bot/code".to_owned());
         for transaction in [invalid_repo, invalid_ref, invalid_time, non_normal_path] {
-            write_transaction(&provider, &serde_json::to_vec(&transaction).unwrap(), 0o600);
+            write_transaction(
+                &provider,
+                &serde_json::to_vec(&transaction).unwrap(),
+                DEPLOY_TRANSACTION_MODE,
+            );
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -805,15 +862,7 @@ mod tests {
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
         let transaction = serde_json::to_vec(&deployment_transaction()).unwrap();
-        write_transaction(&provider, &transaction, 0o644);
-        let snapshot = provider.status().await.unwrap();
-        assert_eq!(snapshot.status, "recovery_required");
-        assert_eq!(snapshot.config_revision, None);
-        std_fs::set_permissions(
-            &provider.transaction_file,
-            std_fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        write_transaction(&provider, &transaction, DEPLOY_TRANSACTION_MODE);
 
         let snapshot = provider.status().await.unwrap();
 
@@ -836,10 +885,38 @@ mod tests {
         let mut committed = deployment_transaction();
         committed["phase"] = Value::String("committed_pending_metadata".to_owned());
         committed["committed_at"] = Value::String("2026-06-27T00:01:00.000Z".to_owned());
-        write_transaction(&provider, &serde_json::to_vec(&committed).unwrap(), 0o600);
+        write_transaction(
+            &provider,
+            &serde_json::to_vec(&committed).unwrap(),
+            DEPLOY_TRANSACTION_MODE,
+        );
         let snapshot = provider.status().await.unwrap();
         assert!(snapshot.markdown().contains("Committed config revision:"));
         assert!(!snapshot.markdown().contains("In-progress config revision:"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn untrusted_transaction_metadata_fails_closed() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let mut provider = provider_in(&root);
+        let transaction = serde_json::to_vec(&deployment_transaction()).unwrap();
+        write_transaction(&provider, &transaction, DEPLOY_TRANSACTION_MODE);
+
+        provider.transaction_owner.0 ^= 1;
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot, ConfigStatusSnapshot::recovery_required());
+
+        provider.transaction_owner = current_test_owner();
+        std_fs::set_permissions(
+            &provider.transaction_file,
+            std_fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot, ConfigStatusSnapshot::recovery_required());
         std_fs::remove_dir_all(root).unwrap();
     }
 
@@ -1123,7 +1200,7 @@ mod tests {
         write_transaction(
             &provider,
             &serde_json::to_vec(&deployment_transaction()).unwrap(),
-            0o600,
+            DEPLOY_TRANSACTION_MODE,
         );
         std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
         std_fs::set_permissions(
@@ -1169,6 +1246,7 @@ mod tests {
         let provider = FileConfigStatusProvider {
             status_file: linked_root.join("status.json"),
             transaction_file: linked_root.join("transaction.json"),
+            transaction_owner: current_test_owner(),
             action_status_file: root.join("action-status.json"),
         };
 
@@ -1181,8 +1259,14 @@ mod tests {
         FileConfigStatusProvider {
             status_file: root.join("status.json"),
             transaction_file: root.join("transaction.json"),
+            transaction_owner: current_test_owner(),
             action_status_file: root.join("action-status.json"),
         }
+    }
+
+    fn current_test_owner() -> (u32, u32) {
+        // SAFETY: these libc calls take no pointers and return the process credentials.
+        unsafe { (libc::geteuid(), libc::getegid()) }
     }
 
     fn write_transaction(provider: &FileConfigStatusProvider, contents: &[u8], mode: u32) {

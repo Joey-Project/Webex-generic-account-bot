@@ -59,6 +59,8 @@ const FLOCK_TIMEOUT_MS = 5000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
 const CHILD_CLOSE_GRACE_MS = 1000;
 const MAX_INSTALL_TRANSACTION_BYTES = 16 * 1024;
+const INSTALL_TRANSACTION_MODE = 0o644;
+const LEGACY_INSTALL_TRANSACTION_MODE = 0o600;
 const DEPLOYMENT_STATUSES = new Set([
   'deployed',
   'installed_without_restart',
@@ -2477,7 +2479,7 @@ async function writeInstallTransaction(plan, installState, fsApi) {
     plan.transactionFile,
     transaction,
     fsApi,
-    { mode: 0o600 },
+    { mode: INSTALL_TRANSACTION_MODE },
   );
 }
 
@@ -2920,7 +2922,7 @@ function assertTrustedInstallTransaction(file, fileStat) {
   if (fileStat.uid !== uid || fileStat.gid !== gid) {
     throw new Error(`deployment transaction ownership is not trusted: ${file}`);
   }
-  if (mode !== 0o600) {
+  if (![INSTALL_TRANSACTION_MODE, LEGACY_INSTALL_TRANSACTION_MODE].includes(mode)) {
     throw new Error(`deployment transaction mode is not trusted: ${file}`);
   }
 }

@@ -64,11 +64,17 @@ can durably submit a fixed action to a separate worker over a host-owned Unix
 socket before acknowledgement, but configuration validation rejects it until
 Codex runs use the isolated runner. The worker runs immutable staged preparation
 only; it cannot reload the bot. `reload` and `sync` also remain undeployable.
-When a valid deployment transaction exists, status reports its allowlisted
-phase and in-progress revision; malformed journals fail closed to
-`recovery_required` without exposing their contents. A strict, bounded public
-worker status file adds the latest pull action state and prepared revision
-without exposing queue records, failure output, or the private transaction.
+When a trusted, valid deployment recovery journal exists, status reports only
+its allowlisted phase, config revision, and service. Production root apply
+writes that credential-free journal as `root:root` with mode `0644` so the
+non-root bot can read it. Deployment recovery remains compatible with legacy
+same-owner mode `0600` journals, but `/config status` treats those private
+legacy files as generic `recovery_required` until recovery removes or rewrites
+them. Malformed journals and files with any other ownership or mode fail closed
+without exposing their contents. This deployment journal is separate
+from the worker's private queue and staging state. A strict, bounded mode
+`0644` public worker status file projects only the latest pull action state and
+prepared revision, without exposing private queue records or failure output.
 The current production host policy also rejects the entire table until a
 companion config PR pins the exact admin Space and sender allowlist. The example
 above is therefore for local validation and the upcoming reviewed deployment,
@@ -318,17 +324,23 @@ durable than the installed config. A post-rename durability failure restores
 the previous config before returning. If rollback changes the live path but its
 final directory fsync fails, service restart/stop compensation still runs and
 the recovery journal is preserved. Before replacing the live config, the
-entrypoint writes and fsyncs a
-mode `0600` transaction journal beside it. The journal advances through
+entrypoint writes and fsyncs a credential-free recovery journal beside it.
+Production root apply publishes the journal as `root:root` with mode `0644`,
+allowing the non-root bot to strictly parse and expose only its allowlisted
+phase, config revision, and service. Deployment recovery continues to accept
+legacy same-owner mode `0600` journals, while `/config status` reports those
+private legacy files only as generic `recovery_required`. The journal
+advances through
 `prepared`, `service_transition_started`, and `committed_pending_metadata`, and
 remains until success metadata is durable. After an unclean exit, the next apply
 either restores the preserved backup without consuming it or finalises metadata
 for an already committed service. Required rollback restarts and verifies an old
 service; a failed first deployment is restored by stopping the service after its
 config is removed. Journal removal is fsynced before deleting the backup or
-starting a new checkout. A malformed journal fails closed and preserves the live
-config, backup, and journal for inspection; `--skip-restart` cannot bypass a
-pending service recovery. If metadata writing or cleanup fails after the new
+starting a new checkout. A malformed or untrusted journal fails closed to a
+generic `recovery_required` status and preserves the live config, backup, and
+journal for inspection; `--skip-restart` cannot bypass a pending service
+recovery. If metadata writing or cleanup fails after the new
 config has been installed and the service restart has succeeded, the entrypoint
 records a post-commit failure state when possible instead of implying the apply
 was rolled back. While any journal remains, `--status` returns
