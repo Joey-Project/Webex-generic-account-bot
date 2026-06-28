@@ -34,6 +34,7 @@ use crate::{
         ExecuteRequest, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS, OUTPUT_MAX_BYTES,
         ReasoningEffort,
     },
+    work_budget::{WorkBudget, WorkCancellation},
 };
 
 pub const RUNTIME_ROOT: &str = "/opt/webex-generic-account-bot/runtime";
@@ -99,6 +100,27 @@ pub struct VerifiedRuntime {
     pub image: PathBuf,
     pub codex_version: String,
     input_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionCancellation {
+    inner: WorkCancellation,
+}
+
+#[cfg(target_os = "linux")]
+impl ExecutionCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -214,9 +236,24 @@ impl Default for RuntimePaths {
 
 #[cfg(target_os = "linux")]
 pub fn preflight() -> Result<VerifiedRuntime> {
-    ensure_activation_enabled()?;
+    preflight_with_deadline(None)
+}
+
+#[cfg(target_os = "linux")]
+pub async fn preflight_bounded() -> Result<VerifiedRuntime> {
+    let deadline = WorkBudget::after(Duration::from_secs(
+        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+    ));
+    tokio::task::spawn_blocking(move || preflight_with_deadline(Some(deadline)))
+        .await
+        .context("isolated Codex preflight task failed")?
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_with_deadline(deadline: Option<WorkBudget>) -> Result<VerifiedRuntime> {
+    ensure_activation_enabled_with_deadline(deadline.clone())?;
     input_sealer::preflight()?;
-    verify_runtime(&RuntimePaths::default(), 0)
+    verify_runtime_with_deadline(&RuntimePaths::default(), 0, deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -231,23 +268,30 @@ pub(crate) fn production_codex_group_ids() -> Result<CodexGroupIds> {
 pub async fn execute(
     request: &ExecuteRequest,
     peer: &AuthorisedPeer,
+    cancellation: &ExecutionCancellation,
 ) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
     let request_for_preparation = request.clone();
     let source_uid = peer.credentials().uid;
-    let prepared = tokio::time::timeout(
+    let deadline = WorkBudget::with_cancellation(
         Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
-        tokio::task::spawn_blocking(move || {
-            prepare_execution(&request_for_preparation, source_uid)
-        }),
-    )
+        cancellation.inner.clone(),
+    );
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_execution(&request_for_preparation, source_uid, deadline)
+    })
     .await
-    .map_err(|_| IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation timed out")))?
     .map_err(|error| {
         IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation task failed: {error}"))
     })??;
-    run_transient(prepared.plan, request, peer, prepared.workspace)
-        .await
-        .map_err(IsolatedExecutionError::Failed)
+    run_transient(
+        prepared.plan,
+        request,
+        peer,
+        cancellation,
+        prepared.workspace,
+    )
+    .await
+    .map_err(IsolatedExecutionError::Failed)
 }
 
 #[cfg(target_os = "linux")]
@@ -260,8 +304,13 @@ struct PreparedExecution {
 fn prepare_execution(
     request: &ExecuteRequest,
     source_uid: u32,
+    deadline: WorkBudget,
 ) -> std::result::Result<PreparedExecution, IsolatedExecutionError> {
-    ensure_activation_enabled().map_err(IsolatedExecutionError::Unavailable)?;
+    deadline
+        .check("isolated Codex preparation")
+        .map_err(IsolatedExecutionError::Failed)?;
+    ensure_activation_enabled_with_deadline(Some(deadline.clone()))
+        .map_err(IsolatedExecutionError::Unavailable)?;
     validate_execution_policy(request).map_err(IsolatedExecutionError::Failed)?;
     let paths = RuntimePaths::default();
     let expected_workspace = paths.input_root.join(&request.run_id);
@@ -270,11 +319,16 @@ fn prepare_execution(
             "runtime workspace does not match the run identifier"
         )));
     }
-    let runtime = verify_runtime(&paths, 0).map_err(IsolatedExecutionError::Unavailable)?;
+    let runtime = verify_runtime_with_deadline(&paths, 0, Some(deadline.clone()))
+        .map_err(IsolatedExecutionError::Unavailable)?;
     let launcher_unit = current_launcher_unit().map_err(IsolatedExecutionError::Failed)?;
-    let sealed_workspace = input_sealer::seal_workspace(&request.run_id, source_uid)
-        .map_err(IsolatedExecutionError::Failed)?;
-    if sealed_workspace != expected_workspace {
+    let sealed_workspace = input_sealer::seal_workspace_with_deadline(
+        &request.run_id,
+        source_uid,
+        Some(deadline.clone()),
+    )
+    .map_err(IsolatedExecutionError::Failed)?;
+    if sealed_workspace.path() != expected_workspace {
         return Err(IsolatedExecutionError::Failed(anyhow!(
             "sealed workspace path does not match the launcher request"
         )));
@@ -284,6 +338,8 @@ fn prepare_execution(
         &paths.consumed_input_root,
         request,
         runtime.input_gid,
+        Some(deadline),
+        sealed_workspace,
     )
     .map_err(IsolatedExecutionError::Failed)?;
     let plan = build_transient_run_plan(
@@ -298,12 +354,18 @@ fn prepare_execution(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn ensure_activation_enabled() -> Result<()> {
+    ensure_activation_enabled_with_deadline(None)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_activation_enabled_with_deadline(deadline: Option<WorkBudget>) -> Result<()> {
     let directory = env::var_os(CREDENTIALS_DIRECTORY_ENV)
         .ok_or_else(|| anyhow!("launcher credential directory is unavailable"))?;
     let boot_id = boot_id_credential_path(&directory)?;
     let paths = ActivationPaths::production_with_boot_id(boot_id);
-    activation::verify_activation_with(&paths)
+    activation::verify_activation_with_deadline(&paths, deadline)
         .map(|_| ())
         .context("isolated Codex execution awaits current production capability canaries")
 }
@@ -339,7 +401,14 @@ fn validate_execution_policy(request: &ExecuteRequest) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRuntime> {
+fn verify_runtime_with_deadline(
+    paths: &RuntimePaths,
+    expected_uid: u32,
+    deadline: Option<WorkBudget>,
+) -> Result<VerifiedRuntime> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("isolated runtime verification")?;
+    }
     trusted_file(
         &paths.active_manifest,
         expected_uid,
@@ -378,7 +447,7 @@ fn verify_runtime(paths: &RuntimePaths, expected_uid: u32) -> Result<VerifiedRun
     if &magic != SQUASHFS_MAGIC {
         return Err(anyhow!("runtime image is not SquashFS"));
     }
-    let digest = hash_reader(file, &magic)?;
+    let digest = hash_reader(file, &magic, deadline)?;
     if digest != manifest.image_sha256 {
         return Err(anyhow!("runtime image digest does not match its manifest"));
     }
@@ -434,7 +503,12 @@ fn verify_workspace(
     consumed_input_root: &Path,
     request: &ExecuteRequest,
     input_gid: u32,
+    deadline: Option<WorkBudget>,
+    mut published_workspace: input_sealer::PublishedWorkspace,
 ) -> Result<VerifiedWorkspace> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("sealed workspace verification")?;
+    }
     trusted_input_root(input_root, input_gid)?;
     use std::os::unix::fs::OpenOptionsExt;
     let input_root_directory = OpenOptions::new()
@@ -470,7 +544,7 @@ fn verify_workspace(
     if !same_file_identity(&metadata, &validation_directory.metadata()?) {
         return Err(anyhow!("runtime workspace changed before validation"));
     }
-    validate_workspace_tree(&validation_directory, 0, input_gid)?;
+    validate_workspace_tree_with_deadline(&validation_directory, 0, input_gid, deadline.clone())?;
     if fs::canonicalize(&request.workspace)? != request.workspace {
         return Err(anyhow!("runtime workspace path is not canonical"));
     }
@@ -494,30 +568,56 @@ fn verify_workspace(
         .map_err(|_| anyhow!("runtime run identifier contains a NUL byte"))?;
     let consumed_name = CString::new(transient_unit_name(&request.run_id))
         .expect("validated run identifiers produce NUL-free unit names");
-    consume_workspace(
+    let cleanup_root = consumed_root_directory.try_clone()?;
+    rename_workspace(
         &input_root_directory,
         &source_name,
         &consumed_root_directory,
         &consumed_name,
     )?;
     let consumed_path = consumed_input_root.join(consumed_name.to_string_lossy().as_ref());
+    let workspace = VerifiedWorkspace {
+        path: consumed_path.clone(),
+        bind_source,
+        consumed_root: cleanup_root,
+        consumed_name: consumed_name.clone(),
+        expected_device: metadata.dev(),
+        expected_inode: metadata.ino(),
+        _guard: guard,
+    };
+    published_workspace.disarm();
+    consumed_root_directory
+        .sync_all()
+        .context("failed to persist the consumed runtime workspace")?;
+    input_root_directory
+        .sync_all()
+        .context("failed to persist removal of the public runtime workspace")?;
     let consumed = fs::symlink_metadata(&consumed_path)?;
     if consumed.dev() != metadata.dev() || consumed.ino() != metadata.ino() {
         return Err(anyhow!("consumed runtime workspace identity changed"));
     }
-    Ok(VerifiedWorkspace {
-        path: consumed_path,
-        bind_source,
-        consumed_root: consumed_root_directory,
-        consumed_name,
-        expected_device: metadata.dev(),
-        expected_inode: metadata.ino(),
-        _guard: guard,
-    })
+    Ok(workspace)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn consume_workspace(
+    input_root: &File,
+    source_name: &CStr,
+    consumed_root: &File,
+    consumed_name: &CStr,
+) -> Result<()> {
+    rename_workspace(input_root, source_name, consumed_root, consumed_name)?;
+    consumed_root
+        .sync_all()
+        .context("failed to persist the consumed runtime workspace")?;
+    input_root
+        .sync_all()
+        .context("failed to persist removal of the public runtime workspace")?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn consume_workspace(
+fn rename_workspace(
     input_root: &File,
     source_name: &CStr,
     consumed_root: &File,
@@ -538,17 +638,21 @@ fn consume_workspace(
         return Err(std::io::Error::last_os_error())
             .context("failed to consume the verified runtime workspace");
     }
-    consumed_root
-        .sync_all()
-        .context("failed to persist the consumed runtime workspace")?;
-    input_root
-        .sync_all()
-        .context("failed to persist removal of the public runtime workspace")?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn validate_workspace_tree(root: &File, expected_uid: u32, input_gid: u32) -> Result<()> {
+    validate_workspace_tree_with_deadline(root, expected_uid, input_gid, None)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace_tree_with_deadline(
+    root: &File,
+    expected_uid: u32,
+    input_gid: u32,
+    deadline: Option<WorkBudget>,
+) -> Result<()> {
     let mut entries = 0_usize;
     let mut total_bytes = 0_u64;
     validate_workspace_directory(
@@ -558,6 +662,7 @@ fn validate_workspace_tree(root: &File, expected_uid: u32, input_gid: u32) -> Re
         0,
         &mut entries,
         &mut total_bytes,
+        deadline,
     )
 }
 
@@ -569,7 +674,11 @@ fn validate_workspace_directory(
     depth: usize,
     entries: &mut usize,
     total_bytes: &mut u64,
+    deadline: Option<WorkBudget>,
 ) -> Result<()> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("sealed workspace tree verification")?;
+    }
     if depth > WORKSPACE_DEPTH_MAX {
         return Err(anyhow!("runtime workspace nesting exceeds its limit"));
     }
@@ -580,6 +689,9 @@ fn validate_workspace_directory(
         directory.as_raw_fd()
     ));
     for entry in fs::read_dir(&directory_path)? {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("sealed workspace tree verification")?;
+        }
         let entry = entry?;
         *entries = entries
             .checked_add(1)
@@ -614,6 +726,7 @@ fn validate_workspace_directory(
                 depth + 1,
                 entries,
                 total_bytes,
+                deadline.clone(),
             )?;
         } else if metadata.is_file() {
             if !sealed_file_mode_valid(metadata.mode()) || metadata.nlink() != 1 {
@@ -809,8 +922,14 @@ async fn run_transient(
     plan: TransientRunPlan,
     request: &ExecuteRequest,
     peer: &AuthorisedPeer,
+    cancellation: &ExecutionCancellation,
     _workspace: VerifiedWorkspace,
 ) -> Result<IsolatedRunResult> {
+    if cancellation.is_cancelled() {
+        return Err(anyhow!(
+            "launcher client disconnected before Codex execution"
+        ));
+    }
     peer.ensure_alive()
         .context("authorised bot caller exited before Codex execution")?;
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
@@ -853,6 +972,9 @@ async fn run_transient(
             tokio::select! {
                 result = &mut prompt_write => break PromptWriteOutcome::Completed(result),
                 _ = sleep(PEER_POLL_INTERVAL) => {
+                    if cancellation.is_cancelled() {
+                        break PromptWriteOutcome::Cancelled;
+                    }
                     if peer.ensure_alive().is_err() {
                         break PromptWriteOutcome::PeerExited;
                     }
@@ -878,6 +1000,13 @@ async fn run_transient(
                 "authorised bot caller exited during Codex prompt delivery"
             ));
         }
+        PromptWriteOutcome::Cancelled => {
+            terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
+                .await?;
+            return Err(anyhow!(
+                "launcher client disconnected during Codex prompt delivery"
+            ));
+        }
         PromptWriteOutcome::TimedOut => {
             terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
                 .await?;
@@ -901,6 +1030,16 @@ async fn run_transient(
                 }
             },
             _ = sleep(PEER_POLL_INTERVAL) => {
+                if cancellation.is_cancelled() {
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
+                    return Err(anyhow!("launcher client disconnected during Codex execution"));
+                }
                 if peer.ensure_alive().is_err() {
                     terminate_and_discard_captures(
                         &plan.unit,
@@ -955,6 +1094,7 @@ async fn run_transient(
 #[cfg(target_os = "linux")]
 enum PromptWriteOutcome {
     Completed(std::io::Result<()>),
+    Cancelled,
     PeerExited,
     TimedOut,
 }
@@ -1294,11 +1434,14 @@ fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
-fn hash_reader(mut reader: File, prefix: &[u8]) -> Result<String> {
+fn hash_reader(mut reader: File, prefix: &[u8], deadline: Option<WorkBudget>) -> Result<String> {
     let mut context = DigestContext::new(&SHA256);
     context.update(prefix);
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("isolated runtime image hashing")?;
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;

@@ -105,23 +105,35 @@ async fn main() -> Result<()> {
     let config = Arc::new(BotConfig::load(&cli.config)?);
     if cli.check_config {
         if config.uses_ephemeral_linux_user() {
-            webex_generic_account_bot::activation::verify_activation()
-                .context("ephemeral Codex runner activation preflight failed")?;
-            webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
-                .context("ephemeral Codex launcher installation preflight failed")?;
+            #[cfg(target_os = "linux")]
+            {
+                webex_generic_account_bot::activation::verify_activation()
+                    .context("ephemeral Codex runner activation preflight failed")?;
+                webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
+                    .context("ephemeral Codex launcher installation preflight failed")?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(
+                webex_generic_account_bot::isolated_execution::unsupported_platform_error(),
+            );
         }
         println!("config_ok=true");
         return Ok(());
     }
     if config.uses_ephemeral_linux_user() {
-        webex_generic_account_bot::activation::verify_activation()
-            .context("ephemeral Codex runner activation preflight failed")?;
-        webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
-            .context("ephemeral Codex launcher installation preflight failed")?;
-        webex_generic_account_bot::launcher_client::LauncherClient::fixed()
-            .preflight()
-            .await
-            .context("ephemeral Codex launcher live preflight failed")?;
+        #[cfg(target_os = "linux")]
+        {
+            webex_generic_account_bot::activation::verify_activation()
+                .context("ephemeral Codex runner activation preflight failed")?;
+            webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
+                .context("ephemeral Codex launcher installation preflight failed")?;
+            webex_generic_account_bot::launcher_client::LauncherClient::fixed()
+                .preflight()
+                .await
+                .context("ephemeral Codex launcher live preflight failed")?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(webex_generic_account_bot::isolated_execution::unsupported_platform_error());
     }
 
     let sidecar_token = sidecar_token(&config)?;

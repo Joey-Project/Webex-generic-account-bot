@@ -24,7 +24,8 @@ use ring::{
 use crate::{
     input_sealer::{CODEX_PENDING_INPUT_ROOT, ensure_posix_acl_absent},
     isolated_execution::production_codex_group_ids,
-    launcher_protocol::INPUT_STAGING_TIMEOUT_SECONDS,
+    launcher_protocol::INPUT_STAGING_WORK_TIMEOUT_SECONDS,
+    work_budget::WorkBudget,
 };
 
 const PENDING_ROOT_MODE: u32 = 0o2730;
@@ -100,31 +101,34 @@ pub(crate) async fn stage_workspace(
 ) -> Result<PendingWorkspace> {
     let message_id = message_id.to_owned();
     let evidence_root = evidence_root.map(Path::to_path_buf);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(INPUT_STAGING_TIMEOUT_SECONDS),
-        tokio::task::spawn_blocking(move || {
-            let groups = production_codex_group_ids()?;
-            stage_workspace_at(
-                Path::new(CODEX_PENDING_INPUT_ROOT),
-                0,
-                effective_uid(),
-                groups.launch,
-                &message_id,
-                evidence_root.as_deref(),
-                Limits::default(),
-            )
-        }),
-    )
+    let deadline = WorkBudget::after(std::time::Duration::from_secs(
+        INPUT_STAGING_WORK_TIMEOUT_SECONDS,
+    ));
+    tokio::task::spawn_blocking(move || {
+        let groups = production_codex_group_ids()?;
+        stage_workspace_at(
+            Path::new(CODEX_PENDING_INPUT_ROOT),
+            0,
+            effective_uid(),
+            groups.launch,
+            &message_id,
+            evidence_root.as_deref(),
+            Limits {
+                deadline: Some(deadline),
+                ..Limits::default()
+            },
+        )
+    })
     .await
-    .context("pending workspace staging timed out")?
     .context("pending workspace staging task failed")?
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Limits {
     entries: usize,
     depth: usize,
     bytes: u64,
+    deadline: Option<WorkBudget>,
     #[cfg(test)]
     mutation_hook: Option<FileMutationHook>,
     #[cfg(test)]
@@ -140,6 +144,7 @@ impl Default for Limits {
             entries: WORKSPACE_ENTRY_MAX,
             depth: WORKSPACE_DEPTH_MAX,
             bytes: WORKSPACE_TOTAL_BYTES_MAX,
+            deadline: None,
             #[cfg(test)]
             mutation_hook: None,
             #[cfg(test)]
@@ -154,6 +159,15 @@ struct CopyState {
     source_uid: u32,
     launch_gid: u32,
     limits: Limits,
+}
+
+impl CopyState {
+    fn check_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.limits.deadline.as_ref() {
+            deadline.check("pending workspace staging")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +234,9 @@ fn stage_workspace_at(
     evidence_root: Option<&Path>,
     limits: Limits,
 ) -> Result<PendingWorkspace> {
+    if let Some(deadline) = limits.deadline.as_ref() {
+        deadline.check("pending workspace staging")?;
+    }
     let pending_root = open_path_directory(pending_root_path, false)
         .context("failed to open the pending input root")?;
     validate_pending_root(
@@ -252,9 +269,13 @@ fn stage_workspace_at(
                 bytes: 0,
                 source_uid,
                 launch_gid,
-                limits,
+                limits: limits.clone(),
             };
             copy_directory(source, &workspace, 0, &mut state)?;
+        }
+
+        if let Some(deadline) = limits.deadline.as_ref() {
+            deadline.check("pending workspace publication")?;
         }
 
         set_mode(workspace.as_raw_fd(), SOURCE_DIRECTORY_MODE)?;
@@ -407,6 +428,7 @@ fn generate_run_id(message_id: &str, random: &SystemRandom) -> Result<String> {
 }
 
 fn copy_directory(source: &File, target: &File, depth: usize, state: &mut CopyState) -> Result<()> {
+    state.check_deadline()?;
     if depth > state.limits.depth {
         bail!("evidence workspace nesting exceeds its limit");
     }
@@ -418,6 +440,7 @@ fn copy_directory(source: &File, target: &File, depth: usize, state: &mut CopySt
     let entries = list_directory(source.as_raw_fd(), remaining_entries)?;
 
     for name in entries {
+        state.check_deadline()?;
         state.entries = state
             .entries
             .checked_add(1)
@@ -478,6 +501,7 @@ fn copy_file(
     entry: &StatSnapshot,
     state: &mut CopyState,
 ) -> Result<()> {
+    state.check_deadline()?;
     if entry.links != 1 {
         bail!("evidence workspace contains a hard-linked file");
     }
@@ -508,14 +532,19 @@ fn copy_file(
         PRIVATE_FILE_MODE,
         0,
     )?;
-    let first_digest = copy_exact_with_digest(&mut source, &mut target, size)?;
+    let first_digest = copy_exact_with_digest(
+        &mut source,
+        &mut target,
+        size,
+        state.limits.deadline.clone(),
+    )?;
     target.flush()?;
     #[cfg(test)]
     if let Some(hook) = state.limits.post_copy_mutation_hook {
         hook(source_directory.as_raw_fd(), name)?;
     }
     source.seek(SeekFrom::Start(0))?;
-    let second_digest = hash_exact_source(&mut source, size)?;
+    let second_digest = hash_exact_source(&mut source, size, state.limits.deadline.clone())?;
     if first_digest.as_ref() != second_digest.as_ref() {
         bail!("evidence workspace file contents changed during copy");
     }
@@ -541,11 +570,15 @@ fn copy_exact_with_digest(
     source: &mut File,
     target: &mut File,
     size: u64,
+    deadline: Option<WorkBudget>,
 ) -> Result<ring::digest::Digest> {
     let mut digest = DigestContext::new(&SHA256);
     let mut remaining = size;
     let mut buffer = [0_u8; 1024 * 1024];
     while remaining > 0 {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("pending workspace copy")?;
+        }
         let limit = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded copy chunk fits usize");
         let read = source.read(&mut buffer[..limit])?;
@@ -560,11 +593,18 @@ fn copy_exact_with_digest(
     Ok(digest.finish())
 }
 
-fn hash_exact_source(source: &mut File, size: u64) -> Result<ring::digest::Digest> {
+fn hash_exact_source(
+    source: &mut File,
+    size: u64,
+    deadline: Option<WorkBudget>,
+) -> Result<ring::digest::Digest> {
     let mut digest = DigestContext::new(&SHA256);
     let mut remaining = size;
     let mut buffer = [0_u8; 1024 * 1024];
     while remaining > 0 {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("pending workspace verification")?;
+        }
         let limit = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded hash chunk fits usize");
         let read = source.read(&mut buffer[..limit])?;
@@ -1032,6 +1072,27 @@ mod tests {
             );
             assert!(!run_id.contains("same-message"));
         }
+    }
+
+    #[test]
+    fn expired_work_budget_fails_before_publishing_a_workspace() {
+        let fixture = Fixture::new();
+        let evidence = fixture.evidence("expired-evidence");
+        fs::write(evidence.join("console.log"), b"data").unwrap();
+
+        let error = fixture
+            .stage_with_limits(
+                "expired-message",
+                Some(&evidence),
+                Limits {
+                    deadline: Some(WorkBudget::after(std::time::Duration::ZERO)),
+                    ..Limits::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("work deadline"));
+        fixture.assert_pending_empty();
     }
 
     #[test]

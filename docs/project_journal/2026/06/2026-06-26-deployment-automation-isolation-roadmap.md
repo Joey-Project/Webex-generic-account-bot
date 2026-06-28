@@ -60,10 +60,12 @@ superseded_by:
   boot-scoped activation receipt. PR 4c2 still owns the production canaries and
   receipt minting; production config remains current-user until then.
   Preflight, evidence staging, and launcher preparation use explicit bounded
-  budgets that are included in ephemeral attempt-lease validation. Normal
-  success, rejection, timeout, and cancellation remove both source quarantine
-  and consumed sealed trees by verified inode; tmpfiles remains the crash
-  fallback.
+  budgets that are included in ephemeral attempt-lease validation. Blocking
+  file workers check cooperative deadlines and launcher-socket cancellation;
+  the launcher waits for their scoped cleanup instead of detaching them.
+  Normal success, rejection, timeout, client disconnect, and cancellation
+  remove ready, source-quarantine, and consumed sealed trees by verified inode;
+  tmpfiles remains the crash fallback.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

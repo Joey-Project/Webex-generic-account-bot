@@ -16,7 +16,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use ring::digest::{Context as DigestContext, SHA256};
 
-use crate::isolated_execution::{CODEX_INPUT_ROOT, production_codex_group_ids};
+use crate::{
+    isolated_execution::{CODEX_INPUT_ROOT, production_codex_group_ids},
+    work_budget::WorkBudget,
+};
 
 pub const CODEX_PENDING_INPUT_ROOT: &str =
     "/var/lib/webex-generic-account-bot/codex-input-staging/pending";
@@ -35,6 +38,43 @@ const WORKSPACE_ENTRY_MAX: usize = 8_192;
 const WORKSPACE_DEPTH_MAX: usize = 32;
 const WORKSPACE_TOTAL_MIB: u64 = 2_112;
 const WORKSPACE_TOTAL_BYTES_MAX: u64 = WORKSPACE_TOTAL_MIB * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct PublishedWorkspace {
+    path: PathBuf,
+    input_root: File,
+    run_name: CString,
+    device: u64,
+    inode: u64,
+    armed: bool,
+}
+
+impl PublishedWorkspace {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublishedWorkspace {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) =
+            remove_owned_tree_at(&self.input_root, &self.run_name, self.device, self.inode)
+        {
+            tracing::warn!(
+                workspace = %self.path.display(),
+                error = %error,
+                "failed to clean a published runtime workspace"
+            );
+        }
+    }
+}
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -73,11 +113,12 @@ impl Default for SealPaths {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Limits {
     entries: usize,
     depth: usize,
     bytes: u64,
+    deadline: Option<WorkBudget>,
     #[cfg(test)]
     mutation_hook: Option<FileMutationHook>,
     #[cfg(test)]
@@ -93,6 +134,7 @@ impl Default for Limits {
             entries: WORKSPACE_ENTRY_MAX,
             depth: WORKSPACE_DEPTH_MAX,
             bytes: WORKSPACE_TOTAL_BYTES_MAX,
+            deadline: None,
             #[cfg(test)]
             mutation_hook: None,
             #[cfg(test)]
@@ -105,6 +147,15 @@ struct CopyState {
     entries: usize,
     bytes: u64,
     limits: Limits,
+}
+
+impl CopyState {
+    fn check_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.limits.deadline.as_ref() {
+            deadline.check("fresh-inode input sealing")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,12 +201,36 @@ impl StatSnapshot {
 
 pub fn seal_workspace(run_id: &str, source_uid: u32) -> Result<PathBuf> {
     let groups = production_codex_group_ids()?;
-    seal_workspace_at(
+    let mut published = seal_workspace_with_limits(
         &SealPaths::production(),
         run_id,
         source_uid,
         groups.launch,
         groups.input,
+        Limits::default(),
+    )?;
+    let path = published.path().to_owned();
+    published.disarm();
+    Ok(path)
+}
+
+pub(crate) fn seal_workspace_with_deadline(
+    run_id: &str,
+    source_uid: u32,
+    deadline: Option<WorkBudget>,
+) -> Result<PublishedWorkspace> {
+    let groups = production_codex_group_ids()?;
+    let paths = SealPaths::production();
+    seal_workspace_with_limits(
+        &paths,
+        run_id,
+        source_uid,
+        groups.launch,
+        groups.input,
+        Limits {
+            deadline,
+            ..Limits::default()
+        },
     )
 }
 
@@ -203,6 +278,7 @@ fn preflight_at(paths: &SealPaths, source_gid: u32, target_gid: u32) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 fn seal_workspace_at(
     paths: &SealPaths,
     run_id: &str,
@@ -210,14 +286,17 @@ fn seal_workspace_at(
     source_gid: u32,
     target_gid: u32,
 ) -> Result<PathBuf> {
-    seal_workspace_with_limits(
+    let mut published = seal_workspace_with_limits(
         paths,
         run_id,
         source_uid,
         source_gid,
         target_gid,
         Limits::default(),
-    )
+    )?;
+    let path = published.path().to_owned();
+    published.disarm();
+    Ok(path)
 }
 
 fn seal_workspace_with_limits(
@@ -227,7 +306,10 @@ fn seal_workspace_with_limits(
     source_gid: u32,
     target_gid: u32,
     limits: Limits,
-) -> Result<PathBuf> {
+) -> Result<PublishedWorkspace> {
+    if let Some(deadline) = limits.deadline.as_ref() {
+        deadline.check("fresh-inode input sealing")?;
+    }
     validate_run_id(run_id)?;
     validate_root_layout(paths)?;
 
@@ -282,6 +364,9 @@ fn seal_workspace_with_limits(
     let mut published_by_us = false;
     let mut published_identity = None;
     let result = (|| {
+        if let Some(deadline) = limits.deadline.as_ref() {
+            deadline.check("fresh-inode input sealing")?;
+        }
         source_consumed_root
             .sync_all()
             .context("failed to persist the quarantined workspace")?;
@@ -303,11 +388,14 @@ fn seal_workspace_with_limits(
         let mut state = CopyState {
             entries: 0,
             bytes: 0,
-            limits,
+            limits: limits.clone(),
         };
         copy_directory(
             &source, &target, source_uid, source_gid, sealer_uid, target_gid, 0, &mut state,
         )?;
+        if let Some(deadline) = limits.deadline.as_ref() {
+            deadline.check("sealed workspace publication")?;
+        }
         validate_root(
             &target,
             sealer_uid,
@@ -350,7 +438,7 @@ fn seal_workspace_with_limits(
         }
         validate_sealed_directory(&published, sealer_uid, target_gid)?;
         ensure_root_path_unchanged(&paths.input_root, &input_root)?;
-        Ok(paths.input_root.join(run_id))
+        Ok(())
     })();
 
     let cleanup_source = || {
@@ -379,8 +467,20 @@ fn seal_workspace_with_limits(
     };
 
     match result {
-        Ok(path) => match cleanup_source() {
-            Ok(()) => Ok(path),
+        Ok(()) => match cleanup_source() {
+            Ok(()) => {
+                let expected = published_identity
+                    .as_ref()
+                    .expect("successful publication records its identity");
+                Ok(PublishedWorkspace {
+                    path: paths.input_root.join(run_id),
+                    input_root,
+                    run_name,
+                    device: expected.device,
+                    inode: expected.inode,
+                    armed: true,
+                })
+            }
             Err(source_error) => match cleanup_target() {
                 Ok(()) => Err(source_error),
                 Err(target_error) => Err(anyhow!(
@@ -618,6 +718,7 @@ fn copy_directory(
     depth: usize,
     state: &mut CopyState,
 ) -> Result<()> {
+    state.check_deadline()?;
     if depth > state.limits.depth {
         bail!("pending workspace nesting exceeds its limit");
     }
@@ -628,6 +729,7 @@ fn copy_directory(
     let entries = list_directory(source.as_raw_fd(), remaining_entries)?;
 
     for name in entries {
+        state.check_deadline()?;
         state.entries = state
             .entries
             .checked_add(1)
@@ -710,6 +812,7 @@ fn copy_file(
     target_gid: u32,
     state: &mut CopyState,
 ) -> Result<()> {
+    state.check_deadline()?;
     validate_source_file(entry, source_uid, source_gid)?;
     let mut source = open_source_file(source_directory.as_raw_fd(), name)?;
     if stat_fd(source.as_raw_fd())? != *entry {
@@ -732,14 +835,19 @@ fn copy_file(
 
     let mut target = create_target_file(target_directory.as_raw_fd(), name)?;
     set_owner_and_mode(target.as_raw_fd(), sealer_uid, target_gid, SOURCE_FILE_MODE)?;
-    let first_digest = copy_exact_with_digest(&mut source, &mut target, size)?;
+    let first_digest = copy_exact_with_digest(
+        &mut source,
+        &mut target,
+        size,
+        state.limits.deadline.clone(),
+    )?;
     target.flush()?;
     #[cfg(test)]
     if let Some(hook) = state.limits.post_copy_mutation_hook {
         hook(source_directory.as_raw_fd(), name)?;
     }
     source.seek(SeekFrom::Start(0))?;
-    let second_digest = hash_exact_source(&mut source, size)?;
+    let second_digest = hash_exact_source(&mut source, size, state.limits.deadline.clone())?;
     if first_digest.as_ref() != second_digest.as_ref() {
         bail!("pending workspace file contents changed during copy");
     }
@@ -768,11 +876,15 @@ fn copy_exact_with_digest(
     source: &mut File,
     target: &mut File,
     size: u64,
+    deadline: Option<WorkBudget>,
 ) -> Result<ring::digest::Digest> {
     let mut digest = DigestContext::new(&SHA256);
     let mut remaining = size;
     let mut buffer = [0_u8; 1024 * 1024];
     while remaining > 0 {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("fresh-inode workspace copy")?;
+        }
         let limit = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded copy chunk fits usize");
         let read = source.read(&mut buffer[..limit])?;
@@ -787,11 +899,18 @@ fn copy_exact_with_digest(
     Ok(digest.finish())
 }
 
-fn hash_exact_source(source: &mut File, size: u64) -> Result<ring::digest::Digest> {
+fn hash_exact_source(
+    source: &mut File,
+    size: u64,
+    deadline: Option<WorkBudget>,
+) -> Result<ring::digest::Digest> {
     let mut digest = DigestContext::new(&SHA256);
     let mut remaining = size;
     let mut buffer = [0_u8; 1024 * 1024];
     while remaining > 0 {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("fresh-inode workspace verification")?;
+        }
         let limit = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded hash chunk fits usize");
         let read = source.read(&mut buffer[..limit])?;
@@ -1153,7 +1272,28 @@ mod tests {
         }
 
         fn seal_with_limits(&self, run_id: &str, limits: Limits) -> Result<PathBuf> {
-            seal_workspace_with_limits(&self.paths, run_id, self.uid, self.gid, self.gid, limits)
+            let mut published = seal_workspace_with_limits(
+                &self.paths,
+                run_id,
+                self.uid,
+                self.gid,
+                self.gid,
+                limits,
+            )?;
+            let path = published.path().to_owned();
+            published.disarm();
+            Ok(path)
+        }
+
+        fn seal_guard(&self, run_id: &str) -> Result<PublishedWorkspace> {
+            seal_workspace_with_limits(
+                &self.paths,
+                run_id,
+                self.uid,
+                self.gid,
+                self.gid,
+                Limits::default(),
+            )
         }
     }
 
@@ -1203,6 +1343,20 @@ mod tests {
         assert_eq!(contents, b"original evidence\n");
         assert!(!roots.paths.pending_root.join("run-one").exists());
         assert!(!roots.paths.source_consumed_root.join("run-one").exists());
+    }
+
+    #[test]
+    fn published_workspace_guard_cleans_an_unconsumed_tree() {
+        let roots = TestRoots::new();
+        let source = roots.source("guarded");
+        roots.write_file(&source.join("evidence"), b"data");
+
+        let published = roots.seal_guard("guarded").unwrap();
+        assert!(published.path().exists());
+        drop(published);
+
+        assert!(!roots.paths.input_root.join("guarded").exists());
+        assert!(!roots.paths.source_consumed_root.join("guarded").exists());
     }
 
     #[test]

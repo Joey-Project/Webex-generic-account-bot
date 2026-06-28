@@ -12,11 +12,11 @@ use webex_generic_account_bot::{
         AuthorisedPeer, authorise_bot_peer, drop_peer_inspection_capability,
         socket_peer_credentials, validate_launcher_process, validate_socket_stdio,
     },
-    isolated_execution::{self, IsolatedExecutionError, IsolatedRunResult},
+    isolated_execution::{self, ExecutionCancellation, IsolatedExecutionError, IsolatedRunResult},
     launcher_protocol::{
-        CompletedResponse, FRAME_HEADER_BYTES, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
-        LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES, RejectedResponse, RejectionCode,
-        decode_request_frame, encode_response_frame,
+        CompletedResponse, FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse,
+        REQUEST_MAX_BYTES, RejectedResponse, RejectionCode, decode_request_frame,
+        encode_response_frame,
     },
 };
 
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     } else {
         decode_request_frame(&packet.frame)
     };
-    let response = response_for_request(request, &peer).await?;
+    let response = response_for_request(request, &peer, &socket).await?;
     peer.ensure_alive()?;
     write_response(&socket, &response).await
 }
@@ -82,6 +82,7 @@ async fn response_for_request(
         webex_generic_account_bot::launcher_protocol::ProtocolError,
     >,
     peer: &AuthorisedPeer,
+    socket: &AsyncFd<OwnedFd>,
 ) -> Result<LauncherResponse> {
     match request {
         Ok(request) => match request.request {
@@ -91,7 +92,7 @@ async fn response_for_request(
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
                 let output_limit = request.output_char_limit;
-                match isolated_execution::execute(&request, peer).await {
+                match execute_until_disconnect(&request, peer, socket).await {
                     Ok(result) => execution_response(run_id, output_limit, result),
                     Err(IsolatedExecutionError::Unavailable(_)) => Ok(rejected(
                         Some(run_id),
@@ -116,14 +117,57 @@ async fn response_for_request(
 
 #[cfg(target_os = "linux")]
 async fn preflight_available() -> bool {
-    matches!(
-        timeout(
-            Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
-            tokio::task::spawn_blocking(isolated_execution::preflight),
-        )
-        .await,
-        Ok(Ok(Ok(_)))
-    )
+    isolated_execution::preflight_bounded().await.is_ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn execute_until_disconnect(
+    request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
+    peer: &AuthorisedPeer,
+    socket: &AsyncFd<OwnedFd>,
+) -> std::result::Result<IsolatedRunResult, IsolatedExecutionError> {
+    let cancellation = ExecutionCancellation::new();
+    let execution = isolated_execution::execute(request, peer, &cancellation);
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => result,
+        _ = wait_for_client_disconnect(socket) => {
+            cancellation.cancel();
+            execution.await
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_client_disconnect(socket: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
+    loop {
+        let mut guard = socket.readable().await?;
+        match guard.try_io(|socket| {
+            let mut byte = 0_u8;
+            // SAFETY: byte is valid writable storage and the socket descriptor remains live.
+            let received = unsafe {
+                libc::recv(
+                    socket.get_ref().as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if received == 0 {
+                return Ok(());
+            }
+            if received > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "launcher client sent more than one request packet",
+                ));
+            }
+            Err(std::io::Error::last_os_error())
+        }) {
+            Ok(result) => return result,
+            Err(_) => continue,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -406,6 +450,25 @@ mod tests {
         assert_eq!(packet.sender.pid, std::process::id());
         assert_eq!(packet.sender.uid, unsafe { libc::geteuid() });
         assert_eq!(packet.sender.gid, unsafe { libc::getegid() });
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_is_detected_without_an_extra_packet() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        drop(writer);
+
+        timeout(
+            Duration::from_millis(100),
+            wait_for_client_disconnect(&reader),
+        )
+        .await
+        .expect("disconnect monitor must observe peer closure")
+        .unwrap();
     }
 
     #[tokio::test]

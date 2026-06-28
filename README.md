@@ -715,9 +715,11 @@ links, special files, control directories, metadata/content races, and the
 existing depth, entry, and byte limits, then identifies the run with an
 unpredictable ID. A request is sent only after launcher preflight succeeds.
 Preflight responses and bot-side evidence staging each have a 10-minute bound;
-launcher runtime verification and sealing have a 9-minute work deadline plus a
-response margin. These fixed costs are included in ephemeral attempt-lease
-validation.
+their blocking file work and launcher preparation use cooperative 9-minute
+deadlines plus response margins. Deadline and client-disconnect cancellation
+are checked between directory, copy, and hash operations, so blocking workers
+finish cleanup before their futures return. These fixed costs are included in
+ephemeral attempt-lease validation.
 
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd
@@ -732,8 +734,10 @@ receipt and fixed root-owned socket metadata, while the live bot additionally
 performs the caller-authorised launcher preflight before Webex startup.
 Source quarantine trees are removed immediately after sealing, and the
 inode-guarded consumed tree is removed when the transient run finishes, fails,
-times out, or is cancelled. One-day tmpfiles expiry remains only a crash or
-host-reboot fallback.
+times out, or is cancelled. Closing the bot's launcher socket cancels both
+preparation and a running transient unit even while the authorised bot process
+remains alive. One-day tmpfiles expiry remains only a crash or host-reboot
+fallback.
 
 PR 4c1c does not mint the receipt or activate production configuration. PR
 4c2 owns permission-capable production-image canaries and receipt creation.

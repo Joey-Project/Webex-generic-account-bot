@@ -14,6 +14,8 @@ use anyhow::{Context, Result, anyhow};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 
+use crate::work_budget::WorkBudget;
+
 pub const ACTIVATION_RECEIPT_PATH: &str = "/run/webex-codex-activation/receipt.json";
 pub const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 pub const ACTIVE_RUNTIME_MANIFEST_PATH: &str = "/opt/webex-generic-account-bot/runtime/active.json";
@@ -278,6 +280,13 @@ pub fn verify_activation() -> Result<VerifiedActivation> {
 }
 
 pub fn verify_activation_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
+    verify_activation_with_deadline(paths, None)
+}
+
+pub(crate) fn verify_activation_with_deadline(
+    paths: &ActivationPaths,
+    deadline: Option<WorkBudget>,
+) -> Result<VerifiedActivation> {
     ensure_linux()?;
     let receipt_file = read_trusted_file(
         paths,
@@ -287,7 +296,7 @@ pub fn verify_activation_with(paths: &ActivationPaths) -> Result<VerifiedActivat
     )?;
     let receipt: ActivationReceipt = serde_json::from_slice(&receipt_file.bytes)
         .context("activation receipt is invalid JSON")?;
-    let binding = load_activation_binding(paths)?;
+    let binding = load_activation_binding_with_deadline(paths, deadline)?;
     let verified = validate_receipt(&receipt, &binding)?;
     ensure_path_identity(paths, &paths.receipt, &receipt_file.identity)?;
     for (path, identity) in &binding.identities {
@@ -336,6 +345,16 @@ fn build_activation_receipt_with(
 }
 
 fn load_activation_binding(paths: &ActivationPaths) -> Result<ActivationBinding> {
+    load_activation_binding_with_deadline(paths, None)
+}
+
+fn load_activation_binding_with_deadline(
+    paths: &ActivationPaths,
+    deadline: Option<WorkBudget>,
+) -> Result<ActivationBinding> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("activation verification")?;
+    }
     let boot_id_file = read_trusted_file(
         paths,
         &paths.boot_id,
@@ -364,10 +383,11 @@ fn load_activation_binding(paths: &ActivationPaths) -> Result<ActivationBinding>
         &runtime_image_path,
         manifest.image_size,
         &manifest.image_sha256,
+        deadline.clone(),
     )?;
-    let bot = hash_trusted_file(paths, &paths.bot_executable)?;
-    let launcher = hash_trusted_file(paths, &paths.launcher_executable)?;
-    let runtime = hash_trusted_file(paths, &paths.runtime_executable)?;
+    let bot = hash_trusted_file(paths, &paths.bot_executable, deadline.clone())?;
+    let launcher = hash_trusted_file(paths, &paths.launcher_executable, deadline.clone())?;
+    let runtime = hash_trusted_file(paths, &paths.runtime_executable, deadline)?;
 
     Ok(ActivationBinding {
         boot_id,
@@ -522,7 +542,11 @@ fn read_trusted_file(
     Ok(TrustedRead { bytes, identity })
 }
 
-fn hash_trusted_file(paths: &ActivationPaths, path: &Path) -> Result<TrustedDigest> {
+fn hash_trusted_file(
+    paths: &ActivationPaths,
+    path: &Path,
+    deadline: Option<WorkBudget>,
+) -> Result<TrustedDigest> {
     let (mut file, identity) = open_trusted_file(
         paths,
         path,
@@ -533,6 +557,9 @@ fn hash_trusted_file(paths: &ActivationPaths, path: &Path) -> Result<TrustedDige
     let mut total = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("activation executable hashing")?;
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -561,6 +588,7 @@ fn hash_runtime_image(
     path: &Path,
     expected_size: u64,
     expected_digest: &str,
+    deadline: Option<WorkBudget>,
 ) -> Result<TrustedDigest> {
     let (mut file, identity) = open_trusted_file(
         paths,
@@ -583,6 +611,9 @@ fn hash_runtime_image(
     let mut total = magic.len() as u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("activation runtime image hashing")?;
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;

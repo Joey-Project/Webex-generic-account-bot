@@ -15,6 +15,7 @@ pub mod runner;
 #[cfg(target_os = "linux")]
 mod runner_input;
 pub mod webex;
+mod work_budget;
 
 pub use config::{
     BotConfig, CodexConfig, CodexConfigPatch, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES,

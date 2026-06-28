@@ -352,14 +352,10 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(launcherModule, /PR_CAPBSET_DROP/);
     assert.match(launcherModule, /capability_bounding_set\(\)\?\.is_empty\(\)/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
-    assert.match(
-      source,
-      /tokio::task::spawn_blocking\(isolated_execution::preflight\)/,
-    );
-    assert.match(
-      source,
-      /Duration::from_secs\(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS\)/,
-    );
+    assert.match(source, /isolated_execution::preflight_bounded\(\)\.await/);
+    assert.match(source, /wait_for_client_disconnect\(socket\)/);
+    assert.match(source, /ExecutionCancellation::new\(\)/);
+    assert.match(source, /cancellation\.cancel\(\)/);
     assert.match(source, /IsolatedRunResult::Completed/);
     assert.match(
       isolatedExecution,
