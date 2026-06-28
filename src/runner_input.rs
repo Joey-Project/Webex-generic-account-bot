@@ -26,6 +26,8 @@ use crate::{
     isolated_execution::production_codex_group_ids,
     launcher_protocol::{
         INPUT_STAGING_PROCESS_TIMEOUT_SECONDS, INPUT_STAGING_WORK_TIMEOUT_SECONDS,
+        PENDING_WORKSPACE_CLEANUP_PROCESS_TIMEOUT_SECONDS,
+        PENDING_WORKSPACE_CLEANUP_WORK_TIMEOUT_SECONDS,
     },
     work_budget::{WorkBudget, run_blocking_with_process_watchdog},
 };
@@ -52,6 +54,7 @@ pub(crate) struct PendingWorkspace {
     workspace: File,
     workspace_name: CString,
     workspace_identity: ObjectIdentity,
+    cleanup_armed: bool,
 }
 
 impl PendingWorkspace {
@@ -63,33 +66,46 @@ impl PendingWorkspace {
     fn pending_path(&self) -> &Path {
         &self.pending_path
     }
-}
 
-impl Drop for PendingWorkspace {
-    fn drop(&mut self) {
-        // Keep the workspace descriptor live while checking the pathname. The
-        // launcher removes the pending name by quarantine rename before use.
-        let held_identity = stat_fd(self.workspace.as_raw_fd())
-            .ok()
-            .map(|metadata| metadata.identity());
-        if held_identity.as_ref() != Some(&self.workspace_identity) {
-            tracing::warn!(
-                run_id = %self.run_id,
-                "refusing to clean a pending workspace whose held identity changed"
-            );
-            return;
+    pub(crate) async fn cleanup(mut self) -> Result<()> {
+        let deadline = WorkBudget::after(std::time::Duration::from_secs(
+            PENDING_WORKSPACE_CLEANUP_WORK_TIMEOUT_SECONDS,
+        ));
+        run_blocking_with_process_watchdog(
+            "pending workspace cleanup",
+            std::time::Duration::from_secs(PENDING_WORKSPACE_CLEANUP_PROCESS_TIMEOUT_SECONDS),
+            move || self.cleanup_with_deadline(Some(&deadline)),
+        )
+        .await?
+    }
+
+    fn cleanup_with_deadline(&mut self, deadline: Option<&WorkBudget>) -> Result<()> {
+        if !self.cleanup_armed {
+            return Ok(());
         }
-        if let Err(error) = remove_owned_workspace(
+        let held_identity = stat_fd(self.workspace.as_raw_fd())?.identity();
+        if held_identity != self.workspace_identity {
+            bail!("refusing to clean a pending workspace whose held identity changed");
+        }
+        remove_owned_workspace(
             &self.pending_root,
             &self.workspace,
             &self.workspace_name,
             &self.workspace_identity,
             true,
-        ) {
+            deadline,
+        )?;
+        self.cleanup_armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PendingWorkspace {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
             tracing::warn!(
                 run_id = %self.run_id,
-                error = %error,
-                "failed to clean a pending workspace"
+                "pending workspace cleanup was deferred to tmpfiles"
             );
         }
     }
@@ -323,6 +339,7 @@ fn stage_workspace_at(
             &workspace_name,
             &workspace_identity,
             false,
+            None,
         ) {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(anyhow!(
@@ -339,6 +356,7 @@ fn stage_workspace_at(
         workspace,
         workspace_name,
         workspace_identity,
+        cleanup_armed: true,
     })
 }
 
@@ -822,7 +840,11 @@ fn remove_owned_workspace(
     workspace_name: &CStr,
     expected: &ObjectIdentity,
     missing_ok: bool,
+    deadline: Option<&WorkBudget>,
 ) -> Result<()> {
+    if let Some(deadline) = deadline {
+        deadline.check("pending workspace cleanup")?;
+    }
     let current = match stat_at(pending_root.as_raw_fd(), workspace_name) {
         Ok(current) => current,
         Err(error) if missing_ok && error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
@@ -833,7 +855,7 @@ fn remove_owned_workspace(
     if &current.identity() != expected {
         bail!("refusing to clean a replaced pending workspace");
     }
-    remove_tree_at(pending_root.as_raw_fd(), workspace_name)?;
+    remove_tree_at(pending_root.as_raw_fd(), workspace_name, deadline)?;
     sync_filesystem(workspace).context("failed to persist pending workspace cleanup")
 }
 
@@ -845,7 +867,10 @@ fn sync_filesystem(file: &File) -> Result<()> {
     Ok(())
 }
 
-fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {
+fn remove_tree_at(parent_fd: RawFd, name: &CStr, deadline: Option<&WorkBudget>) -> Result<()> {
+    if let Some(deadline) = deadline {
+        deadline.check("pending workspace cleanup")?;
+    }
     let metadata = stat_at(parent_fd, name)?;
     if metadata.file_type() == libc::S_IFDIR {
         let directory = open_directory_at(parent_fd, name, true)?;
@@ -854,7 +879,7 @@ fn remove_tree_at(parent_fd: RawFd, name: &CStr) -> Result<()> {
         }
         for child in list_directory(directory.as_raw_fd(), WORKSPACE_ENTRY_MAX)? {
             let child = c_string(&child)?;
-            remove_tree_at(directory.as_raw_fd(), &child)?;
+            remove_tree_at(directory.as_raw_fd(), &child, deadline)?;
         }
         sync_checked(&directory)?;
         unlink_at(parent_fd, name, libc::AT_REMOVEDIR)?;
@@ -1026,14 +1051,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stages_empty_and_copied_workspaces_with_sealer_metadata() {
+    #[tokio::test]
+    async fn stages_empty_and_copied_workspaces_with_sealer_metadata() {
         let fixture = Fixture::new();
         let empty = fixture.stage("message-empty", None).unwrap();
         assert!(fs::read_dir(empty.pending_path()).unwrap().next().is_none());
         assert_directory_metadata(empty.pending_path(), fixture.uid, fixture.gid);
         let empty_path = empty.pending_path().to_owned();
-        drop(empty);
+        empty.cleanup().await.unwrap();
         assert!(!empty_path.exists());
 
         let evidence = fixture.evidence("evidence");
@@ -1056,6 +1081,9 @@ mod tests {
         assert_eq!(file.gid(), fixture.gid);
         assert_eq!(file.mode() & 0o7777, SOURCE_FILE_MODE);
         assert_eq!(file.nlink(), 1);
+        let staged_path = staged.pending_path().to_owned();
+        staged.cleanup().await.unwrap();
+        assert!(!staged_path.exists());
     }
 
     #[test]
@@ -1181,12 +1209,12 @@ mod tests {
         fixture.assert_pending_empty();
     }
 
-    #[test]
-    fn guard_removes_only_its_still_pending_tree() {
+    #[tokio::test]
+    async fn bounded_cleanup_removes_only_its_still_pending_tree() {
         let fixture = Fixture::new();
         let pending = fixture.stage("drop", None).unwrap();
         let pending_path = pending.pending_path().to_owned();
-        drop(pending);
+        pending.cleanup().await.unwrap();
         assert!(!pending_path.exists());
 
         let quarantined = fixture.stage("quarantine", None).unwrap();
@@ -1194,9 +1222,20 @@ mod tests {
         fs::create_dir(&quarantine_root).unwrap();
         let moved = quarantine_root.join(quarantined.run_id());
         fs::rename(quarantined.pending_path(), &moved).unwrap();
-        drop(quarantined);
+        quarantined.cleanup().await.unwrap();
         assert!(moved.is_dir());
         fixture.assert_pending_empty();
+    }
+
+    #[test]
+    fn drop_defers_pending_cleanup_to_tmpfiles() {
+        let fixture = Fixture::new();
+        let pending = fixture.stage("deferred", None).unwrap();
+        let pending_path = pending.pending_path().to_owned();
+
+        drop(pending);
+
+        assert!(pending_path.is_dir());
     }
 
     #[test]

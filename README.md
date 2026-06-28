@@ -761,7 +761,10 @@ budget.
 Pending workspace publication and removal use `syncfs` through the held
 workspace descriptor so the non-enumerable pending root need not be opened for
 listing; the launcher likewise fsyncs source-quarantine removal before it can
-consume a sealed run.
+consume a sealed run. After staging, every normal success or failure path runs
+pending cleanup in the same bounded blocking-worker/process-watchdog envelope
+as staging. A forcibly dropped async task never performs recursive I/O in
+`Drop`; it leaves the private tree for the existing one-day tmpfiles fallback.
 
 The launcher re-verifies the activation receipt on every preflight and execute
 request. Its boot ID comes from the root-owned systemd

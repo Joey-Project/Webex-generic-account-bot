@@ -76,7 +76,9 @@ superseded_by:
   startup preflight and both per-run launcher connections.
   Pending workspace publication and bot-side removal use `syncfs` through the
   held workspace fd before returning, preserving a non-enumerable `2730`
-  pending root.
+  pending root. Normal post-staging cleanup runs in a bounded blocking worker;
+  async task drop defers the private tree to the existing tmpfiles crash
+  fallback instead of performing recursive I/O on a runtime thread.
   Configured request concurrency cannot exceed the socket's four accepted
   connections, and the service runtime maximum stays above the protocol's
   largest request plus preparation, cleanup, and response budget.

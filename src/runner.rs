@@ -250,21 +250,27 @@ impl CodexExecutionBackend for EphemeralLinuxUserBackend {
             )
             .await
             .context("failed to stage the isolated Codex workspace")?;
-            let request = ephemeral_execute_request(
-                invocation.config,
-                invocation.prompt,
-                invocation.message_id,
-                pending.run_id(),
-            )?;
-            let completed = client
-                .execute(request)
-                .await
-                .context("ephemeral Codex launcher execution failed")?;
-            let final_message = normalize_launcher_message(
-                &completed.output,
-                completed.truncated,
-                invocation.config.output_limit_chars,
-            )?;
+            let run_id = pending.run_id().to_owned();
+            let execution = async {
+                let request = ephemeral_execute_request(
+                    invocation.config,
+                    invocation.prompt,
+                    invocation.message_id,
+                    &run_id,
+                )?;
+                let completed = client
+                    .execute(request)
+                    .await
+                    .context("ephemeral Codex launcher execution failed")?;
+                normalize_launcher_message(
+                    &completed.output,
+                    completed.truncated,
+                    invocation.config.output_limit_chars,
+                )
+            }
+            .await;
+            let cleanup = pending.cleanup().await;
+            let final_message = finalise_ephemeral_execution(execution, cleanup)?;
             return Ok(CodexRunOutput {
                 final_message,
                 stdout: String::new(),
@@ -279,6 +285,20 @@ impl CodexExecutionBackend for EphemeralLinuxUserBackend {
                 "ephemeral-linux-user Codex execution is supported only on Linux"
             ))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finalise_ephemeral_execution<T>(execution: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (execution, cleanup) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => {
+            Err(cleanup_error).context("failed to clean pending Codex workspace")
+        }
+        (Err(execution_error), Err(cleanup_error)) => Err(anyhow!(
+            "{execution_error:#}; failed to clean pending Codex workspace: {cleanup_error:#}"
+        )),
     }
 }
 
@@ -765,6 +785,35 @@ mod tests {
             "complete answer"
         );
         assert!(normalize_launcher_message("", true, 64).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ephemeral_execution_preserves_cleanup_failures() {
+        assert_eq!(
+            finalise_ephemeral_execution(Ok("done"), Ok(())).unwrap(),
+            "done"
+        );
+
+        let execution_error =
+            finalise_ephemeral_execution::<()>(Err(anyhow!("execution failed")), Ok(()))
+                .unwrap_err()
+                .to_string();
+        assert!(execution_error.contains("execution failed"));
+
+        let cleanup_error = finalise_ephemeral_execution(Ok(()), Err(anyhow!("cleanup failed")))
+            .unwrap_err()
+            .to_string();
+        assert!(cleanup_error.contains("failed to clean pending Codex workspace"));
+
+        let combined = finalise_ephemeral_execution::<()>(
+            Err(anyhow!("execution failed")),
+            Err(anyhow!("cleanup failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(combined.contains("execution failed"), "{combined}");
+        assert!(combined.contains("cleanup failed"), "{combined}");
     }
 
     fn valid_ephemeral_config() -> CodexConfig {

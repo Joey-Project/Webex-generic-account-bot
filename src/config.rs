@@ -1146,7 +1146,7 @@ prompt_template = "Follow up on {original_message_id}: {body}"
         let config: BotConfig = toml::from_str(
             r#"
 [server]
-attempt_lease_secs = 3000
+attempt_lease_secs = 3600
 
 [codex]
 model = "gpt-5.5"
@@ -1179,7 +1179,7 @@ allow_all_senders = true
         let mut config: BotConfig = toml::from_str(
             r#"
 [server]
-attempt_lease_secs = 3000
+attempt_lease_secs = 3600
 max_concurrent_requests = 5
 
 [codex]
@@ -1304,7 +1304,7 @@ trusted_prompt_authors = true
             &path,
             r#"
 [server]
-attempt_lease_secs = 3000
+attempt_lease_secs = 3600
 
 [codex]
 model = "gpt-5.5"
