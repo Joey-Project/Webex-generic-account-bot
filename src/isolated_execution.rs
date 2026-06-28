@@ -31,10 +31,10 @@ use crate::{
     codex_launcher::AuthorisedPeer,
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
-        ExecuteRequest, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS, OUTPUT_MAX_BYTES,
-        ReasoningEffort,
+        ExecuteRequest, LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS,
+        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS, OUTPUT_MAX_BYTES, ReasoningEffort,
     },
-    work_budget::{WorkBudget, WorkCancellation},
+    work_budget::{WorkBudget, WorkCancellation, run_blocking_with_process_watchdog},
 };
 
 pub const RUNTIME_ROOT: &str = "/opt/webex-generic-account-bot/runtime";
@@ -260,9 +260,12 @@ pub async fn preflight_bounded(cancellation: &ExecutionCancellation) -> Result<V
         Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
         cancellation.inner.clone(),
     );
-    tokio::task::spawn_blocking(move || preflight_with_deadline(Some(deadline)))
-        .await
-        .context("isolated Codex preflight task failed")?
+    run_blocking_with_process_watchdog(
+        "isolated Codex preflight",
+        Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
+        move || preflight_with_deadline(Some(deadline)),
+    )
+    .await?
 }
 
 #[cfg(target_os = "linux")]
@@ -292,13 +295,13 @@ pub async fn execute(
         Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
         cancellation.inner.clone(),
     );
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_execution(&request_for_preparation, source_uid, deadline)
-    })
+    let prepared = run_blocking_with_process_watchdog(
+        "isolated Codex preparation",
+        Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
+        move || prepare_execution(&request_for_preparation, source_uid, deadline),
+    )
     .await
-    .map_err(|error| {
-        IsolatedExecutionError::Failed(anyhow!("isolated Codex preparation task failed: {error}"))
-    })??;
+    .map_err(IsolatedExecutionError::Failed)??;
     let PreparedExecution {
         plan,
         mut workspace,

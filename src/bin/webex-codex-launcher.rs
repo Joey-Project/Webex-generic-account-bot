@@ -14,9 +14,9 @@ use webex_generic_account_bot::{
     },
     isolated_execution::{self, ExecutionCancellation, IsolatedExecutionError, IsolatedRunResult},
     launcher_protocol::{
-        CompletedResponse, FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse,
-        REQUEST_MAX_BYTES, RejectedResponse, RejectionCode, decode_request_frame,
-        encode_response_frame,
+        CompletedResponse, FRAME_HEADER_BYTES, LAUNCHER_CANCELLATION_DRAIN_SECONDS,
+        LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES, RejectedResponse, RejectionCode,
+        decode_request_frame, encode_response_frame,
     },
 };
 
@@ -24,6 +24,8 @@ use webex_generic_account_bot::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const CONTROL_BUFFER_BYTES: usize = 128;
+#[cfg(target_os = "linux")]
+const STUCK_WORK_EXIT_CODE: i32 = 70;
 
 #[cfg(target_os = "linux")]
 struct ReceivedPacket {
@@ -124,7 +126,15 @@ async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> bool {
         result = &mut preflight => result.is_ok(),
         _ = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
-            preflight.await.is_ok()
+            match timeout(
+                Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
+                &mut preflight,
+            )
+            .await
+            {
+                Ok(result) => result.is_ok(),
+                Err(_) => terminate_stuck_launcher("cancelled preflight did not drain"),
+            }
         }
     }
 }
@@ -142,9 +152,23 @@ async fn execute_until_disconnect(
         result = &mut execution => result,
         _ = wait_for_client_disconnect(socket) => {
             cancellation.cancel();
-            execution.await
+            match timeout(
+                Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
+                &mut execution,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => terminate_stuck_launcher("cancelled execution did not drain"),
+            }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_stuck_launcher(reason: &'static str) -> ! {
+    tracing::error!(reason, "terminating a launcher with stuck blocking work");
+    std::process::exit(STUCK_WORK_EXIT_CODE)
 }
 
 #[cfg(target_os = "linux")]

@@ -63,6 +63,9 @@ superseded_by:
   budgets that are included in ephemeral attempt-lease validation. Blocking
   file workers check cooperative deadlines and launcher-socket cancellation;
   the launcher waits for their scoped cleanup instead of detaching them.
+  Independent process watchdogs terminate stuck staging or launcher
+  preparation before the surrounding 10-minute lease budget, while client
+  disconnect gives cooperative launcher cleanup a final 30-second grace.
   Configured request concurrency cannot exceed the socket's four accepted
   connections, and the service runtime maximum stays above the protocol's
   largest request plus preparation, cleanup, and response budget.

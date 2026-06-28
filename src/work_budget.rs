@@ -2,11 +2,49 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+
+const STUCK_WORK_EXIT_CODE: i32 = 70;
+
+pub(crate) async fn run_blocking_with_process_watchdog<F, T>(
+    operation: &'static str,
+    hard_timeout: Duration,
+    work: F,
+) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = Instant::now() + hard_timeout;
+    let (completed, completion) = mpsc::channel();
+    thread::Builder::new()
+        .name("webex-bounded-work".to_owned())
+        .spawn(move || {
+            match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(completed_at) if completed_at <= deadline => {}
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::error!(operation, "blocking work exceeded its process deadline");
+                    std::process::exit(STUCK_WORK_EXIT_CODE);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        })
+        .context("failed to start the blocking-work process watchdog")?;
+
+    tokio::task::spawn_blocking(move || {
+        let result = work();
+        let _ = completed.send(Instant::now());
+        result
+    })
+    .await
+    .with_context(|| format!("{operation} task failed"))
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkCancellation {
@@ -56,6 +94,8 @@ impl WorkBudget {
 mod tests {
     use super::*;
 
+    const WATCHDOG_CHILD_ENV: &str = "WEBEX_WORK_WATCHDOG_CHILD";
+
     #[test]
     fn expired_deadline_fails_closed() {
         let deadline = WorkBudget::after(Duration::ZERO);
@@ -68,5 +108,48 @@ mod tests {
         let budget = WorkBudget::with_cancellation(Duration::from_secs(60), cancellation.clone());
         cancellation.cancel();
         assert!(budget.check("test work").is_err());
+    }
+
+    #[tokio::test]
+    async fn process_watchdog_disarms_when_blocking_work_finishes() {
+        let result = run_blocking_with_process_watchdog("test work", Duration::from_secs(5), || 42)
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn process_watchdog_child_helper() {
+        if std::env::var_os(WATCHDOG_CHILD_ENV).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(run_blocking_with_process_watchdog(
+            "stuck test work",
+            Duration::from_millis(50),
+            || {
+                thread::sleep(Duration::from_secs(10));
+            },
+        ));
+        panic!("stuck child work escaped the process watchdog");
+    }
+
+    #[test]
+    fn process_watchdog_hard_stops_stuck_blocking_work() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "work_budget::tests::process_watchdog_child_helper",
+                "--nocapture",
+            ])
+            .env(WATCHDOG_CHILD_ENV, "1")
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(STUCK_WORK_EXIT_CODE));
     }
 }

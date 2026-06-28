@@ -42,6 +42,12 @@ const ISOLATED_EXECUTION_PATH = fileURLToPath(
 const INPUT_SEALER_PATH = fileURLToPath(
   new URL('../src/input_sealer.rs', import.meta.url),
 );
+const RUNNER_INPUT_PATH = fileURLToPath(
+  new URL('../src/runner_input.rs', import.meta.url),
+);
+const WORK_BUDGET_PATH = fileURLToPath(
+  new URL('../src/work_budget.rs', import.meta.url),
+);
 const RUNTIME_SOURCE_PATH = fileURLToPath(
   new URL('../src/bin/webex-codex-runtime.rs', import.meta.url),
 );
@@ -327,11 +333,20 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('keeps transient execution behind fixed launcher and runtime boundaries', async () => {
-    const [source, launcherModule, isolatedExecution, runtimeSource] = await Promise.all([
+    const [
+      source,
+      launcherModule,
+      isolatedExecution,
+      runtimeSource,
+      runnerInput,
+      workBudget,
+    ] = await Promise.all([
       fs.readFile(LAUNCHER_SOURCE_PATH, 'utf8'),
       fs.readFile(LAUNCHER_MODULE_PATH, 'utf8'),
       fs.readFile(ISOLATED_EXECUTION_PATH, 'utf8'),
       fs.readFile(RUNTIME_SOURCE_PATH, 'utf8'),
+      fs.readFile(RUNNER_INPUT_PATH, 'utf8'),
+      fs.readFile(WORK_BUDGET_PATH, 'utf8'),
     ]);
     const launcherSources = `${source}\n${launcherModule}`;
     const productionSource = source.split(
@@ -368,7 +383,13 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(source, /wait_for_client_disconnect\(socket\)/);
     assert.match(source, /ExecutionCancellation::new\(\)/);
     assert.match(source, /cancellation\.cancel\(\)/);
+    assert.match(source, /LAUNCHER_CANCELLATION_DRAIN_SECONDS/);
+    assert.match(source, /terminate_stuck_launcher/);
     assert.match(source, /IsolatedRunResult::Completed/);
+    assert.match(isolatedExecution, /run_blocking_with_process_watchdog/);
+    assert.match(runnerInput, /run_blocking_with_process_watchdog/);
+    assert.match(workBudget, /completion\.recv_timeout\(/);
+    assert.match(workBudget, /std::process::exit\(STUCK_WORK_EXIT_CODE\)/);
     assert.match(
       isolatedExecution,
       /const SYSTEMD_RUN_PATH: &str = "\/usr\/bin\/systemd-run";/,
@@ -393,7 +414,7 @@ describe('Codex launcher systemd boundary', () => {
       /const ACTIVATION_BOOT_ID_CREDENTIAL_NAME: &str = "activation-boot-id";/,
     );
     assert.match(isolatedExecution, /env::var_os\(CREDENTIALS_DIRECTORY_ENV\)/);
-    assert.match(isolatedExecution, /tokio::task::spawn_blocking/);
+    assert.match(workBudget, /tokio::task::spawn_blocking/);
     assert.match(
       isolatedExecution,
       /Duration::from_secs\(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS\)/,

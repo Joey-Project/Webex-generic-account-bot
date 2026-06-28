@@ -8,13 +8,19 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 
-use crate::work_budget::WorkBudget;
+use crate::{
+    launcher_protocol::{
+        LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+    },
+    work_budget::{WorkBudget, run_blocking_with_process_watchdog},
+};
 
 pub const ACTIVATION_RECEIPT_PATH: &str = "/run/webex-codex-activation/receipt.json";
 pub const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
@@ -277,6 +283,18 @@ enum TrustedFileKind {
 
 pub fn verify_activation() -> Result<VerifiedActivation> {
     verify_activation_with(&ActivationPaths::production())
+}
+
+pub async fn verify_activation_bounded() -> Result<VerifiedActivation> {
+    let deadline = WorkBudget::after(Duration::from_secs(
+        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+    ));
+    run_blocking_with_process_watchdog(
+        "bot activation verification",
+        Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
+        move || verify_activation_with_deadline(&ActivationPaths::production(), Some(deadline)),
+    )
+    .await?
 }
 
 pub fn verify_activation_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {

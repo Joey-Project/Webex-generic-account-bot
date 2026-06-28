@@ -24,8 +24,10 @@ use ring::{
 use crate::{
     input_sealer::{CODEX_PENDING_INPUT_ROOT, ensure_posix_acl_absent},
     isolated_execution::production_codex_group_ids,
-    launcher_protocol::INPUT_STAGING_WORK_TIMEOUT_SECONDS,
-    work_budget::WorkBudget,
+    launcher_protocol::{
+        INPUT_STAGING_PROCESS_TIMEOUT_SECONDS, INPUT_STAGING_WORK_TIMEOUT_SECONDS,
+    },
+    work_budget::{WorkBudget, run_blocking_with_process_watchdog},
 };
 
 const PENDING_ROOT_MODE: u32 = 0o2730;
@@ -104,23 +106,26 @@ pub(crate) async fn stage_workspace(
     let deadline = WorkBudget::after(std::time::Duration::from_secs(
         INPUT_STAGING_WORK_TIMEOUT_SECONDS,
     ));
-    tokio::task::spawn_blocking(move || {
-        let groups = production_codex_group_ids()?;
-        stage_workspace_at(
-            Path::new(CODEX_PENDING_INPUT_ROOT),
-            0,
-            effective_uid(),
-            groups.launch,
-            &message_id,
-            evidence_root.as_deref(),
-            Limits {
-                deadline: Some(deadline),
-                ..Limits::default()
-            },
-        )
-    })
-    .await
-    .context("pending workspace staging task failed")?
+    run_blocking_with_process_watchdog(
+        "pending workspace staging",
+        std::time::Duration::from_secs(INPUT_STAGING_PROCESS_TIMEOUT_SECONDS),
+        move || {
+            let groups = production_codex_group_ids()?;
+            stage_workspace_at(
+                Path::new(CODEX_PENDING_INPUT_ROOT),
+                0,
+                effective_uid(),
+                groups.launch,
+                &message_id,
+                evidence_root.as_deref(),
+                Limits {
+                    deadline: Some(deadline),
+                    ..Limits::default()
+                },
+            )
+        },
+    )
+    .await?
 }
 
 #[derive(Clone)]

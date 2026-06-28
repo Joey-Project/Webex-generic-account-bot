@@ -717,10 +717,14 @@ existing depth, entry, and byte limits, then identifies the run with an
 unpredictable ID. A request is sent only after launcher preflight succeeds.
 Preflight responses and bot-side evidence staging each have a 10-minute bound;
 their blocking file work and launcher preparation use cooperative 9-minute
-deadlines plus response margins. Deadline and client-disconnect cancellation
-are checked between directory, copy, and hash operations, so blocking workers
-finish cleanup before their futures return. These fixed costs are included in
-ephemeral attempt-lease validation. Ephemeral configuration also caps
+deadlines plus response margins. Each blocking worker also owns an independent
+570-second process watchdog, so a syscall that cannot reach a cooperative
+checkpoint terminates the systemd-managed bot or per-connection launcher
+before the 10-minute lease budget expires. Deadline and client-disconnect
+cancellation are checked between directory, copy, and hash operations, so
+normal paths finish scoped cleanup before their futures return. These fixed
+costs are included in ephemeral attempt-lease validation. Ephemeral
+configuration also caps
 `server.max_concurrent_requests` at the launcher's fixed four accepted
 connections. The launcher service runtime maximum is protocol-bound above the
 largest request, preparation, cleanup, and response budget.
@@ -740,9 +744,11 @@ Source quarantine trees are removed immediately after sealing, and the
 inode-guarded consumed tree is removed when the transient run finishes, fails,
 times out, or is cancelled. Closing the bot's launcher socket cancels
 preflight, preparation, and a running transient unit even while the authorised
-bot process remains alive. A normal launcher response is emitted only after
-consumed-tree cleanup succeeds; one-day tmpfiles expiry remains only a crash or
-host-reboot fallback.
+bot process remains alive. Cancellation receives a 30-second cleanup grace;
+the per-connection launcher then exits if blocked work cannot drain. A normal
+launcher response is emitted only after consumed-tree cleanup succeeds;
+one-day tmpfiles expiry remains only a crash, hard-watchdog, or host-reboot
+fallback.
 
 PR 4c1c does not mint the receipt or activate production configuration. PR
 4c2 owns permission-capable production-image canaries and receipt creation.

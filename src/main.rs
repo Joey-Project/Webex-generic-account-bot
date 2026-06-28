@@ -107,7 +107,8 @@ async fn main() -> Result<()> {
         if config.uses_ephemeral_linux_user() {
             #[cfg(target_os = "linux")]
             {
-                webex_generic_account_bot::activation::verify_activation()
+                webex_generic_account_bot::activation::verify_activation_bounded()
+                    .await
                     .context("ephemeral Codex runner activation preflight failed")?;
                 webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
                     .context("ephemeral Codex launcher installation preflight failed")?;
@@ -123,7 +124,8 @@ async fn main() -> Result<()> {
     if config.uses_ephemeral_linux_user() {
         #[cfg(target_os = "linux")]
         {
-            webex_generic_account_bot::activation::verify_activation()
+            webex_generic_account_bot::activation::verify_activation_bounded()
+                .await
                 .context("ephemeral Codex runner activation preflight failed")?;
             webex_generic_account_bot::launcher_client::verify_fixed_launcher_socket()
                 .context("ephemeral Codex launcher installation preflight failed")?;
