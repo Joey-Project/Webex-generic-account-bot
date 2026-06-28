@@ -348,17 +348,17 @@ fn open_pidfd(pid: u32) -> Result<OwnedFd> {
 
 #[cfg(target_os = "linux")]
 fn pidfd_is_alive(pidfd: RawFd) -> Result<()> {
-    // SAFETY: pidfd_send_signal with signal 0 performs a liveness check and uses no pointers.
-    let status = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd,
-            0,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
+    let mut descriptor = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
     };
-    if status != 0 {
+    // SAFETY: descriptor points to one initialized pollfd and timeout zero never blocks.
+    let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if status != 0 || descriptor.revents != 0 {
         return Err(anyhow!("launcher caller exited during request"));
     }
     Ok(())
@@ -682,5 +682,12 @@ mod tests {
             is_symlink: true,
             ..trusted_metadata()
         }));
+    }
+
+    #[test]
+    fn pidfd_poll_reports_the_current_process_alive() {
+        let pidfd = open_pidfd(std::process::id()).unwrap();
+
+        pidfd_is_alive(pidfd.as_raw_fd()).unwrap();
     }
 }
