@@ -13,9 +13,11 @@
 - [completed] Implement PR 4b's immutable root image, transient `DynamicUser`
   execution, credential/model-channel separation, containment, and crash
   cleanup.
-- [pending] Implement PR 4c runner activation and permission-capable
-  production-image smoke tests, then separately grant config-worker socket
-  access and enable `/config pull` under reviewed bot/config policy.
+- [completed] Add PR 4c1a's boot-scoped activation receipt foundation without
+  wiring it into config or execution paths.
+- [pending] Implement PR 4c1b's root fresh-inode input sealer, PR 4c1c's gated
+  runner wiring, and PR 4c2's permission-capable production-image smoke tests;
+  then separately grant config-worker socket access and enable `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
   service work inside the Webex request handler.

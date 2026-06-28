@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod codex_launcher;
 pub mod config;
 pub mod config_actions;

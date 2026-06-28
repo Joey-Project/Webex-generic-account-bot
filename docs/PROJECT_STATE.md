@@ -29,6 +29,9 @@
   still not a member of the launcher or input groups, and a compile-time gate
   rejects launcher preflight/execute until PR 4c adds a root input sealer and
   passes production-image capability canaries.
+- Runner PR 4c1a adds the boot-scoped activation receipt format and strict
+  root-owned verifier as an unused, fail-closed foundation. No runtime/config
+  path calls it and no receipt-minting command or bot group access is added.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -37,13 +40,15 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4c must still prove the inner Codex/bwrap credential, post-exec process
+- PRs 4c1b, 4c1c, and 4c2 must still deliver the fresh-inode sealer, gated
+  runner wiring, and live production canaries. PR 4c2 must prove the inner
+  Codex/bwrap credential, post-exec process
   memory and `/proc`, inherited descriptor, and network boundaries against the
   production image and host kernel policy before activating the runner. Static
-  PR 4b preflight is not a substitute for those canaries. It must also deliver
-  the narrow root-owned broker that converts bot-produced inputs into the
+  PR 4b preflight is not a substitute for those canaries. PR 4c1b must deliver
+  the narrow root-owned sealer that converts bot-produced inputs into the
   recursively validated sealed workspace tree.
-- PRs 4a and 4b do not grant bot group access, enable
+- PRs through 4c1a do not grant bot group access, enable
   `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
   `/config sync`.
 

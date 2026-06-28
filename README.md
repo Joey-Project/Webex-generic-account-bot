@@ -635,6 +635,21 @@ Until PR 4c and the separate command-enablement changes land, the bot has no
 launcher-, input-, or worker-socket group access and `/config pull`,
 `/config reload`, and `/config sync` remain disabled.
 
+### PR 4c1a Activation Receipt Foundation (Not Activated)
+
+PR 4c1a adds only the fail-closed boot-scoped activation receipt format and
+verifier. The root-owned receipt path is
+`/run/webex-codex-activation/receipt.json`; tmpfiles creates only its root-owned
+parent directory and deliberately does not pre-create a receipt. A valid
+receipt binds the current boot ID, active runtime manifest, runtime image
+digest, fixed bot/launcher/runtime executable digests, Codex version, model,
+and the exact required production-canary result set. Unknown, missing, false,
+stale, oversized, linked, misowned, or modified-runtime receipts are rejected.
+
+This foundation does not call the verifier from config or execution paths and
+provides no command that can mint a receipt. Runner activation remains blocked
+until the later sealer/client wiring and production-image canary PRs land.
+
 ## Development
 
 Generated CI runs:

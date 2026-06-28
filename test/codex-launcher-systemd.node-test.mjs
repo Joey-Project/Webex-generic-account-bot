@@ -9,6 +9,10 @@ const SOCKET_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.socket');
 const SERVICE_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher@.service');
 const SYSUSERS_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.sysusers.conf');
 const TMPFILES_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.tmpfiles.conf');
+const ACTIVATION_TMPFILES_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-codex-activation.tmpfiles.conf',
+);
 const RUNTIME_SYSUSERS_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-codex-runtime.sysusers.conf',
@@ -130,6 +134,13 @@ describe('Codex launcher systemd boundary', () => {
         '',
       ].join('\n'),
     );
+  });
+
+  it('provisions only the root-owned boot-scoped activation directory', async () => {
+    const tmpfiles = await fs.readFile(ACTIVATION_TMPFILES_PATH, 'utf8');
+
+    assert.equal(tmpfiles, 'd /run/webex-codex-activation 0755 root root -\n');
+    assert.doesNotMatch(tmpfiles, /receipt\.json/);
   });
 
   it('keeps systemd and process verification visible without writable host paths', async () => {
