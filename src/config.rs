@@ -943,14 +943,14 @@ allow_all_senders = true
     }
 
     #[test]
-    fn parses_status_only_config_commands() {
+    fn rejects_pull_config_until_runner_isolation_is_enabled() {
         let config: BotConfig = toml::from_str(
             r#"
 [config_commands]
 room_id = "admin-room"
 allowed_person_ids = []
 allowed_person_emails = ["operator@example.com"]
-allowed_commands = ["status"]
+allowed_commands = ["status", "pull"]
 
 [[rooms]]
 room_id = "room-1"
@@ -959,10 +959,8 @@ allow_all_senders = true
         )
         .unwrap();
 
-        config.validate().unwrap();
-        let config_commands = config.config_commands.as_ref().unwrap();
-        assert!(config_commands.command_allowed(crate::config_commands::ConfigCommand::Status));
-        assert!(config_commands.sender_allowed(None, Some("operator@example.com")));
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(error.contains("only status is supported"));
     }
 
     #[test]

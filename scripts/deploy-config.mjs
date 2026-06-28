@@ -7,14 +7,18 @@ import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
+const SHARED_DEPLOYMENT_LOCK = '/run/webex-config-deploy/deploy-config.lock';
+const PREPARE_CHECKOUT_DIR = '/var/lib/webex-generic-account-bot/config-prepare-checkout';
+
 const DEFAULTS = Object.freeze({
   configRepo: 'git@github.com:WebexServices-staging/webex-generic-account-bot-config.git',
   configRef: 'main',
   checkoutDir: '/var/lib/webex-generic-account-bot/config-checkout',
+  stagingDir: '/var/lib/webex-generic-account-bot/config-staging',
   renderedConfig: '/var/lib/webex-generic-account-bot/rendered/production.toml',
   botCodeDir: '/opt/webex-generic-account-bot/code',
   service: 'webex-generic-account-bot',
-  lockDir: '/run/webex-generic-account-bot/deploy-config.lock',
+  lockDir: SHARED_DEPLOYMENT_LOCK,
   metadataFile: '/var/lib/webex-generic-account-bot/rendered/deploy-status.json',
   gitBin: '/usr/bin/git',
   bashBin: '/usr/bin/bash',
@@ -55,6 +59,8 @@ const FLOCK_TIMEOUT_MS = 5000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
 const CHILD_CLOSE_GRACE_MS = 1000;
 const MAX_INSTALL_TRANSACTION_BYTES = 16 * 1024;
+const INSTALL_TRANSACTION_MODE = 0o644;
+const LEGACY_INSTALL_TRANSACTION_MODE = 0o600;
 const DEPLOYMENT_STATUSES = new Set([
   'deployed',
   'installed_without_restart',
@@ -70,6 +76,7 @@ const HOST_OVERRIDE_KEYS = new Set([
   'configRepo',
   'configRef',
   'checkoutDir',
+  'stagingDir',
   'renderedConfig',
   'botCodeDir',
   'service',
@@ -103,6 +110,65 @@ const GIT_SAFE_CONFIG = [
 ];
 const GIT_NO_LAZY_FETCH_ENV = Object.freeze({ GIT_NO_LAZY_FETCH: '1' });
 
+export const DEPLOY_EXIT_PROCESS_TREE_UNCONTAINED = 70;
+export const DEPLOY_EXIT_LOCK_BUSY = 75;
+
+class DeploymentStatusError extends Error {
+  constructor(message, exitStatus, { cause = null } = {}) {
+    super(message);
+    this.name = new.target.name;
+    this.exitStatus = exitStatus;
+    if (cause) {
+      this.cause = cause;
+    }
+  }
+}
+
+export class DeploymentLockBusyError extends DeploymentStatusError {
+  constructor(message, options) {
+    super(message, DEPLOY_EXIT_LOCK_BUSY, options);
+  }
+}
+
+export class ProcessTreeUncontainedError extends DeploymentStatusError {
+  constructor(message, options) {
+    super(message, DEPLOY_EXIT_PROCESS_TREE_UNCONTAINED, options);
+  }
+}
+
+function combineCleanupError(primaryError, cleanupError, label) {
+  const reason = primaryError
+    ? `${primaryError.message}; ${label}: ${cleanupError.message}`
+    : `${label}: ${cleanupError.message}`;
+  return errorPreservingDeploymentStatus(primaryError, reason, cleanupError);
+}
+
+function errorPreservingDeploymentStatus(primaryError, message, secondaryError = null) {
+  const classifiedError = findDeploymentStatusError(primaryError)
+    ?? findDeploymentStatusError(secondaryError);
+  if (classifiedError) {
+    return new classifiedError.constructor(message, { cause: classifiedError });
+  }
+  const error = new Error(message);
+  if (primaryError || secondaryError) {
+    error.cause = primaryError ?? secondaryError;
+  }
+  return error;
+}
+
+function findDeploymentStatusError(error) {
+  const seen = new Set();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    if (current instanceof DeploymentStatusError) {
+      return current;
+    }
+    seen.add(current);
+    current = current.cause;
+  }
+  return null;
+}
+
 class UsageError extends Error {
   constructor(message) {
     super(message);
@@ -123,6 +189,7 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     ...DEFAULTS,
     apply: false,
     prepare: false,
+    requestId: null,
     dryRun: false,
     skipRestart: false,
     status: false,
@@ -139,6 +206,8 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
       options.apply = true;
     } else if (arg === '--prepare') {
       options.prepare = true;
+    } else if (arg === '--request-id') {
+      options.requestId = requiredValue(argv, (index += 1), arg);
     } else if (arg === '--dry-run') {
       options.dryRun = true;
     } else if (arg === '--skip-restart' || arg === '--skip-reload') {
@@ -156,6 +225,9 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     } else if (arg === '--checkout-dir') {
       options.checkoutDir = requiredValue(argv, (index += 1), arg);
       overrides.add('checkoutDir');
+    } else if (arg === '--staging-dir') {
+      options.stagingDir = requiredValue(argv, (index += 1), arg);
+      overrides.add('stagingDir');
     } else if (arg === '--rendered-config') {
       options.renderedConfig = requiredValue(argv, (index += 1), arg);
       overrides.add('renderedConfig');
@@ -225,6 +297,17 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   if ((options.prepare || options.status) && options.skipRestart) {
     throw new UsageError('--skip-restart cannot be used with --prepare or --status.');
   }
+  if (options.requestId !== null) {
+    if (!options.prepare) {
+      throw new UsageError('--request-id is valid only with --prepare.');
+    }
+    if (!/^[0-9a-f]{64}$/.test(options.requestId)) {
+      throw new UsageError('--request-id must be 64 lowercase hexadecimal characters.');
+    }
+  }
+  if (options.prepare && !overrides.has('checkoutDir')) {
+    options.checkoutDir = PREPARE_CHECKOUT_DIR;
+  }
   validateHostOverrides(overrides, allowHostOverrides);
   options.hostOverrides = Object.freeze([...overrides]);
   validateOptions(options);
@@ -234,23 +317,25 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
 export function usage() {
   return `Usage:
   node scripts/deploy-config.mjs --dry-run
-  node scripts/deploy-config.mjs --prepare [--json]
+  node scripts/deploy-config.mjs --prepare [--request-id <id>] [--json]
   node scripts/deploy-config.mjs --apply [--skip-restart]
   node scripts/deploy-config.mjs --status [--json]
 
 Options:
       --apply                     Execute the fixed deployment plan.
       --prepare                   Fetch, render, and validate an immutable staged config only.
+      --request-id <id>           Bind prepared metadata to a 64-character worker action ID.
       --dry-run                   Print the fixed deployment plan without running it.
       --status                    Print the last deployment metadata file when present.
       --skip-restart              Install config but do not restart the service.
       --config-repo <url>         Expected config repo URL.
       --config-ref <name>         Expected config ref, default main.
-      --checkout-dir <path>       Host-owned config checkout directory.
+      --checkout-dir <path>       Mode-specific config checkout directory.
+      --staging-dir <path>        Worker-owned prepared config staging directory.
       --rendered-config <path>    Final rendered config path.
       --bot-code-dir <path>       Host-installed bot code directory.
       --service <name>            systemd service name.
-      --lock-dir <path>           Single-flight lock directory.
+      --lock-dir <path>           Single-flight lock file.
       --metadata-file <path>      Deployment metadata JSON path.
       --git-bin <path>            Fixed Git executable path.
       --bash-bin <path>           Fixed Bash executable path.
@@ -271,10 +356,14 @@ Options:
 export function buildDeployPlan(options) {
   const checkoutDir = path.resolve(options.checkoutDir);
   const checkoutWorkDir = path.join(checkoutDir, 'work');
+  const stagingDir = path.resolve(options.stagingDir);
   const renderedConfig = path.resolve(options.renderedConfig);
-  const candidateConfig = `${renderedConfig}.candidate`;
-  const stagedConfig = `${renderedConfig}.staged`;
-  const stagedMetadataFile = `${renderedConfig}.staged.json`;
+  const stagingBase = path.join(stagingDir, path.basename(renderedConfig));
+  const candidateConfig = options.prepare
+    ? `${stagingBase}.candidate`
+    : `${renderedConfig}.candidate`;
+  const stagedConfig = `${stagingBase}.staged`;
+  const stagedMetadataFile = `${stagingBase}.staged.json`;
   const backupConfig = `${renderedConfig}.previous`;
   const transactionFile = `${renderedConfig}.transaction`;
   const botCodeDir = path.resolve(options.botCodeDir);
@@ -412,6 +501,7 @@ export function buildDeployPlan(options) {
   const plan = {
     checkoutDir,
     checkoutWorkDir,
+    stagingDir,
     renderedConfig,
     candidateConfig,
     stagedConfig,
@@ -435,6 +525,8 @@ export function buildDeployPlan(options) {
     sshKnownHosts: path.resolve(options.sshKnownHosts),
     commandTimeoutMs: options.commandTimeoutMs,
     outputLimitBytes: options.outputLimitBytes,
+    requestId: options.requestId,
+    prepare: options.prepare,
   };
   assertSafePlanPathTopology(plan);
   return plan;
@@ -503,7 +595,11 @@ export async function runCli({
     writeStatus(stdout, result, options.json);
     return 0;
   } catch (error) {
-    const status = error instanceof UsageError ? 2 : 1;
+    const status = error instanceof UsageError
+      ? 2
+      : error instanceof DeploymentStatusError
+        ? error.exitStatus
+        : 1;
     stderr.write(`${redact(String(error.message))}\n`);
     if (error instanceof UsageError) {
       stderr.write('\n');
@@ -552,15 +648,14 @@ export async function executePreparePlan({
   let primaryError = null;
   let outputDirectoriesTrusted = false;
   try {
-    await prepareTrustedOutputDirectories(plan, fsApi);
+    await prepareTrustedOutputDirectories(plan, fsApi, {
+      includeStaging: true,
+      includeLive: false,
+    });
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
-    const transaction = await readInstallTransaction(plan, fsApi);
-    if (transaction) {
-      throw new Error(
-        `deployment recovery is required before preparing a new config revision: ${transaction.phase}`,
-      );
-    }
+    await assertPrepareLiveDirectoriesReadOnly(plan, fsApi);
+    await assertNoInstallTransaction(plan, fsApi);
     await prepareFreshCheckout(plan, fsApi, { removeBackup: false });
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -596,10 +691,7 @@ export async function executePreparePlan({
       cleanupError ??= error;
     }
     if (cleanupError) {
-      const reason = primaryError
-        ? `${primaryError.message}; prepare cleanup failed: ${cleanupError.message}`
-        : `prepare cleanup failed: ${cleanupError.message}`;
-      throw new Error(reason);
+      throw combineCleanupError(primaryError, cleanupError, 'prepare cleanup failed');
     }
   }
 }
@@ -629,6 +721,7 @@ export async function executePlan({
     status,
     reason,
     configRevision = captures.configRevision || null,
+    primaryFailure = null,
   ) => {
     recordedFailureStatus = status;
     recordedFailureConfigRevision = configRevision;
@@ -637,7 +730,11 @@ export async function executePlan({
       failureMetadataWritten = true;
     } catch (error) {
       failureMetadataError = error;
-      throw new Error(`${reason}; failed to write deployment failure metadata: ${error.message}`);
+      throw errorPreservingDeploymentStatus(
+        primaryFailure,
+        `${reason}; failed to write deployment failure metadata: ${error.message}`,
+        error,
+      );
     }
   };
   try {
@@ -683,11 +780,18 @@ export async function executePlan({
           rollbackError = restoreError;
         }
         if (rollbackError) {
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; failed to restore previous config: ${rollbackError.message}`,
+            rollbackError,
+          );
           await recordFailure(
             'failed_restart_rollback_failed',
-            `${error.message}; failed to restore previous config: ${rollbackError.message}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(`${error.message}; failed to restore previous config: ${rollbackError.message}`);
+          throw failure;
         }
         try {
           await runServiceRollback(plan, rollbackState, runner, parentEnv);
@@ -698,31 +802,51 @@ export async function executePlan({
           const durabilityFailure = rollbackDurabilityError
             ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
             : '';
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
+            restoreError,
+          );
           await recordFailure(
             'failed_restart_rollback_restart_failed',
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
-          );
+          throw failure;
         }
         if (rollbackDurabilityError) {
           const reason = `${error.message}; restored previous config and service but failed to make config rollback durable: ${rollbackDurabilityError.message}`;
-          await recordFailure('failed_restart_rollback_failed', reason);
-          throw new Error(reason);
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            reason,
+            rollbackDurabilityError,
+          );
+          await recordFailure(
+            'failed_restart_rollback_failed',
+            reason,
+            undefined,
+            failure,
+          );
+          throw failure;
         }
-        await recordFailure('failed_restart_rolled_back', error.message);
+        await recordFailure('failed_restart_rolled_back', error.message, undefined, error);
         try {
           await clearInstallTransaction(plan, fsApi);
           await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
         } catch (restoreError) {
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
+            restoreError,
+          );
           await recordFailure(
             'failed_restart_rollback_failed',
-            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
+            failure.message,
+            undefined,
+            failure,
           );
-          throw new Error(
-            `${error.message}; restored previous config and service but failed to finalise rollback: ${restoreError.message}`,
-          );
+          throw failure;
         }
         throw error;
       }
@@ -753,11 +877,17 @@ export async function executePlan({
     primaryError = error;
     if (outputDirectoriesTrusted && !failureMetadataWritten && !failureMetadataError) {
       const recoveredCommit = error instanceof CommittedRecoveryError;
-      await recordFailure(
-        commitReached || recoveredCommit ? 'failed_after_commit' : 'failed_apply',
-        error.message,
-        recoveredCommit ? error.configRevision : captures.configRevision || null,
-      );
+      try {
+        await recordFailure(
+          commitReached || recoveredCommit ? 'failed_after_commit' : 'failed_apply',
+          error.message,
+          recoveredCommit ? error.configRevision : captures.configRevision || null,
+          error,
+        );
+      } catch (metadataError) {
+        primaryError = metadataError;
+        throw metadataError;
+      }
     }
     throw error;
   } finally {
@@ -824,7 +954,7 @@ export async function executePlan({
           : closeReason;
     }
     if (combinedReason) {
-      throw new Error(combinedReason);
+      throw errorPreservingDeploymentStatus(primaryError, combinedReason, cleanupError);
     }
   }
 }
@@ -927,20 +1057,93 @@ function validateDeploymentMetadata(metadata) {
   return metadata;
 }
 
+export async function validateDeploymentLockProvisioning(
+  lockDir,
+  fsApi = fs,
+  processApi = process,
+) {
+  const lockParent = path.dirname(lockDir);
+  const policy = deploymentLockPolicy(lockDir);
+  const rootStat = await fsApi.lstat(path.parse(path.resolve(lockDir)).root);
+  let lockParentStat;
+  let lockStat;
+  try {
+    lockParentStat = await fsApi.lstat(lockParent);
+  } catch (error) {
+    if (policy === 'shared' && error?.code === 'ENOENT') {
+      throw new Error(`shared deployment lock parent is not provisioned: ${lockParent}`);
+    }
+    throw error;
+  }
+  try {
+    lockStat = await fsApi.lstat(lockDir);
+  } catch (error) {
+    if (policy === 'shared' && error?.code === 'ENOENT') {
+      throw new Error(`shared deployment lock is not provisioned: ${lockDir}`);
+    }
+    throw error;
+  }
+  assertTrustedDeploymentLockParent(
+    lockParent,
+    lockParentStat,
+    policy,
+    rootStat.uid,
+    processApi,
+  );
+  assertTrustedDeploymentLock(
+    lockDir,
+    lockStat,
+    policy,
+    lockParentStat,
+    rootStat.uid,
+    processApi,
+  );
+  return { policy, lockParentStat, lockStat, rootUid: rootStat.uid };
+}
+
 async function acquireLock(lockDir, fsApi) {
   const lockParent = path.dirname(lockDir);
-  await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
-  const lockParentStat = await fsApi.lstat(lockParent);
-  assertTrustedDeploymentDirectory(lockParent, lockParentStat, 'lock parent');
+  const policy = deploymentLockPolicy(lockDir);
+  let lockParentStat;
+  let provisionedLockStat = null;
+  let rootUid = null;
+  if (policy === 'shared') {
+    const provisioning = await validateDeploymentLockProvisioning(lockDir, fsApi);
+    lockParentStat = provisioning.lockParentStat;
+    provisionedLockStat = provisioning.lockStat;
+    rootUid = provisioning.rootUid;
+  } else {
+    await fsApi.mkdir(lockParent, { recursive: true, mode: 0o700 });
+    lockParentStat = await fsApi.lstat(lockParent);
+    assertTrustedDeploymentLockParent(lockParent, lockParentStat, policy);
+  }
   const openFlags = fsConstants.O_RDWR
-    | fsConstants.O_CREAT
+    | (policy === 'private' ? fsConstants.O_CREAT : 0)
     | (fsConstants.O_NOFOLLOW ?? 0);
   let handle;
   try {
-    handle = await fsApi.open(lockDir, openFlags, 0o600);
-    await handle.chmod(0o600);
+    try {
+      handle = await fsApi.open(lockDir, openFlags, 0o600);
+    } catch (error) {
+      if (policy === 'shared' && error?.code === 'ENOENT') {
+        throw new Error(`shared deployment lock is not provisioned: ${lockDir}`);
+      }
+      throw error;
+    }
+    if (policy === 'private') {
+      await handle.chmod(0o600);
+    }
     const identity = await handle.stat();
-    assertTrustedDeploymentLock(lockDir, identity);
+    assertTrustedDeploymentLock(
+      lockDir,
+      identity,
+      policy,
+      lockParentStat,
+      rootUid,
+    );
+    if (provisionedLockStat && !sameFileIdentity(provisionedLockStat, identity)) {
+      throw new Error(`shared deployment lock changed before acquisition: ${lockDir}`);
+    }
     await acquireKernelFlock(handle, lockDir);
     const owner = {
       version: 1,
@@ -951,13 +1154,38 @@ async function acquireLock(lockDir, fsApi) {
       lock_kind: 'linux-flock',
     };
     await writeLockMetadata(handle, owner);
-    await syncDirectory(lockParent, fsApi);
+    if (policy === 'private') {
+      await syncDirectory(lockParent, fsApi);
+    }
+    const currentParentIdentity = await fsApi.lstat(lockParent);
+    assertTrustedDeploymentLockParent(
+      lockParent,
+      currentParentIdentity,
+      policy,
+      rootUid,
+    );
+    if (!sameFileIdentity(lockParentStat, currentParentIdentity)) {
+      throw new Error(`deployment lock parent changed during acquisition: ${lockParent}`);
+    }
     const currentIdentity = await fsApi.lstat(lockDir);
-    assertTrustedDeploymentLock(lockDir, currentIdentity);
+    assertTrustedDeploymentLock(
+      lockDir,
+      currentIdentity,
+      policy,
+      currentParentIdentity,
+      rootUid,
+    );
     if (!sameFileIdentity(identity, currentIdentity)) {
       throw new Error(`deployment lock path changed during acquisition: ${lockDir}`);
     }
-    return { owner, handle, identity };
+    return {
+      owner,
+      handle,
+      identity,
+      lockParentIdentity: currentParentIdentity,
+      policy,
+      rootUid,
+    };
   } catch (error) {
     await handle?.close().catch(() => {});
     throw error;
@@ -1008,7 +1236,9 @@ async function acquireKernelFlock(handle, lockFile) {
       if (code === 0) {
         finish();
       } else if (code === 1) {
-        finish(new Error(`deployment already in progress: ${lockFile}`));
+        finish(new DeploymentLockBusyError(
+          `deployment already in progress: ${lockFile}`,
+        ));
       } else {
         finish(new Error(
           `${FLOCK_BIN} failed with code ${code}: ${truncate(redact(stderr), 1000)}`,
@@ -1019,7 +1249,25 @@ async function acquireKernelFlock(handle, lockFile) {
 }
 
 async function verifyLockForRelease(lockDir, lockState, fsApi) {
+  const lockParent = path.dirname(lockDir);
+  const currentParentIdentity = await fsApi.lstat(lockParent);
+  assertTrustedDeploymentLockParent(
+    lockParent,
+    currentParentIdentity,
+    lockState.policy,
+    lockState.rootUid,
+  );
+  if (!sameFileIdentity(lockState.lockParentIdentity, currentParentIdentity)) {
+    throw new Error(`deployment lock parent changed before cleanup: ${lockParent}`);
+  }
   const currentIdentity = await fsApi.lstat(lockDir);
+  assertTrustedDeploymentLock(
+    lockDir,
+    currentIdentity,
+    lockState.policy,
+    currentParentIdentity,
+    lockState.rootUid,
+  );
   if (!sameFileIdentity(lockState.identity, currentIdentity)) {
     throw new Error(`deployment lock path changed before cleanup: ${lockDir}`);
   }
@@ -1103,18 +1351,236 @@ function gitEnvForRepo(options) {
   };
 }
 
-export async function runCommand(commandSpec, env, signal = null) {
+export function createLinuxCgroupV2MembershipInspector({
+  fsApi = fs,
+  platform = process.platform,
+  procRoot = '/proc',
+  cgroupRoot = '/sys/fs/cgroup',
+  selfPid = process.pid,
+} = {}) {
+  const baselineMarker = Symbol('linux-cgroup-v2-baseline');
+  const resolvedProcRoot = path.resolve(procRoot);
+  const resolvedCgroupRoot = path.resolve(cgroupRoot);
+
+  const readSnapshot = async () => {
+    if (platform !== 'linux') {
+      throw new Error(`Linux cgroup v2 inspection is unavailable on ${platform}`);
+    }
+    if (!Number.isSafeInteger(selfPid) || selfPid <= 0) {
+      throw new Error('current process PID is invalid');
+    }
+
+    const cgroupPath = await readUnifiedCgroupPath(fsApi, resolvedProcRoot);
+    const cgroupDir = resolveCgroupDirectory(resolvedCgroupRoot, cgroupPath);
+    const membershipFile = path.join(cgroupDir, 'cgroup.procs');
+    const firstPids = await readCgroupPids(fsApi, membershipFile);
+    const firstIdentities = await readProcessIdentities(fsApi, resolvedProcRoot, firstPids);
+
+    const confirmedCgroupPath = await readUnifiedCgroupPath(fsApi, resolvedProcRoot);
+    if (confirmedCgroupPath !== cgroupPath) {
+      throw new Error('current process changed cgroup during membership inspection');
+    }
+    const confirmedPids = await readCgroupPids(fsApi, membershipFile);
+    if (!sameNumberArray(firstPids, confirmedPids)) {
+      throw new Error('cgroup membership changed during membership inspection');
+    }
+    const identities = await readProcessIdentities(fsApi, resolvedProcRoot, confirmedPids);
+    for (const pid of confirmedPids) {
+      if (firstIdentities.get(pid)?.key !== identities.get(pid)?.key) {
+        throw new Error(`process identity changed during membership inspection: ${pid}`);
+      }
+    }
+
+    const selfIdentity = identities.get(selfPid);
+    if (!selfIdentity || !selfIdentity.live) {
+      throw new Error('current process is not a live member of its cgroup');
+    }
+    return { cgroupPath, cgroupDir, identities, selfIdentity };
+  };
+
+  return Object.freeze({
+    async captureBaseline() {
+      const snapshot = await readSnapshot();
+      return Object.freeze({
+        marker: baselineMarker,
+        cgroupPath: snapshot.cgroupPath,
+        cgroupDir: snapshot.cgroupDir,
+        selfIdentityKey: snapshot.selfIdentity.key,
+        identityKeys: new Set(
+          [...snapshot.identities.values()].map((identity) => identity.key),
+        ),
+      });
+    },
+
+    async assertContained(baseline) {
+      if (baseline?.marker !== baselineMarker || !(baseline.identityKeys instanceof Set)) {
+        throw new Error('cgroup membership baseline is invalid');
+      }
+      const snapshot = await readSnapshot();
+      if (
+        snapshot.cgroupPath !== baseline.cgroupPath
+        || snapshot.cgroupDir !== baseline.cgroupDir
+        || snapshot.selfIdentity.key !== baseline.selfIdentityKey
+      ) {
+        throw new Error('current process cgroup identity changed after command execution');
+      }
+      const unexpected = [...snapshot.identities.values()]
+        .filter((identity) => identity.live && !baseline.identityKeys.has(identity.key))
+        .map((identity) => identity.key);
+      if (unexpected.length > 0) {
+        throw new ProcessTreeUncontainedError(
+          `command left live cgroup members outside its PID identity baseline: ${unexpected.join(', ')}`,
+        );
+      }
+    },
+  });
+}
+
+async function readUnifiedCgroupPath(fsApi, procRoot) {
+  const contents = await fsApi.readFile(path.join(procRoot, 'self', 'cgroup'), 'utf8');
+  const matches = String(contents)
+    .split('\n')
+    .filter((line) => line.startsWith('0::'));
+  if (matches.length !== 1) {
+    throw new Error('current process does not have exactly one unified cgroup v2 membership');
+  }
+  const cgroupPath = matches[0].slice(3);
+  if (
+    !cgroupPath.startsWith('/')
+    || cgroupPath.includes('\0')
+    || path.posix.normalize(cgroupPath) !== cgroupPath
+  ) {
+    throw new Error('current process has an invalid unified cgroup path');
+  }
+  return cgroupPath;
+}
+
+function resolveCgroupDirectory(cgroupRoot, cgroupPath) {
+  const cgroupDir = path.resolve(cgroupRoot, `.${cgroupPath}`);
+  if (!isPathWithin(cgroupRoot, cgroupDir)) {
+    throw new Error('current process cgroup path escapes the cgroup v2 mount');
+  }
+  return cgroupDir;
+}
+
+async function readCgroupPids(fsApi, membershipFile) {
+  const contents = await fsApi.readFile(membershipFile, 'utf8');
+  const lines = String(contents).split('\n').filter((line) => line.length > 0);
+  const pids = lines.map((line) => {
+    if (!/^[1-9][0-9]*$/.test(line)) {
+      throw new Error(`cgroup contains an invalid PID entry: ${JSON.stringify(line)}`);
+    }
+    const pid = Number(line);
+    if (!Number.isSafeInteger(pid)) {
+      throw new Error(`cgroup PID is outside the safe integer range: ${line}`);
+    }
+    return pid;
+  }).sort((left, right) => left - right);
+  if (new Set(pids).size !== pids.length) {
+    throw new Error('cgroup contains duplicate PID entries');
+  }
+  return pids;
+}
+
+async function readProcessIdentities(fsApi, procRoot, pids) {
+  const identities = await Promise.all(pids.map(async (pid) => {
+    const contents = await fsApi.readFile(path.join(procRoot, String(pid), 'stat'), 'utf8');
+    return parseProcessIdentity(pid, String(contents));
+  }));
+  return new Map(identities.map((identity) => [identity.pid, identity]));
+}
+
+function parseProcessIdentity(expectedPid, statContents) {
+  const commEnd = statContents.lastIndexOf(') ');
+  const commStart = statContents.indexOf(' (');
+  if (commStart <= 0 || commEnd <= commStart) {
+    throw new Error(`process stat is malformed for PID ${expectedPid}`);
+  }
+  const pidText = statContents.slice(0, commStart);
+  const fields = statContents.slice(commEnd + 2).trim().split(/\s+/);
+  if (pidText !== String(expectedPid) || fields.length < 20) {
+    throw new Error(`process stat identity is malformed for PID ${expectedPid}`);
+  }
+  const state = fields[0];
+  const startTicks = fields[19];
+  if (!/^[A-Za-z]$/.test(state) || !/^[0-9]+$/.test(startTicks)) {
+    throw new Error(`process stat identity is invalid for PID ${expectedPid}`);
+  }
+  return Object.freeze({
+    pid: expectedPid,
+    startTicks,
+    key: `${expectedPid}:${startTicks}`,
+    live: !['X', 'Z'].includes(state.toUpperCase()),
+  });
+}
+
+function sameNumberArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+const DEFAULT_PROCESS_TREE_INSPECTOR = createLinuxCgroupV2MembershipInspector();
+
+async function captureProcessTreeBaseline(inspector) {
+  if (
+    !inspector
+    || typeof inspector.captureBaseline !== 'function'
+    || typeof inspector.assertContained !== 'function'
+  ) {
+    throw new ProcessTreeUncontainedError('command process-tree inspector is invalid');
+  }
+  try {
+    return await inspector.captureBaseline();
+  } catch (error) {
+    throw processTreeInspectionError(error, 'before command spawn');
+  }
+}
+
+async function assertCommandProcessTreeContained(inspector, baseline) {
+  try {
+    await inspector.assertContained(baseline);
+  } catch (error) {
+    throw processTreeInspectionError(error, 'after command close');
+  }
+}
+
+function processTreeInspectionError(error, phase) {
+  if (error instanceof ProcessTreeUncontainedError) {
+    return error;
+  }
+  return new ProcessTreeUncontainedError(
+    `cannot reliably inspect command process tree ${phase}: ${error.message}`,
+    { cause: error },
+  );
+}
+
+export async function runCommand(
+  commandSpec,
+  env,
+  signal = null,
+  processTreeInspector = DEFAULT_PROCESS_TREE_INSPECTOR,
+) {
+  throwIfAborted(signal);
+  const processTreeBaseline = await captureProcessTreeBaseline(processTreeInspector);
   throwIfAborted(signal);
   return await new Promise((resolve, reject) => {
     const detached = process.platform !== 'win32';
     const invocation = commandInvocation(commandSpec);
-    const child = spawn(invocation.bin, invocation.args, {
-      cwd: commandSpec.cwd || TRUSTED_CHILD_CWD,
-      env,
-      detached,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    let child;
+    try {
+      child = spawn(invocation.bin, invocation.args, {
+        cwd: commandSpec.cwd || TRUSTED_CHILD_CWD,
+        env,
+        detached,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      void assertCommandProcessTreeContained(
+        processTreeInspector,
+        processTreeBaseline,
+      ).then(() => reject(error), reject);
+      return;
+    }
     let stdout = '';
     let stderr = '';
     const stdoutCapture = outputCapture(commandSpec.outputLimitBytes);
@@ -1122,6 +1588,9 @@ export async function runCommand(commandSpec, env, signal = null) {
     let terminationError = null;
     let killTimer = null;
     let closeTimer = null;
+    let forcedCloseError = null;
+    let spawnError = null;
+    let containmentCheck = null;
     let settled = false;
     const clearTimers = () => {
       clearTimeout(timeoutTimer);
@@ -1149,6 +1618,13 @@ export async function runCommand(commandSpec, env, signal = null) {
       clearTimers();
       resolve(result);
     };
+    const verifyContainment = () => {
+      containmentCheck ??= assertCommandProcessTreeContained(
+        processTreeInspector,
+        processTreeBaseline,
+      );
+      return containmentCheck;
+    };
     const beginTermination = (error) => {
       if (settled || terminationError) {
         return;
@@ -1158,12 +1634,16 @@ export async function runCommand(commandSpec, env, signal = null) {
       killTimer = setTimeout(() => {
         killChildProcess(child, detached, 'SIGKILL');
         closeTimer = setTimeout(() => {
+          forcedCloseError = new ProcessTreeUncontainedError(
+            `${terminationError.message}; child did not close after SIGKILL`,
+          );
           child.stdout.destroy();
           child.stderr.destroy();
           child.unref();
-          rejectOnce(new Error(
-            `${terminationError.message}; child did not close after SIGKILL`,
-          ));
+          void verifyContainment().then(
+            () => rejectOnce(forcedCloseError),
+            (inspectionError) => rejectOnce(inspectionError),
+          );
         }, commandSpec.closeGraceMs ?? CHILD_CLOSE_GRACE_MS);
         closeTimer.unref?.();
       }, commandSpec.terminationGraceMs ?? CHILD_TERMINATION_GRACE_MS);
@@ -1189,32 +1669,42 @@ export async function runCommand(commandSpec, env, signal = null) {
       stderr = stderrCapture.append(stderr, chunk);
     });
     child.on('error', (error) => {
-      rejectOnce(error);
+      spawnError = error;
     });
     child.on('close', (code) => {
-      if (terminationError) {
-        rejectOnce(terminationError);
-        return;
-      }
-      if (code === 0 || commandSpec.optional) {
-        const result = {
-          stdout,
-          stderr,
-          code,
-          stdoutTruncated: stdoutCapture.truncated,
-          stderrTruncated: stderrCapture.truncated,
-        };
-        try {
-          validateCommandResult(commandSpec, result);
-        } catch (error) {
-          rejectOnce(error);
+      void verifyContainment().then(() => {
+        if (forcedCloseError) {
+          rejectOnce(forcedCloseError);
           return;
         }
-        resolveOnce(result);
-        return;
-      }
-      const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
-      rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
+        if (terminationError) {
+          rejectOnce(terminationError);
+          return;
+        }
+        if (spawnError) {
+          rejectOnce(spawnError);
+          return;
+        }
+        if (code === 0 || commandSpec.optional) {
+          const result = {
+            stdout,
+            stderr,
+            code,
+            stdoutTruncated: stdoutCapture.truncated,
+            stderrTruncated: stderrCapture.truncated,
+          };
+          try {
+            validateCommandResult(commandSpec, result);
+          } catch (error) {
+            rejectOnce(error);
+            return;
+          }
+          resolveOnce(result);
+          return;
+        }
+        const suffix = stderrCapture.truncated ? ' [stderr truncated]' : '';
+        rejectOnce(new Error(`${commandSpec.bin} failed with code ${code}: ${truncate(redact(stderr), 2000)}${suffix}`));
+      }, rejectOnce);
     });
   });
 }
@@ -1390,6 +1880,7 @@ function writePlan(stdout, plan, json) {
   stdout.write(`config_ref=${plan.configRef}\n`);
   stdout.write(`checkout_dir=${plan.checkoutDir}\n`);
   stdout.write(`checkout_work_dir=${plan.checkoutWorkDir}\n`);
+  stdout.write(`staging_dir=${plan.stagingDir}\n`);
   stdout.write(`rendered_config=${plan.renderedConfig}\n`);
   stdout.write(`candidate_config=${plan.candidateConfig}\n`);
   stdout.write(`staged_config=${plan.stagedConfig}\n`);
@@ -1429,6 +1920,7 @@ function serialisablePlan(plan) {
     config_ref: plan.configRef,
     checkout_dir: plan.checkoutDir,
     checkout_work_dir: plan.checkoutWorkDir,
+    staging_dir: plan.stagingDir,
     rendered_config: plan.renderedConfig,
     candidate_config: plan.candidateConfig,
     staged_config: plan.stagedConfig,
@@ -1443,6 +1935,7 @@ function serialisablePlan(plan) {
     ssh_known_hosts: plan.sshKnownHosts,
     command_timeout_ms: plan.commandTimeoutMs,
     output_limit_bytes: plan.outputLimitBytes,
+    request_id: plan.requestId,
     commands: allPlanCommands(plan),
   };
 }
@@ -1453,6 +1946,7 @@ function validateOptions(options) {
   validateService(options.service);
   for (const key of [
     'checkoutDir',
+    'stagingDir',
     'renderedConfig',
     'botCodeDir',
     'lockDir',
@@ -1514,6 +2008,7 @@ async function writeMetadataAtomically(file, metadata, fsApi, { mode = 0o644 } =
   let handle = null;
   try {
     handle = await fsApi.open(temporary, 'wx', mode);
+    await handle.chmod(mode);
     await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
     await handle.sync();
     await handle.close();
@@ -1599,6 +2094,9 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
     ['SSH key directory', path.dirname(plan.sshKey), true],
     ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts), true],
   ];
+  if (plan.prepare) {
+    paths.splice(2, 0, ['staging directory', plan.stagingDir, false]);
+  }
   const seen = new Set();
   for (const [label, candidate, includePath] of paths) {
     const resolved = path.resolve(candidate);
@@ -1636,19 +2134,29 @@ async function canonicalPathWithMissingSuffix(candidate, fsApi) {
   }
 }
 
-async function prepareTrustedOutputDirectories(plan, fsApi) {
-  const directories = [
-    [path.dirname(plan.renderedConfig), 'rendered config directory'],
-    [path.dirname(plan.metadataFile), 'metadata directory'],
-  ];
+async function prepareTrustedOutputDirectories(
+  plan,
+  fsApi,
+  { includeStaging = false, includeLive = true } = {},
+) {
+  const directories = [];
+  if (includeStaging) {
+    directories.push([plan.stagingDir, 'staging directory', 0o700]);
+  }
+  if (includeLive) {
+    directories.push(
+      [path.dirname(plan.renderedConfig), 'rendered config directory', 0o755],
+      [path.dirname(plan.metadataFile), 'metadata directory', 0o755],
+    );
+  }
   const seen = new Set();
-  for (const [directory, label] of directories) {
+  for (const [directory, label, createMode] of directories) {
     if (seen.has(directory)) {
       continue;
     }
     seen.add(directory);
     await assertTrustedPathAncestors(directory, label, fsApi);
-    await createDirectoryDurably(directory, 0o755, fsApi);
+    await createDirectoryDurably(directory, createMode, fsApi);
     await assertTrustedPathAncestors(directory, label, fsApi);
     const resolved = await fsApi.realpath(directory);
     if (resolved !== path.resolve(directory)) {
@@ -1656,6 +2164,9 @@ async function prepareTrustedOutputDirectories(plan, fsApi) {
     }
     const directoryStat = await fsApi.lstat(directory);
     assertTrustedOutputDirectory(directory, directoryStat, label);
+    if (label === 'staging directory' && (directoryStat.mode & 0o7777) !== 0o700) {
+      throw new Error(`staging directory mode is not trusted: ${directory}`);
+    }
   }
 }
 
@@ -1762,23 +2273,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     throw new Error(`candidate config must be a regular file: ${plan.candidateConfig}`);
   }
 
-  let mode = 0o644;
-  try {
-    const currentStat = await fsApi.lstat(plan.renderedConfig);
-    if (!currentStat.isFile() || currentStat.isSymbolicLink()) {
-      throw new Error(`rendered config must be a regular file when present: ${plan.renderedConfig}`);
-    }
-    assertSafeRenderedConfigMetadata(plan.renderedConfig, currentStat);
-    mode = currentStat.mode & 0o777;
-    if (candidateStat.uid !== currentStat.uid || candidateStat.gid !== currentStat.gid) {
-      await fsApi.chown(plan.candidateConfig, currentStat.uid, currentStat.gid);
-    }
-  } catch (error) {
-    if (!error || error.code !== 'ENOENT') {
-      throw error;
-    }
-  }
-  await fsApi.chmod(plan.candidateConfig, mode);
+  await fsApi.chmod(plan.candidateConfig, 0o600);
   await syncFile(plan.candidateConfig, fsApi);
   const contents = await fsApi.readFile(plan.candidateConfig);
   const configSha256 = createHash('sha256').update(contents).digest('hex');
@@ -1790,7 +2285,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
   if (!stagedStat.isFile() || stagedStat.isSymbolicLink()) {
     throw new Error(`staged config must be a regular file: ${plan.stagedConfig}`);
   }
-  assertSafeRenderedConfigMetadata(plan.stagedConfig, stagedStat);
+  assertWorkerOwnedPrivateFile(plan.stagedConfig, stagedStat, 'staged config');
 
   const metadata = {
     version: 1,
@@ -1799,6 +2294,7 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
     config_ref: plan.configRef,
     config_revision: configRevision,
     config_sha256: configSha256,
+    request_id: plan.requestId,
     bot_code_dir: plan.botCodeDir,
     rendered_config: plan.renderedConfig,
     staged_config: plan.stagedConfig,
@@ -1807,12 +2303,20 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
   };
   try {
     await writeMetadataAtomically(plan.stagedMetadataFile, metadata, fsApi, { mode: 0o600 });
+    const metadataStat = await fsApi.lstat(plan.stagedMetadataFile);
+    assertWorkerOwnedPrivateFile(
+      plan.stagedMetadataFile,
+      metadataStat,
+      'staged metadata file',
+    );
   } catch (error) {
     try {
       await removeDurablyIfPresent(plan.stagedMetadataFile, fsApi);
     } catch (cleanupError) {
-      throw new Error(
+      throw errorPreservingDeploymentStatus(
+        error,
         `${error.message}; failed to remove incomplete staged metadata: ${cleanupError.message}`,
+        cleanupError,
       );
     }
     throw error;
@@ -1868,8 +2372,10 @@ async function installCandidateConfig(plan, configRevision, fsApi) {
       try {
         await rollbackCandidateConfig(plan, installState, fsApi);
       } catch (rollbackError) {
-        throw new Error(
+        throw errorPreservingDeploymentStatus(
+          error,
           `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
+          rollbackError,
         );
       }
     }
@@ -1894,8 +2400,10 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
       await runServiceRollback(plan, installState, runner, parentEnv);
     } catch (error) {
       if (durabilityError) {
-        throw new Error(
+        throw errorPreservingDeploymentStatus(
+          error,
           `${error.message}; config rollback durability also failed: ${durabilityError.message}`,
+          durabilityError,
         );
       }
       throw error;
@@ -1971,7 +2479,7 @@ async function writeInstallTransaction(plan, installState, fsApi) {
     plan.transactionFile,
     transaction,
     fsApi,
-    { mode: 0o600 },
+    { mode: INSTALL_TRANSACTION_MODE },
   );
 }
 
@@ -2065,6 +2573,80 @@ function deploymentMetadataFromInstallState(plan, installState) {
     service_restart_skipped: plan.skipRestart,
     deployed_at: installState.committedAt,
   };
+}
+
+async function assertNoInstallTransaction(plan, fsApi) {
+  try {
+    await fsApi.lstat(plan.transactionFile);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return;
+    }
+    throw new Error(
+      `cannot confirm that no deployment transaction exists: ${error.message}`,
+    );
+  }
+  throw new Error('deployment recovery is required before preparing a new config revision');
+}
+
+async function assertPrepareLiveDirectoriesReadOnly(plan, fsApi) {
+  const directories = [
+    [path.dirname(plan.renderedConfig), 'rendered config directory'],
+    [path.dirname(plan.metadataFile), 'metadata directory'],
+  ];
+  const seen = new Set();
+  for (const [directory, label] of directories) {
+    if (seen.has(directory)) continue;
+    seen.add(directory);
+    await assertPathNotWritableByCurrentProcess(directory, label, fsApi);
+  }
+}
+
+async function assertPathNotWritableByCurrentProcess(directory, label, fsApi) {
+  let current = path.resolve(directory);
+  for (;;) {
+    let stat;
+    try {
+      stat = await fsApi.lstat(current);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+      continue;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${label} must resolve through real directories: ${current}`);
+    }
+    const rootStat = await fsApi.lstat(path.parse(current).root);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+    if (stat.uid !== uid && stat.uid !== rootStat.uid) {
+      throw new Error(`${label} ownership is not trusted: ${current}`);
+    }
+    if (stat.uid === uid) {
+      throw new Error(`${label} must not be owned by the prepare worker: ${current}`);
+    }
+    if (directoryWritableByCurrentProcess(stat)) {
+      throw new Error(`${label} must not be writable by the prepare worker: ${current}`);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+function directoryWritableByCurrentProcess(stat) {
+  const mode = stat.mode & 0o7777;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+  if (uid === 0) return true;
+  if (stat.uid === uid) return (mode & 0o200) !== 0;
+  const groups = new Set(
+    typeof process.getgroups === 'function'
+      ? process.getgroups()
+      : [typeof process.getgid === 'function' ? process.getgid() : stat.gid],
+  );
+  if (groups.has(stat.gid)) return (mode & 0o020) !== 0;
+  return (mode & 0o002) !== 0;
 }
 
 async function readInstallTransaction(plan, fsApi) {
@@ -2249,19 +2831,85 @@ function assertTrustedDeploymentDirectory(file, fileStat, label) {
   }
 }
 
-function assertTrustedDeploymentLock(file, fileStat) {
+function deploymentLockPolicy(lockDir) {
+  return path.resolve(lockDir) === SHARED_DEPLOYMENT_LOCK ? 'shared' : 'private';
+}
+
+function assertTrustedDeploymentLockParent(
+  file,
+  fileStat,
+  policy,
+  rootUid = null,
+  processApi = process,
+) {
+  if (!fileStat.isDirectory() || fileStat.isSymbolicLink()) {
+    throw new Error(`lock parent must be a real directory: ${file}`);
+  }
+  const mode = fileStat.mode & 0o7777;
+  const identity = deploymentProcessIdentity(processApi, fileStat);
+  if (policy === 'shared') {
+    if (fileStat.uid !== rootUid || !identityCanUseSharedGroup(identity, fileStat.gid, rootUid)) {
+      throw new Error(`shared lock parent ownership is not trusted: ${file}`);
+    }
+    if (mode !== 0o750) {
+      throw new Error(`shared lock parent mode is not trusted: ${file}`);
+    }
+    return;
+  }
+  if (fileStat.uid !== identity.uid || fileStat.gid !== identity.gid) {
+    throw new Error(`lock parent ownership is not trusted: ${file}`);
+  }
+  if ((mode & 0o700) !== 0o700 || (mode & 0o077) !== 0) {
+    throw new Error(`lock parent mode is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedDeploymentLock(
+  file,
+  fileStat,
+  policy,
+  lockParentStat,
+  rootUid = null,
+  processApi = process,
+) {
   if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
     throw new Error(`deployment lock must be a real file: ${file}`);
   }
   const mode = fileStat.mode & 0o7777;
-  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
-  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
-  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+  const identity = deploymentProcessIdentity(processApi, fileStat);
+  if (policy === 'shared') {
+    if (
+      fileStat.uid !== rootUid
+      || fileStat.gid !== lockParentStat.gid
+      || !identityCanUseSharedGroup(identity, fileStat.gid, rootUid)
+    ) {
+      throw new Error(`shared deployment lock ownership is not trusted: ${file}`);
+    }
+    if (mode !== 0o660) {
+      throw new Error(`shared deployment lock mode is not trusted: ${file}`);
+    }
+    return;
+  }
+  if (fileStat.uid !== identity.uid || fileStat.gid !== identity.gid) {
     throw new Error(`deployment lock ownership is not trusted: ${file}`);
   }
   if (mode !== 0o600) {
     throw new Error(`deployment lock mode is not trusted: ${file}`);
   }
+}
+
+function deploymentProcessIdentity(processApi, fallbackStat) {
+  const uid = typeof processApi.getuid === 'function' ? processApi.getuid() : fallbackStat.uid;
+  const gid = typeof processApi.getgid === 'function' ? processApi.getgid() : fallbackStat.gid;
+  const groups = new Set(
+    typeof processApi.getgroups === 'function' ? processApi.getgroups() : [gid],
+  );
+  groups.add(gid);
+  return { uid, gid, groups };
+}
+
+function identityCanUseSharedGroup(identity, sharedGid, rootUid) {
+  return identity.uid === rootUid || identity.groups.has(sharedGid);
 }
 
 function assertTrustedInstallTransaction(file, fileStat) {
@@ -2270,11 +2918,10 @@ function assertTrustedInstallTransaction(file, fileStat) {
   }
   const mode = fileStat.mode & 0o7777;
   const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
-  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
-  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+  if (fileStat.uid !== uid) {
     throw new Error(`deployment transaction ownership is not trusted: ${file}`);
   }
-  if (mode !== 0o600) {
+  if (![INSTALL_TRANSACTION_MODE, LEGACY_INSTALL_TRANSACTION_MODE].includes(mode)) {
     throw new Error(`deployment transaction mode is not trusted: ${file}`);
   }
 }
@@ -2290,6 +2937,20 @@ function assertTrustedOutputDirectory(file, fileStat, label) {
     throw new Error(`${label} ownership is not trusted: ${file}`);
   }
   if ((mode & 0o700) !== 0o700 || (mode & 0o022) !== 0) {
+    throw new Error(`${label} mode is not trusted: ${file}`);
+  }
+}
+
+function assertWorkerOwnedPrivateFile(file, fileStat, label) {
+  if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real file: ${file}`);
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : fileStat.uid;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : fileStat.gid;
+  if (fileStat.uid !== uid || fileStat.gid !== gid) {
+    throw new Error(`${label} ownership is not trusted: ${file}`);
+  }
+  if ((fileStat.mode & 0o7777) !== 0o600) {
     throw new Error(`${label} mode is not trusted: ${file}`);
   }
 }
@@ -2315,21 +2976,50 @@ function assertSafePlanPathTopology(plan) {
   const checkoutRoot = path.resolve(plan.checkoutDir);
   const checkoutWork = path.resolve(plan.checkoutWorkDir);
   const lockDir = path.resolve(plan.lockDir);
+  const stagingDir = plan.prepare ? path.resolve(plan.stagingDir) : null;
   const botCodeDir = path.resolve(plan.botCodeDir);
   const botBin = path.resolve(plan.botBin);
-  const outputPaths = [
+  const liveOutputPaths = [
     ['rendered config', path.resolve(plan.renderedConfig)],
-    ['candidate config', path.resolve(plan.candidateConfig)],
-    ['staged config', path.resolve(plan.stagedConfig)],
-    ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
     ['backup config', path.resolve(plan.backupConfig)],
     ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
+    ...(!plan.prepare
+      ? [['candidate config', path.resolve(plan.candidateConfig)]]
+      : []),
   ];
+  const stagingOutputPaths = plan.prepare
+    ? [
+        ['candidate config', path.resolve(plan.candidateConfig)],
+        ['staged config', path.resolve(plan.stagedConfig)],
+        ['staged metadata file', path.resolve(plan.stagedMetadataFile)],
+      ]
+    : [];
+  const outputPaths = [...liveOutputPaths, ...stagingOutputPaths];
   const credentialPaths = [
     ['SSH key', path.resolve(plan.sshKey)],
     ['SSH known-hosts file', path.resolve(plan.sshKnownHosts)],
   ];
+  const liveOutputDirectories = [
+    ['rendered config directory', path.dirname(path.resolve(plan.renderedConfig))],
+    ['metadata directory', path.dirname(path.resolve(plan.metadataFile))],
+  ];
+  const stagingConflicts = [
+    ['checkout directory', checkoutRoot],
+    ['deployment lock directory', lockDir],
+    ['bot code directory', botCodeDir],
+    ['bot binary', botBin],
+    ...liveOutputDirectories,
+    ...credentialPaths,
+    ...liveOutputPaths,
+  ];
+  if (stagingDir) {
+    for (const [label, protectedPath] of stagingConflicts) {
+      if (pathsOverlap(stagingDir, protectedPath)) {
+        throw new UsageError(`staging directory must not overlap ${label}`);
+      }
+    }
+  }
   const protectedPaths = [
     ...outputPaths,
     ['bot code directory', botCodeDir],

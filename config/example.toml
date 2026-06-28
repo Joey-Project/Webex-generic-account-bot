@@ -27,7 +27,8 @@ access_token_file_env = "WEBEX_ACCESS_TOKEN_FILE"
 
 # Optional administrative command Space. Keep this disabled until a dedicated
 # Space and explicit sender allowlist are provisioned. Only status is currently
-# deployable; pull, reload, and sync are reserved for a future durable worker.
+# deployable. Pull remains disabled until Codex runs use the isolated runner;
+# reload and sync additionally require recoverable activation and in-flight drain.
 # [config_commands]
 # room_id = "ADMIN_WEBEX_ROOM_ID"
 # allowed_person_ids = []

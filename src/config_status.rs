@@ -30,9 +30,18 @@ const DEPLOY_STATUS_FILE: &str = "/var/lib/webex-generic-account-bot/rendered/de
 const DEPLOY_TRANSACTION_FILE: &str =
     "/var/lib/webex-generic-account-bot/rendered/production.toml.transaction";
 #[cfg(target_os = "linux")]
+const DEPLOY_TRANSACTION_OWNER_UID: u32 = 0;
+#[cfg(target_os = "linux")]
+const DEPLOY_TRANSACTION_MODE: u32 = 0o644;
+#[cfg(target_os = "linux")]
+const CONFIG_ACTION_STATUS_FILE: &str =
+    "/var/lib/webex-generic-account-bot/config-actions/public-status.json";
+#[cfg(target_os = "linux")]
 const STATUS_FILE_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const TRANSACTION_FILE_MAX_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const CONFIG_ACTION_STATUS_MAX_BYTES: u64 = 16 * 1024;
 #[cfg(target_os = "linux")]
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
@@ -76,6 +85,14 @@ pub struct ConfigStatusSnapshot {
     pub config_revision: Option<String>,
     pub service: Option<String>,
     pub transaction_phase: Option<String>,
+    pub config_action: Option<ConfigActionStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigActionStatusSnapshot {
+    pub action_id: String,
+    pub state: String,
+    pub config_revision: Option<String>,
 }
 
 impl ConfigStatusSnapshot {
@@ -96,10 +113,15 @@ impl ConfigStatusSnapshot {
             .as_deref()
             .map(|phase| format!("\n- Transaction phase: `{phase}`"))
             .unwrap_or_default();
+        let config_action = self
+            .config_action
+            .as_ref()
+            .map(ConfigActionStatusSnapshot::markdown)
+            .unwrap_or_default();
         format!(
             "**Config deployment status**\n\n- State: `{}`\n- {revision_label}: `{revision}`{transaction_phase}\n- Service: `{service}`",
             self.status
-        )
+        ) + &config_action
     }
 
     #[cfg(target_os = "linux")]
@@ -109,6 +131,7 @@ impl ConfigStatusSnapshot {
             config_revision: None,
             service: None,
             transaction_phase: None,
+            config_action: None,
         }
     }
 
@@ -119,7 +142,22 @@ impl ConfigStatusSnapshot {
             config_revision: None,
             service: Some("webex-generic-account-bot".to_owned()),
             transaction_phase: None,
+            config_action: None,
         }
+    }
+}
+
+impl ConfigActionStatusSnapshot {
+    fn markdown(&self) -> String {
+        let revision = self
+            .config_revision
+            .as_deref()
+            .map(|revision| format!("\n- Prepared config revision: `{revision}`"))
+            .unwrap_or_default();
+        format!(
+            "\n\n**Latest configuration action**\n\n- Action: `pull`\n- State: `{}`\n- Action ID: `{}`{revision}",
+            self.state, self.action_id
+        )
     }
 }
 
@@ -133,6 +171,10 @@ pub struct FileConfigStatusProvider {
     status_file: PathBuf,
     #[cfg(target_os = "linux")]
     transaction_file: PathBuf,
+    #[cfg(target_os = "linux")]
+    transaction_owner_uid: u32,
+    #[cfg(target_os = "linux")]
+    action_status_file: PathBuf,
 }
 
 impl Default for FileConfigStatusProvider {
@@ -142,6 +184,10 @@ impl Default for FileConfigStatusProvider {
             status_file: PathBuf::from(DEPLOY_STATUS_FILE),
             #[cfg(target_os = "linux")]
             transaction_file: PathBuf::from(DEPLOY_TRANSACTION_FILE),
+            #[cfg(target_os = "linux")]
+            transaction_owner_uid: DEPLOY_TRANSACTION_OWNER_UID,
+            #[cfg(target_os = "linux")]
+            action_status_file: PathBuf::from(CONFIG_ACTION_STATUS_FILE),
         }
     }
 }
@@ -150,22 +196,49 @@ impl Default for FileConfigStatusProvider {
 impl ConfigStatusProvider for FileConfigStatusProvider {
     #[cfg(target_os = "linux")]
     async fn status(&self) -> Result<ConfigStatusSnapshot> {
-        match read_optional_bounded_file(&self.transaction_file, TRANSACTION_FILE_MAX_BYTES, true)
-            .await
+        let mut snapshot = match read_optional_bounded_file(
+            &self.transaction_file,
+            TRANSACTION_FILE_MAX_BYTES,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(self.transaction_owner_uid),
+        )
+        .await
         {
-            Ok(None) => {}
-            Ok(Some(contents)) => {
-                return Ok(parse_deployment_transaction(&contents)
-                    .unwrap_or_else(|_| ConfigStatusSnapshot::recovery_required()));
-            }
-            Err(_) => return Ok(ConfigStatusSnapshot::recovery_required()),
-        }
-        let Some(contents) =
-            read_optional_bounded_file(&self.status_file, STATUS_FILE_MAX_BYTES, false).await?
-        else {
-            return Ok(ConfigStatusSnapshot::unknown());
+            Ok(Some(contents)) => parse_deployment_transaction(&contents)
+                .unwrap_or_else(|_| ConfigStatusSnapshot::recovery_required()),
+            Err(_) => ConfigStatusSnapshot::recovery_required(),
+            Ok(None) => match read_optional_bounded_file(
+                &self.status_file,
+                STATUS_FILE_MAX_BYTES,
+                None,
+                None,
+            )
+            .await?
+            {
+                Some(contents) => parse_deployment_status(&contents)?,
+                None => ConfigStatusSnapshot::unknown(),
+            },
         };
-        parse_deployment_status(&contents)
+        let config_action = read_optional_bounded_file(
+            &self.action_status_file,
+            CONFIG_ACTION_STATUS_MAX_BYTES,
+            Some(0o644),
+            None,
+        )
+        .await
+        .and_then(|contents| {
+            contents
+                .map(|contents| parse_config_action_status(&contents))
+                .transpose()
+        });
+        snapshot.config_action = match config_action {
+            Ok(config_action) => config_action,
+            Err(_) => {
+                tracing::warn!("ignoring unavailable public config action status");
+                None
+            }
+        };
+        Ok(snapshot)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -180,7 +253,8 @@ impl ConfigStatusProvider for FileConfigStatusProvider {
 async fn read_optional_bounded_file(
     path: &Path,
     max_bytes: u64,
-    require_trusted_owner: bool,
+    required_mode: Option<u32>,
+    expected_owner_uid: Option<u32>,
 ) -> Result<Option<Vec<u8>>> {
     let open_path = path.to_path_buf();
     let file = match timeout(
@@ -206,17 +280,13 @@ async fn read_optional_bounded_file(
     if !metadata.is_file() {
         return Err(anyhow!("status input must be a regular file"));
     }
-    if require_trusted_owner {
-        // SAFETY: these libc calls take no pointers and return the process credentials.
-        let (effective_uid, effective_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        if metadata.uid() != effective_uid
-            || metadata.gid() != effective_gid
-            || metadata.mode() & 0o7777 != 0o600
-        {
-            return Err(anyhow!(
-                "deployment transaction ownership or mode is not trusted"
-            ));
-        }
+    if !file_metadata_matches_policy(
+        metadata.uid(),
+        metadata.mode(),
+        required_mode,
+        expected_owner_uid,
+    ) {
+        return Err(anyhow!("status input ownership or mode is not trusted"));
     }
     if metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(anyhow!("status input size is invalid"));
@@ -233,6 +303,17 @@ async fn read_optional_bounded_file(
         return Err(anyhow!("status input exceeded the size limit"));
     }
     Ok(Some(contents))
+}
+
+#[cfg(target_os = "linux")]
+fn file_metadata_matches_policy(
+    owner_uid: u32,
+    mode: u32,
+    required_mode: Option<u32>,
+    expected_owner_uid: Option<u32>,
+) -> bool {
+    required_mode.is_none_or(|required| mode & 0o7777 == required)
+        && expected_owner_uid.is_none_or(|expected| owner_uid == expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -367,6 +448,7 @@ fn parse_deployment_status(contents: &[u8]) -> Result<ConfigStatusSnapshot> {
         config_revision,
         service: Some(service.to_owned()),
         transaction_phase: None,
+        config_action: None,
     })
 }
 
@@ -447,6 +529,69 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
         config_revision: Some(revision.to_ascii_lowercase()),
         service: Some(service.to_owned()),
         transaction_phase: Some(phase.to_owned()),
+        config_action: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_config_action_status(contents: &[u8]) -> Result<ConfigActionStatusSnapshot> {
+    let value: Value =
+        serde_json::from_slice(contents).context("invalid config action status JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config action status must be a JSON object"))?;
+    let expected = [
+        "action",
+        "action_id",
+        "config_revision",
+        "state",
+        "updated_at",
+        "version",
+    ];
+    if object.len() != expected.len() || !expected.iter().all(|field| object.contains_key(*field)) {
+        return Err(anyhow!("config action status contains unexpected fields"));
+    }
+    if object.get("version").and_then(Value::as_u64) != Some(1)
+        || object.get("action").and_then(Value::as_str) != Some("pull")
+    {
+        return Err(anyhow!("config action status identity is invalid"));
+    }
+    let action_id = object
+        .get("action_id")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| anyhow!("config action status action ID is invalid"))?;
+    let state = object
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|state| matches!(*state, "queued" | "running" | "succeeded" | "failed"))
+        .ok_or_else(|| anyhow!("config action status state is invalid"))?;
+    let config_revision = match object.get("config_revision") {
+        Some(Value::Null) => None,
+        Some(Value::String(revision)) if revision.len() == 40 && valid_revision(revision) => {
+            Some(revision.clone())
+        }
+        _ => return Err(anyhow!("config action status revision is invalid")),
+    };
+    if (state == "succeeded") != config_revision.is_some() {
+        return Err(anyhow!("config action status revision is inconsistent"));
+    }
+    let updated_at = object
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("config action status timestamp is invalid"))?;
+    if DateTime::parse_from_rfc3339(updated_at).is_err() {
+        return Err(anyhow!("config action status timestamp is invalid"));
+    }
+    Ok(ConfigActionStatusSnapshot {
+        action_id: action_id.to_owned(),
+        state: state.to_owned(),
+        config_revision,
     })
 }
 
@@ -526,6 +671,37 @@ mod tests {
     use super::*;
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn production_transaction_metadata_policy_ignores_gid_and_fails_closed() {
+        let provider = FileConfigStatusProvider::default();
+        let root_owned_with_nonzero_gid = (DEPLOY_TRANSACTION_OWNER_UID, 1234);
+
+        assert_eq!(
+            provider.transaction_file,
+            PathBuf::from(DEPLOY_TRANSACTION_FILE)
+        );
+        assert_eq!(provider.transaction_owner_uid, DEPLOY_TRANSACTION_OWNER_UID);
+        assert_ne!(root_owned_with_nonzero_gid.1, 0);
+        assert!(file_metadata_matches_policy(
+            root_owned_with_nonzero_gid.0,
+            0o100644,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner_uid),
+        ));
+        assert!(!file_metadata_matches_policy(
+            1,
+            0o100644,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner_uid),
+        ));
+        assert!(!file_metadata_matches_policy(
+            DEPLOY_TRANSACTION_OWNER_UID,
+            0o100600,
+            Some(DEPLOY_TRANSACTION_MODE),
+            Some(provider.transaction_owner_uid),
+        ));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -618,7 +794,11 @@ mod tests {
         let root = temp_root();
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
-        write_transaction(&provider, b"secret transaction details", 0o600);
+        write_transaction(
+            &provider,
+            b"secret transaction details",
+            DEPLOY_TRANSACTION_MODE,
+        );
 
         let snapshot = provider.status().await.unwrap();
 
@@ -639,7 +819,7 @@ mod tests {
             b"{not valid json".to_vec(),
             vec![b'x'; TRANSACTION_FILE_MAX_BYTES as usize + 1],
         ] {
-            write_transaction(&provider, &contents, 0o600);
+            write_transaction(&provider, &contents, DEPLOY_TRANSACTION_MODE);
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -655,7 +835,11 @@ mod tests {
         non_normal_path["bot_code_dir"] =
             Value::String("/opt//webex-generic-account-bot/code".to_owned());
         for transaction in [invalid_repo, invalid_ref, invalid_time, non_normal_path] {
-            write_transaction(&provider, &serde_json::to_vec(&transaction).unwrap(), 0o600);
+            write_transaction(
+                &provider,
+                &serde_json::to_vec(&transaction).unwrap(),
+                DEPLOY_TRANSACTION_MODE,
+            );
             let snapshot = provider.status().await.unwrap();
             assert_eq!(snapshot.status, "recovery_required");
             assert_eq!(snapshot.config_revision, None);
@@ -672,15 +856,7 @@ mod tests {
         std_fs::create_dir_all(&root).unwrap();
         let provider = provider_in(&root);
         let transaction = serde_json::to_vec(&deployment_transaction()).unwrap();
-        write_transaction(&provider, &transaction, 0o644);
-        let snapshot = provider.status().await.unwrap();
-        assert_eq!(snapshot.status, "recovery_required");
-        assert_eq!(snapshot.config_revision, None);
-        std_fs::set_permissions(
-            &provider.transaction_file,
-            std_fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        write_transaction(&provider, &transaction, DEPLOY_TRANSACTION_MODE);
 
         let snapshot = provider.status().await.unwrap();
 
@@ -703,10 +879,45 @@ mod tests {
         let mut committed = deployment_transaction();
         committed["phase"] = Value::String("committed_pending_metadata".to_owned());
         committed["committed_at"] = Value::String("2026-06-27T00:01:00.000Z".to_owned());
-        write_transaction(&provider, &serde_json::to_vec(&committed).unwrap(), 0o600);
+        write_transaction(
+            &provider,
+            &serde_json::to_vec(&committed).unwrap(),
+            DEPLOY_TRANSACTION_MODE,
+        );
         let snapshot = provider.status().await.unwrap();
         assert!(snapshot.markdown().contains("Committed config revision:"));
         assert!(!snapshot.markdown().contains("In-progress config revision:"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_provider_pins_current_euid_and_fails_closed() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let mut provider = provider_in(&root);
+        let transaction = serde_json::to_vec(&deployment_transaction()).unwrap();
+        write_transaction(&provider, &transaction, DEPLOY_TRANSACTION_MODE);
+
+        assert_eq!(provider.transaction_owner_uid, current_test_euid());
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(
+            snapshot.transaction_phase.as_deref(),
+            Some("service_transition_started")
+        );
+
+        provider.transaction_owner_uid ^= 1;
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot, ConfigStatusSnapshot::recovery_required());
+
+        provider.transaction_owner_uid = current_test_euid();
+        std_fs::set_permissions(
+            &provider.transaction_file,
+            std_fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot, ConfigStatusSnapshot::recovery_required());
         std_fs::remove_dir_all(root).unwrap();
     }
 
@@ -818,6 +1029,202 @@ mod tests {
         std_fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn reads_allowlisted_public_config_action_status() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status("queued", None)).unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        let action = snapshot.config_action.unwrap();
+        assert_eq!(action.action_id, "a".repeat(64));
+        assert_eq!(action.state, "queued");
+        assert_eq!(action.config_revision, None);
+        let markdown = provider.status().await.unwrap().markdown();
+        assert!(markdown.contains("Latest configuration action"));
+        assert!(markdown.contains("State: `queued`"));
+        assert!(!markdown.contains("Prepared config revision"));
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn succeeded_config_action_requires_a_revision_when_present() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status(
+                "succeeded",
+                Some("abcdef0123456789abcdef0123456789abcdef01"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "unknown");
+        assert!(
+            snapshot
+                .markdown()
+                .contains("Prepared config revision: `abcdef0123456789abcdef0123456789abcdef01`")
+        );
+        let mut invalid = action_status("succeeded", None);
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.config_action, None);
+        invalid["state"] = Value::String("failed".to_owned());
+        invalid["config_revision"] =
+            Value::String("abcdef0123456789abcdef0123456789abcdef01".to_owned());
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.config_action, None);
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_public_config_action_status_preserves_deployment_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std_fs::write(
+            &provider.action_status_file,
+            serde_json::to_vec(&action_status("running", None)).unwrap(),
+        )
+        .unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
+
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
+
+        std_fs::remove_file(&provider.action_status_file).unwrap();
+        let target = root.join("target.json");
+        std_fs::write(
+            &target,
+            serde_json::to_vec(&action_status("running", None)).unwrap(),
+        )
+        .unwrap();
+        symlink(target, &provider.action_status_file).unwrap();
+        let snapshot = provider.status().await.unwrap();
+        assert_eq!(snapshot.status, "deployed");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(snapshot.config_action, None);
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_public_config_action_status_preserves_recovery_required_transaction() {
+        let root = temp_root();
+        std_fs::create_dir_all(&root).unwrap();
+        let provider = provider_in(&root);
+        std_fs::write(
+            &provider.status_file,
+            serde_json::to_vec(&deployment_metadata(
+                "deployed",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        write_transaction(
+            &provider,
+            &serde_json::to_vec(&deployment_transaction()).unwrap(),
+            DEPLOY_TRANSACTION_MODE,
+        );
+        std_fs::write(&provider.action_status_file, br#"{"version":1}"#).unwrap();
+        std_fs::set_permissions(
+            &provider.action_status_file,
+            std_fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let snapshot = provider.status().await.unwrap();
+
+        assert_eq!(snapshot.status, "recovery_required");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            snapshot.transaction_phase.as_deref(),
+            Some("service_transition_started")
+        );
+        assert_eq!(snapshot.config_action, None);
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlinked_parent_components() {
@@ -840,6 +1247,8 @@ mod tests {
         let provider = FileConfigStatusProvider {
             status_file: linked_root.join("status.json"),
             transaction_file: linked_root.join("transaction.json"),
+            transaction_owner_uid: current_test_euid(),
+            action_status_file: root.join("action-status.json"),
         };
 
         let snapshot = provider.status().await.unwrap();
@@ -851,7 +1260,14 @@ mod tests {
         FileConfigStatusProvider {
             status_file: root.join("status.json"),
             transaction_file: root.join("transaction.json"),
+            transaction_owner_uid: current_test_euid(),
+            action_status_file: root.join("action-status.json"),
         }
+    }
+
+    fn current_test_euid() -> u32 {
+        // SAFETY: this libc call takes no pointers and returns the process credential.
+        unsafe { libc::geteuid() }
     }
 
     fn write_transaction(provider: &FileConfigStatusProvider, contents: &[u8], mode: u32) {
@@ -876,6 +1292,17 @@ mod tests {
             "service_action": "restart",
             "service_restart_skipped": false,
             "deployed_at": "2026-06-27T00:00:00.000Z"
+        })
+    }
+
+    fn action_status(state: &str, config_revision: Option<&str>) -> Value {
+        serde_json::json!({
+            "version": 1,
+            "action": "pull",
+            "action_id": "a".repeat(64),
+            "state": state,
+            "config_revision": config_revision,
+            "updated_at": "2026-06-27T00:00:00.000Z",
         })
     }
 

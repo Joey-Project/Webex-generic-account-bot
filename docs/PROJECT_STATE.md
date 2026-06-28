@@ -10,7 +10,10 @@
   every message through Webex before security decisions, and adds an optional
   explicit-sender admin Space with read-only `/config status`.
 - Configuration Space PR 2b1 adds immutable staged config preparation without
-  changing live config or service state; Webex mutation remains disabled.
+  changing live config or service state.
+- Configuration Space PR 2b2a adds the separate-identity durable pull-worker
+  foundation. Bot socket-group access and deployable `/config pull` remain
+  disabled until Codex runs use the isolated runner.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -19,7 +22,8 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- None.
+- `/config pull` enablement depends on the ephemeral Linux-user runner so
+  prompt-controlled Codex children cannot inherit the bot's worker-socket group.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

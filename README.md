@@ -27,7 +27,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   body, thread, Codex, or reply-routing decisions. Sidecar message fields are
   hints only.
 - Supports an optional dedicated Configuration Space with explicit sender and
-  command allowlists. The current slice implements read-only `/config status`.
+  command allowlists. The current slice implements read-only `/config status`
+  and the dormant durable pull-worker foundation.
 
 The first implementation is synchronous per sidecar request: the HTTP request
 returns after Codex finishes and the Webex reply is accepted. For this slice,
@@ -58,12 +59,24 @@ The admin Space cannot overlap an input or output room, has no
 `allow_all_senders` mode, and accepts only exact `/config ...` commands after
 authoritative Webex hydration. `/config status` reads fixed host deployment
 metadata with no-follow and size checks, returns only allowlisted fields, and
-uses the normal idempotent Webex reply marker. `pull`, `reload`, and `sync` are
-reserved command names but remain undeployable until the durable external
-action worker is implemented; configuration validation rejects them.
-When a valid deployment transaction exists, status reports its allowlisted
-phase and in-progress revision; malformed journals fail closed to
-`recovery_required` without exposing their contents.
+uses the normal idempotent Webex reply marker. The dormant `/config pull` path
+can durably submit a fixed action to a separate worker over a host-owned Unix
+socket before acknowledgement, but configuration validation rejects it until
+Codex runs use the isolated runner. The worker runs immutable staged preparation
+only; it cannot reload the bot. `reload` and `sync` also remain undeployable.
+When a trusted, valid deployment recovery journal exists, status reports only
+its allowlisted phase, config revision, and service. Production root apply
+writes that credential-free journal as root-owned (UID 0) with mode `0644` so
+the non-root bot can read it. Its GID is not trusted or required because mode
+`0644` grants no group write. Deployment recovery trusts the same-owner UID for
+both current mode `0644` and legacy mode `0600` journals. `/config status`
+still parses only the root-owned (UID 0), mode `0644` journal at the fixed path;
+private legacy files and files with an untrusted UID or mode map to generic
+`recovery_required` without exposing their contents. Malformed journals also
+fail closed. This deployment journal is separate
+from the worker's private queue and staging state. A strict, bounded mode
+`0644` public worker status file projects only the latest pull action state and
+prepared revision, without exposing private queue records or failure output.
 The current production host policy also rejects the entire table until a
 companion config PR pins the exact admin Space and sender allowlist. The example
 above is therefore for local validation and the upcoming reviewed deployment,
@@ -146,19 +159,24 @@ not forward `SSH_AUTH_SOCK`, proxy variables, ambient `GIT_*` settings, `HOME`,
 or token-shaped secrets. GitHub fetch uses fixed host policy:
 `GIT_SSH_COMMAND` points at `/usr/bin/ssh`,
 `/var/lib/webex-generic-account-bot/deploy/id_ed25519`, and
-`/etc/ssh/ssh_known_hosts`. The config checkout is recreated under a fresh
-`work` directory for each apply, and the trusted policy helper reads it only
-through `--source-root`. Final config validation invokes the fixed host-installed
+`/etc/ssh/ssh_known_hosts`. Each mode recreates its own config checkout under a
+fresh `work` directory, and the trusted policy helper reads it only through
+`--source-root`. Final config validation invokes the fixed host-installed
 bot binary directly; deployment never runs Cargo, downloads crates, or executes
 dependency build scripts. The default paths match the staging deployment layout:
 
-- config checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- apply checkout: `/var/lib/webex-generic-account-bot/config-checkout`
+- prepare checkout:
+  `/var/lib/webex-generic-account-bot/config-prepare-checkout`
+- config staging: `/var/lib/webex-generic-account-bot/config-staging`
 - bot code: `/opt/webex-generic-account-bot/code`
 - bot binary: `/opt/webex-generic-account-bot/bin/webex-generic-account-bot`
 - Codex workspace: `/var/lib/webex-generic-account-bot/codex-workspace`
 - rendered config: `/var/lib/webex-generic-account-bot/rendered/production.toml`
-- staged config: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged`
-- staged metadata: `/var/lib/webex-generic-account-bot/rendered/production.toml.staged.json`
+- staged config:
+  `/var/lib/webex-generic-account-bot/config-staging/production.toml.staged`
+- staged metadata:
+  `/var/lib/webex-generic-account-bot/config-staging/production.toml.staged.json`
 - service: `webex-generic-account-bot`
 
 Use `--prepare` to fetch the fixed config ref, render and validate it, and
@@ -171,12 +189,122 @@ the older metadata, so a crash or metadata commit failure cannot leave old
 metadata pointing at new config bytes. A pending or malformed install
 transaction makes prepare fail closed without attempting recovery or starting
 Git/render work. Preparation uses the same host-wide deployment lock and
-scrubbed fixed-argv execution as apply.
+scrubbed fixed-argv execution as apply. Apply does not inspect, create, clean,
+or validate ownership of the prepare checkout or config staging directory.
+An optional `--request-id` accepts only a 64-character lowercase hexadecimal
+worker action ID and records it in staged metadata. This lets the worker recover
+a prepare that committed before its private action state was updated, without
+fetching a newer revision for the same Webex request.
+
+The reviewed pull worker assets are:
+
+- `scripts/config-pull-worker.mjs`
+- `deploy/systemd/webex-config-pull-worker.service`
+- `deploy/systemd/webex-config-pull-worker.sysusers.conf`
+- `deploy/systemd/webex-config-pull-worker.tmpfiles.conf`
+
+The service runs as the stable `webex-config-deploy` user with the dedicated
+`webex-config-pull` primary group; it is not lifecycle-coupled to the bot unit.
+The mode `0660` socket is at `/run/webex-config-pull/config-pull.sock`; the
+common state parent `/var/lib/webex-generic-account-bot` is root-owned with mode
+`0755`. The worker state root
+`/var/lib/webex-generic-account-bot/config-actions` is owned by
+`webex-config-deploy:webex-config-pull` with mode `0755`, while its worker-owned
+`queue` and `state` subdirectories remain mode `0700`. The only public worker
+artifact is the mode `0644`
+`/var/lib/webex-generic-account-bot/config-actions/public-status.json`, whose
+schema excludes message text, stderr, paths, and failure details.
+Before creating its state directories, the worker verifies every state-root
+ancestor through `/` is a real root-owned directory that non-root identities
+cannot write. The root-owned sticky `/tmp` directory is accepted only for the
+isolated test layout, relying on sticky-directory replacement protection.
+Before connecting, the bot resolves the fixed system account and group names and
+requires both the socket and its mode `0750` parent to be owned by
+`webex-config-deploy:webex-config-pull`. The worker is never added to the bot's
+own group, so it cannot read bot tokens, Codex state, or Jenkins credentials.
+The bot is deliberately not added to `webex-config-pull` in this slice: a Codex
+child currently inherits the bot's supplementary groups, so granting socket
+access before isolated runner execution would let ordinary-room code bypass the
+configuration Space allowlist. The service keeps `UMask=0077`; worker code
+explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
+public status file after creation.
+
+The socket parent and lock parent are deliberately separate. The shared socket
+parent is mode `0750` at `/run/webex-config-pull`. The root-owned
+`/run/webex-config-deploy` parent contains two distinct mode `0660`,
+`root:webex-config-pull` files: `config-pull-worker.lock` is the worker lifetime
+singleton, while `deploy-config.lock` serialises non-root prepare with a future
+root activation. The unit grants write access to those exact files without
+giving the worker write access to their parent. The lifetime lock does not
+replace the deployment transaction lock.
+Lock contention is reported by the fixed deployment entrypoint as a structured
+retryable status. The worker durably moves that oldest action back to `queued`,
+waits one second, and retries without allowing newer actions to pass it. A
+deployment child tree that cannot be fully reaped is instead an integrity
+failure: the worker persists a terminal taint for that action, exits non-zero,
+and relies on the unit's explicit `KillMode=control-group` to remove every
+process in the worker cgroup before systemd restarts it. The tainted staged pair
+is never reconciled as success; after operator review, a new Webex message is
+required to request another preparation.
+The unit requires Linux cgroup v2. Each fixed deployment command records the
+unit cgroup's PID and process-start-time identities before spawn and verifies
+the same membership after the direct child closes. A new live identity, or an
+inability to prove membership, is the same integrity failure. The worker never
+receives cgroup write or delegation access.
+The prepare checkout and prepared candidate, staged config, and staged metadata
+files are confined to worker-owned mode `0700` directories. The worker unit
+mounts the live `rendered` directory read-only and does not provision or own it,
+so preparation cannot overwrite the live config or deployment metadata. The
+read-only path is optional at unit startup so a fresh host can prepare before
+the first live install; `ProtectSystem=strict` still keeps an absent or
+later-created live path outside the worker's writable allowlist. Prepare also
+rejects a live directory or checked existing parent owned by its own UID even
+when mode `0555`, because that owner could restore write permission.
+
+Before enabling the unit, provision the sysusers and tmpfiles definitions and
+make the fixed deploy key readable only by `webex-config-deploy`. Tmpfiles
+enforces the common state parent as `root:root` mode `0755`, creates the
+worker-owned `config-actions` root and its private `queue` and `state` leaves,
+and creates worker-owned `config-prepare-checkout` and `config-staging`; it does
+not create or change the existing root/apply
+`/var/lib/webex-generic-account-bot/config-checkout`. On hosts deployed from an
+older worker definition, stop the worker before migration, remove the old
+nested `StateDirectory=` management by installing the current unit, then apply
+the current tmpfiles definition. Verify the common parent is `root:root` mode
+`0755`, the `config-actions` root is
+`webex-config-deploy:webex-config-pull` mode `0755`, and its `queue` and `state`
+leaves are mode `0700` before restarting the worker. Do not recursively change
+the common parent's children: restore `config-checkout` to the root/apply
+identity if the old definition assigned it to `webex-config-deploy`. Do not
+grant the worker write access to that apply checkout. Keep the live `rendered`
+directory and
+`/opt/webex-generic-account-bot` outside the worker's write boundary. The worker
+has no bot token, Codex home, Jenkins credential,
+`systemctl`, or live-config activation permission. It invokes only
+`/usr/bin/node /opt/webex-generic-account-bot/code/scripts/deploy-config.mjs
+--prepare --json --request-id <action-id>` with a scrubbed environment and no
+shell. A response is sent only after the immutable request, private queued
+state, and public status are durable. A lost response converges through the
+same message-derived action ID; running actions recover after restart, and
+terminal actions are not executed again.
+Worker startup and shutdown are single-use and serialised. Before any durable
+queue or action-state recovery, the worker acquires a non-blocking kernel flock
+on `config-pull-worker.lock` and retains it for the entire worker lifetime,
+including shutdown cleanup. A second process under the same UID therefore
+fails on the singleton lock before it can change durable state, rather than
+changing state and only then discovering the first worker's active socket. A
+stop signal aborts the bounded stale-socket probe, waits for partial startup to
+unwind, and removes any socket already created before the process exits.
+
+The bot-side client and fixed command routing are present for integration tests,
+but configuration validation still rejects `pull`, `reload`, and `sync` and no
+bot socket-group drop-in is shipped. A later enablement PR may allow `pull` only
+after `ephemeral-linux-user` runner isolation is deployable and verified.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
 It still replaces the live rendered config and therefore is not equivalent to
-`--prepare` or `/config pull`.
+`--prepare`.
 `--status` is a separate read-only operation and cannot be combined with apply,
 prepare, dry-run, or restart flags.
 Normal apply renders and validates a candidate config first, installs it
@@ -198,17 +326,26 @@ durable than the installed config. A post-rename durability failure restores
 the previous config before returning. If rollback changes the live path but its
 final directory fsync fails, service restart/stop compensation still runs and
 the recovery journal is preserved. Before replacing the live config, the
-entrypoint writes and fsyncs a
-mode `0600` transaction journal beside it. The journal advances through
+entrypoint writes and fsyncs a credential-free recovery journal beside it.
+Production root apply publishes the journal as root-owned (UID 0) with mode
+`0644`, allowing the non-root bot to strictly parse and expose only its
+allowlisted phase, config revision, and service. Its GID is not trusted or
+required because mode `0644` grants no group write. Deployment recovery trusts
+the same-owner UID for both current mode `0644` and legacy mode `0600` journals,
+while `/config status` parses only the root-owned (UID 0), mode `0644` journal
+at the fixed path and reports private legacy files only as generic
+`recovery_required`. The journal
+advances through
 `prepared`, `service_transition_started`, and `committed_pending_metadata`, and
 remains until success metadata is durable. After an unclean exit, the next apply
 either restores the preserved backup without consuming it or finalises metadata
 for an already committed service. Required rollback restarts and verifies an old
 service; a failed first deployment is restored by stopping the service after its
 config is removed. Journal removal is fsynced before deleting the backup or
-starting a new checkout. A malformed journal fails closed and preserves the live
-config, backup, and journal for inspection; `--skip-restart` cannot bypass a
-pending service recovery. If metadata writing or cleanup fails after the new
+starting a new checkout. A malformed or untrusted journal fails closed to a
+generic `recovery_required` status and preserves the live config, backup, and
+journal for inspection; `--skip-restart` cannot bypass a pending service
+recovery. If metadata writing or cleanup fails after the new
 config has been installed and the service restart has succeeded, the entrypoint
 records a post-commit failure state when possible instead of implying the apply
 was rolled back. While any journal remains, `--status` returns
@@ -228,14 +365,20 @@ closed, and no deployment status is written after lock release. `SIGINT` and
 `SIGTERM` are converted into controlled transaction
 aborts; active child process groups are terminated and an installed but
 uncommitted candidate follows the normal rollback and failure-metadata path.
-Existing checkout and lock-parent directories must be owned by the
-deployment user and mode `0700`.
+Each mode's existing checkout must be owned by that mode's deployment identity
+and group with mode `0700`. A custom private lock uses a current-deployment-user
+owned parent with mode `0700` and a mode `0600` lock file. The default shared
+lock is different: `/run/webex-config-deploy` is preprovisioned as
+`root:webex-config-pull` mode `0750`, and `deploy-config.lock` is root-owned with
+group `webex-config-pull` and mode `0660` so root apply and non-root prepare use
+the same kernel flock.
 Missing rendered-config and metadata directories are created one component at
 a time, and each new directory entry is made durable by fsyncing its parent.
 Path, repo, binary, timeout, and output-cap overrides are rejected
 unless the host environment sets `WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1`. The
-entrypoint creates the lock parent directory when host permissions allow it and
-writes deployment metadata to
+entrypoint creates a custom private lock parent when host permissions allow it;
+the default shared lock parent and file must already be provisioned. It writes
+deployment metadata to
 `/var/lib/webex-generic-account-bot/rendered/deploy-status.json` after a
 successful apply. Fetch credentials must be provided by host policy without
 ambient agent, proxy, or token environment leakage.

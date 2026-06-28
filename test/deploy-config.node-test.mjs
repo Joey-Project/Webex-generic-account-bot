@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
@@ -9,6 +9,8 @@ import { describe, it } from 'node:test';
 
 import {
   buildDeployPlan,
+  createLinuxCgroupV2MembershipInspector,
+  ProcessTreeUncontainedError,
   executePlan,
   executePreparePlan,
   installProcessSignalHandlers,
@@ -17,8 +19,10 @@ import {
   runCli,
   runCommand,
   scrubEnv,
+  usage,
   validateConfigTreeManifest,
   validateConfigTreePaths,
+  validateDeploymentLockProvisioning,
 } from '../scripts/deploy-config.mjs';
 import {
   assertMaxRenderedBytes,
@@ -40,6 +44,19 @@ import {
   redactedConsoleLinesFromText,
 } from '../scripts/jenkins-readonly.mjs';
 
+const CONTAINED_PROCESS_TREE_INSPECTOR = Object.freeze({
+  async captureBaseline() {
+    return 'contained-test-baseline';
+  },
+  async assertContained(baseline) {
+    assert.equal(baseline, 'contained-test-baseline');
+  },
+});
+
+function runContainedCommand(commandSpec, env, signal = null) {
+  return runCommand(commandSpec, env, signal, CONTAINED_PROCESS_TREE_INSPECTOR);
+}
+
 describe('deploy-config argument parsing', () => {
   it('defaults to dry-run-safe host deployment paths', () => {
     const options = parseArgs(['--dry-run']);
@@ -48,8 +65,10 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.dryRun, true);
     assert.equal(options.configRef, 'main');
     assert.equal(options.checkoutDir, '/var/lib/webex-generic-account-bot/config-checkout');
+    assert.equal(options.stagingDir, '/var/lib/webex-generic-account-bot/config-staging');
     assert.equal(options.renderedConfig, '/var/lib/webex-generic-account-bot/rendered/production.toml');
     assert.equal(options.botCodeDir, '/opt/webex-generic-account-bot/code');
+    assert.equal(options.lockDir, '/run/webex-config-deploy/deploy-config.lock');
     assert.equal(options.gitBin, '/usr/bin/git');
     assert.equal(options.bashBin, '/usr/bin/bash');
     assert.equal(options.nodeBin, '/usr/bin/node');
@@ -66,6 +85,23 @@ describe('deploy-config argument parsing', () => {
     assert.equal(options.outputLimitBytes, 1_048_576);
   });
 
+  it('uses separate default checkouts for apply and prepare while preserving overrides', () => {
+    assert.equal(
+      parseArgs(['--apply']).checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-checkout',
+    );
+    assert.equal(
+      parseArgs(['--prepare']).checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+    );
+    for (const mode of ['--apply', '--prepare']) {
+      assert.equal(
+        parseArgsAllow([mode, '--checkout-dir', '/tmp/explicit-config-checkout']).checkoutDir,
+        '/tmp/explicit-config-checkout',
+      );
+    }
+  });
+
   it('rejects refs, repositories, services, and paths that cannot be fixed host policy', () => {
     assert.throws(() => parseArgsAllow(['--config-ref', '../main']), /config-ref/);
     assert.throws(() => parseArgsAllow(['--config-ref', 'main;id']), /config-ref/);
@@ -78,6 +114,7 @@ describe('deploy-config argument parsing', () => {
       /fixed bot unit/,
     );
     assert.throws(() => parseArgsAllow(['--checkout-dir', 'relative/path']), /checkout-dir/);
+    assert.throws(() => parseArgsAllow(['--staging-dir', 'relative/path']), /staging-dir/);
     assert.throws(() => parseArgsAllow(['--git-bin', 'git']), /git-bin/);
     assert.throws(() => parseArgsAllow(['--node-bin', 'node']), /node-bin/);
     assert.throws(() => parseArgsAllow(['--python-bin', 'python3']), /python-bin/);
@@ -93,10 +130,23 @@ describe('deploy-config argument parsing', () => {
       () => parseArgs(['--bot-code-dir', '/opt/evil']),
       /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
     );
+    assert.throws(
+      () => parseArgs(['--staging-dir', '/var/lib/webex-generic-account-bot/config-staging']),
+      /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
+    );
+    assert.throws(
+      () => parseArgs(['--prepare', '--checkout-dir', '/tmp/prepare-checkout']),
+      /WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES=1/,
+    );
     assert.equal(
       parseArgsAllow(['--bot-code-dir', '/opt/webex-generic-account-bot/code']).botCodeDir,
       '/opt/webex-generic-account-bot/code',
     );
+    assert.equal(
+      parseArgsAllow(['--staging-dir', '/tmp/webex-config-staging']).stagingDir,
+      '/tmp/webex-config-staging',
+    );
+    assert.match(usage(), /--staging-dir <path>/);
   });
 
   it('requires execution modes to be unambiguous', () => {
@@ -122,6 +172,188 @@ describe('deploy-config argument parsing', () => {
       () => parseArgs(['--status', '--skip-restart']),
       /--skip-restart cannot be used with --prepare or --status/,
     );
+    const requestId = 'a'.repeat(64);
+    assert.equal(
+      parseArgs(['--prepare', '--request-id', requestId]).requestId,
+      requestId,
+    );
+    assert.throws(
+      () => parseArgs(['--apply', '--request-id', requestId]),
+      /--request-id is valid only with --prepare/,
+    );
+    assert.throws(
+      () => parseArgs(['--prepare', '--request-id', 'A'.repeat(64)]),
+      /64 lowercase hexadecimal/,
+    );
+  });
+});
+
+describe('deploy-config lock policy', () => {
+  const sharedLock = '/run/webex-config-deploy/deploy-config.lock';
+  const rootUid = 0;
+  const workerUid = 1001;
+  const sharedGid = 2001;
+  const workerProcess = fakeProcessIdentity(workerUid, sharedGid, [sharedGid]);
+  const rootProcess = fakeProcessIdentity(rootUid, 0, [0]);
+
+  it('accepts the root-owned shared lock for both worker and root callers', async () => {
+    const fsApi = fakeLockProvisioningFs(sharedLock, {
+      rootUid,
+      parentUid: rootUid,
+      parentGid: sharedGid,
+      parentMode: 0o750,
+      lockUid: rootUid,
+      lockGid: sharedGid,
+      lockMode: 0o660,
+    });
+
+    assert.equal(
+      (await validateDeploymentLockProvisioning(sharedLock, fsApi, workerProcess)).policy,
+      'shared',
+    );
+    assert.equal(
+      (await validateDeploymentLockProvisioning(sharedLock, fsApi, rootProcess)).policy,
+      'shared',
+    );
+  });
+
+  it('accepts a private custom lock owned by the current deployment identity', async () => {
+    const privateLock = '/tmp/webex-config-test/deploy-config.lock';
+    const fsApi = fakeLockProvisioningFs(privateLock, {
+      rootUid,
+      parentUid: workerUid,
+      parentGid: sharedGid,
+      parentMode: 0o700,
+      lockUid: workerUid,
+      lockGid: sharedGid,
+      lockMode: 0o600,
+    });
+
+    assert.equal(
+      (await validateDeploymentLockProvisioning(privateLock, fsApi, workerProcess)).policy,
+      'private',
+    );
+  });
+
+  it('fails closed when shared lock provisioning is absent', async () => {
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, { rootUid, missing: 'parent' }),
+        workerProcess,
+      ),
+      /shared deployment lock parent is not provisioned/,
+    );
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, {
+          rootUid,
+          parentUid: rootUid,
+          parentGid: sharedGid,
+          parentMode: 0o750,
+          missing: 'lock',
+        }),
+        workerProcess,
+      ),
+      /shared deployment lock is not provisioned/,
+    );
+  });
+
+  it('rejects misowned, mis-moded, or symlinked shared provisioning', async () => {
+    const valid = {
+      rootUid,
+      parentUid: rootUid,
+      parentGid: sharedGid,
+      parentMode: 0o750,
+      lockUid: rootUid,
+      lockGid: sharedGid,
+      lockMode: 0o660,
+    };
+    const cases = [
+      [{ parentUid: workerUid }, /shared lock parent ownership is not trusted/],
+      [{ lockUid: workerUid }, /shared deployment lock ownership is not trusted/],
+      [{ lockGid: sharedGid + 1 }, /shared deployment lock ownership is not trusted/],
+      [{ parentMode: 0o770 }, /shared lock parent mode is not trusted/],
+      [{ lockMode: 0o600 }, /shared deployment lock mode is not trusted/],
+      [{ parentKind: 'symlink' }, /lock parent must be a real directory/],
+      [{ lockKind: 'symlink' }, /deployment lock must be a real file/],
+    ];
+
+    for (const [override, expected] of cases) {
+      await assert.rejects(
+        () => validateDeploymentLockProvisioning(
+          sharedLock,
+          fakeLockProvisioningFs(sharedLock, { ...valid, ...override }),
+          workerProcess,
+        ),
+        expected,
+      );
+    }
+    await assert.rejects(
+      () => validateDeploymentLockProvisioning(
+        sharedLock,
+        fakeLockProvisioningFs(sharedLock, valid),
+        fakeProcessIdentity(workerUid, sharedGid + 1, [sharedGid + 1]),
+      ),
+      /shared lock parent ownership is not trusted/,
+    );
+  });
+
+  it('pins the shared lock systemd and tmpfiles defaults', async () => {
+    const service = await fs.readFile(
+      path.join(REPO_ROOT, 'deploy/systemd/webex-config-pull-worker.service'),
+      'utf8',
+    );
+    const tmpfiles = await fs.readFile(
+      path.join(REPO_ROOT, 'deploy/systemd/webex-config-pull-worker.tmpfiles.conf'),
+      'utf8',
+    );
+    const servicePaths = service
+      .split('\n')
+      .filter((line) => /^(ReadOnlyPaths|ReadWritePaths)=/.test(line));
+
+    assert.deepEqual(servicePaths, [
+      'ReadOnlyPaths=/run/webex-config-deploy',
+      'ReadWritePaths=/run/webex-config-deploy/config-pull-worker.lock',
+      'ReadWritePaths=/run/webex-config-deploy/deploy-config.lock',
+      'ReadWritePaths=/run/webex-config-pull',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-actions',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-prepare-checkout',
+      'ReadWritePaths=/var/lib/webex-generic-account-bot/config-staging',
+      'ReadOnlyPaths=-/var/lib/webex-generic-account-bot/rendered',
+    ]);
+    assert.match(service, /^ConditionPathExists=\/sys\/fs\/cgroup\/cgroup\.controllers$/m);
+    assert.doesNotMatch(service, /^ReadWritePaths=\/run\/webex-config-deploy\/?$/m);
+    assert.doesNotMatch(service, /ReadWritePaths=.*\/config-checkout$/m);
+    assert.doesNotMatch(service, /^RuntimeDirectory=/m);
+    assert.doesNotMatch(service, /\/run\/webex-generic-account-bot/);
+    assert.doesNotMatch(service, /^Group=webex-generic-account-bot$/m);
+    assert.doesNotMatch(service, /^SupplementaryGroups=.*webex-generic-account-bot/m);
+    assert.match(service, /^KillMode=control-group$/m);
+    assert.doesNotMatch(service, /^Delegate=/m);
+    const tmpfilesLines = tmpfiles.trim().split('\n');
+    assert.deepEqual(tmpfilesLines, [
+      'd /run/webex-config-deploy 0750 root webex-config-pull -',
+      'f /run/webex-config-deploy/config-pull-worker.lock 0660 root webex-config-pull -',
+      'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
+      'd /run/webex-config-pull 0750 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot 0755 root root -',
+      'd /var/lib/webex-generic-account-bot/config-actions 0755 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-actions/queue 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-actions/state 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-prepare-checkout 0700 webex-config-deploy webex-config-pull -',
+      'd /var/lib/webex-generic-account-bot/config-staging 0700 webex-config-deploy webex-config-pull -',
+    ]);
+    const sharedLockRecords = tmpfilesLines.filter(
+      (line) => line.startsWith('f /run/webex-config-deploy/'),
+    );
+    assert.deepEqual(sharedLockRecords, [
+      'f /run/webex-config-deploy/config-pull-worker.lock 0660 root webex-config-pull -',
+      'f /run/webex-config-deploy/deploy-config.lock 0660 root webex-config-pull -',
+    ]);
+    assert.doesNotMatch(sharedLockRecords.join('\n'), /\swebex-generic-account-bot\s/);
+    assert.doesNotMatch(tmpfiles, /\/config-checkout /);
   });
 });
 
@@ -133,9 +365,14 @@ describe('deploy-config plan', () => {
     const fetchCommands = allGitCommands.filter((command) => command.args.includes('fetch'));
 
     assert.equal(plan.checkoutWorkDir, path.join(plan.checkoutDir, 'work'));
+    assert.equal(plan.stagingDir, '/var/lib/webex-generic-account-bot/config-staging');
     assert.equal(plan.transactionFile, `${plan.renderedConfig}.transaction`);
-    assert.equal(plan.stagedConfig, `${plan.renderedConfig}.staged`);
-    assert.equal(plan.stagedMetadataFile, `${plan.renderedConfig}.staged.json`);
+    assert.equal(plan.candidateConfig, `${plan.renderedConfig}.candidate`);
+    assert.equal(plan.stagedConfig, path.join(plan.stagingDir, 'production.toml.staged'));
+    assert.equal(
+      plan.stagedMetadataFile,
+      path.join(plan.stagingDir, 'production.toml.staged.json'),
+    );
     assert.deepEqual(commands[0], ['/usr/bin/git', ['-c', 'advice.detachedHead=false', '-c', 'core.hooksPath=/dev/null', '-c', 'filter.lfs.required=false', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'init', plan.checkoutWorkDir]]);
     assert.deepEqual(commands[2], [
       '/usr/bin/git',
@@ -226,6 +463,19 @@ describe('deploy-config plan', () => {
     assert.deepEqual(plan.serviceVerificationCommands, []);
   });
 
+  it('binds prepare plans to an optional validated worker request ID', () => {
+    const requestId = 'a'.repeat(64);
+    const plan = buildDeployPlan(parseArgs(['--prepare', '--request-id', requestId]));
+
+    assert.equal(plan.requestId, requestId);
+    assert.equal(
+      plan.checkoutDir,
+      '/var/lib/webex-generic-account-bot/config-prepare-checkout',
+    );
+    assert.equal(plan.candidateConfig, path.join(plan.stagingDir, 'production.toml.candidate'));
+    assert.equal(buildDeployPlan(parseArgs(['--prepare'])).requestId, null);
+  });
+
   it('rejects mutable deployment paths that overlap the checkout or lock', () => {
     assert.throws(
       () => buildDeployPlan(parseArgsAllow([
@@ -302,10 +552,12 @@ describe('deploy-config plan', () => {
         '--prepare',
         '--rendered-config',
         '/tmp/webex-output/production.toml',
+        '--staging-dir',
+        '/tmp/webex-staging',
         '--metadata-file',
-        '/tmp/webex-output/production.toml.staged',
+        '/tmp/webex-staging/deploy-status.json',
       ])),
-      /staged config must not overlap metadata file/,
+      /staging directory must not overlap metadata directory/,
     );
     assert.throws(
       () => buildDeployPlan(parseArgsAllow([
@@ -317,6 +569,108 @@ describe('deploy-config plan', () => {
       ])),
       /metadata file must not overlap checkout work directory/,
     );
+  });
+
+  it('rejects staging roots that overlap protected deployment paths', () => {
+    const renderedConfig = '/tmp/webex-topology/rendered/production.toml';
+    const cases = [
+      {
+        args: ['--checkout-dir', '/tmp/webex-topology/checkout', '--staging-dir', '/tmp/webex-topology/checkout/staging'],
+        expected: /staging directory must not overlap checkout directory/,
+      },
+      {
+        args: ['--lock-dir', '/tmp/webex-topology/run/deploy.lock', '--staging-dir', '/tmp/webex-topology/run'],
+        expected: /staging directory must not overlap deployment lock directory/,
+      },
+      {
+        args: ['--bot-code-dir', '/tmp/webex-topology/code', '--staging-dir', '/tmp/webex-topology/code/staging'],
+        expected: /staging directory must not overlap bot code directory/,
+      },
+      {
+        args: ['--bot-bin', '/tmp/webex-topology/bin/webex-bot', '--staging-dir', '/tmp/webex-topology/bin/webex-bot'],
+        expected: /staging directory must not overlap bot binary/,
+      },
+      {
+        args: ['--ssh-key', '/tmp/webex-topology/deploy/id_ed25519', '--staging-dir', '/tmp/webex-topology/deploy'],
+        expected: /staging directory must not overlap SSH key/,
+      },
+      {
+        args: ['--ssh-known-hosts', '/tmp/webex-topology/ssh/known_hosts', '--staging-dir', '/tmp/webex-topology/ssh'],
+        expected: /staging directory must not overlap SSH known-hosts file/,
+      },
+      {
+        args: ['--staging-dir', '/tmp/webex-topology/rendered'],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        args: ['--metadata-file', '/tmp/webex-topology/status/deploy.json', '--staging-dir', '/tmp/webex-topology/status'],
+        expected: /staging directory must not overlap metadata directory/,
+      },
+      {
+        args: ['--staging-dir', `${renderedConfig}.previous`],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        args: ['--staging-dir', `${renderedConfig}.transaction`],
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+    ];
+
+    for (const { args, expected } of cases) {
+      assert.throws(
+        () => buildDeployPlan(parseArgsAllow([
+          '--prepare',
+          '--rendered-config',
+          renderedConfig,
+          ...args,
+        ])),
+        expected,
+      );
+    }
+  });
+
+  it('rejects staging roots inside or containing live output directories', () => {
+    const cases = [
+      {
+        renderedConfig: '/tmp/webex-live-rendered/production.toml',
+        metadataFile: '/tmp/webex-live-metadata/deploy-status.json',
+        stagingDir: '/tmp/webex-live-rendered/staging',
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-live-root/rendered/production.toml',
+        metadataFile: '/tmp/webex-other-metadata/deploy-status.json',
+        stagingDir: '/tmp/webex-live-root',
+        expected: /staging directory must not overlap rendered config directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-other-rendered/production.toml',
+        metadataFile: '/tmp/webex-live-status/deploy-status.json',
+        stagingDir: '/tmp/webex-live-status/staging',
+        expected: /staging directory must not overlap metadata directory/,
+      },
+      {
+        renderedConfig: '/tmp/webex-separate-rendered/production.toml',
+        metadataFile: '/tmp/webex-status-root/live/deploy-status.json',
+        stagingDir: '/tmp/webex-status-root',
+        expected: /staging directory must not overlap metadata directory/,
+      },
+    ];
+
+    for (const { renderedConfig, metadataFile, stagingDir, expected } of cases) {
+      assert.throws(
+        () => buildDeployPlan(parseArgsAllow([
+          '--prepare',
+          '--rendered-config',
+          renderedConfig,
+          '--metadata-file',
+          metadataFile,
+          '--staging-dir',
+          stagingDir,
+        ])),
+        expected,
+      );
+    }
   });
 });
 
@@ -1635,6 +1989,191 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(processApi.listenerCount('SIGTERM'), 0);
   });
 
+  it('returns exit 75 when the deployment flock is busy', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-lock-busy-test-'));
+    const lockFile = path.join(temp, 'run', 'deploy.lock');
+    const readyFile = path.join(temp, 'lock-holder.ready');
+    await fs.mkdir(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+    await fs.writeFile(lockFile, '', { mode: 0o600 });
+    const lockHolder = spawn(
+      '/usr/bin/flock',
+      [
+        '--exclusive',
+        lockFile,
+        '/usr/bin/python3',
+        '-c',
+        'import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text("ready"); time.sleep(30)',
+        readyFile,
+      ],
+      { detached: true, stdio: 'ignore' },
+    );
+    let stderr = '';
+
+    try {
+      await waitForFile(readyFile);
+      const status = await runCli({
+        argv: prepareTestArgs(temp, lockFile),
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+      });
+
+      assert.equal(status, 75);
+      assert.match(stderr, /deployment already in progress/);
+    } finally {
+      await stopDetachedChild(lockHolder);
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('returns exit 70 for an uncontained command process tree', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const fsApi = await protectPrepareLiveDirectories(renderedConfig, metadataFile);
+    let stderr = '';
+
+    try {
+      const status = await runCli({
+        argv: prepareTestArgs(temp),
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+        fsApi,
+        runner: async () => {
+          throw new ProcessTreeUncontainedError('command process tree was not reaped');
+        },
+      });
+
+      assert.equal(status, 70);
+      assert.match(stderr, /command process tree was not reaped/);
+    } finally {
+      await removeProtectedPrepareTemp(temp, renderedConfig);
+    }
+  });
+
+  it('preserves process-tree classification across prepare cleanup failure', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const plan = buildDeployPlan(parseArgsAllow(prepareTestArgs(temp)));
+    let commandFailed = false;
+    const baseFsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (commandFailed && file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+    const fsApi = await protectPrepareLiveDirectories(
+      renderedConfig,
+      metadataFile,
+      baseFsApi,
+    );
+
+    try {
+      await assert.rejects(
+        () => executePreparePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandFailed = true;
+            throw new ProcessTreeUncontainedError('command process tree was not reaped');
+          },
+        }),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(
+            error.message,
+            /command process tree was not reaped; prepare cleanup failed: candidate cleanup failed/,
+          );
+          return true;
+        },
+      );
+      await assertLockReleased(plan.lockDir);
+    } finally {
+      await removeProtectedPrepareTemp(temp, renderedConfig);
+    }
+  });
+
+  it('preserves exit 70 across apply metadata and cleanup failures', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-process-tree-test-'));
+    const argv = [
+      '--apply',
+      '--skip-restart',
+      '--checkout-dir',
+      path.join(temp, 'checkout'),
+      '--staging-dir',
+      path.join(temp, 'staging'),
+      '--rendered-config',
+      path.join(temp, 'rendered', 'production.toml'),
+      '--metadata-file',
+      path.join(temp, 'rendered', 'deploy-status.json'),
+      '--lock-dir',
+      path.join(temp, 'run', 'deploy.lock'),
+      '--bot-code-dir',
+      path.join(temp, 'bot-code'),
+      '--bot-bin',
+      '/usr/bin/true',
+    ];
+    const plan = buildDeployPlan(parseArgsAllow(argv));
+    let commandFailed = false;
+    let stderr = '';
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (commandFailed && target === plan.metadataFile) {
+          throw new Error('metadata persistence failed');
+        }
+        return fs.rename(source, target);
+      },
+      async rm(file, ...args) {
+        if (commandFailed && file === plan.candidateConfig) {
+          throw new Error('candidate cleanup failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+
+    try {
+      const status = await runCli({
+        argv,
+        parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
+        stdout: writer(),
+        stderr: writer((chunk) => {
+          stderr += chunk;
+        }),
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            commandFailed = true;
+            throw new ProcessTreeUncontainedError('apply command tree was not contained');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'7'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      });
+
+      assert.equal(status, 70);
+      assert.match(stderr, /apply command tree was not contained/);
+      assert.match(stderr, /failed to write deployment failure metadata: metadata persistence failed/);
+      assert.match(stderr, /deployment cleanup failed: candidate cleanup failed/);
+      assert.match(stderr, /failed to record cleanup state: metadata persistence failed/);
+      await assertLockReleased(plan.lockDir);
+    } finally {
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
   it('dry-run prints a plan without executing commands', async () => {
     let stdout = '';
     let executed = false;
@@ -1655,24 +2194,59 @@ describe('deploy-config CLI and execution', () => {
     assert.match(stdout, /checkout_work_dir=/);
     assert.match(
       stdout,
+      /staging_dir=\/var\/lib\/webex-generic-account-bot\/config-staging/,
+    );
+    assert.match(
+      stdout,
       /command_1=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
     );
+
+    let jsonStdout = '';
+    const jsonStatus = await runCli({
+      argv: ['--dry-run', '--json'],
+      stdout: writer((chunk) => {
+        jsonStdout += chunk;
+      }),
+      stderr: writer(),
+      runner: async () => {
+        executed = true;
+      },
+    });
+    const serialised = JSON.parse(jsonStdout);
+    assert.equal(jsonStatus, 0);
+    assert.equal(
+      serialised.plan.staging_dir,
+      '/var/lib/webex-generic-account-bot/config-staging',
+    );
+    assert.equal(
+      serialised.plan.candidate_config,
+      '/var/lib/webex-generic-account-bot/rendered/production.toml.candidate',
+    );
+    assert.equal(executed, false);
   });
 
   it('prepare CLI emits machine-readable staged metadata', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-cli-test-'));
-    const renderedConfig = path.join(temp, 'rendered', 'production.toml');
+    const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+    const metadataFile = path.join(path.dirname(renderedConfig), 'deploy-status.json');
+    const stagingDir = path.join(temp, 'staging');
+    const fsApi = await protectPrepareLiveDirectories(renderedConfig, metadataFile);
     let stdout = '';
+    const requestId = 'd'.repeat(64);
     const status = await runCli({
       argv: [
         '--prepare',
+        '--request-id',
+        requestId,
         '--json',
         '--checkout-dir',
         path.join(temp, 'checkout'),
+        '--staging-dir',
+        stagingDir,
         '--rendered-config',
         renderedConfig,
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        metadataFile,
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1685,9 +2259,14 @@ describe('deploy-config CLI and execution', () => {
         stdout += chunk;
       }),
       stderr: writer(),
+      fsApi,
       runner: async (command) => {
         if (command.bin === '/usr/bin/bash') {
-          await fs.writeFile(`${renderedConfig}.candidate`, 'prepared config\n', 'utf8');
+          await fs.writeFile(
+            path.join(stagingDir, 'production.toml.candidate'),
+            'prepared config\n',
+            'utf8',
+          );
         }
         return {
           stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
@@ -1700,7 +2279,8 @@ describe('deploy-config CLI and execution', () => {
     const metadata = JSON.parse(stdout);
     assert.equal(metadata.status, 'prepared');
     assert.equal(metadata.config_revision, 'd'.repeat(40));
-    assert.equal(metadata.staged_config, `${renderedConfig}.staged`);
+    assert.equal(metadata.staged_config, path.join(stagingDir, 'production.toml.staged'));
+    assert.equal(metadata.request_id, requestId);
   });
 
   it('rejects invalid JSON metadata in JSON status mode', async () => {
@@ -1784,9 +2364,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'deploy.lock'),
         '--bot-code-dir',
@@ -1837,9 +2417,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1855,9 +2435,23 @@ describe('deploy-config CLI and execution', () => {
     await fs.writeFile(plan.metadataFile, deploymentStatus, { mode: 0o644 });
     await fs.writeFile(plan.backupConfig, backupConfig, { mode: 0o644 });
     const calls = [];
+    let chownCalled = false;
+    const baseFsApi = {
+      ...fs,
+      async chown(...args) {
+        chownCalled = true;
+        return fs.chown(...args);
+      },
+    };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     const metadata = await executePreparePlan({
       plan,
+      fsApi,
       parentEnv: {
         PATH: '/bin',
         SSH_AUTH_SOCK: '/tmp/agent.sock',
@@ -1890,12 +2484,151 @@ describe('deploy-config CLI and execution', () => {
       JSON.parse(await fs.readFile(plan.stagedMetadataFile, 'utf8')),
       metadata,
     );
-    assert.equal((await fs.stat(plan.stagedConfig)).mode & 0o777, 0o644);
-    assert.equal((await fs.stat(plan.stagedMetadataFile)).mode & 0o777, 0o600);
+    const stagedStat = await fs.stat(plan.stagedConfig);
+    const stagedMetadataStat = await fs.stat(plan.stagedMetadataFile);
+    assert.equal(stagedStat.mode & 0o777, 0o600);
+    assert.equal(stagedStat.uid, process.getuid());
+    assert.equal(stagedStat.gid, process.getgid());
+    assert.equal(stagedMetadataStat.mode & 0o777, 0o600);
+    assert.equal(stagedMetadataStat.uid, process.getuid());
+    assert.equal(stagedMetadataStat.gid, process.getgid());
+    assert.equal(chownCalled, false);
+    assert.equal((await fs.stat(plan.stagingDir)).mode & 0o777, 0o700);
     assert.equal(calls.length, plan.commands.length);
     assert(calls.every((call) => call.command.bin !== '/usr/bin/systemctl'));
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when the live output directory is worker-owned mode 0555', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-live-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.chmod(path.dirname(plan.renderedConfig), 0o555);
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /must not be owned by the prepare worker/,
+    );
+
+    assert.equal(executed, false);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when the checked existing live parent is worker-owned mode 0555', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-parent-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const liveDirectory = path.dirname(plan.renderedConfig);
+    const existingParent = path.dirname(liveDirectory);
+    await fs.mkdir(existingParent, { recursive: true, mode: 0o755 });
+    await fs.chmod(existingParent, 0o555);
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /must not be owned by the prepare worker/,
+    );
+
+    assert.equal(executed, false);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects prepare when a live grandparent is worker-owned mode 0555', async () => {
+    const temp = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'deploy-config-prepare-grandparent-test-'),
+    );
+    const workerGrandparent = path.join(temp, 'worker-grandparent');
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--staging-dir',
+        path.join(temp, 'staging'),
+        '--rendered-config',
+        path.join(workerGrandparent, 'live-root', 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(workerGrandparent, 'live-root', 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.chmod(workerGrandparent, 0o555);
+    const trustedFsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+    );
+    const fsApi = {
+      ...trustedFsApi,
+      async lstat(candidate, ...args) {
+        if (path.resolve(candidate) === workerGrandparent) {
+          return fs.lstat(candidate, ...args);
+        }
+        return trustedFsApi.lstat(candidate, ...args);
+      },
+    };
+    let executed = false;
+
+    await assert.rejects(
+      executePreparePlan({
+        plan,
+        fsApi,
+        runner: async () => {
+          executed = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      {
+        message: `rendered config directory must not be owned by the prepare worker: ${workerGrandparent}`,
+      },
+    );
+
+    assert.equal(executed, false);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -1907,9 +2640,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1919,13 +2652,19 @@ describe('deploy-config CLI and execution', () => {
     const outsideConfig = path.join(temp, 'outside-config');
     const outsideMetadata = path.join(temp, 'outside-metadata');
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(plan.stagingDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(outsideConfig, 'outside config sentinel\n', 'utf8');
     await fs.writeFile(outsideMetadata, 'outside metadata sentinel\n', 'utf8');
     await fs.symlink(outsideConfig, plan.stagedConfig);
     await fs.symlink(outsideMetadata, plan.stagedMetadataFile);
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+    );
 
     await executePreparePlan({
       plan,
+      fsApi,
       runner: async (command) => {
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(plan.candidateConfig, 'prepared config\n', 'utf8');
@@ -1953,9 +2692,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -1969,11 +2708,29 @@ describe('deploy-config CLI and execution', () => {
       configRevision: 'b'.repeat(40),
       serviceRestartRequired: true,
     });
+    await fs.chmod(plan.transactionFile, 0o000);
     let executed = false;
+    let transactionRead = false;
+    const baseFsApi = {
+      ...fs,
+      async open(file, ...args) {
+        if (file === plan.transactionFile) {
+          transactionRead = true;
+          throw new Error('transaction contents must not be opened by prepare');
+        }
+        return fs.open(file, ...args);
+      },
+    };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
         plan,
+        fsApi,
         runner: async () => {
           executed = true;
           return { stdout: '', stderr: '' };
@@ -1983,6 +2740,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.equal(executed, false);
+    assert.equal(transactionRead, false);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'live config\n');
     assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'rollback sentinel\n');
     assert.equal((await fs.stat(plan.transactionFile)).isFile(), true);
@@ -1997,9 +2755,9 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
@@ -2007,12 +2765,13 @@ describe('deploy-config CLI and execution', () => {
       ]),
     );
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(plan.stagingDir, { recursive: true, mode: 0o700 });
     await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
     await fs.writeFile(plan.stagedConfig, 'old staged config\n', { mode: 0o644 });
     await fs.writeFile(plan.stagedMetadataFile, '{"status":"prepared","stale":true}\n', {
       mode: 0o600,
     });
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async rename(source, destination) {
         if (destination === plan.stagedMetadataFile) {
@@ -2023,6 +2782,11 @@ describe('deploy-config CLI and execution', () => {
         return fs.rename(source, destination);
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
@@ -2055,21 +2819,21 @@ describe('deploy-config CLI and execution', () => {
         '--checkout-dir',
         path.join(temp, 'checkout'),
         '--rendered-config',
-        path.join(temp, 'rendered', 'production.toml'),
+        path.join(temp, 'live-root', 'rendered', 'production.toml'),
         '--metadata-file',
-        path.join(temp, 'rendered', 'deploy-status.json'),
+        path.join(temp, 'live-root', 'rendered', 'deploy-status.json'),
         '--lock-dir',
         path.join(temp, 'run', 'deploy.lock'),
         '--bot-code-dir',
         path.join(temp, 'bot-code'),
       ]),
     );
-    const renderedDirectory = path.dirname(plan.renderedConfig);
-    await fs.mkdir(renderedDirectory, { recursive: true, mode: 0o755 });
+    const stagingDirectory = plan.stagingDir;
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
     await fs.writeFile(plan.renderedConfig, 'live config\n', { mode: 0o644 });
     let metadataRenamed = false;
     let metadataDirectorySyncFailed = false;
-    const fsApi = {
+    const baseFsApi = {
       ...fs,
       async rename(source, destination) {
         await fs.rename(source, destination);
@@ -2080,7 +2844,7 @@ describe('deploy-config CLI and execution', () => {
       async open(file, ...args) {
         const handle = await fs.open(file, ...args);
         if (
-          file === renderedDirectory
+          file === stagingDirectory
           && metadataRenamed
           && !metadataDirectorySyncFailed
         ) {
@@ -2097,6 +2861,11 @@ describe('deploy-config CLI and execution', () => {
         return handle;
       },
     };
+    const fsApi = await protectPrepareLiveDirectories(
+      plan.renderedConfig,
+      plan.metadataFile,
+      baseFsApi,
+    );
 
     await assert.rejects(
       executePreparePlan({
@@ -2173,10 +2942,79 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(JSON.parse(await fs.readFile(plan.metadataFile, 'utf8')).config_revision, 'a'.repeat(40));
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'candidate config\n');
     assert.equal((await fs.stat(plan.renderedConfig)).mode & 0o777, 0o644);
+    await assert.rejects(fs.stat(plan.stagingDir), { code: 'ENOENT' });
+    assert.equal((await fs.stat(path.dirname(plan.renderedConfig))).isDirectory(), true);
     assert.equal((await fs.stat(path.dirname(plan.lockDir))).isDirectory(), true);
     assert.equal(lockOwner.pid, process.pid);
     assert.match(lockOwner.process_start_ticks, /^[0-9]+$/);
     assert.equal(typeof lockOwner.token, 'string');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('apply ignores worker-owned staging and prepare checkout directories', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-boundary-test-'));
+    const workerStaging = path.join(temp, 'worker-staging');
+    const workerPrepareCheckout = path.join(temp, 'worker-prepare-checkout');
+    const preparePlan = buildDeployPlan(
+      parseArgsAllow([
+        '--prepare',
+        '--checkout-dir',
+        workerPrepareCheckout,
+        '--staging-dir',
+        workerStaging,
+        '--rendered-config',
+        path.join(temp, 'prepare-live', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'prepare-live', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'prepare-run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'apply-checkout'),
+        '--staging-dir',
+        workerStaging,
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'run', 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const workerDirectories = [plan.stagingDir, preparePlan.checkoutDir];
+    for (const directory of workerDirectories) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, 'sentinel'), 'worker-owned\n', 'utf8');
+    }
+    const fsApi = rejectPathAccessFs(fs, workerDirectories);
+
+    const metadata = await executePlan({
+      plan,
+      fsApi,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'candidate config\n', 'utf8');
+        }
+        return {
+          stdout: command.capture === 'configRevision' ? `${'1'.repeat(40)}\n` : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'installed_without_restart');
+    for (const directory of workerDirectories) {
+      assert.equal(await fs.readFile(path.join(directory, 'sentinel'), 'utf8'), 'worker-owned\n');
+    }
     await assertLockReleased(plan.lockDir);
   });
 
@@ -2520,6 +3358,8 @@ describe('deploy-config CLI and execution', () => {
         '--skip-restart',
         '--checkout-dir',
         path.join(temp, 'checkout'),
+        '--staging-dir',
+        path.join(temp, 'staging'),
         '--rendered-config',
         path.join(unsafeParent, 'rendered', 'production.toml'),
         '--metadata-file',
@@ -2968,7 +3808,7 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
-  it('recovers an interrupted install before checkout cleanup can delete its backup', async () => {
+  it('recovers a valid legacy same-owner 0600 journal before checkout cleanup', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
     const plan = buildDeployPlan(
       parseArgsAllow([
@@ -2992,7 +3832,14 @@ describe('deploy-config CLI and execution', () => {
     await writeInstallTransactionFixture(plan, {
       configRevision: '1'.repeat(40),
       serviceRestartRequired: false,
+      mode: 0o600,
     });
+    const legacyTransactionStat = await fs.stat(plan.transactionFile);
+    assert.equal(legacyTransactionStat.mode & 0o777, 0o600);
+    if (typeof process.getuid === 'function') {
+      assert.equal(legacyTransactionStat.uid, process.getuid());
+      assert.equal(legacyTransactionStat.gid, process.getgid());
+    }
     let commandRan = false;
 
     await assert.rejects(
@@ -3012,6 +3859,129 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(commandRan, true);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
     await assertLockReleased(plan.lockDir);
+  });
+
+  it('recovers current and legacy journals owned by the same UID after a GID change', async () => {
+    for (const mode of [0o644, 0o600]) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+      const plan = buildDeployPlan(
+        parseArgsAllow([
+          '--apply',
+          '--skip-restart',
+          '--checkout-dir',
+          path.join(temp, 'checkout'),
+          '--rendered-config',
+          path.join(temp, 'rendered', 'production.toml'),
+          '--metadata-file',
+          path.join(temp, 'rendered', 'deploy-status.json'),
+          '--lock-dir',
+          path.join(temp, 'deploy.lock'),
+          '--bot-code-dir',
+          path.join(temp, 'bot-code'),
+        ]),
+      );
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+      await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+      await writeInstallTransactionFixture(plan, {
+        configRevision: '2'.repeat(40),
+        serviceRestartRequired: false,
+        mode,
+      });
+      const transactionStat = await fs.stat(plan.transactionFile);
+      const fsApi = overrideInstallTransactionStat(fs, plan.transactionFile, {
+        gid: transactionStat.gid + 1,
+      });
+      let commandRan = false;
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandRan = true;
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
+            await assert.rejects(() => fs.access(plan.transactionFile));
+            throw new Error(`stop after ${mode.toString(8)} recovery`);
+          },
+        }),
+        new RegExp(`stop after ${mode.toString(8)} recovery`),
+      );
+
+      assert.equal(commandRan, true);
+      await assertLockReleased(plan.lockDir);
+    }
+  });
+
+  it('rejects recovery journals with a wrong UID or unsafe modes', async () => {
+    const cases = [
+      {
+        label: 'wrong UID',
+        override: (transactionStat) => ({ uid: transactionStat.uid + 1 }),
+        expected: /deployment transaction ownership is not trusted/,
+      },
+      {
+        label: 'group-writable mode',
+        override: () => ({ mode: 0o664 }),
+        expected: /deployment transaction mode is not trusted/,
+      },
+      {
+        label: 'world-writable mode',
+        override: () => ({ mode: 0o646 }),
+        expected: /deployment transaction mode is not trusted/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-recovery-test-'));
+      const plan = buildDeployPlan(
+        parseArgsAllow([
+          '--apply',
+          '--skip-restart',
+          '--checkout-dir',
+          path.join(temp, 'checkout'),
+          '--rendered-config',
+          path.join(temp, 'rendered', 'production.toml'),
+          '--metadata-file',
+          path.join(temp, 'rendered', 'deploy-status.json'),
+          '--lock-dir',
+          path.join(temp, 'deploy.lock'),
+          '--bot-code-dir',
+          path.join(temp, 'bot-code'),
+        ]),
+      );
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
+      await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
+      await writeInstallTransactionFixture(plan, {
+        configRevision: '3'.repeat(40),
+        serviceRestartRequired: false,
+      });
+      const transactionStat = await fs.stat(plan.transactionFile);
+      const fsApi = overrideInstallTransactionStat(
+        fs,
+        plan.transactionFile,
+        testCase.override(transactionStat),
+      );
+      let commandRan = false;
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          fsApi,
+          runner: async () => {
+            commandRan = true;
+            return { stdout: '', stderr: '' };
+          },
+        }),
+        testCase.expected,
+        testCase.label,
+      );
+
+      assert.equal(commandRan, false, testCase.label);
+      assert.equal((await fs.stat(plan.transactionFile)).isFile(), true, testCase.label);
+      await assertLockReleased(plan.lockDir);
+    }
   });
 
   it('rolls back a prepared first install without stopping or restarting the service', async () => {
@@ -3101,7 +4071,7 @@ describe('deploy-config CLI and execution', () => {
     );
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
     assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
-    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o644);
 
     await assert.rejects(
       () => executePlan({
@@ -3140,7 +4110,7 @@ describe('deploy-config CLI and execution', () => {
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
     await fs.writeFile(plan.renderedConfig, 'uncommitted config\n', { mode: 0o644 });
     await fs.writeFile(plan.backupConfig, 'old config\n', { mode: 0o644 });
-    await fs.writeFile(plan.transactionFile, '{not valid json\n', { mode: 0o600 });
+    await fs.writeFile(plan.transactionFile, '{not valid json\n', { mode: 0o644 });
     let commandRan = false;
 
     await assert.rejects(
@@ -3194,7 +4164,7 @@ describe('deploy-config CLI and execution', () => {
 
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'uncommitted config\n');
     assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
-    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o644);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -3329,7 +4299,7 @@ describe('deploy-config CLI and execution', () => {
     ]);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
     assert.equal(rollbackDirectorySyncFailed, true);
-    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(plan.transactionFile)).mode & 0o777, 0o644);
     assert.equal(await fs.readFile(plan.backupConfig, 'utf8'), 'old config\n');
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_apply');
@@ -3522,6 +4492,64 @@ describe('deploy-config CLI and execution', () => {
     const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
     assert.equal(transaction.phase, 'committed_pending_metadata');
     assert.equal(transaction.config_revision, '8'.repeat(40));
+  });
+
+  it('atomically publishes new install transaction journals with mode 0644', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--skip-restart',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    const transactionRenames = [];
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (target === plan.transactionFile) {
+          const temporaryStat = await fs.stat(source);
+          await fs.rename(source, target);
+          const publishedStat = await fs.stat(target);
+          transactionRenames.push({ temporaryStat, publishedStat });
+          return;
+        }
+        await fs.rename(source, target);
+      },
+    };
+
+    await executePlan({
+      plan,
+      fsApi,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+        }
+        return {
+          stdout: command.capture === 'configRevision' ? `${'9'.repeat(40)}\n` : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(transactionRenames.length, 2);
+    for (const { temporaryStat, publishedStat } of transactionRenames) {
+      assert.equal(temporaryStat.mode & 0o777, 0o644);
+      assert.equal(publishedStat.mode & 0o777, 0o644);
+      assert.equal(publishedStat.uid, temporaryStat.uid);
+      assert.equal(publishedStat.gid, temporaryStat.gid);
+    }
+    await assert.rejects(() => fs.access(plan.transactionFile));
+    await assertLockReleased(plan.lockDir);
   });
 
   it('records failure metadata when validation fails before install', async () => {
@@ -3803,6 +4831,74 @@ describe('deploy-config CLI and execution', () => {
     const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failureMetadata.status, 'failed_restart_rolled_back');
     assert.equal(failureMetadata.config_revision, 'c'.repeat(40));
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('preserves process-tree classification when restart rollback also fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
+    const plan = buildDeployPlan(
+      parseArgsAllow([
+        '--apply',
+        '--checkout-dir',
+        path.join(temp, 'checkout'),
+        '--rendered-config',
+        path.join(temp, 'rendered', 'production.toml'),
+        '--metadata-file',
+        path.join(temp, 'rendered', 'deploy-status.json'),
+        '--lock-dir',
+        path.join(temp, 'deploy.lock'),
+        '--bot-code-dir',
+        path.join(temp, 'bot-code'),
+      ]),
+    );
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old config\n', { mode: 0o644 });
+    let restartFailed = false;
+    const fsApi = {
+      ...fs,
+      async rename(source, target) {
+        if (
+          restartFailed
+          && source === plan.candidateConfig
+          && target === plan.renderedConfig
+        ) {
+          throw new Error('rollback rename failed');
+        }
+        return fs.rename(source, target);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
+          }
+          if (command.bin === '/usr/bin/systemctl' && command.args[0] === 'restart') {
+            restartFailed = true;
+            throw new ProcessTreeUncontainedError('restart command tree was not contained');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      (error) => {
+        assert(error instanceof ProcessTreeUncontainedError);
+        assert.equal(error.exitStatus, 70);
+        assert.match(
+          error.message,
+          /restart command tree was not contained; failed to restore previous config: rollback rename failed/,
+        );
+        return true;
+      },
+    );
+
+    const failureMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failureMetadata.status, 'failed_restart_rollback_failed');
     await assertLockReleased(plan.lockDir);
   });
 
@@ -4291,8 +5387,85 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(failureMetadata.config_revision, 'd'.repeat(40));
   });
 
-  it('bounds child output captured by runCommand', async () => {
+  it('runs the injected process-tree inspector before spawn and after close', async () => {
+    const events = [];
+    const baseline = Object.freeze({ test: 'baseline' });
+    const inspector = {
+      async captureBaseline() {
+        events.push('before');
+        return baseline;
+      },
+      async assertContained(actualBaseline) {
+        events.push('after');
+        assert.equal(actualBaseline, baseline);
+      },
+    };
+
     const result = await runCommand(
+      {
+        bin: '/usr/bin/printf',
+        args: ['contained'],
+        timeoutMs: 5_000,
+        outputLimitBytes: 100,
+      },
+      scrubEnv(),
+      null,
+      inspector,
+    );
+
+    assert.equal(result.stdout, 'contained');
+    assert.deepEqual(events, ['before', 'after']);
+  });
+
+  it('fails closed when process-tree inspection cannot establish containment', async () => {
+    for (const [phase, inspector, expected] of [
+      [
+        'before',
+        {
+          async captureBaseline() {
+            throw new Error('baseline unavailable');
+          },
+          async assertContained() {},
+        },
+        /before command spawn: baseline unavailable/,
+      ],
+      [
+        'after',
+        {
+          async captureBaseline() {
+            return 'baseline';
+          },
+          async assertContained() {
+            throw new Error('membership unavailable');
+          },
+        },
+        /after command close: membership unavailable/,
+      ],
+    ]) {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/usr/bin/true',
+            args: [],
+            timeoutMs: 5_000,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+          null,
+          inspector,
+        ),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError, phase);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, expected);
+          return true;
+        },
+      );
+    }
+  });
+
+  it('bounds child output captured by runCommand', async () => {
+    const result = await runContainedCommand(
       {
         bin: '/usr/bin/python3',
         args: ['-c', 'import sys; sys.stdout.write("x" * 20); sys.stderr.write("y" * 20)'],
@@ -4309,7 +5482,7 @@ describe('deploy-config CLI and execution', () => {
   });
 
   it('executes resource-limited commands through the fixed prlimit wrapper', async () => {
-    const result = await runCommand(
+    const result = await runContainedCommand(
       {
         bin: '/usr/bin/python3',
         args: ['-c', 'print("limited")'],
@@ -4325,7 +5498,7 @@ describe('deploy-config CLI and execution', () => {
 
   it('fails closed when a command tree manifest does not pass validation', async () => {
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: '/usr/bin/python3',
           args: ['-c', 'print("not a tree manifest")'],
@@ -4340,7 +5513,7 @@ describe('deploy-config CLI and execution', () => {
   });
 
   it('accepts only ready or authenticated bot health responses', async () => {
-    const ready = await runCommand(
+    const ready = await runContainedCommand(
       {
         bin: '/usr/bin/printf',
         args: ['401'],
@@ -4353,7 +5526,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(ready.stdout, '401');
 
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: '/usr/bin/printf',
           args: ['503'],
@@ -4369,7 +5542,7 @@ describe('deploy-config CLI and execution', () => {
 
   it('times out child processes', async () => {
     await assert.rejects(
-      () => runCommand(
+      () => runContainedCommand(
         {
           bin: process.execPath,
           args: [
@@ -4393,7 +5566,7 @@ describe('deploy-config CLI and execution', () => {
     );
     try {
       await assert.rejects(
-        () => runCommand(
+        () => runContainedCommand(
           {
             bin: '/usr/bin/python3',
             args: ['-c', 'import time; time.sleep(30)'],
@@ -4414,9 +5587,11 @@ describe('deploy-config CLI and execution', () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const pidFile = path.join(temp, 'escaped.pid');
     const script = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 30' &\nwait`;
+    let escapedPid = null;
+    let escapedDescendantKilled = false;
     try {
       await assert.rejects(
-        () => runCommand(
+        () => runContainedCommand(
           {
             bin: '/bin/sh',
             args: ['-c', script],
@@ -4427,17 +5602,185 @@ describe('deploy-config CLI and execution', () => {
           },
           scrubEnv(),
         ),
-        /did not close after SIGKILL/,
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, /did not close after SIGKILL/);
+          return true;
+        },
       );
+      escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      assert.equal(process.kill(-escapedPid, 0), true);
     } finally {
       try {
-        const escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
-        process.kill(-escapedPid, 'SIGKILL');
+        escapedPid ??= Number((await fs.readFile(pidFile, 'utf8')).trim());
+        escapedDescendantKilled = process.kill(-escapedPid, 'SIGKILL');
       } catch (_) {}
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+    assert.equal(escapedDescendantKilled, true);
+  });
+
+  it('detects a live setsid descendant after the direct child closes its pipes', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-cgroup-test-'));
+    const pidFile = path.join(temp, 'escaped.pid');
+    const script = [
+      `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; exec /bin/sleep 30' </dev/null >/dev/null 2>&1 &`,
+      `while [ ! -s ${pidFile} ]; do /bin/sleep 0.01; done`,
+    ].join('\n');
+    const inspector = namespaceVisibleCgroupInspector(pidFile);
+    let escapedPid = null;
+
+    try {
+      await assert.rejects(
+        () => runCommand(
+          {
+            bin: '/bin/sh',
+            args: ['-c', script],
+            timeoutMs: 5_000,
+            outputLimitBytes: 100,
+          },
+          scrubEnv(),
+          null,
+          inspector,
+        ),
+        (error) => {
+          assert(error instanceof ProcessTreeUncontainedError);
+          assert.equal(error.exitStatus, 70);
+          assert.match(error.message, /live cgroup members outside its PID identity baseline/);
+          return true;
+        },
+      );
+      escapedPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      assert.equal(process.kill(-escapedPid, 0), true);
+    } finally {
+      try {
+        escapedPid ??= Number((await fs.readFile(pidFile, 'utf8')).trim());
+        process.kill(-escapedPid, 'SIGKILL');
+        await waitForProcessExit(escapedPid);
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') {
+          throw error;
+        }
+      }
       await fs.rm(temp, { recursive: true, force: true });
     }
   });
 });
+
+function prepareTestArgs(temp, lockFile = path.join(temp, 'run', 'deploy.lock')) {
+  const renderedConfig = path.join(temp, 'live-root', 'rendered', 'production.toml');
+  return [
+    '--prepare',
+    '--checkout-dir',
+    path.join(temp, 'checkout'),
+    '--staging-dir',
+    path.join(temp, 'staging'),
+    '--rendered-config',
+    renderedConfig,
+    '--metadata-file',
+    path.join(path.dirname(renderedConfig), 'deploy-status.json'),
+    '--lock-dir',
+    lockFile,
+    '--bot-code-dir',
+    path.join(temp, 'bot-code'),
+    '--bot-bin',
+    '/usr/bin/true',
+  ];
+}
+
+async function waitForFile(file, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await fs.stat(file);
+      return;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for file: ${file}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function namespaceVisibleCgroupInspector(pidFile) {
+  const fsApi = {
+    ...fs,
+    async readFile(file, ...args) {
+      const contents = await fs.readFile(file, ...args);
+      if (path.basename(String(file)) !== 'cgroup.procs') {
+        return contents;
+      }
+      const allowedPids = new Set([process.pid]);
+      try {
+        allowedPids.add(Number((await fs.readFile(pidFile, 'utf8')).trim()));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+      return String(contents)
+        .split('\n')
+        .filter((line) => allowedPids.has(Number(line)))
+        .join('\n');
+    },
+  };
+  return createLinuxCgroupV2MembershipInspector({ fsApi });
+}
+
+async function waitForProcessExit(pid, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === 'ESRCH') {
+        return;
+      }
+      throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for process exit: ${pid}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function stopDetachedChild(child) {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') {
+      throw error;
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    await new Promise((resolve) => child.once('close', resolve));
+  }
+}
+
+async function removeProtectedPrepareTemp(temp, renderedConfig) {
+  for (const directory of [
+    path.dirname(renderedConfig),
+    path.dirname(path.dirname(renderedConfig)),
+  ]) {
+    try {
+      await fs.chmod(directory, 0o755);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+  await fs.rm(temp, { recursive: true, force: true });
+}
 
 async function assertLockReleased(lockFile) {
   const metadata = await fs.stat(lockFile);
@@ -4461,6 +5804,7 @@ async function writeInstallTransactionFixture(
     committedAt = phase === 'committed_pending_metadata'
       ? '2026-06-27T00:01:00.000Z'
       : null,
+    mode = 0o644,
   },
 ) {
   await fs.writeFile(
@@ -4480,14 +5824,181 @@ async function writeInstallTransactionFixture(
       started_at: '2026-06-27T00:00:00.000Z',
       committed_at: committedAt,
     }, null, 2)}\n`,
-    { mode: 0o600 },
+    { mode },
   );
 }
 
+function overrideInstallTransactionStat(fsApi, transactionFile, overrides) {
+  return {
+    ...fsApi,
+    async open(file, ...args) {
+      const handle = await fsApi.open(file, ...args);
+      if (file !== transactionFile) {
+        return handle;
+      }
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === 'stat') {
+            return async (...statArgs) => {
+              const metadata = await target.stat(...statArgs);
+              return new Proxy(metadata, {
+                get(statTarget, statProperty) {
+                  if (Object.prototype.hasOwnProperty.call(overrides, statProperty)) {
+                    return overrides[statProperty];
+                  }
+                  const value = Reflect.get(statTarget, statProperty, statTarget);
+                  return typeof value === 'function' ? value.bind(statTarget) : value;
+                },
+              });
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+}
+
+async function protectPrepareLiveDirectories(renderedConfig, metadataFile, fsApi = fs) {
+  const directories = new Set([
+    path.resolve(path.dirname(renderedConfig)),
+    path.resolve(path.dirname(metadataFile)),
+  ]);
+  const readOnlyDirectories = new Set();
+  const trustedAncestors = new Set();
+  for (const directory of directories) {
+    await fs.mkdir(directory, { recursive: true, mode: 0o755 });
+    await fs.chmod(directory, 0o555);
+    readOnlyDirectories.add(directory);
+    readOnlyDirectories.add(path.dirname(directory));
+    let current = directory;
+    for (;;) {
+      trustedAncestors.add(current);
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  for (const parent of [...readOnlyDirectories].filter(
+    (candidate) => !directories.has(candidate),
+  )) {
+    await fs.chmod(parent, 0o555);
+  }
+  const rootUid = (await fs.lstat(path.parse(path.resolve(renderedConfig)).root)).uid;
+  return {
+    ...fsApi,
+    async lstat(candidate, ...args) {
+      const stat = await fsApi.lstat(candidate, ...args);
+      if (!trustedAncestors.has(path.resolve(candidate))) {
+        return stat;
+      }
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === 'uid') return rootUid;
+          if (property === 'mode') return target.mode & ~0o022;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+}
+
+function rejectPathAccessFs(fsApi, rejectedRoots) {
+  const roots = rejectedRoots.map((root) => path.resolve(root));
+  return new Proxy(fsApi, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        for (const candidate of args.filter((arg) => typeof arg === 'string')) {
+          const resolved = path.resolve(candidate);
+          if (roots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`))) {
+            throw new Error(`unexpected worker path access: ${resolved}`);
+          }
+        }
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+}
+
+function fakeProcessIdentity(uid, gid, groups) {
+  return {
+    getuid: () => uid,
+    getgid: () => gid,
+    getgroups: () => groups,
+  };
+}
+
+function fakeLockProvisioningFs(
+  lockFile,
+  {
+    rootUid = 0,
+    parentUid = rootUid,
+    parentGid = 0,
+    parentMode = 0o750,
+    parentKind = 'directory',
+    lockUid = rootUid,
+    lockGid = parentGid,
+    lockMode = 0o660,
+    lockKind = 'file',
+    missing = null,
+  },
+) {
+  const root = path.parse(path.resolve(lockFile)).root;
+  const parent = path.dirname(lockFile);
+  const stats = new Map([
+    [root, fakeLockStat('directory', rootUid, 0, 0o755)],
+    [parent, fakeLockStat(parentKind, parentUid, parentGid, parentMode)],
+    [lockFile, fakeLockStat(lockKind, lockUid, lockGid, lockMode)],
+  ]);
+  return {
+    async lstat(candidate) {
+      if ((missing === 'parent' && candidate === parent) || (missing === 'lock' && candidate === lockFile)) {
+        const error = new Error(`ENOENT: no such file or directory, lstat '${candidate}'`);
+        error.code = 'ENOENT';
+        throw error;
+      }
+      const stat = stats.get(candidate);
+      assert(stat, `unexpected lstat path: ${candidate}`);
+      return stat;
+    },
+  };
+}
+
+function fakeLockStat(kind, uid, gid, mode) {
+  return {
+    uid,
+    gid,
+    mode,
+    isDirectory: () => kind === 'directory',
+    isFile: () => kind === 'file',
+    isSymbolicLink: () => kind === 'symlink',
+  };
+}
+
 function parseArgsAllow(args) {
-  const withBotBin = args.includes('--bot-bin')
-    ? args
-    : [...args, '--bot-bin', '/usr/bin/true'];
+  let testArgs = args;
+  if (!testArgs.includes('--staging-dir')) {
+    const renderedConfigIndex = testArgs.indexOf('--rendered-config');
+    if (renderedConfigIndex !== -1) {
+      const renderedConfig = testArgs[renderedConfigIndex + 1];
+      const renderedDirectoryParent = path.dirname(path.dirname(renderedConfig));
+      const testRoot = path.basename(renderedDirectoryParent) === 'live-root'
+        ? path.dirname(renderedDirectoryParent)
+        : renderedDirectoryParent;
+      testArgs = [
+        ...testArgs,
+        '--staging-dir',
+        path.join(testRoot, 'config-staging'),
+      ];
+    }
+  }
+  const withBotBin = testArgs.includes('--bot-bin')
+    ? testArgs
+    : [...testArgs, '--bot-bin', '/usr/bin/true'];
   return parseArgs(withBotBin, { allowHostOverrides: true });
 }
 

@@ -103,7 +103,7 @@ impl ConfigCommandsConfig {
             .find(|command| **command != ConfigCommand::Status)
         {
             return Err(anyhow!(
-                "config_commands command {command:?} is not implemented; only status is supported"
+                "config_commands command {command:?} is not deployable until runner isolation is enabled; only status is supported"
             ));
         }
 
@@ -327,7 +327,7 @@ allowed_commands = ["status"]
     }
 
     #[test]
-    fn rejects_mutating_commands_until_worker_exists() {
+    fn rejects_mutating_commands_until_runner_isolation_is_enabled() {
         for command in [
             ConfigCommand::Pull,
             ConfigCommand::Reload,
