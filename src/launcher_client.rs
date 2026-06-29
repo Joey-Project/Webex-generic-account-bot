@@ -758,8 +758,8 @@ mod linux {
             }
         }
 
-        #[test]
-        fn client_socket_is_unix_nonblocking_cloexec_seqpacket() {
+        #[tokio::test]
+        async fn client_socket_is_unix_nonblocking_cloexec_seqpacket() {
             let Some(socket) = available_or_skip(new_socket()) else {
                 return;
             };
