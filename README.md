@@ -562,14 +562,18 @@ static PIE before installing it at the fixed source path:
 
 ```bash
 cargo rustc --release --bin webex-codex-runtime -- -C target-feature=+crt-static
+cargo rustc --release --bin webex-codex-canary-probe -- -C target-feature=+crt-static
 file target/release/webex-codex-runtime
+file target/release/webex-codex-canary-probe
 ldd target/release/webex-codex-runtime
+ldd target/release/webex-codex-canary-probe
 ```
 
 The fixed root-owned source layout is:
 
 ```text
 /opt/webex-generic-account-bot/bin/webex-codex-runtime
+/opt/webex-generic-account-bot/bin/webex-codex-canary-probe
 /opt/webex-generic-account-bot/runtime-sources/busybox
 /opt/webex-generic-account-bot/runtime-sources/codex/bin/codex
 /opt/webex-generic-account-bot/runtime-sources/codex/codex-path/rg
@@ -808,6 +812,24 @@ fallback.
 
 PR 4c1c does not mint the receipt or activate production configuration. PR
 4c2 owns permission-capable production-image canaries and receipt creation.
+
+### PR 4c2a1 Runtime Canary Contract (Not Activated)
+
+PR 4c2a1 adds the versioned `runtime-boundary-v1` canary report contract and a
+static `/bin/webex-codex-canary-probe` inside the content-addressed production
+image. The report uses an exact allowlist of checks, a 32-byte lowercase hex
+nonce, a fixed final-line binding, one-line JSON framing, and a 16 KiB byte
+limit. Missing, unknown, false, duplicated, oversized, or malformed results are
+not successful canary evidence.
+
+The probe performs direct filesystem, process, descriptor, capability,
+privilege, Unix-socket, and loopback TCP checks rather than delegating those
+checks to shell text. PR 4c2a2 will run it through Codex `exec --json` and trust
+only the pinned command-execution event, not the model's final prose. Host
+lifecycle canaries and receipt minting also remain in 4c2a2. PR 4c2b alone owns
+the deployment transaction that installs bot launcher access and removes the
+current-user configuration. This slice therefore keeps the activation receipt
+unminted, the bot drop-in absent, and `ephemeral-linux-user` rejected.
 
 ## Development
 

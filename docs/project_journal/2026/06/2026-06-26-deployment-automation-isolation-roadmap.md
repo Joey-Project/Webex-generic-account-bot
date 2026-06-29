@@ -24,7 +24,8 @@ superseded_by:
   backend abstraction), PR 4a (root-owned launcher foundation), PR 4b
   (isolated execution), PR 4c1a (boot-scoped activation receipt foundation),
   PR 4c1b (root fresh-inode input sealer), PR 4c1c (gated runner wiring), PR
-  4c2 (production-image smoke tests and final activation), PR 2b2b (`/config
+  4c2a1 (canary contract/probe), 4c2a2 (production-image and lifecycle
+  canaries plus receipt helper), 4c2b (transactional final activation), PR 2b2b (`/config
   pull` enablement), and PR 2b3 (recoverable
   activation plus `/config reload` and `/config sync`). Mutating commands
   remain undeployable until their security dependencies land.
@@ -324,6 +325,20 @@ superseded_by:
   receipt.
 - PR 4c2 activates only the runner. `/config pull`, `/config reload`, and
   `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
+
+#### PR 4c2 delivery split
+- PR 4c2a1 adds the exact `runtime-boundary-v1` report schema, static syscall
+  probe, and immutable image allowlist entry. It does not run Codex, mint a
+  receipt, install a bot drop-in, or remove the config gate.
+- PR 4c2a2 validates the probe through the pinned Codex `exec --json`
+  command-execution event, runs host timeout/crash/reboot canaries, and owns
+  the root-only boot receipt helper and renewal unit. It still grants no bot
+  launcher access and does not enable production configuration.
+- PR 4c2b extends the existing deploy-config recovery transaction to install
+  only the launch-group/pending-path bot permission, switch every effective
+  Codex config away from current-user execution, mint or renew the receipt,
+  restart and health-check the service, and roll all three states back
+  together. Bot launcher permission must never land in an earlier slice.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.

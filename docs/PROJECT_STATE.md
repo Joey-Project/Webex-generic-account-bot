@@ -59,6 +59,11 @@
   their lease budgets expire. Production configuration remains on
   `current-user` until PR 4c2 mints a receipt after live capability canaries
   pass and atomically installs the minimum launcher/pending-path access.
+- Runner PR 4c2a1 adds the exact runtime-boundary canary report schema and a
+  static syscall probe to the immutable image allowlist. It does not yet parse
+  Codex JSONL, run host lifecycle canaries, mint a receipt, install bot
+  permissions, or remove the ephemeral activation gate. Those remain split
+  between PR 4c2a2 and PR 4c2b.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -67,7 +72,8 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4c2 must still deliver live production canaries and activation. It must
+- PR 4c2a2 and PR 4c2b must still deliver live production canaries and
+  transactional activation. They must
   prove the inner
   Codex/bwrap credential, post-exec process
   memory and `/proc`, inherited descriptor, and network boundaries against the

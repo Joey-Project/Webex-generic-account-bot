@@ -289,6 +289,11 @@ const EXPECTED_RUNTIME_SOURCE_FILES: &[(&str, &str, &str)] = &[
         "0555",
     ),
     (
+        "/bin/webex-codex-canary-probe",
+        "/opt/webex-generic-account-bot/bin/webex-codex-canary-probe",
+        "0555",
+    ),
+    (
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/ssl/certs/ca-certificates.crt",
         "0444",
@@ -1794,7 +1799,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_runtime_wrapper_source_and_image_binding_drift() {
+    fn rejects_runtime_probe_wrapper_source_and_image_binding_drift() {
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["source"] = json!("/tmp/untrusted-canary-probe");
+        });
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["mode"] = json!("0777");
+        });
         assert_source_manifest_rejected(|source| {
             source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["sha256"] = json!("d".repeat(64));
         });
