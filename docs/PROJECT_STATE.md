@@ -14,9 +14,11 @@
 - Configuration Space PR 2b2a adds the separate-identity durable pull-worker
   foundation. Bot socket-group access and deployable `/config pull` remain
   disabled until Codex runs use the isolated runner.
-- Runner PR 3 routes each current-user Codex invocation through a replaceable
-  backend with existing behaviour unchanged. `ephemeral-linux-user` remains
-  rejected by config validation and `--check-config`, with no fallback.
+- Runner PR 3 routed each current-user Codex invocation through a replaceable
+  backend with existing behaviour unchanged. At that stage,
+  `ephemeral-linux-user` remained rejected by config validation and
+  `--check-config`, with no fallback. PR 4c1c validates the fixed
+  receipt-gated contract but still rejects activation.
 - Runner PR 4a adds only the root-owned launcher
   protocol, caller-authorisation, and systemd socket foundation at
   `/run/webex-codex-launcher/launcher.sock`, backed by
@@ -38,6 +40,25 @@
   consumption plus the launcher-side staging group/path contract. It adds no
   bot drop-in, client, runtime call site, or activation-receipt read, so it
   remains unused and fail closed.
+- Runner PR 4c1c wires the fixed launcher client, explicit evidence staging,
+  and receipt-gated runner dispatch, but grants no bot socket/pending-root
+  access while production still uses current-user execution.
+  Configuration validation rejects mixed current-user and ephemeral backends
+  and then rejects all ephemeral activation until PR 4c2 installs the required
+  permissions in the same change that removes that final gate.
+  Consequently, 4c1c `--check-config` stops at the gate; receipt, socket, and
+  live image canary validation become reachable only in PR 4c2.
+  Cooperative work deadlines and launcher-socket disconnect cancellation
+  clean inode-verified ready and consumed trees before returning. Ready trees
+  remain group-inaccessible until moved below the root-only consumed root.
+  Bot and launcher activation verification bind the currently executing
+  `/proc/self/exe` path, inode metadata, and digest to the fixed executable and
+  receipt, rejecting receipts minted after an atomic binary replacement.
+  Independent
+  process watchdogs hard-stop stuck staging and preparation syscalls before
+  their lease budgets expire. Production configuration remains on
+  `current-user` until PR 4c2 mints a receipt after live capability canaries
+  pass and atomically installs the minimum launcher/pending-path access.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -46,16 +67,15 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PRs 4c1c and 4c2 must still deliver gated runner wiring and live production
-  canaries. PR 4c2 must prove the inner
+- PR 4c2 must still deliver live production canaries and activation. It must
+  prove the inner
   Codex/bwrap credential, post-exec process
   memory and `/proc`, inherited descriptor, and network boundaries against the
   production image and host kernel policy before activating the runner. Static
   PR 4b preflight and the unused 4c1b sealer are not substitutes for those
   canaries.
-- PRs through 4c1b do not grant the bot launcher/staging group access, enable
-  `ephemeral-linux-user`, or enable `/config pull`, `/config reload`, or
-  `/config sync`.
+- Production config does not enable `ephemeral-linux-user`, `/config pull`,
+  `/config reload`, or `/config sync` before PR 4c2 activation.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

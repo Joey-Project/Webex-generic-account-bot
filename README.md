@@ -96,8 +96,9 @@ diagnostics with a trusted helper script and append the result to the Codex
 prompt. Configure `script` as an absolute path outside any Codex workspace, for
 example `/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs`. The bot
 runs the helper from the helper script's directory, kills timed-out helpers, and
-requires `server.attempt_lease_secs` to cover the Codex timeout, Jenkins
-prefetch timeout budget, and Webex request margin. Codex then summarises the
+requires `server.attempt_lease_secs` to cover the Codex timeout, ephemeral
+launcher/staging overhead when selected, Jenkins prefetch timeout budget, and
+Webex request margin. Codex then summarises the
 prefetched evidence without needing network access to Jenkins from inside its
 sandbox.
 Production host policy pins this lease to 3600 seconds and validates the
@@ -300,8 +301,10 @@ unwind, and removes any socket already created before the process exits.
 
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no
-bot socket-group drop-in is shipped. A later enablement PR may allow `pull` only
-after `ephemeral-linux-user` runner isolation is deployable and verified;
+config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
+only the receipt-gated Codex launcher client path; PR 4c2 owns the bot launcher
+group drop-in when it removes the current-user path. A later enablement PR may allow `pull`
+only after `ephemeral-linux-user` runner isolation is deployable and verified;
 `reload` and `sync` require the later activation work as well.
 
 Use `--skip-restart` when validating an install without restarting the service.
@@ -486,9 +489,14 @@ Temporary Linux user isolation is the intended boundary for untrusted
 chat-driven prompts. `codex.isolation.mode = "current-user"` remains only a
 trusted-prompt-author mode and requires
 `codex.isolation.trusted_prompt_authors = true`; it is not a secret-read
-boundary against allowed prompt authors. Configuration validation, including
-`--check-config`, still rejects the `ephemeral-linux-user` mode for
-`codex.isolation.mode`, with no fallback to current-user execution.
+boundary against allowed prompt authors. Static configuration validation
+validates the fixed `ephemeral-linux-user` contract but PR 4c1c then rejects
+activation before `--check-config` can reach host receipt or socket checks. PR
+4c2 must remove that final gate only while adding bot access; after that,
+`--check-config` requires a current boot-scoped activation receipt and verifies
+the fixed launcher socket installation. The live service then also performs an
+authorised launcher preflight before reading Webex credentials or opening its
+listener. No failure falls back to current-user execution.
 
 PR 4 is split into three fail-closed slices: PR 4a establishes the root-owned
 launcher protocol, caller authorisation, and systemd socket foundation; PR 4b
@@ -598,16 +606,22 @@ validates and emits only that bounded UTF-8 file.
 
 Input workspaces live below `/var/lib/webex-codex-runtime-inputs/ready`. The host provisions
 that root as sticky `root:webex-codex-input` mode `1730`; each run must be
-sealed by a root-owned broker before launch. The run root and every nested directory must
-be `root:webex-codex-input` mode `0550`; regular files must be mode `0440` with
-the same owner/group and a single hard link. Symlinks, special files, more than
+sealed by a root-owned broker before launch. Ready run directories are
+`root:webex-codex-input` mode `0500` and files are mode `0400`, so a launcher
+hard stop cannot leave group-readable evidence there. After the verified inode
+is moved below the root-only consumed quarantine, the launcher recursively
+grants directory mode `0550` and file mode `0440` before creating the transient
+unit. Regular files retain the same owner/group and a single hard link.
+Symlinks, special files, more than
 8192 entries, nesting beyond 32 levels, and aggregate regular-file bytes above
 2 GiB plus 64 MiB are rejected. The host group database entry must have no
 static members, no numeric-GID alias, and no static user with that primary GID.
 The root launcher retains the supplementary input group after systemd starts
 it. PR 4c1b also adds `webex-codex-launch` solely so the capability-dropped
-launcher can read the pending source tree; the bot still belongs to neither
-group, and the launcher has no config-worker group membership. Its template
+launcher can read the pending source tree. In the PR 4c1b-only state, the bot
+still belongs to neither group; PR 4c2 later grants it only the launch group
+while activating ephemeral execution.
+The launcher has no config-worker group membership. Its template
 instances are pinned directly to `system.slice`, matching the launcher's strict
 cgroup identity check. It opens the run
 directory with `O_PATH|O_NOFOLLOW` and binds the held
@@ -624,20 +638,27 @@ does not add the bot to it or provide the privileged sealing broker.
 The minimum host contract is systemd 255, Linux 5.9 or newer, cgroup v2,
 SquashFS/loop support, mount and PID namespaces, `close_range(2)`, and a host
 policy that permits the bundled `bwrap` to create its inner sandbox. These are
-not inferred from version strings alone. PR 4c must run the real image and
-permission canaries on the deployment host, add the narrow root-owned input
-sealer, and remove PR 4b's compile-time activation gate before granting either
-input-group or launcher-socket access. Until then launcher preflight and execute
-requests both fail closed even if an operator installs every PR 4b asset. If
-any canary fails, configuration continues to reject `ephemeral-linux-user` with
-no current-user fallback. In particular, ordinary `exec` resets process
-dumpability: the transient unit denies the `@debug` syscall group, process-VM
-access calls, and core dumps, while PR 4c must still prove that the inner tool
+not inferred from version strings alone. PR 4c2 must run the real image and
+permission canaries on the deployment host and mint the boot-scoped activation
+receipt before the wired runner can be selected by a deployable configuration.
+Those executable canaries must prove that the Codex main process can write the
+bounded final message, tool subprocesses cannot read the auth credential, main
+home, or final output, and launcher stdout contains only the final message.
+In PR 4c1c, config validation rejects activation before receipt or socket
+preflight. After PR 4c2 atomically removes that gate, a missing receipt makes
+`--check-config`, launcher preflight, and execute requests fail closed. If any
+canary fails, `ephemeral-linux-user` remains
+undeployable with no current-user fallback. In particular, ordinary `exec`
+resets process dumpability: the transient unit denies the `@debug` syscall group, process-VM
+access calls, and core dumps, while PR 4c2 must still prove that the inner tool
 PID/filesystem sandbox cannot inspect the Codex main process after `exec`.
 
-Until PR 4c and the separate command-enablement changes land, the bot has no
-launcher-, input-, or worker-socket group access and `/config pull`,
-`/config reload`, and `/config sync` remain disabled.
+PR 4c1c does not grant the bot a launcher group or pending-staging write path,
+because current-user Codex children would inherit either permission. PR 4c2
+must grant only the launcher group and pending path in the same activation that
+removes current-user execution; the bot never receives the sealed-input group
+or worker-socket access. `/config pull`, `/config reload`, and `/config sync`
+remain disabled until their separate command-enablement changes land.
 
 ### PR 4c1a Activation Receipt Foundation (Not Activated)
 
@@ -647,25 +668,37 @@ verifier. The root-owned receipt path is
 parent directory and deliberately does not pre-create a receipt. A valid
 receipt binds the current boot ID, active runtime manifest, runtime image
 digest, fixed bot/launcher/runtime executable digests, Codex version, model,
-and the exact required production-canary result set. Unknown, missing, false,
+and the exact required production-canary result set. The active image's source
+manifest digest and `/usr/libexec/webex-codex-runtime` entry must match the
+fixed host runtime wrapper digest, size, source path, and mode. Unknown, missing, false,
 stale, oversized, linked, misowned, or modified-runtime receipts are rejected.
+The launcher unit treats the read-only activation bind mount as optional so a
+missing tmpfiles directory reaches the verifier and produces the same
+fail-closed activation error instead of failing during systemd namespace setup.
 
 This foundation does not call the verifier from config or execution paths and
 provides no command that can mint a receipt. Runner activation remains blocked
 until the later sealer/client wiring and production-image canary PRs land.
 Because the launcher keeps `ProcSubset=pid`, PR 4c1c must copy the current boot
 ID with a root-owned systemd credential and pass that fixed credential path to
-`ActivationPaths::production_with_boot_id`; it must not loosen the launcher
+the launcher-specific activation verifier; it must not loosen the launcher
 procfs boundary. Executable verification also rejects Linux file capabilities
 so a canary-approved binary cannot gain ambient privilege without invalidating
 activation.
 
 ### PR 4c1b Fresh-Inode Input Sealer (Not Wired)
 
-PR 4c1b adds the root-only input sealer and its host staging layout. The
-pending root is setgid `root:webex-codex-launch` mode `2730`; each per-run tree
+PR 4c1b adds the root-only input sealer and its host staging layout. PR 4c1c
+sets the pending root to non-enumerable `root:webex-codex-launch` mode `2730`.
+The bot uses `O_PATH` descriptor-relative operations and `syncfs` on the held
+workspace fd to persist publication/removal without gaining directory-list
+permission. Each per-run tree
 inside it is owned by the future bot caller with group `webex-codex-launch`,
-using mode `2750` for directories and `0640` for files. The sealer first moves
+using mode `2770` for directories and `0640` for files. The launch group write
+bit permits the capability-dropped sealer to remove the source after quarantine.
+The launcher receives the launch group now; the fixed bot receives it only
+when PR 4c2 atomically activates ephemeral execution. The unpredictable run ID
+prevents callers outside that boundary from selecting a run. The sealer first moves
 that pathname into a root-only consumed-source
 quarantine, recursively validates it through no-follow descriptor-relative
 operations, and copies only regular files and directories into fresh
@@ -695,6 +728,86 @@ This slice adds no bot service drop-in, no launcher client or runtime
 call site, no activation-receipt read, and no config enablement. The bot still
 cannot reach the launcher socket or pending root, so the isolation backend
 remains undeployable until PR 4c1c wires the gated path.
+
+### PR 4c1c Gated Runner Wiring (Receipt-Gated)
+
+PR 4c1c adds the fixed `SOCK_SEQPACKET` launcher client and explicit evidence
+staging, but deliberately ships no bot service drop-in. Granting the launch
+group while production still uses current-user execution would also grant it
+to prompt-controlled Codex children. PR 4c2 must add the launcher group and
+pending-path write access only while activating ephemeral execution; the bot
+is never a member of `webex-codex-input`. Configuration validation rejects any
+mix of current-user and ephemeral execution whenever ephemeral execution is
+present, then rejects ephemeral activation entirely in this slice. PR 4c2 must
+remove that final gate in the same change that installs the bot permission, so
+no current-user child can inherit launcher access. The runner
+copies only the evidence root supplied by the Jenkins prefetch path, rejects
+links, special files, control directories, metadata/content races, and the
+existing depth, entry, and byte limits, then identifies the run with an
+unpredictable ID. A request is sent only after launcher preflight succeeds.
+Preflight responses and bot-side evidence staging each have a 10-minute bound;
+their blocking file work and launcher preparation use cooperative 9-minute
+deadlines plus response margins. Each blocking worker also owns an independent
+570-second process watchdog, so a syscall that cannot reach a cooperative
+checkpoint terminates the systemd-managed bot or per-connection launcher
+before the 10-minute lease budget expires. Deadline and client-disconnect
+cancellation are checked between directory, copy, and hash operations, so
+normal paths finish scoped cleanup before their futures return. These fixed
+costs are included in ephemeral attempt-lease validation. Ephemeral
+configuration also caps
+`server.max_concurrent_requests` at the launcher's fixed four accepted
+connections. Socket trigger and poll bursts include startup preflight plus two
+connections per concurrent run. The launcher service runtime maximum is
+protocol-bound above the largest request, preparation, cleanup, and response
+budget.
+
+Pending workspace publication and removal use `syncfs` through the held
+workspace descriptor so the non-enumerable pending root need not be opened for
+listing; the launcher likewise fsyncs source-quarantine removal before it can
+consume a sealed run. After staging, every normal success or failure path runs
+pending cleanup in the same bounded blocking-worker/process-watchdog envelope
+as staging. A forcibly dropped async task never performs recursive I/O in
+`Drop`; it leaves the private tree for the existing one-day tmpfiles fallback.
+
+The launcher re-verifies the activation receipt on every preflight and execute
+request. Its boot ID comes from the root-owned systemd
+`activation-boot-id` credential, preserving `ProcSubset=pid`; isolated child
+units do not receive that credential and cannot read the activation directory.
+Bot startup and every launcher verification also open `/proc/self/exe` and
+require its path, inode metadata, and SHA-256 digest to match both the fixed
+root-owned executable and the receipt. An already-running process therefore
+cannot accept a receipt minted after an atomic executable replacement.
+The verified activation snapshot is carried into runtime selection: the exact
+active-manifest bytes and selected image digest must still match the receipt,
+so an overlapping runtime rollout cannot substitute an untested image. Launcher
+diagnostics are emitted only to `stderr`, which systemd sends to the journal;
+protocol `stdout` remains the accepted socket. Preflight and execution failures
+log only bounded, control-character-sanitised internal causes while clients
+continue to receive stable generic rejection messages.
+Their own Codex credential remains available to the runtime wrapper and is
+denied to tool subprocesses by the fixed permission profile. Static config
+requires model `gpt-5.5`, no profile, `--ephemeral`, the fixed repository-check
+bypass, bounded timeout/output values, and
+`trusted_prompt_authors = false`. This slice then rejects activation, so its
+`--check-config` path does not claim host receipt/socket coverage. PR 4c2 must
+remove that gate only after deployment preflight verifies the activation
+receipt and fixed root-owned socket metadata; the live bot must additionally
+perform the caller-authorised launcher preflight before Webex startup.
+Source quarantine trees are removed immediately after sealing, and the
+inode-guarded consumed tree is removed when the transient run finishes, fails,
+times out, or is cancelled. Closing the bot's launcher socket cancels
+preflight, preparation, and a running transient unit even while the authorised
+bot process remains alive. Cancellation receives a 105-second cleanup grace;
+the per-connection launcher then exits if blocked work cannot drain. A normal
+launcher response is emitted only after source and consumed parent-directory
+cleanup is durable. Consumed cleanup runs off the current-thread runtime and
+has its own 50-second process watchdog after at most 50 seconds of transient
+unit cleanup, all inside the 110-second response budget;
+one-day tmpfiles expiry remains only a crash, hard-watchdog, or host-reboot
+fallback.
+
+PR 4c1c does not mint the receipt or activate production configuration. PR
+4c2 owns permission-capable production-image canaries and receipt creation.
 
 ## Development
 

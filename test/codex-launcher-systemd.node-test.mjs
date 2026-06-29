@@ -7,6 +7,11 @@ import { fileURLToPath } from 'node:url';
 const SYSTEMD_ROOT = fileURLToPath(new URL('../deploy/systemd/', import.meta.url));
 const SOCKET_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.socket');
 const SERVICE_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher@.service');
+const BOT_DROP_IN_ROOT = path.join(
+  SYSTEMD_ROOT,
+  'webex-generic-account-bot.service.d',
+);
+const BOT_DROP_IN_PATH = path.join(BOT_DROP_IN_ROOT, '10-codex-launcher.conf');
 const SYSUSERS_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.sysusers.conf');
 const TMPFILES_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.tmpfiles.conf');
 const ACTIVATION_TMPFILES_PATH = path.join(
@@ -37,8 +42,17 @@ const ISOLATED_EXECUTION_PATH = fileURLToPath(
 const INPUT_SEALER_PATH = fileURLToPath(
   new URL('../src/input_sealer.rs', import.meta.url),
 );
+const RUNNER_INPUT_PATH = fileURLToPath(
+  new URL('../src/runner_input.rs', import.meta.url),
+);
+const WORK_BUDGET_PATH = fileURLToPath(
+  new URL('../src/work_budget.rs', import.meta.url),
+);
 const RUNTIME_SOURCE_PATH = fileURLToPath(
   new URL('../src/bin/webex-codex-runtime.rs', import.meta.url),
+);
+const LAUNCHER_PROTOCOL_PATH = fileURLToPath(
+  new URL('../src/launcher_protocol.rs', import.meta.url),
 );
 const CARGO_TOML_PATH = fileURLToPath(new URL('../Cargo.toml', import.meta.url));
 
@@ -50,10 +64,11 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('provisions only a root-owned group-gated accepted socket', async () => {
-    const [socket, sysusers, tmpfiles] = await Promise.all([
+    const [socket, sysusers, tmpfiles, protocol] = await Promise.all([
       fs.readFile(SOCKET_PATH, 'utf8'),
       fs.readFile(SYSUSERS_PATH, 'utf8'),
       fs.readFile(TMPFILES_PATH, 'utf8'),
+      fs.readFile(LAUNCHER_PROTOCOL_PATH, 'utf8'),
     ]);
 
     assert.deepEqual(directiveValues(socket, 'ListenSequentialPacket'), [
@@ -68,11 +83,17 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(socket, 'DirectoryMode'), ['0750']);
     assert.deepEqual(directiveValues(socket, 'RemoveOnStop'), ['yes']);
     assert.deepEqual(directiveValues(socket, 'TriggerLimitIntervalSec'), ['10s']);
-    assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), ['8']);
+    const triggerBurst = protocol.match(
+      /pub const LAUNCHER_TRIGGER_LIMIT_BURST: usize = ([\d_]+);/,
+    );
+    assert.ok(triggerBurst);
+    const triggerBurstValue = triggerBurst[1].replaceAll('_', '');
+    assert.deepEqual(directiveValues(socket, 'TriggerLimitBurst'), [triggerBurstValue]);
     assert.deepEqual(directiveValues(socket, 'PollLimitIntervalSec'), ['2s']);
-    assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), ['8']);
+    assert.deepEqual(directiveValues(socket, 'PollLimitBurst'), [triggerBurstValue]);
     assert.deepEqual(directiveValues(socket, 'Backlog'), ['16']);
     assert.deepEqual(directiveValues(socket, 'MaxConnections'), ['4']);
+    assert.match(protocol, /pub const LAUNCHER_MAX_CONNECTIONS: usize = 4;/);
     assert.deepEqual(directiveValues(socket, 'ReceiveBuffer'), ['1M']);
     assert.deepEqual(directiveValues(socket, 'SendBuffer'), ['2M']);
     assert.deepEqual(directiveValues(socket, 'ConditionPathExists'), [
@@ -89,9 +110,10 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('pairs the accepted socket with a fixed root-owned launcher process', async () => {
-    const [socket, service] = await Promise.all([
+    const [socket, service, protocol] = await Promise.all([
       fs.readFile(SOCKET_PATH, 'utf8'),
       fs.readFile(SERVICE_PATH, 'utf8'),
+      fs.readFile(LAUNCHER_PROTOCOL_PATH, 'utf8'),
     ]);
 
     assert.equal(path.basename(SOCKET_PATH), 'webex-codex-launcher.socket');
@@ -110,6 +132,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), [
       'webex-codex-input webex-codex-launch',
     ]);
+    assert.deepEqual(directiveValues(service, 'LoadCredential'), [
+      'activation-boot-id:/proc/sys/kernel/random/boot_id',
+    ]);
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
       '/opt/webex-generic-account-bot/bin/webex-codex-launcher',
     ]);
@@ -118,7 +143,13 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'StandardError'), ['journal']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['15s']);
     assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);
-    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['3660s']);
+    const runtimeMaximum = protocol.match(
+      /pub const LAUNCHER_SERVICE_RUNTIME_MAX_SECONDS: u64 = ([\d_]+);/,
+    );
+    assert.ok(runtimeMaximum);
+    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), [
+      `${Number(runtimeMaximum[1].replaceAll('_', ''))}s`,
+    ]);
     assert.deepEqual(directiveValues(service, 'OOMPolicy'), ['kill']);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
@@ -199,12 +230,31 @@ describe('Codex launcher systemd boundary', () => {
 
     assert.deepEqual(directiveValues(service, 'ProtectProc'), ['ptraceable']);
     assert.deepEqual(directiveValues(service, 'ProcSubset'), ['pid']);
-    assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), ['/proc', '/run/systemd']);
+    assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), [
+      '/proc',
+      '/run/systemd',
+      '-/run/webex-codex-activation',
+    ]);
     assert.deepEqual(directiveValues(service, 'ReadWritePaths'), [
       '/var/lib/webex-generic-account-bot/codex-input-staging',
       '/var/lib/webex-codex-runtime-inputs',
     ]);
     assert.deepEqual(directiveValues(service, 'BindPaths'), []);
+    assert.deepEqual(directiveValues(service, 'BindReadOnlyPaths'), []);
+    for (const directive of [
+      'ReadOnlyPaths',
+      'ReadWritePaths',
+      'BindPaths',
+      'BindReadOnlyPaths',
+    ]) {
+      assert.equal(
+        directiveValues(service, directive).some((value) =>
+          value.includes('/proc/sys')
+        ),
+        false,
+        `${directive} must not expose /proc/sys directly`,
+      );
+    }
     assert.doesNotMatch(service, /^InaccessiblePaths=.*(?:\/proc|\/run\/systemd)/m);
     assert.doesNotMatch(service, /^PrivateUsers=true$/m);
     assert.doesNotMatch(
@@ -230,29 +280,31 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });
 
-  it('does not grant the bot access or delegate execution to policy helpers', async () => {
-    const launcherFiles = await Promise.all(
-      [
-        SOCKET_PATH,
-        SERVICE_PATH,
-        SYSUSERS_PATH,
-        TMPFILES_PATH,
-        RUNTIME_SYSUSERS_PATH,
-        RUNTIME_TMPFILES_PATH,
-        INPUT_STAGING_TMPFILES_PATH,
-      ].map((file) =>
-        fs.readFile(file, 'utf8'),
+  it('keeps bot launcher access disabled until isolated activation', async () => {
+    await assert.rejects(fs.stat(BOT_DROP_IN_PATH), { code: 'ENOENT' });
+    const [launcherFiles, botDropIns] = await Promise.all([
+      Promise.all(
+        [
+          SOCKET_PATH,
+          SERVICE_PATH,
+          SYSUSERS_PATH,
+          TMPFILES_PATH,
+          RUNTIME_SYSUSERS_PATH,
+          RUNTIME_TMPFILES_PATH,
+          INPUT_STAGING_TMPFILES_PATH,
+        ].map((file) => fs.readFile(file, 'utf8')),
       ),
-    );
-    const systemdEntries = await fs.readdir(SYSTEMD_ROOT, { recursive: true });
-    const botDropIns = systemdEntries.filter((entry) =>
-      entry.startsWith('webex-generic-account-bot.service.d/')
-    );
+      readTextFilesRecursively(BOT_DROP_IN_ROOT),
+    ]);
 
-    for (const entry of botDropIns) {
-      const contents = await fs.readFile(path.join(SYSTEMD_ROOT, entry), 'utf8');
-      assert.doesNotMatch(contents, /webex-codex-launch/, entry);
+    for (const { file, contents } of botDropIns) {
+      assert.doesNotMatch(
+        contents,
+        /webex-codex-(?:launch|input)|codex-input-staging|webex-codex-activation|webex-codex-launcher|\/run\/credentials/,
+        file,
+      );
     }
+
     for (const contents of launcherFiles) {
       assert.doesNotMatch(contents, /\b(?:sudo|pkexec)\b|polkit|PolicyKit/i);
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-launch$/m);
@@ -262,11 +314,20 @@ describe('Codex launcher systemd boundary', () => {
   });
 
   it('keeps transient execution behind fixed launcher and runtime boundaries', async () => {
-    const [source, launcherModule, isolatedExecution, runtimeSource] = await Promise.all([
+    const [
+      source,
+      launcherModule,
+      isolatedExecution,
+      runtimeSource,
+      runnerInput,
+      workBudget,
+    ] = await Promise.all([
       fs.readFile(LAUNCHER_SOURCE_PATH, 'utf8'),
       fs.readFile(LAUNCHER_MODULE_PATH, 'utf8'),
       fs.readFile(ISOLATED_EXECUTION_PATH, 'utf8'),
       fs.readFile(RUNTIME_SOURCE_PATH, 'utf8'),
+      fs.readFile(RUNNER_INPUT_PATH, 'utf8'),
+      fs.readFile(WORK_BUDGET_PATH, 'utf8'),
     ]);
     const launcherSources = `${source}\n${launcherModule}`;
     const productionSource = source.split(
@@ -299,8 +360,28 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(launcherModule, /PR_CAPBSET_DROP/);
     assert.match(launcherModule, /capability_bounding_set\(\)\?\.is_empty\(\)/);
     assert.match(source, /#\[tokio::main\(flavor = "current_thread"\)\]/);
-    assert.match(source, /isolated_execution::preflight\(\)\.is_ok\(\)/);
+    assert.match(source, /tracing_subscriber::fmt\(\)/);
+    assert.match(source, /\.with_writer\(std::io::stderr\)/);
+    assert.match(source, /log_launcher_error\("preflight unavailable", &error\)/);
+    assert.match(source, /log_launcher_error\("execute unavailable", &error\)/);
+    assert.match(source, /log_launcher_error\("execute failed", &error\)/);
+    assert.match(source, /isolated_execution::preflight_bounded\(&cancellation\)/);
+    assert.match(source, /wait_for_client_disconnect\(socket\)/);
+    assert.match(source, /ExecutionCancellation::new\(\)/);
+    assert.match(source, /cancellation\.cancel\(\)/);
+    assert.match(source, /LAUNCHER_CANCELLATION_DRAIN_SECONDS/);
+    assert.match(source, /terminate_stuck_launcher/);
     assert.match(source, /IsolatedRunResult::Completed/);
+    assert.match(isolatedExecution, /run_blocking_with_process_watchdog/);
+    assert.match(
+      isolatedExecution,
+      /if Instant::now\(\) >= deadline \{\s*discard_captures\(stdout_task, stderr_task\)\.await;\s*return Ok\(IsolatedRunResult::TimedOut\);/,
+    );
+    assert.match(runnerInput, /run_blocking_with_process_watchdog/);
+    assert.match(workBudget, /completion\.recv_timeout\(/);
+    assert.match(workBudget, /std::process::exit\(STUCK_WORK_EXIT_CODE\)/);
+    assert.match(runnerInput, /const PENDING_ROOT_MODE: u32 = 0o2730;/);
+    assert.match(runnerInput, /libc::syncfs\(file\.as_raw_fd\(\)\)/);
     assert.match(
       isolatedExecution,
       /const SYSTEMD_RUN_PATH: &str = "\/usr\/bin\/systemd-run";/,
@@ -316,13 +397,34 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(isolatedExecution, /\.stdout\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stderr\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /DynamicUser=yes/);
-    assert.match(isolatedExecution, /const ISOLATED_EXECUTION_ACTIVATED: bool = false/);
+    assert.match(
+      isolatedExecution,
+      /const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";/,
+    );
+    assert.match(
+      isolatedExecution,
+      /const ACTIVATION_BOOT_ID_CREDENTIAL_NAME: &str = "activation-boot-id";/,
+    );
+    assert.match(isolatedExecution, /env::var_os\(CREDENTIALS_DIRECTORY_ENV\)/);
+    assert.match(workBudget, /tokio::task::spawn_blocking/);
+    assert.match(
+      isolatedExecution,
+      /Duration::from_secs\(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS\)/,
+    );
+    assert.match(
+      isolatedExecution,
+      /ActivationPaths::production_for_launcher_with_boot_id\(boot_id\)/,
+    );
     assert.match(isolatedExecution, /RootImage=/);
     assert.match(isolatedExecution, /O_PATH/);
     assert.match(isolatedExecution, /O_NOFOLLOW/);
     assert.match(isolatedExecution, /\/proc\/\{\}\/fd\/\{\}/);
     assert.match(isolatedExecution, /failed to consume the verified runtime workspace/);
     assert.match(isolatedExecution, /LoadCredential=codex-auth\.json/);
+    assert.match(
+      isolatedExecution,
+      /InaccessiblePaths=[^"\n]*-\/run\/webex-codex-activation(?:\s|$)/,
+    );
     assert.match(isolatedExecution, /CapabilityBoundingSet=/);
     assert.match(
       isolatedExecution,
@@ -357,4 +459,32 @@ function directiveValues(unit, directive) {
     .split('\n')
     .filter((line) => line.startsWith(prefix))
     .map((line) => line.slice(prefix.length));
+}
+
+async function readTextFilesRecursively(root) {
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await readTextFilesRecursively(entryPath)));
+      continue;
+    }
+    assert.equal(
+      entry.isFile(),
+      true,
+      `unexpected bot drop-in entry: ${entryPath}`,
+    );
+    files.push({ file: entryPath, contents: await fs.readFile(entryPath, 'utf8') });
+  }
+  return files;
 }

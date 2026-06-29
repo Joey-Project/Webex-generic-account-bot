@@ -8,11 +8,19 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    launcher_protocol::{
+        LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS, LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+    },
+    work_budget::{WorkBudget, run_blocking_with_process_watchdog},
+};
 
 pub const ACTIVATION_RECEIPT_PATH: &str = "/run/webex-codex-activation/receipt.json";
 pub const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
@@ -22,6 +30,8 @@ pub const BOT_EXECUTABLE_PATH: &str =
 pub const LAUNCHER_EXECUTABLE_PATH: &str =
     "/opt/webex-generic-account-bot/bin/webex-codex-launcher";
 pub const RUNTIME_EXECUTABLE_PATH: &str = "/opt/webex-generic-account-bot/bin/webex-codex-runtime";
+pub const RUNTIME_SOURCE_MANIFEST_PATH: &str =
+    "/etc/webex-generic-account-bot/codex-runtime-sources.json";
 
 pub const ACTIVATION_SCHEMA_VERSION: u16 = 1;
 pub const SUPPORTED_CODEX_VERSION: &str = "0.142.3";
@@ -45,6 +55,7 @@ pub const REQUIRED_CANARIES: &[&str] = &[
 const RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 const BOOT_ID_MAX_BYTES: u64 = 128;
 const ACTIVE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+const RUNTIME_SOURCE_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const EXECUTABLE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const RUNTIME_IMAGE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
@@ -92,9 +103,23 @@ pub struct ActivationPaths {
     bot_executable: PathBuf,
     launcher_executable: PathBuf,
     runtime_executable: PathBuf,
+    runtime_source_manifest: PathBuf,
     trusted_root: PathBuf,
     expected_uid: u32,
     expected_gid: u32,
+    current_process: Option<CurrentProcessExecutable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessExecutableRole {
+    Bot,
+    Launcher,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentProcessExecutable {
+    proc_path: PathBuf,
+    role: ProcessExecutableRole,
 }
 
 impl ActivationPaths {
@@ -105,6 +130,7 @@ impl ActivationPaths {
         bot_executable: impl Into<PathBuf>,
         launcher_executable: impl Into<PathBuf>,
         runtime_executable: impl Into<PathBuf>,
+        runtime_source_manifest: impl Into<PathBuf>,
     ) -> Self {
         Self {
             receipt: receipt.into(),
@@ -113,9 +139,11 @@ impl ActivationPaths {
             bot_executable: bot_executable.into(),
             launcher_executable: launcher_executable.into(),
             runtime_executable: runtime_executable.into(),
+            runtime_source_manifest: runtime_source_manifest.into(),
             trusted_root: PathBuf::from("/"),
             expected_uid: 0,
             expected_gid: 0,
+            current_process: None,
         }
     }
 
@@ -131,7 +159,29 @@ impl ActivationPaths {
             BOT_EXECUTABLE_PATH,
             LAUNCHER_EXECUTABLE_PATH,
             RUNTIME_EXECUTABLE_PATH,
+            RUNTIME_SOURCE_MANIFEST_PATH,
         )
+    }
+
+    fn production_for_bot() -> Self {
+        Self::production().with_current_process("/proc/self/exe", ProcessExecutableRole::Bot)
+    }
+
+    pub(crate) fn production_for_launcher_with_boot_id(boot_id: impl Into<PathBuf>) -> Self {
+        Self::production_with_boot_id(boot_id)
+            .with_current_process("/proc/self/exe", ProcessExecutableRole::Launcher)
+    }
+
+    fn with_current_process(
+        mut self,
+        proc_path: impl Into<PathBuf>,
+        role: ProcessExecutableRole,
+    ) -> Self {
+        self.current_process = Some(CurrentProcessExecutable {
+            proc_path: proc_path.into(),
+            role,
+        });
+        self
     }
 
     pub fn receipt(&self) -> &Path {
@@ -158,6 +208,10 @@ impl ActivationPaths {
         &self.runtime_executable
     }
 
+    pub fn runtime_source_manifest(&self) -> &Path {
+        &self.runtime_source_manifest
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     fn for_test(root: &Path) -> Self {
         let mut paths = Self::new(
@@ -167,6 +221,7 @@ impl ActivationPaths {
             root.join("webex-generic-account-bot"),
             root.join("webex-codex-launcher"),
             root.join("webex-codex-runtime"),
+            root.join("codex-runtime-sources.json"),
         );
         paths.trusted_root = root.to_path_buf();
         // SAFETY: these libc calls have no pointer arguments or side effects.
@@ -198,6 +253,71 @@ struct ActiveRuntimeManifest {
     mksquashfs_sha256: String,
     mksquashfs_argv_sha256: String,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceManifest {
+    version: u16,
+    codex_version: String,
+    codex_target: String,
+    codex_layout_version: u16,
+    files: Vec<RuntimeSourceFile>,
+    symlinks: Vec<RuntimeSourceSymlink>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceFile {
+    source: String,
+    destination: String,
+    size: u64,
+    sha256: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSourceSymlink {
+    destination: String,
+    target: String,
+}
+
+const EXPECTED_RUNTIME_SOURCE_FILES: &[(&str, &str, &str)] = &[
+    (
+        "/bin/busybox",
+        "/opt/webex-generic-account-bot/runtime-sources/busybox",
+        "0555",
+    ),
+    (
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "0444",
+    ),
+    (
+        "/opt/codex/bin/codex",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/bin/codex",
+        "0555",
+    ),
+    (
+        "/opt/codex/codex-path/rg",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/codex-path/rg",
+        "0555",
+    ),
+    (
+        "/opt/codex/codex-resources/bwrap",
+        "/opt/webex-generic-account-bot/runtime-sources/codex/codex-resources/bwrap",
+        "0555",
+    ),
+];
+
+const EXPECTED_RUNTIME_SOURCE_SYMLINKS: &[(&str, &str)] = &[
+    ("/bin/sh", "busybox"),
+    ("/bin/cat", "busybox"),
+    ("/bin/find", "busybox"),
+    ("/bin/ls", "busybox"),
+    ("/bin/sed", "busybox"),
+    ("/bin/wc", "busybox"),
+];
 
 #[derive(Debug)]
 struct ActivationBinding {
@@ -274,10 +394,31 @@ enum TrustedFileKind {
 }
 
 pub fn verify_activation() -> Result<VerifiedActivation> {
-    verify_activation_with(&ActivationPaths::production())
+    verify_activation_with(&ActivationPaths::production_for_bot())
+}
+
+pub async fn verify_activation_bounded() -> Result<VerifiedActivation> {
+    let deadline = WorkBudget::after(Duration::from_secs(
+        LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS,
+    ));
+    run_blocking_with_process_watchdog(
+        "bot activation verification",
+        Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
+        move || {
+            verify_activation_with_deadline(&ActivationPaths::production_for_bot(), Some(deadline))
+        },
+    )
+    .await?
 }
 
 pub fn verify_activation_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
+    verify_activation_with_deadline(paths, None)
+}
+
+pub(crate) fn verify_activation_with_deadline(
+    paths: &ActivationPaths,
+    deadline: Option<WorkBudget>,
+) -> Result<VerifiedActivation> {
     ensure_linux()?;
     let receipt_file = read_trusted_file(
         paths,
@@ -287,8 +428,9 @@ pub fn verify_activation_with(paths: &ActivationPaths) -> Result<VerifiedActivat
     )?;
     let receipt: ActivationReceipt = serde_json::from_slice(&receipt_file.bytes)
         .context("activation receipt is invalid JSON")?;
-    let binding = load_activation_binding(paths)?;
+    let binding = load_activation_binding_with_deadline(paths, deadline.clone())?;
     let verified = validate_receipt(&receipt, &binding)?;
+    verify_current_process_executable(paths, &receipt, &binding, deadline)?;
     ensure_path_identity(paths, &paths.receipt, &receipt_file.identity)?;
     for (path, identity) in &binding.identities {
         ensure_path_identity(paths, path, identity)?;
@@ -336,6 +478,16 @@ fn build_activation_receipt_with(
 }
 
 fn load_activation_binding(paths: &ActivationPaths) -> Result<ActivationBinding> {
+    load_activation_binding_with_deadline(paths, None)
+}
+
+fn load_activation_binding_with_deadline(
+    paths: &ActivationPaths,
+    deadline: Option<WorkBudget>,
+) -> Result<ActivationBinding> {
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("activation verification")?;
+    }
     let boot_id_file = read_trusted_file(
         paths,
         &paths.boot_id,
@@ -364,10 +516,21 @@ fn load_activation_binding(paths: &ActivationPaths) -> Result<ActivationBinding>
         &runtime_image_path,
         manifest.image_size,
         &manifest.image_sha256,
+        deadline.clone(),
     )?;
-    let bot = hash_trusted_file(paths, &paths.bot_executable)?;
-    let launcher = hash_trusted_file(paths, &paths.launcher_executable)?;
-    let runtime = hash_trusted_file(paths, &paths.runtime_executable)?;
+    let bot = hash_trusted_file(paths, &paths.bot_executable, deadline.clone())?;
+    let launcher = hash_trusted_file(paths, &paths.launcher_executable, deadline.clone())?;
+    let runtime = hash_trusted_file(paths, &paths.runtime_executable, deadline.clone())?;
+    let source_manifest = read_trusted_file(
+        paths,
+        &paths.runtime_source_manifest,
+        TrustedFileKind::ReadOnlyData,
+        RUNTIME_SOURCE_MANIFEST_MAX_BYTES,
+    )?;
+    validate_runtime_source_binding(paths, &manifest, &source_manifest.bytes, &runtime)?;
+    if let Some(deadline) = deadline.as_ref() {
+        deadline.check("activation source manifest verification")?;
+    }
 
     Ok(ActivationBinding {
         boot_id,
@@ -383,8 +546,87 @@ fn load_activation_binding(paths: &ActivationPaths) -> Result<ActivationBinding>
             (paths.bot_executable.clone(), bot.identity),
             (paths.launcher_executable.clone(), launcher.identity),
             (paths.runtime_executable.clone(), runtime.identity),
+            (
+                paths.runtime_source_manifest.clone(),
+                source_manifest.identity,
+            ),
         ],
     })
+}
+
+fn validate_runtime_source_binding(
+    paths: &ActivationPaths,
+    active: &ActiveRuntimeManifest,
+    source_bytes: &[u8],
+    runtime: &TrustedDigest,
+) -> Result<()> {
+    if sha256(source_bytes) != active.source_manifest_sha256 {
+        return Err(anyhow!(
+            "runtime source manifest digest does not match the active image"
+        ));
+    }
+    let source: RuntimeSourceManifest =
+        serde_json::from_slice(source_bytes).context("runtime source manifest is invalid JSON")?;
+    let runtime_source = paths
+        .runtime_executable
+        .to_str()
+        .ok_or_else(|| anyhow!("runtime executable path is not UTF-8"))?;
+    if source.version != 1
+        || source.codex_version != active.codex_version
+        || source.codex_target != active.codex_target
+        || source.codex_layout_version != active.codex_layout_version
+        || source.files.len() != EXPECTED_RUNTIME_SOURCE_FILES.len() + 1
+        || source.symlinks.len() != EXPECTED_RUNTIME_SOURCE_SYMLINKS.len()
+    {
+        return Err(anyhow!(
+            "runtime source manifest policy does not match the active image"
+        ));
+    }
+    let mut files = BTreeMap::new();
+    for entry in &source.files {
+        if entry.size == 0
+            || entry.size > RUNTIME_IMAGE_MAX_BYTES
+            || !valid_digest(&entry.sha256)
+            || files.insert(entry.destination.as_str(), entry).is_some()
+        {
+            return Err(anyhow!("runtime source manifest file entry is invalid"));
+        }
+    }
+    for (destination, expected_source, expected_mode) in EXPECTED_RUNTIME_SOURCE_FILES {
+        let entry = files
+            .get(destination)
+            .ok_or_else(|| anyhow!("runtime source manifest is missing a required file"))?;
+        if entry.source != *expected_source || entry.mode != *expected_mode {
+            return Err(anyhow!("runtime source manifest file policy is invalid"));
+        }
+    }
+    let runtime_entry = files
+        .get("/usr/libexec/webex-codex-runtime")
+        .ok_or_else(|| anyhow!("runtime source manifest is missing the runtime wrapper"))?;
+    if runtime_entry.source != runtime_source
+        || runtime_entry.mode != "0555"
+        || runtime_entry.sha256 != runtime.digest
+        || runtime_entry.size != runtime.identity.length
+    {
+        return Err(anyhow!(
+            "runtime source manifest wrapper binding is invalid"
+        ));
+    }
+    let mut symlinks = BTreeMap::new();
+    for entry in &source.symlinks {
+        if symlinks
+            .insert(entry.destination.as_str(), entry.target.as_str())
+            .is_some()
+        {
+            return Err(anyhow!("runtime source manifest symlink is duplicated"));
+        }
+    }
+    for (destination, expected_target) in EXPECTED_RUNTIME_SOURCE_SYMLINKS {
+        if symlinks.get(destination).copied() != Some(*expected_target) {
+            return Err(anyhow!("runtime source manifest symlink policy is invalid"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_receipt(
@@ -522,17 +764,31 @@ fn read_trusted_file(
     Ok(TrustedRead { bytes, identity })
 }
 
-fn hash_trusted_file(paths: &ActivationPaths, path: &Path) -> Result<TrustedDigest> {
+fn hash_trusted_file(
+    paths: &ActivationPaths,
+    path: &Path,
+    deadline: Option<WorkBudget>,
+) -> Result<TrustedDigest> {
     let (mut file, identity) = open_trusted_file(
         paths,
         path,
         TrustedFileKind::Executable,
         EXECUTABLE_MAX_BYTES,
     )?;
+    let digest = hash_open_executable(&mut file, deadline)?;
+    ensure_open_file_identity(&file, &identity)?;
+    ensure_path_identity(paths, path, &identity)?;
+    Ok(TrustedDigest { digest, identity })
+}
+
+fn hash_open_executable(file: &mut File, deadline: Option<WorkBudget>) -> Result<String> {
     let mut context = DigestContext::new(&SHA256);
     let mut total = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("activation executable hashing")?;
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -548,12 +804,66 @@ fn hash_trusted_file(paths: &ActivationPaths, path: &Path) -> Result<TrustedDige
     if total == 0 {
         return Err(anyhow!("trusted executable is empty"));
     }
-    ensure_open_file_identity(&file, &identity)?;
-    ensure_path_identity(paths, path, &identity)?;
-    Ok(TrustedDigest {
-        digest: hex(context.finish().as_ref()),
-        identity,
-    })
+    Ok(hex(context.finish().as_ref()))
+}
+
+fn verify_current_process_executable(
+    paths: &ActivationPaths,
+    receipt: &ActivationReceipt,
+    binding: &ActivationBinding,
+    deadline: Option<WorkBudget>,
+) -> Result<()> {
+    let Some(current) = paths.current_process.as_ref() else {
+        return Ok(());
+    };
+    let (expected_path, expected_digest) = match current.role {
+        ProcessExecutableRole::Bot => (&paths.bot_executable, &receipt.bot_executable_sha256),
+        ProcessExecutableRole::Launcher => (
+            &paths.launcher_executable,
+            &receipt.launcher_executable_sha256,
+        ),
+    };
+    let expected_identity = binding
+        .identities
+        .iter()
+        .find_map(|(path, identity)| (path == expected_path).then_some(identity))
+        .ok_or_else(|| anyhow!("activation binding omitted the current executable"))?;
+
+    if fs::read_link(&current.proc_path)? != *expected_path {
+        return Err(anyhow!("current process executable path is invalid"));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&current.proc_path)
+        .context("failed to open current process executable")?;
+    let metadata = file.metadata()?;
+    validate_file_metadata(
+        paths,
+        &metadata,
+        TrustedFileKind::Executable,
+        EXECUTABLE_MAX_BYTES,
+    )?;
+    let current_identity = FileIdentity::from_metadata(&metadata);
+    if !expected_identity.matches(&current_identity) {
+        return Err(anyhow!(
+            "current process executable does not match the active path"
+        ));
+    }
+    ensure_xattr_absent(&file, b"security.capability\0", "file capability")?;
+    let digest = hash_open_executable(&mut file, deadline)?;
+    if digest != *expected_digest {
+        return Err(anyhow!(
+            "current process executable does not match the activation receipt"
+        ));
+    }
+    ensure_open_file_identity(&file, &current_identity)?;
+    if fs::read_link(&current.proc_path)? != *expected_path {
+        return Err(anyhow!(
+            "current process executable changed during verification"
+        ));
+    }
+    ensure_path_identity(paths, expected_path, expected_identity)
 }
 
 fn hash_runtime_image(
@@ -561,6 +871,7 @@ fn hash_runtime_image(
     path: &Path,
     expected_size: u64,
     expected_digest: &str,
+    deadline: Option<WorkBudget>,
 ) -> Result<TrustedDigest> {
     let (mut file, identity) = open_trusted_file(
         paths,
@@ -583,6 +894,9 @@ fn hash_runtime_image(
     let mut total = magic.len() as u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if let Some(deadline) = deadline.as_ref() {
+            deadline.check("activation runtime image hashing")?;
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -949,6 +1263,7 @@ mod tests {
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
     const BOOT_ID: &str = "11111111-2222-3333-4444-555555555555";
     const RUNTIME_IMAGE: &[u8] = b"hsqstest runtime image\n";
+    const RUNTIME_EXECUTABLE: &[u8] = b"runtime executable\n";
 
     struct Fixture {
         root: PathBuf,
@@ -973,14 +1288,16 @@ mod tests {
             fs::create_dir(&image_directory).unwrap();
             fs::set_permissions(&image_directory, fs::Permissions::from_mode(0o755)).unwrap();
             write_mode(&paths.boot_id, format!("{BOOT_ID}\n").as_bytes(), 0o444);
-            write_mode(
-                &paths.active_manifest,
-                &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
-                0o444,
-            );
             write_mode(&paths.bot_executable, b"bot executable\n", 0o555);
             write_mode(&paths.launcher_executable, b"launcher executable\n", 0o555);
-            write_mode(&paths.runtime_executable, b"runtime executable\n", 0o555);
+            write_mode(&paths.runtime_executable, RUNTIME_EXECUTABLE, 0o555);
+            let source_manifest = serde_json::to_vec_pretty(&source_manifest(&paths)).unwrap();
+            write_mode(&paths.runtime_source_manifest, &source_manifest, 0o444);
+            write_mode(
+                &paths.active_manifest,
+                &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_manifest))).unwrap(),
+                0o444,
+            );
             write_mode(&runtime_image_path(&paths), RUNTIME_IMAGE, 0o444);
             Self { root, paths }
         }
@@ -1000,6 +1317,18 @@ mod tests {
                 0o444,
             );
         }
+
+        fn bind_current_process(&mut self, role: ProcessExecutableRole) -> File {
+            let executable = match role {
+                ProcessExecutableRole::Bot => &self.paths.bot_executable,
+                ProcessExecutableRole::Launcher => &self.paths.launcher_executable,
+            };
+            let file = File::open(executable).unwrap();
+            let proc_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            assert_eq!(fs::read_link(&proc_path).unwrap(), *executable);
+            self.paths = self.paths.clone().with_current_process(proc_path, role);
+            file
+        }
     }
 
     impl Drop for Fixture {
@@ -1008,7 +1337,7 @@ mod tests {
         }
     }
 
-    fn active_manifest() -> serde_json::Value {
+    fn active_manifest(source_manifest_sha256: &str) -> serde_json::Value {
         let image_digest = sha256(RUNTIME_IMAGE);
         json!({
             "version": 1,
@@ -1019,10 +1348,62 @@ mod tests {
             "image": format!("images/{image_digest}.squashfs"),
             "image_sha256": image_digest,
             "image_size": RUNTIME_IMAGE.len(),
-            "source_manifest_sha256": "b".repeat(64),
+            "source_manifest_sha256": source_manifest_sha256,
             "mksquashfs_sha256": "c".repeat(64),
             "mksquashfs_argv_sha256": EXPECTED_MKSQUASHFS_ARGV_SHA256,
         })
+    }
+
+    fn source_manifest(paths: &ActivationPaths) -> serde_json::Value {
+        let mut files = EXPECTED_RUNTIME_SOURCE_FILES
+            .iter()
+            .map(|(destination, source, mode)| {
+                json!({
+                    "source": source,
+                    "destination": destination,
+                    "size": 1,
+                    "sha256": "a".repeat(64),
+                    "mode": mode
+                })
+            })
+            .collect::<Vec<_>>();
+        files.push(json!({
+            "source": paths.runtime_executable.to_string_lossy(),
+            "destination": "/usr/libexec/webex-codex-runtime",
+            "size": RUNTIME_EXECUTABLE.len(),
+            "sha256": sha256(RUNTIME_EXECUTABLE),
+            "mode": "0555"
+        }));
+        let symlinks = EXPECTED_RUNTIME_SOURCE_SYMLINKS
+            .iter()
+            .map(|(destination, target)| json!({ "destination": destination, "target": target }))
+            .collect::<Vec<_>>();
+        json!({
+            "version": 1,
+            "codex_version": SUPPORTED_CODEX_VERSION,
+            "codex_target": SUPPORTED_CODEX_TARGET,
+            "codex_layout_version": SUPPORTED_CODEX_LAYOUT_VERSION,
+            "files": files,
+            "symlinks": symlinks
+        })
+    }
+
+    fn active_manifest_for(paths: &ActivationPaths) -> serde_json::Value {
+        active_manifest(&sha256(&fs::read(&paths.runtime_source_manifest).unwrap()))
+    }
+
+    fn assert_source_manifest_rejected(mutator: impl FnOnce(&mut serde_json::Value)) {
+        let fixture = Fixture::new();
+        let mut source = source_manifest(&fixture.paths);
+        mutator(&mut source);
+        let source_bytes = serde_json::to_vec_pretty(&source).unwrap();
+        replace_read_only(&fixture.paths.runtime_source_manifest, &source_bytes, 0o444);
+        replace_read_only(
+            &fixture.paths.active_manifest,
+            &serde_json::to_vec_pretty(&active_manifest(&sha256(&source_bytes))).unwrap(),
+            0o444,
+        );
+        assert!(build_activation_receipt_with(&fixture.paths, passing_canaries()).is_err());
     }
 
     fn runtime_image_path(paths: &ActivationPaths) -> PathBuf {
@@ -1043,6 +1424,17 @@ mod tests {
         assert_eq!(
             paths.runtime_executable(),
             Path::new(RUNTIME_EXECUTABLE_PATH)
+        );
+        assert_eq!(
+            paths.runtime_source_manifest(),
+            Path::new(RUNTIME_SOURCE_MANIFEST_PATH)
+        );
+        assert!(paths.current_process.is_none());
+
+        let launcher = ActivationPaths::production_for_launcher_with_boot_id(&boot_id);
+        assert_eq!(
+            launcher.current_process.as_ref().unwrap().role,
+            ProcessExecutableRole::Launcher
         );
     }
 
@@ -1158,6 +1550,33 @@ mod tests {
     }
 
     #[test]
+    fn verifies_current_bot_and_launcher_images_against_the_receipt() {
+        for role in [ProcessExecutableRole::Bot, ProcessExecutableRole::Launcher] {
+            let mut fixture = Fixture::new();
+            let current_image = fixture.bind_current_process(role);
+            let receipt = fixture.receipt();
+            fixture.install(&receipt);
+
+            verify_activation_with(&fixture.paths).unwrap();
+            drop(current_image);
+        }
+    }
+
+    #[test]
+    fn rejects_a_running_launcher_replaced_before_a_new_receipt_is_minted() {
+        let mut fixture = Fixture::new();
+        let current_image = fixture.bind_current_process(ProcessExecutableRole::Launcher);
+        let replacement = fixture.root.join("replacement-launcher");
+        write_mode(&replacement, b"replacement launcher executable\n", 0o555);
+        fs::rename(&replacement, &fixture.paths.launcher_executable).unwrap();
+        let receipt = fixture.receipt();
+        fixture.install(&receipt);
+
+        assert!(verify_activation_with(&fixture.paths).is_err());
+        drop(current_image);
+    }
+
+    #[test]
     fn rejects_stale_boot_and_modified_manifest_or_binaries() {
         let fixture = Fixture::new();
         let receipt = fixture.receipt();
@@ -1175,13 +1594,13 @@ mod tests {
             0o444,
         );
 
-        let mut manifest = serde_json::to_vec_pretty(&active_manifest()).unwrap();
+        let mut manifest = serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap();
         manifest.push(b'\n');
         replace_read_only(&fixture.paths.active_manifest, &manifest, 0o444);
         assert!(verify_activation_with(&fixture.paths).is_err());
         replace_read_only(
             &fixture.paths.active_manifest,
-            &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
+            &serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap(),
             0o444,
         );
 
@@ -1315,7 +1734,7 @@ mod tests {
         assert!(verify_activation_with(&fixture.paths).is_err());
         replace_read_only(
             &fixture.paths.active_manifest,
-            &serde_json::to_vec_pretty(&active_manifest()).unwrap(),
+            &serde_json::to_vec_pretty(&active_manifest_for(&fixture.paths)).unwrap(),
             0o444,
         );
 
@@ -1361,7 +1780,7 @@ mod tests {
         assert!(ensure_root(1).is_err());
         assert!(ensure_root(0).is_ok());
 
-        let mut manifest = active_manifest();
+        let mut manifest = active_manifest_for(&fixture.paths);
         manifest
             .as_object_mut()
             .unwrap()
@@ -1372,5 +1791,39 @@ mod tests {
             0o444,
         );
         assert!(build_activation_receipt_with(&fixture.paths, passing_canaries()).is_err());
+    }
+
+    #[test]
+    fn rejects_runtime_wrapper_source_and_image_binding_drift() {
+        assert_source_manifest_rejected(|source| {
+            source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["sha256"] = json!("d".repeat(64));
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["mode"] = json!("0444");
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"].as_array_mut().unwrap().pop();
+        });
+        assert_source_manifest_rejected(|source| {
+            source["files"].as_array_mut().unwrap().push(json!({
+                "source": "/tmp/extra",
+                "destination": "/tmp/extra",
+                "size": 1,
+                "sha256": "e".repeat(64),
+                "mode": "0444"
+            }));
+        });
+        assert_source_manifest_rejected(|source| {
+            source["symlinks"].as_array_mut().unwrap().push(json!({
+                "destination": "/bin/extra",
+                "target": "busybox"
+            }));
+        });
+        assert_source_manifest_rejected(|source| {
+            source
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".to_owned(), json!(true));
+        });
     }
 }

@@ -290,9 +290,35 @@ fn read_final_output(path: &Path) -> Result<Vec<u8>> {
         return Err(anyhow!("final Codex message metadata is invalid"));
     }
     let mut output = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut output)?;
+    Read::by_ref(&mut file)
+        .take(FINAL_OUTPUT_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut output)?;
+    if output.len() as u64 > FINAL_OUTPUT_MAX_BYTES {
+        return Err(anyhow!("final Codex message exceeds its size limit"));
+    }
+    let final_metadata = file.metadata()?;
+    if !same_final_output_metadata(&metadata, &final_metadata)
+        || final_metadata.len() != output.len() as u64
+    {
+        return Err(anyhow!("final Codex message changed while it was read"));
+    }
     std::str::from_utf8(&output).context("final Codex message is not UTF-8")?;
     Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn same_final_output_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.mode() == right.mode()
+        && left.nlink() == right.nlink()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[cfg(target_os = "linux")]
@@ -462,6 +488,11 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_final_output(&path).unwrap(), b"final response\n");
 
+        fs::write(&path, vec![b'x'; FINAL_OUTPUT_MAX_BYTES as usize + 1]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_final_output(&path).is_err());
+
+        fs::write(&path, b"final response\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_final_output(&path).is_err());
         fs::remove_file(path).unwrap();

@@ -51,6 +51,41 @@ superseded_by:
   wiring, and PR 4c2 owns live canaries plus final activation. Bot socket
   groups and `/config pull`, `/config reload`, and `/config sync` remain
   disabled in PR 4c1a.
+- PR 4c1c wires the fixed launcher client, explicit Jenkins evidence staging,
+  root fresh-inode sealer, boot-ID systemd credential, and exact
+  `ephemeral-linux-user` dispatcher path. It grants no bot launcher group or
+  pending-root path while current-user children could inherit them; PR 4c2
+  owns that access as part of atomic ephemeral activation. The bot never
+  receives the sealed-input group. Config validation rejects mixed
+  current-user and ephemeral effective runner configurations, then rejects all
+  ephemeral activation in this slice. PR 4c2 must remove that final gate only
+  while adding bot access and minting the boot-scoped receipt after production
+  canaries pass; 4c1c `--check-config` therefore stops at the activation gate,
+  and production config remains current-user until then.
+  Preflight, evidence staging, and launcher preparation use explicit bounded
+  budgets that are included in ephemeral attempt-lease validation. Blocking
+  file workers check cooperative deadlines and launcher-socket cancellation;
+  the launcher waits for their scoped cleanup instead of detaching them.
+  Independent process watchdogs terminate stuck staging or launcher
+  preparation before the surrounding 10-minute lease budget, while client
+  disconnect gives cooperative launcher cleanup a final 105-second grace.
+  Source-quarantine deletion fsyncs its parent before success, and consumed
+  cleanup runs in a blocking worker with a 50-second hard bound inside the
+  protocol's 110-second cleanup allowance after at most 50 seconds of
+  transient-unit cleanup. Socket trigger capacity includes
+  startup preflight and both per-run launcher connections.
+  Pending workspace publication and bot-side removal use `syncfs` through the
+  held workspace fd before returning, preserving a non-enumerable `2730`
+  pending root. Normal post-staging cleanup runs in a bounded blocking worker;
+  async task drop defers the private tree to the existing tmpfiles crash
+  fallback instead of performing recursive I/O on a runtime thread.
+  Configured request concurrency cannot exceed the socket's four accepted
+  connections, and the service runtime maximum stays above the protocol's
+  largest request plus preparation, cleanup, and response budget.
+  Normal success, rejection, timeout, client disconnect, and cancellation
+  remove ready, source-quarantine, and consumed sealed trees by verified inode;
+  ready trees remain group-inaccessible until consumed, and tmpfiles remains
+  the crash fallback.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -255,13 +290,21 @@ superseded_by:
 ### PR 4c1c: Gated Runner Wiring
 - Repository: `Joey-Project/Webex-generic-account-bot`.
 - Connect the `ephemeral-linux-user` runner backend to the fixed PR 4a launcher
-  only after the PR 4b boundary is present, then add only the minimum reviewed
-  bot group/drop-in access required to reach the launcher socket.
+  only after the PR 4b boundary is present. Do not add a bot group/drop-in
+  while current-user Codex children could inherit launcher access.
 - Enabling `ephemeral-linux-user` must require `--check-config` and deployment preflight to verify the launcher is present, fixed-path, root-owned, not writable by the bot/deployment user, uses fixed argv semantics, and has its required `DynamicUser` or helper capability available.
 - If the launcher preflight is unavailable or fails, `ephemeral-linux-user` configs must stay undeployable and must not fall back to current-user execution.
 - Preserve `ProcSubset=pid`: copy the current kernel boot ID into the launcher
   with a root-owned systemd credential and verify activation through
-  `ActivationPaths::production_with_boot_id` instead of exposing `/proc/sys`.
+  the launcher-specific activation path instead of exposing `/proc/sys`.
+- Bind bot startup and every launcher verification to the currently executing
+  `/proc/self/exe` path, inode metadata, and digest as well as the fixed path
+  and receipt, so an old process cannot accept a receipt minted for an
+  atomically replaced executable.
+- Bind each verified activation snapshot to the exact active-manifest bytes and
+  selected image digest used by the run, and send launcher diagnostics only to
+  journal-backed `stderr` so protocol `stdout` remains unmodified. Bound and
+  sanitise internal failure causes before logging them.
 
 ### PR 4c2: Production-Image Smoke Tests and Final Activation
 - Repository: `Joey-Project/Webex-generic-account-bot`, with a matching config
@@ -273,6 +316,12 @@ superseded_by:
   prompt-controlled descendants cannot reuse the credential/model channel,
   launcher socket, bot/config-worker sockets, or forbidden network paths; and
   timeout, launcher crash, bot crash, and host-reboot cleanup converge safely.
+- Install the minimum bot launcher-group and pending-path access only in the
+  same activation that switches production away from current-user execution.
+- Run the real production image to prove the main process can write the bounded
+  final message, tool subprocesses cannot read auth/main-home/final-output
+  paths, and launcher stdout contains only the final message before minting the
+  receipt.
 - PR 4c2 activates only the runner. `/config pull`, `/config reload`, and
   `/config sync` remain owned by PRs 2b2b and 2b3 and stay disabled here.
 

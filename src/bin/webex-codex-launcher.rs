@@ -12,11 +12,11 @@ use webex_generic_account_bot::{
         AuthorisedPeer, authorise_bot_peer, drop_peer_inspection_capability,
         socket_peer_credentials, validate_launcher_process, validate_socket_stdio,
     },
-    isolated_execution::{self, IsolatedExecutionError, IsolatedRunResult},
+    isolated_execution::{self, ExecutionCancellation, IsolatedExecutionError, IsolatedRunResult},
     launcher_protocol::{
-        CompletedResponse, FRAME_HEADER_BYTES, LauncherRequestKind, LauncherResponse,
-        REQUEST_MAX_BYTES, RejectedResponse, RejectionCode, decode_request_frame,
-        encode_response_frame,
+        CompletedResponse, FRAME_HEADER_BYTES, LAUNCHER_CANCELLATION_DRAIN_SECONDS,
+        LauncherRequestKind, LauncherResponse, REQUEST_MAX_BYTES, RejectedResponse, RejectionCode,
+        bound_error_message, decode_request_frame, encode_response_frame,
     },
 };
 
@@ -24,6 +24,10 @@ use webex_generic_account_bot::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const CONTROL_BUFFER_BYTES: usize = 128;
+#[cfg(target_os = "linux")]
+const STUCK_WORK_EXIT_CODE: i32 = 70;
+#[cfg(target_os = "linux")]
+const DIAGNOSTIC_BUFFER_MAX_CHARS: usize = 512;
 
 #[cfg(target_os = "linux")]
 struct ReceivedPacket {
@@ -39,6 +43,14 @@ struct ControlBuffer([u8; CONTROL_BUFFER_BYTES]);
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "webex_codex_launcher=info,webex_generic_account_bot=info".into()
+            }),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     validate_launcher_process()?;
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
@@ -62,7 +74,13 @@ async fn main() -> Result<()> {
     } else {
         decode_request_frame(&packet.frame)
     };
-    let response = response_for_request(request, &peer).await?;
+    let response = match pre_dispatch_protocol_response(socket.get_ref().as_raw_fd())? {
+        Some(response) => Some(response),
+        None => response_for_request(request, &peer, &socket).await?,
+    };
+    let Some(response) = response else {
+        return Ok(());
+    };
     peer.ensure_alive()?;
     write_response(&socket, &response).await
 }
@@ -82,36 +100,390 @@ async fn response_for_request(
         webex_generic_account_bot::launcher_protocol::ProtocolError,
     >,
     peer: &AuthorisedPeer,
-) -> Result<LauncherResponse> {
+    socket: &AsyncFd<OwnedFd>,
+) -> Result<Option<LauncherResponse>> {
     match request {
         Ok(request) => match request.request {
-            LauncherRequestKind::Preflight(_) => Ok(LauncherResponse::ready(
-                isolated_execution::preflight().is_ok(),
-            )),
+            LauncherRequestKind::Preflight(_) => match preflight_available(socket).await {
+                Ok(Some(available)) => Ok(Some(LauncherResponse::ready(available))),
+                Ok(None) => Ok(None),
+                Err(_) => Ok(Some(rejected(
+                    None,
+                    RejectionCode::MalformedRequest,
+                    "launcher connection violated the one-packet protocol",
+                )?)),
+            },
             LauncherRequestKind::Execute(request) => {
                 let run_id = request.run_id.clone();
+                if let Some(response) = execute_policy_rejection(&request)? {
+                    return Ok(Some(response));
+                }
                 let output_limit = request.output_char_limit;
-                match isolated_execution::execute(&request, peer).await {
-                    Ok(result) => execution_response(run_id, output_limit, result),
-                    Err(IsolatedExecutionError::Unavailable(_)) => Ok(rejected(
-                        Some(run_id),
-                        RejectionCode::ExecutionUnavailable,
-                        "isolated Codex runtime is unavailable",
-                    )?),
-                    Err(IsolatedExecutionError::Failed(_)) => Ok(rejected(
-                        Some(run_id),
-                        RejectionCode::InternalError,
-                        "isolated Codex execution failed internally",
-                    )?),
+                match execute_until_disconnect(&request, peer, socket).await {
+                    Ok(ExecuteRequestOutcome::Response(result)) => {
+                        execution_response(run_id, output_limit, result).map(Some)
+                    }
+                    Ok(ExecuteRequestOutcome::Disconnected) => Ok(None),
+                    Err(ExecuteRequestError::DisconnectedFailure(error)) => {
+                        log_isolated_execution_error("disconnected execute drain", &error);
+                        Err(anyhow!(
+                            "isolated execution failed while draining a disconnected client"
+                        ))
+                    }
+                    Err(error) => execute_error_response(run_id, error).map(Some),
                 }
             }
         },
-        Err(error) => Ok(rejected(
+        Err(error) => Ok(Some(rejected(
             None,
             protocol_rejection_code(error),
             "launcher request failed protocol validation",
-        )?),
+        )?)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_policy_rejection(
+    request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
+) -> Result<Option<LauncherResponse>> {
+    let Err(error) = isolated_execution::validate_execution_policy(request) else {
+        return Ok(None);
+    };
+    Ok(Some(rejected(
+        Some(request.run_id.clone()),
+        protocol_rejection_code(error),
+        "launcher execute request failed policy validation",
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn execute_error_response(run_id: String, error: ExecuteRequestError) -> Result<LauncherResponse> {
+    match error {
+        ExecuteRequestError::Execution(IsolatedExecutionError::Unavailable(error)) => {
+            log_launcher_error("execute unavailable", &error);
+            rejected(
+                Some(run_id),
+                RejectionCode::ExecutionUnavailable,
+                "isolated Codex runtime is unavailable",
+            )
+        }
+        ExecuteRequestError::Execution(IsolatedExecutionError::Failed(error)) => {
+            log_launcher_error("execute failed", &error);
+            rejected(
+                Some(run_id),
+                RejectionCode::InternalError,
+                "isolated Codex execution failed internally",
+            )
+        }
+        ExecuteRequestError::Execution(IsolatedExecutionError::Cancelled) => {
+            tracing::error!(operation = "execute cancelled", "launcher operation failed");
+            rejected(
+                Some(run_id),
+                RejectionCode::InternalError,
+                "isolated Codex execution was cancelled unexpectedly",
+            )
+        }
+        ExecuteRequestError::Protocol => rejected(
+            Some(run_id),
+            RejectionCode::MalformedRequest,
+            "launcher connection violated the one-packet protocol",
+        ),
+        ExecuteRequestError::DisconnectedFailure(_) => {
+            Err(anyhow!("disconnected execution failure has no response"))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pre_dispatch_protocol_response(socket_fd: RawFd) -> Result<Option<LauncherResponse>> {
+    match inspect_client_socket(socket_fd) {
+        Ok(ClientSocketState::Open) => Ok(None),
+        Ok(ClientSocketState::Closed) => Err(anyhow!(
+            "launcher client disconnected before request dispatch"
+        )),
+        Err(_) => Ok(Some(rejected(
+            None,
+            RejectionCode::MalformedRequest,
+            "launcher connection violated the one-packet protocol",
+        )?)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn preflight_available(socket: &AsyncFd<OwnedFd>) -> std::io::Result<Option<bool>> {
+    let cancellation = ExecutionCancellation::new();
+    let preflight = isolated_execution::preflight_bounded(&cancellation);
+    tokio::pin!(preflight);
+    tokio::select! {
+        result = &mut preflight => {
+            let available = match result {
+                Ok(_) => true,
+                Err(error) => {
+                    log_launcher_error("preflight unavailable", &error);
+                    false
+                }
+            };
+            match inspect_client_socket(socket.get_ref().as_raw_fd())? {
+                ClientSocketState::Open => Ok(Some(available)),
+                ClientSocketState::Closed => Ok(None),
+            }
+        },
+        disconnect = wait_for_client_disconnect(socket) => {
+            cancellation.cancel();
+            match timeout(
+                Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
+                &mut preflight,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => terminate_stuck_launcher("cancelled preflight did not drain"),
+            }
+            disconnect?;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_launcher_error(operation: &'static str, error: &anyhow::Error) {
+    let diagnostic = bounded_error_diagnostic(error);
+    tracing::error!(operation, error = %diagnostic, "launcher operation failed");
+}
+
+#[cfg(target_os = "linux")]
+fn log_isolated_execution_error(operation: &'static str, error: &IsolatedExecutionError) {
+    match error {
+        IsolatedExecutionError::Unavailable(error) | IsolatedExecutionError::Failed(error) => {
+            log_launcher_error(operation, error);
+        }
+        IsolatedExecutionError::Cancelled => {
+            tracing::error!(operation, "launcher operation was cancelled unexpectedly");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_error_diagnostic(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+
+    struct DiagnosticWriter {
+        value: String,
+        remaining: usize,
+    }
+
+    impl std::fmt::Write for DiagnosticWriter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            for character in value.chars() {
+                if self.remaining == 0 {
+                    break;
+                }
+                self.value.push(if character.is_control() {
+                    ' '
+                } else {
+                    character
+                });
+                self.remaining -= 1;
+            }
+            Ok(())
+        }
+    }
+
+    let mut writer = DiagnosticWriter {
+        value: String::new(),
+        remaining: DIAGNOSTIC_BUFFER_MAX_CHARS,
+    };
+    let _ = write!(&mut writer, "{error:#}");
+    bound_error_message(&writer.value)
+}
+
+#[cfg(target_os = "linux")]
+async fn execute_until_disconnect(
+    request: &webex_generic_account_bot::launcher_protocol::ExecuteRequest,
+    peer: &AuthorisedPeer,
+    socket: &AsyncFd<OwnedFd>,
+) -> std::result::Result<ExecuteRequestOutcome, ExecuteRequestError> {
+    let cancellation = ExecutionCancellation::new();
+    let execution = isolated_execution::execute(request, peer, &cancellation);
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => match inspect_client_socket(socket.get_ref().as_raw_fd()) {
+            Ok(ClientSocketState::Open) => result
+                .map(ExecuteRequestOutcome::Response)
+                .map_err(ExecuteRequestError::Execution),
+            Ok(ClientSocketState::Closed) => disconnected_execution_outcome(result),
+            Err(_) => Err(ExecuteRequestError::Protocol),
+        },
+        disconnect = wait_for_client_disconnect(socket) => {
+            cancellation.cancel();
+            let result = match timeout(
+                Duration::from_secs(LAUNCHER_CANCELLATION_DRAIN_SECONDS),
+                &mut execution,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => terminate_stuck_launcher("cancelled execution did not drain"),
+            };
+            match disconnect {
+                Ok(()) => disconnected_execution_outcome(result),
+                Err(_) => Err(ExecuteRequestError::Protocol),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disconnected_execution_outcome(
+    result: std::result::Result<IsolatedRunResult, IsolatedExecutionError>,
+) -> std::result::Result<ExecuteRequestOutcome, ExecuteRequestError> {
+    match result {
+        Ok(_) | Err(IsolatedExecutionError::Cancelled) => Ok(ExecuteRequestOutcome::Disconnected),
+        Err(error) => Err(ExecuteRequestError::DisconnectedFailure(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ExecuteRequestError {
+    Execution(IsolatedExecutionError),
+    Protocol,
+    DisconnectedFailure(IsolatedExecutionError),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ExecuteRequestOutcome {
+    Response(IsolatedRunResult),
+    Disconnected,
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_stuck_launcher(reason: &'static str) -> ! {
+    tracing::error!(reason, "terminating a launcher with stuck blocking work");
+    std::process::exit(STUCK_WORK_EXIT_CODE)
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_client_disconnect(socket: &AsyncFd<OwnedFd>) -> std::io::Result<()> {
+    loop {
+        let mut guard = socket.readable().await?;
+        match guard.try_io(
+            |socket| match inspect_client_socket(socket.get_ref().as_raw_fd())? {
+                ClientSocketState::Closed => Ok(()),
+                ClientSocketState::Open => {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            },
+        ) {
+            Ok(result) => return result,
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientSocketState {
+    Open,
+    Closed,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientReadSideState {
+    Open,
+    HalfClosed,
+    Closed,
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_client_socket(socket_fd: RawFd) -> std::io::Result<ClientSocketState> {
+    let mut byte = 0_u8;
+    let mut control = ControlBuffer([0_u8; CONTROL_BUFFER_BYTES]);
+    let mut iovec = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen = control.0.len();
+    // SAFETY: message references initialized byte, control, and iovec storage for this call.
+    let received = unsafe {
+        libc::recvmsg(
+            socket_fd,
+            &mut message,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if received == 0 {
+        // A real zero-length packet still carries SCM_CREDENTIALS on this SO_PASSCRED
+        // socket. EOF carries no packet metadata and must also report read-side HUP.
+        // MSG_EOR is not reliable for distinguishing an empty SEQPACKET record.
+        let has_packet_metadata = unsafe { !libc::CMSG_FIRSTHDR(&message).is_null() };
+        if has_packet_metadata || message.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client sent an empty extra request packet",
+            ));
+        }
+        return match client_read_side_state(socket_fd)? {
+            ClientReadSideState::Closed => Ok(ClientSocketState::Closed),
+            ClientReadSideState::HalfClosed => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client half-closed the request stream",
+            )),
+            ClientReadSideState::Open => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launcher client sent an empty extra request packet",
+            )),
+        };
+    }
+    if received > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launcher client sent more than one request packet",
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(ClientSocketState::Open)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn client_read_side_state(socket_fd: RawFd) -> std::io::Result<ClientReadSideState> {
+    let mut descriptor = libc::pollfd {
+        fd: socket_fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: descriptor points to one initialized pollfd for this nonblocking probe.
+    let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    let hung_up = descriptor.revents & libc::POLLHUP != 0;
+    let read_half_closed = descriptor.revents & libc::POLLRDHUP != 0;
+    if descriptor.revents & libc::POLLERR != 0 && !hung_up {
+        return Err(std::io::Error::other(
+            "launcher client socket reported a read error",
+        ));
+    }
+    Ok(if hung_up {
+        ClientReadSideState::Closed
+    } else if read_half_closed {
+        ClientReadSideState::HalfClosed
+    } else {
+        ClientReadSideState::Open
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -319,10 +691,13 @@ fn main() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::process::Command;
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use webex_generic_account_bot::launcher_protocol::{
-        LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
+        ExecuteRequest, LauncherRequest, LauncherResponseKind, ProtocolError, encode_request_frame,
     };
 
     use super::*;
@@ -357,6 +732,21 @@ mod tests {
                 LauncherResponseKind::Rejected(response) if response.code == code
             ));
         }
+
+        assert_malformed_response(
+            execute_error_response("run-1".to_owned(), ExecuteRequestError::Protocol).unwrap(),
+        );
+
+        assert!(matches!(
+            disconnected_execution_outcome(Err(IsolatedExecutionError::Cancelled)),
+            Ok(ExecuteRequestOutcome::Disconnected)
+        ));
+        assert!(matches!(
+            disconnected_execution_outcome(Err(IsolatedExecutionError::Failed(anyhow!(
+                "cleanup failed"
+            )))),
+            Err(ExecuteRequestError::DisconnectedFailure(_))
+        ));
     }
 
     #[test]
@@ -374,6 +764,49 @@ mod tests {
                 if response.run_id.is_none()
                     && response.code == RejectionCode::MalformedRequest
         ));
+    }
+
+    #[test]
+    fn internal_diagnostics_are_bounded_and_single_line() {
+        let error = anyhow!("{}\nsecret-shaped continuation", "x".repeat(4096));
+        let diagnostic = bounded_error_diagnostic(&error);
+
+        assert!(diagnostic.chars().count() <= 512);
+        assert!(!diagnostic.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn execute_policy_is_rejected_before_isolated_work() {
+        let mut request = ExecuteRequest {
+            run_id: "run-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            prompt: "diagnose the failure".to_owned(),
+            workspace: Path::new(webex_generic_account_bot::isolated_execution::CODEX_INPUT_ROOT)
+                .join("run-1"),
+            model: Some("gpt-5.5".to_owned()),
+            reasoning_effort: None,
+            timeout_seconds: 600,
+            output_char_limit: 100,
+            skip_git_repo_check: true,
+        };
+        assert!(execute_policy_rejection(&request).unwrap().is_none());
+
+        request.model = Some("gpt-4.1".to_owned());
+        assert_rejection_code(
+            execute_policy_rejection(&request).unwrap().unwrap(),
+            RejectionCode::InvalidModel,
+        );
+        request.model = Some("gpt-5.5".to_owned());
+        request.workspace = PathBuf::from("/tmp/wrong-workspace");
+        assert_rejection_code(
+            execute_policy_rejection(&request).unwrap().unwrap(),
+            RejectionCode::InvalidWorkspace,
+        );
+        request.workspace =
+            Path::new(webex_generic_account_bot::isolated_execution::CODEX_INPUT_ROOT)
+                .join("run-1");
+        request.skip_git_repo_check = false;
+        assert_malformed_response(execute_policy_rejection(&request).unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -394,6 +827,113 @@ mod tests {
         assert_eq!(packet.sender.pid, std::process::id());
         assert_eq!(packet.sender.uid, unsafe { libc::geteuid() });
         assert_eq!(packet.sender.gid, unsafe { libc::getegid() });
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_is_detected_without_an_extra_packet() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        drop(writer);
+
+        timeout(
+            Duration::from_millis(100),
+            wait_for_client_disconnect(&reader),
+        )
+        .await
+        .expect("disconnect monitor must observe peer closure")
+        .unwrap();
+        assert_eq!(
+            inspect_client_socket(reader.get_ref().as_raw_fd()).unwrap(),
+            ClientSocketState::Closed
+        );
+        assert!(matches!(
+            disconnected_execution_outcome(Ok(IsolatedRunResult::Completed {
+                output: "done".to_owned(),
+                truncated: false,
+            })),
+            Ok(ExecuteRequestOutcome::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_second_packet_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("queued packet must block dispatch"),
+        );
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn an_empty_second_packet_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        // SAFETY: the writer descriptor is live; a null pointer is valid for a zero-byte send.
+        assert_eq!(
+            unsafe { libc::send(writer.as_raw_fd(), std::ptr::null(), 0, libc::MSG_NOSIGNAL,) },
+            0
+        );
+        drop(writer);
+
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("queued empty packet must block dispatch"),
+        );
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_write_half_close_is_a_protocol_error_not_a_disconnect() {
+        let Some((writer, reader)) = credentialled_packet_pair() else {
+            return;
+        };
+        let frame = encode_request_frame(&LauncherRequest::preflight()).unwrap();
+        send_packet(writer.as_raw_fd(), &frame);
+        receive_request_packet(&reader).await.unwrap();
+        // SAFETY: the writer descriptor is live and owned by this test.
+        assert_eq!(
+            unsafe { libc::shutdown(writer.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+
+        assert_malformed_response(
+            pre_dispatch_protocol_response(reader.get_ref().as_raw_fd())
+                .unwrap()
+                .expect("write half-close must block dispatch"),
+        );
+        let error = wait_for_client_disconnect(&reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn assert_malformed_response(response: LauncherResponse) {
+        assert_rejection_code(response, RejectionCode::MalformedRequest);
+    }
+
+    fn assert_rejection_code(response: LauncherResponse, expected: RejectionCode) {
+        let LauncherResponseKind::Rejected(response) = response.response else {
+            panic!("protocol violation must be rejected");
+        };
+        assert_eq!(response.code, expected);
     }
 
     #[tokio::test]
