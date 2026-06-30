@@ -603,8 +603,6 @@ async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
     let unit = lifecycle_unit_name("timeout", nonce);
     let mut args = vec![
         "--quiet".into(),
-        "--wait".into(),
-        "--collect".into(),
         "--service-type=exec".into(),
         format!("--unit={unit}"),
     ];
@@ -617,9 +615,23 @@ async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
         "-c".into(),
         "exec sleep 30".into(),
     ]);
-    let status = run_command(SYSTEMD_RUN_PATH, &args, COMMAND_TIMEOUT).await?;
-    ensure!(!status.success(), "timeout canary unexpectedly completed");
-    wait_for_unit_inactive(&unit).await
+    let result = async {
+        let start = run_command(SYSTEMD_RUN_PATH, &args, COMMAND_TIMEOUT).await?;
+        ensure!(start.success(), "timeout canary failed to start");
+        wait_for_unit_active(&unit).await?;
+        wait_for_unit_inactive(&unit).await?;
+        verify_timeout_unit_result(&unit).await
+    }
+    .await;
+    let cleanup = cleanup_lifecycle_unit(&unit).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; failed to clean timeout canary unit: {cleanup_error:#}"
+        )),
+    }
 }
 
 async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> {
@@ -693,6 +705,32 @@ async fn run_command(
         .with_context(|| format!("failed to run fixed lifecycle command {program}"))
 }
 
+async fn run_command_output(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .env("LANG", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| anyhow!("fixed lifecycle command timed out"))?
+        .with_context(|| format!("failed to run fixed lifecycle command {program}"))?;
+    if output.stdout.len() > 128 {
+        bail!("fixed lifecycle command output is oversized");
+    }
+    Ok(output)
+}
+
 async fn stop_unit(unit: &str) -> Result<()> {
     let status = run_command(
         SYSTEMCTL_PATH,
@@ -701,6 +739,61 @@ async fn stop_unit(unit: &str) -> Result<()> {
     )
     .await?;
     ensure!(status.success(), "failed to stop lifecycle canary unit");
+    Ok(())
+}
+
+async fn cleanup_lifecycle_unit(unit: &str) -> Result<()> {
+    let stop = stop_unit(unit).await;
+    let reset = reset_failed_unit(unit).await;
+    match (stop, reset) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(stop_error), Err(reset_error)) => Err(anyhow!(
+            "{stop_error:#}; failed to reset lifecycle canary unit: {reset_error:#}"
+        )),
+    }
+}
+
+async fn reset_failed_unit(unit: &str) -> Result<()> {
+    let status = run_command(
+        SYSTEMCTL_PATH,
+        &[
+            "--no-ask-password".into(),
+            "reset-failed".into(),
+            unit.into(),
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    ensure!(status.success(), "failed to reset lifecycle canary unit");
+    Ok(())
+}
+
+async fn verify_timeout_unit_result(unit: &str) -> Result<()> {
+    let output = run_command_output(
+        SYSTEMCTL_PATH,
+        &[
+            "--no-pager".into(),
+            "--no-ask-password".into(),
+            "show".into(),
+            "--property=Result".into(),
+            "--value".into(),
+            unit.into(),
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    ensure!(
+        output.status.success(),
+        "failed to inspect timeout canary result"
+    );
+    validate_timeout_unit_result(&output.stdout)
+}
+
+fn validate_timeout_unit_result(output: &[u8]) -> Result<()> {
+    if output != b"timeout\n" {
+        bail!("timeout canary unit did not finish because RuntimeMaxSec expired");
+    }
     Ok(())
 }
 
@@ -1063,6 +1156,19 @@ mod tests {
         assert!(!RequiredUnitState::Active.reached(false));
         assert!(RequiredUnitState::Inactive.reached(false));
         assert!(!RequiredUnitState::Inactive.reached(true));
+    }
+
+    #[test]
+    fn timeout_canary_requires_the_exact_systemd_result() {
+        validate_timeout_unit_result(b"timeout\n").unwrap();
+        for invalid in [
+            b"success\n".as_slice(),
+            b"exit-code\n".as_slice(),
+            b"timeout".as_slice(),
+            b"timeout\nother\n".as_slice(),
+        ] {
+            assert!(validate_timeout_unit_result(invalid).is_err());
+        }
     }
 
     #[test]
