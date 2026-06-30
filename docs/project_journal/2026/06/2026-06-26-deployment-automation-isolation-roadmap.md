@@ -330,8 +330,9 @@ superseded_by:
 #### PR 4c2 delivery split
 - PR 4c2a1 adds the exact `runtime-boundary-v1` report schema, static syscall
   probe, immutable image allowlist entry, and activation-time host probe
-  digest/size binding. Inconclusive socket timeouts fail closed. It does not run
-  Codex, mint a receipt, install a bot drop-in, or remove the config gate.
+  digest/size binding. Inconclusive socket timeouts and a merely absent but
+  creatable final-output path fail closed. It does not run Codex, mint a
+  receipt, install a bot drop-in, or remove the config gate.
 - PR 4c2a2 validates the probe through the pinned Codex `exec --json`
   command-execution event. Its host harness must create nonce-scoped protected
   regular file, nested read-only workspace file, and live Unix/TCP listener

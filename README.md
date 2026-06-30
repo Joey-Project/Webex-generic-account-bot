@@ -856,10 +856,12 @@ counts for the instrumented host Unix and TCP fixtures. It also requires the
 credential, protected-path, and workspace fixtures to retain the same
 regular-file identity, requires private-home and workspace fixture contents to
 remain unchanged, and requires the fixed launcher and config-worker sockets to
-remain live before and after the probe. The process boundary directly checks `ptrace`, `kcmp`,
-`process_vm_readv`, and `process_vm_writev`; parsing a boolean-only inner report
-can never establish success. Socket connection timeouts are inconclusive and
-fail closed rather than being treated as access denial.
+remain live before and after the probe. The process boundary directly checks
+`ptrace`, `kcmp`, `process_vm_readv`, and `process_vm_writev`; parsing a
+boolean-only inner report can never establish success. The absent final-output
+path must also reject an actual `create_new` attempt, so `NotFound` alone cannot
+prove output isolation. Socket connection timeouts are inconclusive and fail
+closed rather than being treated as access denial.
 
 ## Development
 

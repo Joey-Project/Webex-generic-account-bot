@@ -115,7 +115,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "final_output_denied".to_owned(),
-        path_denied(Path::new(FINAL_OUTPUT_PATH)),
+        final_output_path_denied(Path::new(FINAL_OUTPUT_PATH)),
     );
     checks.insert(
         "forbidden_network_denied".to_owned(),
@@ -273,6 +273,11 @@ fn main_home_denied(nonce: &str) -> bool {
         && file_access_denied(Path::new(CODEX_AUTH_PATH))
         && file_access_denied(Path::new(&main_fixture))
         && file_access_denied(Path::new(&codex_fixture))
+}
+
+#[cfg(target_os = "linux")]
+fn final_output_path_denied(path: &Path) -> bool {
+    path_denied(path) && create_file_denied(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -844,6 +849,8 @@ mod tests {
             std::process::id()
         ));
         assert!(path_denied(&missing));
+        assert!(!final_output_path_denied(&missing));
+        assert!(!missing.exists());
         assert!(!path_denied(Path::new("/proc/self/status")));
     }
 
