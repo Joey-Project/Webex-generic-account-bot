@@ -831,6 +831,15 @@ the deployment transaction that installs bot launcher access and removes the
 current-user configuration. This slice therefore keeps the activation receipt
 unminted, the bot drop-in absent, and `ephemeral-linux-user` rejected.
 
+A successful probe report is not standalone activation evidence. Before the
+4c2a2 harness starts Codex, it must create nonce-scoped protected path and live
+Unix/TCP listener fixtures, verify each fixture is healthy, and pass the exact
+nonce and endpoints in the pinned command. After Codex exits, it must prove the
+same fixtures remained live and that the denied listeners accepted zero
+connections. A missing, replaced, unhealthy, or accepted fixture invalidates
+the run even if the inner probe reported `true`; the receipt writer must never
+consume the inner report without these host-side preconditions.
+
 ## Development
 
 Generated CI runs:

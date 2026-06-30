@@ -332,9 +332,13 @@ superseded_by:
   probe, and immutable image allowlist entry. It does not run Codex, mint a
   receipt, install a bot drop-in, or remove the config gate.
 - PR 4c2a2 validates the probe through the pinned Codex `exec --json`
-  command-execution event, runs host timeout/crash/reboot canaries, and owns
-  the root-only boot receipt helper and renewal unit. It still grants no bot
-  launcher access and does not enable production configuration.
+  command-execution event. Its host harness must create nonce-scoped protected
+  path and live Unix/TCP listener fixtures before launch, verify them before
+  and after Codex, and require zero accepted denied connections; an inner
+  `true` is never sufficient when a fixture is missing or unhealthy. It also
+  runs host timeout/crash/reboot canaries and owns the root-only boot receipt
+  helper and renewal unit. It still grants no bot launcher access and does not
+  enable production configuration.
 - PR 4c2b extends the existing deploy-config recovery transaction to install
   only the launch-group/pending-path bot permission, switch every effective
   Codex config away from current-user execution, mint or renew the receipt,

@@ -7,7 +7,10 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::{
         fd::AsRawFd,
-        unix::{fs::MetadataExt, net::UnixStream},
+        unix::{
+            fs::{FileTypeExt, MetadataExt},
+            net::UnixStream,
+        },
     },
     path::{Path, PathBuf},
     time::Duration,
@@ -205,12 +208,49 @@ fn access_denial_error(error: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn unix_socket_denied(path: &Path) -> bool {
-    UnixStream::connect(path).is_err()
+    match UnixStream::connect(path) {
+        Ok(_) => false,
+        Err(error) => unix_connection_denial_error(&error),
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn tcp_connection_denied(address: SocketAddr) -> bool {
-    TcpStream::connect_timeout(&address, NETWORK_TIMEOUT).is_err()
+    match TcpStream::connect_timeout(&address, NETWORK_TIMEOUT) {
+        Ok(_) => false,
+        Err(error) => tcp_connection_denial_error(&error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unix_connection_denial_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::ConnectionRefused
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ECONNREFUSED)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_connection_denial_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::TimedOut
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM)
+            | Some(libc::EACCES)
+            | Some(libc::ECONNREFUSED)
+            | Some(libc::ETIMEDOUT)
+            | Some(libc::ENETUNREACH)
+            | Some(libc::EHOSTUNREACH)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -339,9 +379,13 @@ fn check_child_succeeded(child: libc::pid_t) -> bool {
 
 #[cfg(target_os = "linux")]
 fn sensitive_descriptors_denied(expected_digest: &str) -> bool {
+    if !standard_input_sanitized(expected_digest) {
+        return false;
+    }
     let Ok(entries) = fs::read_dir("/proc/self/fd") else {
         return false;
     };
+    let self_fd_directory = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
     let mut inspected = 0_usize;
     for entry in entries {
         let Ok(entry) = entry else {
@@ -358,19 +402,45 @@ fn sensitive_descriptors_denied(expected_digest: &str) -> bool {
             return false;
         }
         let path = entry.path();
-        if fs::read_link(&path).ok().is_some_and(|target| {
-            let target = target.to_string_lossy();
-            target.contains("webex-codex-main")
-                || target.contains("/run/credentials")
-                || target.contains("webex-codex-launcher")
-        }) {
+        let Ok(target) = fs::read_link(&path) else {
+            return false;
+        };
+        if open_fd_digest(&path).as_deref() == Some(expected_digest) {
             return false;
         }
-        if open_fd_digest(&path).as_deref() == Some(expected_digest) {
+        if !inherited_descriptor_target_allowed(&target, &self_fd_directory) {
             return false;
         }
     }
     true
+}
+
+#[cfg(target_os = "linux")]
+fn standard_input_sanitized(expected_digest: &str) -> bool {
+    let path = Path::new("/proc/self/fd/0");
+    let target = match fs::read_link(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if !standard_input_target_allowed(&target) {
+        return false;
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_char_device()
+        && open_fd_digest(path).as_deref() != Some(expected_digest)
+}
+
+#[cfg(target_os = "linux")]
+fn standard_input_target_allowed(target: &Path) -> bool {
+    target == Path::new("/dev/null")
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_descriptor_target_allowed(target: &Path, self_fd_directory: &Path) -> bool {
+    target == self_fd_directory
 }
 
 #[cfg(target_os = "linux")]
@@ -521,6 +591,18 @@ mod tests {
         assert!(validate_digest("A").is_err());
         assert!(validate_main_pid("1").is_err());
         assert!(validate_main_pid("2147483648").is_err());
+        assert!(unix_connection_denial_error(
+            &std::io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+        assert!(tcp_connection_denial_error(
+            &std::io::Error::from_raw_os_error(libc::ENETUNREACH)
+        ));
+        assert!(!unix_connection_denial_error(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+        assert!(!tcp_connection_denial_error(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
+        ));
     }
 
     #[test]
@@ -540,5 +622,38 @@ mod tests {
             .map(|name| ((*name).to_owned(), false))
             .collect();
         RuntimeCanaryReport::new(NONCE.to_owned(), checks).unwrap();
+    }
+
+    #[test]
+    fn descriptor_probe_rejects_non_null_stdin_and_unexpected_descriptors() {
+        let self_fd_directory = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+        assert!(standard_input_target_allowed(Path::new("/dev/null")));
+        assert!(!standard_input_target_allowed(Path::new("pipe:[123]")));
+        assert!(inherited_descriptor_target_allowed(
+            &self_fd_directory,
+            &self_fd_directory
+        ));
+        for target in ["socket:[123]", "pipe:[123]", "/tmp/secret"] {
+            assert!(!inherited_descriptor_target_allowed(
+                Path::new(target),
+                &self_fd_directory
+            ));
+        }
+
+        let mut pipe_fds = [-1; 2];
+        // SAFETY: pipe_fds is a live two-element out-buffer and the returned
+        // descriptors are closed below.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert!(!sensitive_descriptors_denied(NONCE));
+        for fd in pipe_fds {
+            // SAFETY: each descriptor was returned by the successful pipe2 call.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+
+        let (_left, _right) = UnixStream::pair().unwrap();
+        assert!(!sensitive_descriptors_denied(NONCE));
     }
 }
