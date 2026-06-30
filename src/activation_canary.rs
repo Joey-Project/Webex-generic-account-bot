@@ -272,8 +272,10 @@ impl HostFixtureSet {
             0o700,
             "protected canary root",
         )?;
+        let mut setup = FixtureSetupGuard::new();
         let protected_path = Path::new(RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT).join(nonce);
         create_private_fixture(&protected_path, &random_fixture_contents()?)?;
+        setup.track(&protected_path, FixtureSetupKind::File)?;
         let protected = BoundedRegularFileSnapshot::capture(&protected_path, FIXTURE_MAX_BYTES)?;
 
         let workspace_root =
@@ -281,10 +283,14 @@ impl HostFixtureSet {
         let workspace_canary_root = workspace_root.join(".webex-codex-canary");
         let workspace_nonce_root = workspace_canary_root.join(nonce);
         create_private_directory(&workspace_root)?;
+        setup.track(&workspace_root, FixtureSetupKind::Directory)?;
         create_private_directory(&workspace_canary_root)?;
+        setup.track(&workspace_canary_root, FixtureSetupKind::Directory)?;
         create_private_directory(&workspace_nonce_root)?;
+        setup.track(&workspace_nonce_root, FixtureSetupKind::Directory)?;
         let workspace_path = workspace_nonce_root.join("probe.txt");
         create_private_fixture(&workspace_path, &workspace_probe_payload(nonce)?)?;
+        setup.track(&workspace_path, FixtureSetupKind::File)?;
         let workspace = BoundedRegularFileSnapshot::capture(&workspace_path, FIXTURE_MAX_BYTES)?;
 
         let unix_path =
@@ -292,7 +298,7 @@ impl HostFixtureSet {
         let unix = InstrumentedUnixListener::bind(unix_path)?;
         let forbidden = bind_assigned_non_loopback_listener()?;
         let bot = bind_loopback_bot_listener()?;
-        Ok(Self {
+        let fixtures = Self {
             protected,
             workspace,
             workspace_root,
@@ -302,7 +308,9 @@ impl HostFixtureSet {
             forbidden,
             bot,
             files_cleaned: false,
-        })
+        };
+        setup.disarm();
+        Ok(fixtures)
     }
 
     fn shutdown_listeners(&mut self) -> Result<()> {
@@ -333,18 +341,130 @@ impl Drop for HostFixtureSet {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixtureSetupKind {
+    File,
+    Directory,
+}
+
+struct FixtureSetupEntry {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    kind: FixtureSetupKind,
+}
+
+struct FixtureSetupGuard {
+    entries: Vec<FixtureSetupEntry>,
+    armed: bool,
+}
+
+impl FixtureSetupGuard {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn track(&mut self, path: &Path, kind: FixtureSetupKind) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to track canary fixture {}", path.display()))?;
+        let expected_kind = match kind {
+            FixtureSetupKind::File => metadata.is_file(),
+            FixtureSetupKind::Directory => metadata.is_dir(),
+        };
+        if metadata.file_type().is_symlink() || !expected_kind {
+            bail!("created canary fixture type is invalid");
+        }
+        self.entries.push(FixtureSetupEntry {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind,
+        });
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.entries.clear();
+        self.armed = false;
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        for entry in self.entries.drain(..).rev() {
+            let result = (|| -> Result<()> {
+                let metadata = match fs::symlink_metadata(&entry.path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+                let expected_kind = match entry.kind {
+                    FixtureSetupKind::File => metadata.is_file(),
+                    FixtureSetupKind::Directory => metadata.is_dir(),
+                };
+                if metadata.file_type().is_symlink()
+                    || !expected_kind
+                    || metadata.dev() != entry.device
+                    || metadata.ino() != entry.inode
+                {
+                    bail!("created canary fixture was replaced before rollback");
+                }
+                match entry.kind {
+                    FixtureSetupKind::File => fs::remove_file(&entry.path)?,
+                    FixtureSetupKind::Directory => fs::remove_dir(&entry.path)?,
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                failures.push(format!("{}: {error:#}", entry.path.display()));
+            }
+        }
+        self.armed = false;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "failed to roll back canary fixture setup: {}",
+                failures.join("; ")
+            )
+        }
+    }
+}
+
+impl Drop for FixtureSetupGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.cleanup()
+        {
+            tracing::error!(error = %error, "runtime canary setup requires manual cleanup");
+        }
+    }
+}
+
 fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir(path)
         .with_context(|| format!("failed to create canary directory {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
-        || metadata.mode() & 0o7777 != 0o700
-    {
-        bail!("created canary directory metadata is invalid");
+    let result = (|| -> Result<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.mode() & 0o7777 != 0o700
+        {
+            bail!("created canary directory metadata is invalid");
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err(failed_creation_error(
+            path,
+            FixtureSetupKind::Directory,
+            error,
+        ));
     }
     Ok(())
 }
@@ -357,9 +477,34 @@ fn create_private_fixture(path: &Path, contents: &[u8]) -> Result<()> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("failed to create canary fixture {}", path.display()))?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    validate_private_root_file(&file.metadata()?, "canary fixture")
+    let result = (|| -> Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        validate_private_root_file(&file.metadata()?, "canary fixture")
+    })();
+    drop(file);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(failed_creation_error(path, FixtureSetupKind::File, error)),
+    }
+}
+
+fn failed_creation_error(
+    path: &Path,
+    kind: FixtureSetupKind,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let cleanup = match kind {
+        FixtureSetupKind::File => fs::remove_file(path),
+        FixtureSetupKind::Directory => fs::remove_dir(path),
+    };
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => anyhow!(
+            "{error:#}; failed to roll back canary fixture {}: {cleanup_error}",
+            path.display()
+        ),
+    }
 }
 
 fn validate_private_root_file(metadata: &fs::Metadata, description: &str) -> Result<()> {
@@ -912,6 +1057,44 @@ mod tests {
         let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(workspace_probe_payload(nonce).unwrap(), nonce.as_bytes());
         assert!(workspace_probe_payload("not-a-nonce").is_err());
+    }
+
+    #[test]
+    fn setup_guard_removes_tracked_fixtures_in_reverse_order() {
+        let directory = TestDirectory::new("setup-rollback");
+        let workspace = directory.join("workspace");
+        let nested = workspace.join("nested");
+        let fixture = nested.join("fixture");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(&fixture, b"fixture").unwrap();
+
+        let mut setup = FixtureSetupGuard::new();
+        setup
+            .track(&workspace, FixtureSetupKind::Directory)
+            .unwrap();
+        setup.track(&nested, FixtureSetupKind::Directory).unwrap();
+        setup.track(&fixture, FixtureSetupKind::File).unwrap();
+        drop(setup);
+
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn setup_guard_preserves_replaced_paths() {
+        let directory = TestDirectory::new("setup-replacement");
+        let fixture = directory.join("fixture");
+        let original = directory.join("original");
+        fs::write(&fixture, b"original").unwrap();
+
+        let mut setup = FixtureSetupGuard::new();
+        setup.track(&fixture, FixtureSetupKind::File).unwrap();
+        fs::rename(&fixture, &original).unwrap();
+        fs::write(&fixture, b"replacement").unwrap();
+
+        assert!(setup.cleanup().is_err());
+        assert_eq!(fs::read(&fixture).unwrap(), b"replacement");
+        assert_eq!(fs::read(&original).unwrap(), b"original");
     }
 
     #[test]
