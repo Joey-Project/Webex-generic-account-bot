@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import re
 import sys
@@ -222,8 +223,14 @@ PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
 
 class Validator:
-    def __init__(self, document: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        document: dict[str, Any],
+        *,
+        require_ephemeral_linux_user: bool = False,
+    ) -> None:
         self.document = document
+        self.require_ephemeral_linux_user = require_ephemeral_linux_user
         self.errors: list[str] = []
 
     def validate(self) -> list[str]:
@@ -237,6 +244,7 @@ class Validator:
             "codex",
             allow_profile=False,
             require_fixed=True,
+            require_ephemeral_linux_user=self.require_ephemeral_linux_user,
         )
         self.validate_top_level_paths()
         self.validate_rooms(self.document.get("rooms"))
@@ -249,7 +257,15 @@ class Validator:
         self.require_equal(server, "server", "health_path", "/healthz")
         self.require_equal(server, "server", "sidecar_token_env", "WEBEX_SIDECAR_TOKEN")
         self.require_equal(server, "server", "allow_unauthenticated", False)
-        self.expect_int_range(server, "server", "max_concurrent_requests", 1, 8, required=True)
+        max_concurrent_requests = 4 if self.require_ephemeral_linux_user else 8
+        self.expect_int_range(
+            server,
+            "server",
+            "max_concurrent_requests",
+            1,
+            max_concurrent_requests,
+            required=True,
+        )
         self.require_equal(server, "server", "attempt_lease_secs", 3600)
 
     def validate_webex(self, webex: dict[str, Any]) -> None:
@@ -272,6 +288,7 @@ class Validator:
         *,
         allow_profile: bool,
         require_fixed: bool,
+        require_ephemeral_linux_user: bool,
     ) -> None:
         self.expect_keys(codex, path, ALLOWED_CODEX_KEYS)
         self.expect_or_require_equal(codex, path, "bin", "codex", require_fixed)
@@ -324,18 +341,64 @@ class Validator:
                 as_table(codex.get("isolation"), f"{path}.isolation", self.errors),
                 f"{path}.isolation",
                 require_fixed=True,
+                require_ephemeral_linux_user=require_ephemeral_linux_user,
             )
 
-    def validate_isolation(self, isolation: dict[str, Any], path: str, *, require_fixed: bool) -> None:
+    def validate_isolation(
+        self,
+        isolation: dict[str, Any],
+        path: str,
+        *,
+        require_fixed: bool,
+        require_ephemeral_linux_user: bool,
+    ) -> None:
         self.expect_keys(isolation, path, ALLOWED_ISOLATION_KEYS)
-        self.expect_or_require_equal(isolation, path, "mode", "current-user", require_fixed)
-        self.expect_or_require_equal(
-            isolation,
-            path,
-            "trusted_prompt_authors",
-            True,
-            require_fixed,
-        )
+        if require_ephemeral_linux_user:
+            self.expect_or_require_equal(
+                isolation,
+                path,
+                "mode",
+                "ephemeral-linux-user",
+                require_fixed,
+            )
+            self.expect_or_require_equal(
+                isolation,
+                path,
+                "trusted_prompt_authors",
+                False,
+                require_fixed,
+            )
+            return
+
+        mode = isolation.get("mode")
+        if mode is None:
+            if require_fixed:
+                self.error(
+                    f"{path}.mode is required and must be one of "
+                    "'current-user', 'ephemeral-linux-user'"
+                )
+        else:
+            self.expect_enum(
+                isolation,
+                path,
+                "mode",
+                {"current-user", "ephemeral-linux-user"},
+            )
+
+        trusted_prompt_authors = isolation.get("trusted_prompt_authors")
+        if trusted_prompt_authors is None:
+            if require_fixed:
+                self.error(f"{path}.trusted_prompt_authors is required and must be true or false")
+            return
+        if not isinstance(trusted_prompt_authors, bool):
+            self.error(f"{path}.trusted_prompt_authors must be true or false")
+            return
+        if mode == "current-user" and not trusted_prompt_authors:
+            self.error(f"{path}.trusted_prompt_authors must be true for current-user mode")
+        elif mode == "ephemeral-linux-user" and trusted_prompt_authors:
+            self.error(
+                f"{path}.trusted_prompt_authors must be false for ephemeral-linux-user mode"
+            )
 
     def validate_top_level_paths(self) -> None:
         state_file = self.document.get("state_file")
@@ -461,6 +524,7 @@ class Validator:
                     f"{path}.codex",
                     allow_profile=False,
                     require_fixed=False,
+                    require_ephemeral_linux_user=self.require_ephemeral_linux_user,
                 )
             if jenkins_room_pins is not None:
                 codex = as_table(room.get("codex"), f"{path}.codex", self.errors)
@@ -743,11 +807,19 @@ def as_table(value: Any, path: str, errors: list[str]) -> dict[str, Any]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: static-config-check.py <rendered-config.toml>", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(
+        prog="static-config-check.py",
+        usage=(
+            "static-config-check.py [--require-ephemeral-linux-user] "
+            "<rendered-config.toml>"
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--require-ephemeral-linux-user", action="store_true")
+    parser.add_argument("rendered_config")
+    arguments = parser.parse_args(argv[1:])
 
-    config_path = argv[1]
+    config_path = arguments.rendered_config
     if tomllib is None:
         print(
             "static config check requires Python 3.11+ tomllib or the tomli package",
@@ -765,7 +837,10 @@ def main(argv: list[str]) -> int:
         print(f"failed to read {config_path}: {error}", file=sys.stderr)
         return 1
 
-    errors = Validator(document).validate()
+    errors = Validator(
+        document,
+        require_ephemeral_linux_user=arguments.require_ephemeral_linux_user,
+    ).validate()
     if errors:
         for error in errors:
             print(f"static_config_error={error}", file=sys.stderr)

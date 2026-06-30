@@ -152,6 +152,7 @@ Trusted config deployment entrypoint:
 node scripts/deploy-config.mjs --dry-run
 node scripts/deploy-config.mjs --prepare
 node scripts/deploy-config.mjs --apply
+node scripts/deploy-config.mjs --apply --activate-runner
 ```
 
 The deployment entrypoint lives in this bot repository, not in the config
@@ -181,6 +182,9 @@ dependency build scripts. The default paths match the staging deployment layout:
 - staged metadata:
   `/var/lib/webex-generic-account-bot/config-staging/production.toml.staged.json`
 - service: `webex-generic-account-bot`
+- runner permission drop-in:
+  `/etc/systemd/system/webex-generic-account-bot.service.d/10-codex-launcher.conf`
+- activation receipt: `/run/webex-codex-activation/receipt.json`
 
 Use `--prepare` to fetch the fixed config ref, render and validate it, and
 durably publish an immutable staged artifact without replacing the live
@@ -302,8 +306,9 @@ unwind, and removes any socket already created before the process exits.
 The bot-side client and fixed command routing are present for integration tests,
 but configuration validation still rejects `pull`, `reload`, and `sync` and no
 config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
-only the receipt-gated Codex launcher client path; PR 4c2 owns the bot launcher
-group drop-in when it removes the current-user path. A later enablement PR may allow `pull`
+only the receipt-gated Codex launcher client path. Runner activation grants the
+bot only launcher-group and pending-input access while removing the
+current-user path. A later enablement PR may allow `pull`
 only after `ephemeral-linux-user` runner isolation is deployable and verified;
 `reload` and `sync` require the later activation work as well.
 
@@ -359,6 +364,31 @@ was rolled back. While any journal remains, `--status` returns
 added without replacing an earlier, more specific failure status. Status output,
 including `--status --json`, validates the status schema and rejects malformed or
 incomplete metadata.
+
+`--apply --activate-runner` is the explicit final runner activation path. It
+first renders a candidate that is statically required to use
+`ephemeral-linux-user` for every effective Codex policy. Before canaries run,
+the entrypoint writes a version 2 recovery journal and snapshots the live
+config, bot permission drop-in, and any prior boot receipt. It then restarts
+`webex-codex-activation-renew.service`, waits up to the unit's 5400-second
+budget, requires a root-owned mode `0444` receipt, and runs the installed bot's
+full `--check-config` host preflight. Only then does it install the ephemeral
+config followed by the exact minimal permission drop-in, run `daemon-reload`,
+restart the bot, and verify systemd plus `/healthz` readiness. Failure before
+the commit point stops and verifies the renewal unit, restores all three
+states, reloads systemd, and verifies the old service. A canary failure leaves
+no stale receipt. Version 1 deployment journals remain recoverable.
+
+The activation unit remains active after a successful oneshot. The bot drop-in
+requires it and orders bot startup after it, so a real boot regenerates the
+boot-scoped receipt before an ephemeral bot starts. The first activation on a
+new host intentionally fails while preparing the reboot-cleanup challenge;
+perform one real host reboot and rerun the same activation command. A service
+restart is not reboot evidence. After activation, ordinary apply detects the
+installed permission drop-in and rejects any candidate that would restore
+`current-user`, preventing inherited launcher access from becoming reachable
+to prompt-controlled children.
+
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,
 validation, or restart cannot hold the deployment lock forever. The lock stores
@@ -874,7 +904,8 @@ denial.
 
 PR 4c2a2 adds the root-only
 `/opt/webex-generic-account-bot/bin/webex-codex-activation renew` helper and an
-inactive `webex-codex-activation-renew.service` oneshot. The helper invalidates
+initially inactive `webex-codex-activation-renew.service` oneshot; PR 4c2b later
+keeps the successful unit active and orders bot startup after it. The helper invalidates
 any old receipt before testing, locks renewal to one process, snapshots the
 candidate image and executable identities, and writes a new receipt only when
 the same artifact binding remains current after every canary succeeds.
@@ -903,6 +934,22 @@ groups, install a bot drop-in, switch production away from `current-user`, or
 enable `/config pull`, `/config reload`, or `/config sync`. Those permission
 and configuration changes remain transactional work for PR 4c2b and the later
 configuration-command PRs.
+
+### PR 4c2b Transactional Runner Activation
+
+PR 4c2b adds the explicit deployment transaction described above and removes
+only the final schema-level prohibition on `ephemeral-linux-user`. Mixed
+effective backends remain invalid, the launcher connection cap remains four,
+and every ephemeral Codex policy still requires the fixed model, no profile,
+ephemeral state, repository-check bypass, bounded timeout/output, and
+`trusted_prompt_authors = false`.
+
+The installed bot drop-in grants only `webex-codex-launch` and write access to
+the non-enumerable pending-input directory. It does not grant
+`webex-codex-input` or `webex-config-pull`. The drop-in also requires the
+boot-scoped renewal unit, which remains active after success so isolated
+transient units can bind their lifetime to it. `/config pull`, `/config reload`,
+and `/config sync` remain disabled and are owned by later PRs.
 
 ## Development
 

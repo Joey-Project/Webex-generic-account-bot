@@ -57,13 +57,22 @@ const DEPLOYMENT_STATUSES: &[&str] = &[
     "failed_cleanup",
 ];
 #[cfg(target_os = "linux")]
-const TRANSACTION_PHASES: &[&str] = &[
+const TRANSACTION_V1_PHASES: &[&str] = &[
     "prepared",
     "service_transition_started",
     "committed_pending_metadata",
 ];
 #[cfg(target_os = "linux")]
-const TRANSACTION_KEYS: &[&str] = &[
+const TRANSACTION_V2_PHASES: &[&str] = &[
+    "prepared",
+    "activation_renewal_started",
+    "activation_renewed",
+    "activation_files_installed",
+    "service_transition_started",
+    "committed_pending_metadata",
+];
+#[cfg(target_os = "linux")]
+const TRANSACTION_V1_KEYS: &[&str] = &[
     "bot_code_dir",
     "committed_at",
     "config_ref",
@@ -77,6 +86,15 @@ const TRANSACTION_KEYS: &[&str] = &[
     "service_restart_required",
     "started_at",
     "version",
+];
+#[cfg(target_os = "linux")]
+const RUNNER_ACTIVATION_KEYS: &[&str] = &[
+    "activation_receipt",
+    "activation_receipt_backup",
+    "bot_service_drop_in",
+    "bot_service_drop_in_backup",
+    "permission_had_previous",
+    "receipt_had_previous",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,18 +477,27 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("deployment transaction must be a JSON object"))?;
-    if object.len() != TRANSACTION_KEYS.len()
-        || !TRANSACTION_KEYS
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or_else(|| anyhow!("deployment transaction has an invalid version"))?;
+    let expected_key_count = TRANSACTION_V1_KEYS.len() + usize::from(version == 2);
+    if object.len() != expected_key_count
+        || !TRANSACTION_V1_KEYS
             .iter()
             .all(|field| object.contains_key(*field))
+        || (version == 2) != object.contains_key("runner_activation")
     {
         return Err(anyhow!("deployment transaction contains unexpected fields"));
     }
-    if object.get("version").and_then(Value::as_u64) != Some(1) {
-        return Err(anyhow!("deployment transaction has an invalid version"));
-    }
     let phase = required_nonempty_string(object, "phase")?;
-    if !TRANSACTION_PHASES.contains(&phase) {
+    let allowed_phases = if version == 2 {
+        TRANSACTION_V2_PHASES
+    } else {
+        TRANSACTION_V1_PHASES
+    };
+    if !allowed_phases.contains(&phase) {
         return Err(anyhow!("deployment transaction has an invalid phase"));
     }
     let revision = required_nonempty_string(object, "config_revision")?;
@@ -487,6 +514,18 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
         .ok_or_else(|| anyhow!("deployment transaction has an invalid restart requirement"))?;
     if phase == "service_transition_started" && !restart_required {
         return Err(anyhow!("deployment transaction phase is inconsistent"));
+    }
+    if version == 2 {
+        if !restart_required {
+            return Err(anyhow!(
+                "runner activation transaction must require a service restart"
+            ));
+        }
+        validate_runner_activation_transaction(
+            object
+                .get("runner_activation")
+                .expect("v2 transaction key set includes runner_activation"),
+        )?;
     }
     if !object.get("had_previous").is_some_and(Value::is_boolean) {
         return Err(anyhow!(
@@ -531,6 +570,49 @@ fn parse_deployment_transaction(contents: &[u8]) -> Result<ConfigStatusSnapshot>
         transaction_phase: Some(phase.to_owned()),
         config_action: None,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_runner_activation_transaction(value: &Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("deployment transaction has an invalid runner_activation"))?;
+    if object.len() != RUNNER_ACTIVATION_KEYS.len()
+        || !RUNNER_ACTIVATION_KEYS
+            .iter()
+            .all(|field| object.contains_key(*field))
+    {
+        return Err(anyhow!(
+            "deployment transaction runner_activation contains unexpected fields"
+        ));
+    }
+    for field in [
+        "activation_receipt",
+        "activation_receipt_backup",
+        "bot_service_drop_in",
+        "bot_service_drop_in_backup",
+    ] {
+        let path = object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                anyhow!("deployment transaction has an invalid runner_activation.{field}")
+            })?;
+        if !is_normal_absolute_path(Path::new(path)) {
+            return Err(anyhow!(
+                "deployment transaction has an invalid runner_activation.{field}"
+            ));
+        }
+    }
+    for field in ["permission_had_previous", "receipt_had_previous"] {
+        if !object.get(field).is_some_and(Value::is_boolean) {
+            return Err(anyhow!(
+                "deployment transaction has an invalid runner_activation.{field}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -888,6 +970,87 @@ mod tests {
         assert!(snapshot.markdown().contains("Committed config revision:"));
         assert!(!snapshot.markdown().contains("In-progress config revision:"));
         std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_all_v2_transaction_phases_without_exposing_runner_activation() {
+        for phase in TRANSACTION_V2_PHASES {
+            let transaction = deployment_transaction_v2(phase);
+            let snapshot =
+                parse_deployment_transaction(&serde_json::to_vec(&transaction).unwrap()).unwrap();
+
+            assert_eq!(snapshot.status, "recovery_required");
+            assert_eq!(
+                snapshot.config_revision.as_deref(),
+                Some("abcdef0123456789abcdef0123456789abcdef01")
+            );
+            assert_eq!(
+                snapshot.service.as_deref(),
+                Some("webex-generic-account-bot")
+            );
+            assert_eq!(snapshot.transaction_phase.as_deref(), Some(*phase));
+            assert!(!snapshot.markdown().contains("activation-receipt"));
+            assert!(!snapshot.markdown().contains("systemd/system"));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_v2_runner_activation_schema() {
+        let mut malformed = Vec::new();
+
+        let mut missing_field = deployment_transaction_v2("prepared");
+        missing_field["runner_activation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activation_receipt");
+        malformed.push(missing_field);
+
+        let mut unexpected_field = deployment_transaction_v2("prepared");
+        unexpected_field["runner_activation"]["unexpected"] = Value::Bool(true);
+        malformed.push(unexpected_field);
+
+        for value in [
+            Value::Null,
+            serde_json::json!([]),
+            Value::String("invalid".into()),
+        ] {
+            let mut invalid_object = deployment_transaction_v2("prepared");
+            invalid_object["runner_activation"] = value;
+            malformed.push(invalid_object);
+        }
+
+        for field in [
+            "activation_receipt",
+            "activation_receipt_backup",
+            "bot_service_drop_in",
+            "bot_service_drop_in_backup",
+        ] {
+            for value in [
+                Value::Bool(false),
+                Value::String("relative/path".into()),
+                Value::String("/var/lib/../invalid".into()),
+            ] {
+                let mut invalid_path = deployment_transaction_v2("prepared");
+                invalid_path["runner_activation"][field] = value;
+                malformed.push(invalid_path);
+            }
+        }
+
+        for field in ["permission_had_previous", "receipt_had_previous"] {
+            let mut invalid_boolean = deployment_transaction_v2("prepared");
+            invalid_boolean["runner_activation"][field] = Value::String("true".into());
+            malformed.push(invalid_boolean);
+        }
+
+        let mut restart_not_required = deployment_transaction_v2("prepared");
+        restart_not_required["service_restart_required"] = Value::Bool(false);
+        malformed.push(restart_not_required);
+
+        for transaction in malformed {
+            assert!(
+                parse_deployment_transaction(&serde_json::to_vec(&transaction).unwrap()).is_err()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1322,6 +1485,26 @@ mod tests {
             "started_at": "2026-06-27T00:00:00.000Z",
             "committed_at": null
         })
+    }
+
+    fn deployment_transaction_v2(phase: &str) -> Value {
+        let mut transaction = deployment_transaction();
+        transaction["version"] = Value::from(2);
+        transaction["phase"] = Value::String(phase.to_owned());
+        transaction["committed_at"] = if phase == "committed_pending_metadata" {
+            Value::String("2026-06-27T00:01:00.000Z".to_owned())
+        } else {
+            Value::Null
+        };
+        transaction["runner_activation"] = serde_json::json!({
+            "activation_receipt": "/var/lib/webex-generic-account-bot/activation-receipt.json",
+            "activation_receipt_backup": "/var/lib/webex-generic-account-bot/activation-receipt.json.backup",
+            "bot_service_drop_in": "/etc/systemd/system/webex-generic-account-bot.service.d/runner-activation.conf",
+            "bot_service_drop_in_backup": "/etc/systemd/system/webex-generic-account-bot.service.d/runner-activation.conf.backup",
+            "permission_had_previous": true,
+            "receipt_had_previous": false,
+        });
+        transaction
     }
 
     fn temp_root() -> PathBuf {

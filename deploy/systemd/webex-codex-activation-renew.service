@@ -9,7 +9,7 @@ ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 
 [Service]
 Type=oneshot
-RemainAfterExit=no
+RemainAfterExit=yes
 User=root
 Group=root
 SupplementaryGroups=webex-config-pull
@@ -18,7 +18,6 @@ ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-activation renew
 Restart=no
 TimeoutStartSec=5400s
 TimeoutStopSec=15s
-RuntimeMaxSec=5400s
 KillMode=control-group
 OOMPolicy=kill
 UMask=0077

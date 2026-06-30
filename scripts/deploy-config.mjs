@@ -26,6 +26,8 @@ const DEFAULTS = Object.freeze({
   pythonBin: '/usr/bin/python3',
   botBin: '/opt/webex-generic-account-bot/bin/webex-generic-account-bot',
   systemctlBin: '/usr/bin/systemctl',
+  botServiceDropIn: '/etc/systemd/system/webex-generic-account-bot.service.d/10-codex-launcher.conf',
+  activationReceipt: '/run/webex-codex-activation/receipt.json',
   sshBin: '/usr/bin/ssh',
   sshKey: '/var/lib/webex-generic-account-bot/deploy/id_ed25519',
   sshKnownHosts: '/etc/ssh/ssh_known_hosts',
@@ -53,12 +55,17 @@ const MAX_CONFIG_TREE_BYTES = 8 * 1024 * 1024;
 const MAX_CONFIG_PATH_BYTES = 512;
 const SERVICE_READINESS_BIN = '/usr/bin/curl';
 const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
+const ACTIVATION_RENEWAL_UNIT = 'webex-codex-activation-renew.service';
+const ACTIVATION_RENEW_TIMEOUT_MS = 5_500_000;
+const BOT_SERVICE_DROP_IN_RELATIVE = 'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf';
+const BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
 const FLOCK_BIN = '/usr/bin/flock';
 const FLOCK_CHILD_FD = '3';
 const FLOCK_TIMEOUT_MS = 5000;
 const CHILD_TERMINATION_GRACE_MS = 5000;
 const CHILD_CLOSE_GRACE_MS = 1000;
 const MAX_INSTALL_TRANSACTION_BYTES = 16 * 1024;
+const MAX_ACTIVATION_RECEIPT_BYTES = 256 * 1024;
 const INSTALL_TRANSACTION_MODE = 0o644;
 const LEGACY_INSTALL_TRANSACTION_MODE = 0o600;
 const DEPLOYMENT_STATUSES = new Set([
@@ -88,6 +95,8 @@ const HOST_OVERRIDE_KEYS = new Set([
   'pythonBin',
   'botBin',
   'systemctlBin',
+  'botServiceDropIn',
+  'activationReceipt',
   'sshBin',
   'sshKey',
   'sshKnownHosts',
@@ -188,6 +197,7 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   const options = {
     ...DEFAULTS,
     apply: false,
+    activateRunner: false,
     prepare: false,
     requestId: null,
     dryRun: false,
@@ -204,6 +214,8 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
       options.help = true;
     } else if (arg === '--apply') {
       options.apply = true;
+    } else if (arg === '--activate-runner') {
+      options.activateRunner = true;
     } else if (arg === '--prepare') {
       options.prepare = true;
     } else if (arg === '--request-id') {
@@ -261,6 +273,12 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
     } else if (arg === '--systemctl-bin') {
       options.systemctlBin = requiredValue(argv, (index += 1), arg);
       overrides.add('systemctlBin');
+    } else if (arg === '--bot-service-drop-in') {
+      options.botServiceDropIn = requiredValue(argv, (index += 1), arg);
+      overrides.add('botServiceDropIn');
+    } else if (arg === '--activation-receipt') {
+      options.activationReceipt = requiredValue(argv, (index += 1), arg);
+      overrides.add('activationReceipt');
     } else if (arg === '--ssh-bin') {
       options.sshBin = requiredValue(argv, (index += 1), arg);
       overrides.add('sshBin');
@@ -297,6 +315,15 @@ export function parseArgs(argv, { allowHostOverrides = false } = {}) {
   if ((options.prepare || options.status) && options.skipRestart) {
     throw new UsageError('--skip-restart cannot be used with --prepare or --status.');
   }
+  if (options.activateRunner && (options.prepare || options.status)) {
+    throw new UsageError('--activate-runner cannot be used with --prepare or --status.');
+  }
+  if (options.activateRunner && !options.apply && !options.dryRun) {
+    throw new UsageError('--activate-runner requires --apply or --dry-run.');
+  }
+  if (options.activateRunner && options.skipRestart) {
+    throw new UsageError('--activate-runner cannot be used with --skip-restart.');
+  }
   if (options.requestId !== null) {
     if (!options.prepare) {
       throw new UsageError('--request-id is valid only with --prepare.');
@@ -318,11 +345,12 @@ export function usage() {
   return `Usage:
   node scripts/deploy-config.mjs --dry-run
   node scripts/deploy-config.mjs --prepare [--request-id <id>] [--json]
-  node scripts/deploy-config.mjs --apply [--skip-restart]
+  node scripts/deploy-config.mjs --apply [--skip-restart] [--activate-runner]
   node scripts/deploy-config.mjs --status [--json]
 
 Options:
       --apply                     Execute the fixed deployment plan.
+      --activate-runner           Atomically activate the ephemeral Codex runner.
       --prepare                   Fetch, render, and validate an immutable staged config only.
       --request-id <id>           Bind prepared metadata to a 64-character worker action ID.
       --dry-run                   Print the fixed deployment plan without running it.
@@ -343,6 +371,8 @@ Options:
       --python-bin <path>         Fixed Python executable path for trusted install policy.
       --bot-bin <path>            Installed bot executable used for --check-config.
       --systemctl-bin <path>      Fixed systemctl executable path.
+      --bot-service-drop-in <path> Fixed bot launcher-permission drop-in path.
+      --activation-receipt <path> Fixed boot-scoped activation receipt path.
       --ssh-bin <path>            Fixed SSH executable path for GitHub fetch.
       --ssh-key <path>            Host-owned deploy key for GitHub fetch.
       --ssh-known-hosts <path>    Fixed known_hosts file for GitHub fetch.
@@ -367,8 +397,17 @@ export function buildDeployPlan(options) {
   const backupConfig = `${renderedConfig}.previous`;
   const transactionFile = `${renderedConfig}.transaction`;
   const botCodeDir = path.resolve(options.botCodeDir);
+  const botServiceDropInSource = path.join(botCodeDir, BOT_SERVICE_DROP_IN_RELATIVE);
+  const botServiceDropIn = path.resolve(options.botServiceDropIn);
+  const botServiceDropInBackup = `${renderedConfig}.bot-service-drop-in.previous`;
+  const activationReceipt = path.resolve(options.activationReceipt);
+  const activationReceiptBackup = `${renderedConfig}.activation-receipt.previous`;
   const metadataFile = path.resolve(options.metadataFile);
   const trustedValidateScript = path.join(botCodeDir, 'scripts/config-policy/validate-config.sh');
+  const trustedStaticCheckScript = path.join(
+    botCodeDir,
+    'scripts/config-policy/static-config-check.py',
+  );
   const gitEnv = gitEnvForRepo(options);
   const noLazyGitEnv = { ...gitEnv, ...GIT_NO_LAZY_FETCH_ENV };
   const commandDefaults = {
@@ -449,6 +488,7 @@ export function buildDeployPlan(options) {
       'production',
       '--out',
       candidateConfig,
+      ...(options.activateRunner ? ['--stage-runner-activation'] : []),
     ], {
       env: {
         WEBEX_BOT_CODE_DIR: botCodeDir,
@@ -498,6 +538,38 @@ export function buildDeployPlan(options) {
         ], { ...commandDefaults, validation: 'service-readiness' }),
       ];
 
+  const activationRenewCommand = options.activateRunner
+    ? command(
+        options.systemctlBin,
+        ['restart', '--', ACTIVATION_RENEWAL_UNIT],
+        { ...commandDefaults, timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS },
+      )
+    : null;
+  const activationDaemonReloadCommand = options.activateRunner
+    ? command(options.systemctlBin, ['daemon-reload'], commandDefaults)
+    : null;
+  const activationStopCommand = options.activateRunner
+    ? command(options.systemctlBin, ['stop', '--', ACTIVATION_RENEWAL_UNIT], commandDefaults)
+    : null;
+  const activationStateCommand = options.activateRunner
+    ? command(
+        options.systemctlBin,
+        ['show', '--property=ActiveState', '--value', '--', ACTIVATION_RENEWAL_UNIT],
+        { ...commandDefaults, validation: 'activation-inactive' },
+      )
+    : null;
+  const activationConfigCheckCommand = options.activateRunner
+    ? command(options.botBin, ['--config', candidateConfig, '--check-config'], commandDefaults)
+    : null;
+  const daemonReloadCommand = options.activateRunner
+    ? command(options.systemctlBin, ['daemon-reload'], commandDefaults)
+    : null;
+  const runnerPolicyCheckCommand = command(
+    options.pythonBin,
+    [trustedStaticCheckScript, '--require-ephemeral-linux-user', candidateConfig],
+    commandDefaults,
+  );
+
   const plan = {
     checkoutDir,
     checkoutWorkDir,
@@ -509,6 +581,11 @@ export function buildDeployPlan(options) {
     backupConfig,
     transactionFile,
     botCodeDir,
+    botServiceDropInSource,
+    botServiceDropIn,
+    botServiceDropInBackup,
+    activationReceipt,
+    activationReceiptBackup,
     botBin: path.resolve(options.botBin),
     metadataFile,
     configRepo: options.configRepo,
@@ -519,6 +596,13 @@ export function buildDeployPlan(options) {
     serviceCommand,
     serviceStopCommand,
     serviceVerificationCommands,
+    activationRenewCommand,
+    activationDaemonReloadCommand,
+    activationStopCommand,
+    activationStateCommand,
+    activationConfigCheckCommand,
+    daemonReloadCommand,
+    runnerPolicyCheckCommand,
     skipRestart: options.skipRestart,
     serviceAction: options.skipRestart ? null : 'restart',
     sshKey: path.resolve(options.sshKey),
@@ -527,6 +611,7 @@ export function buildDeployPlan(options) {
     outputLimitBytes: options.outputLimitBytes,
     requestId: options.requestId,
     prepare: options.prepare,
+    activateRunner: options.activateRunner,
   };
   assertSafePlanPathTopology(plan);
   return plan;
@@ -717,6 +802,7 @@ export async function executePlan({
   let recordedFailureStatus = null;
   let recordedFailureConfigRevision = null;
   let outputDirectoriesTrusted = false;
+  let runnerPermissionActive = false;
   const recordFailure = async (
     status,
     reason,
@@ -743,6 +829,7 @@ export async function executePlan({
     throwIfAborted(signal);
     await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
     throwIfAborted(signal);
+    runnerPermissionActive = await detectRunnerPermission(plan, fsApi);
     await prepareFreshCheckout(plan, fsApi);
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -754,11 +841,65 @@ export async function executePlan({
       }
     }
     assertConfigRevision(captures.configRevision);
-    installState = await installCandidateConfig(
-      plan,
-      captures.configRevision,
-      fsApi,
-    );
+    if (runnerPermissionActive && !plan.activateRunner) {
+      await runner(
+        plan.runnerPolicyCheckCommand,
+        scrubEnv(parentEnv, plan.runnerPolicyCheckCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+    }
+    if (plan.activateRunner) {
+      installState = await prepareRunnerActivation(
+        plan,
+        captures.configRevision,
+        fsApi,
+      );
+      await runner(
+        plan.activationDaemonReloadCommand,
+        scrubEnv(parentEnv, plan.activationDaemonReloadCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+      installState = await updateInstallTransactionPhase(
+        plan,
+        installState,
+        'activation_renewal_started',
+        fsApi,
+      );
+      await runner(
+        plan.activationRenewCommand,
+        scrubEnv(parentEnv, plan.activationRenewCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+      await assertTrustedActivationReceipt(plan.activationReceipt, fsApi);
+      installState = await updateInstallTransactionPhase(
+        plan,
+        installState,
+        'activation_renewed',
+        fsApi,
+      );
+      await runner(
+        plan.activationConfigCheckCommand,
+        scrubEnv(parentEnv, plan.activationConfigCheckCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+      await installRunnerActivationFiles(plan, fsApi);
+      installState = await updateInstallTransactionPhase(
+        plan,
+        installState,
+        'activation_files_installed',
+        fsApi,
+      );
+    } else {
+      installState = await installCandidateConfig(
+        plan,
+        captures.configRevision,
+        fsApi,
+      );
+    }
     throwIfAborted(signal);
     if (plan.serviceCommand) {
       installState = await updateInstallTransactionPhase(
@@ -775,7 +916,10 @@ export async function executePlan({
         let rollbackError = null;
         let rollbackDurabilityError = null;
         try {
-          rollbackDurabilityError = await restoreCandidateConfig(plan, rollbackState, fsApi);
+          if (rollbackState.runnerActivation) {
+            await stopActivationRenewal(plan, runner, parentEnv);
+          }
+          rollbackDurabilityError = await restoreDeploymentState(plan, rollbackState, fsApi);
         } catch (restoreError) {
           rollbackError = restoreError;
         }
@@ -833,7 +977,7 @@ export async function executePlan({
         await recordFailure('failed_restart_rolled_back', error.message, undefined, error);
         try {
           await clearInstallTransaction(plan, fsApi);
-          await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+          await cleanupInstallBackups(plan, rollbackState, fsApi).catch(() => {});
         } catch (restoreError) {
           const failure = errorPreservingDeploymentStatus(
             error,
@@ -858,13 +1002,14 @@ export async function executePlan({
       'committed_pending_metadata',
       fsApi,
     );
-    const metadata = deploymentMetadataFromInstallState(plan, installState);
+    const committedState = installState;
+    const metadata = deploymentMetadataFromInstallState(plan, committedState);
     installState = null;
     commitReached = true;
     await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
     await clearInstallTransaction(plan, fsApi);
     try {
-      await removeDurablyIfPresent(plan.backupConfig, fsApi);
+      await cleanupInstallBackups(plan, committedState, fsApi);
     } catch (error) {
       backupCleanupError = error;
     }
@@ -961,6 +1106,14 @@ export async function executePlan({
 
 async function runServiceTransition(plan, runner, parentEnv, signal = null) {
   throwIfAborted(signal);
+  if (plan.daemonReloadCommand) {
+    await runner(
+      plan.daemonReloadCommand,
+      scrubEnv(parentEnv, plan.daemonReloadCommand.env),
+      signal,
+    );
+    throwIfAborted(signal);
+  }
   await runner(
     plan.serviceCommand,
     scrubEnv(parentEnv, plan.serviceCommand.env),
@@ -975,6 +1128,20 @@ async function runServiceTransition(plan, runner, parentEnv, signal = null) {
     );
     throwIfAborted(signal);
   }
+}
+
+async function stopActivationRenewal(plan, runner, parentEnv) {
+  if (!plan.activationStopCommand || !plan.activationStateCommand) {
+    return;
+  }
+  await runner(
+    plan.activationStopCommand,
+    scrubEnv(parentEnv, plan.activationStopCommand.env),
+  );
+  await runner(
+    plan.activationStateCommand,
+    scrubEnv(parentEnv, plan.activationStateCommand.env),
+  );
 }
 
 async function printStatus({ options, stdout, stderr, fsApi }) {
@@ -1753,6 +1920,13 @@ function validateCommandResult(commandSpec, result) {
     }
     return;
   }
+  if (commandSpec.validation === 'activation-inactive') {
+    const state = result.stdout.trim();
+    if (state !== 'inactive') {
+      throw new Error(`activation renewal unit remained ${state || 'unknown'}`);
+    }
+    return;
+  }
   throw new Error(`unknown command output validation: ${commandSpec.validation}`);
 }
 
@@ -1886,6 +2060,11 @@ function writePlan(stdout, plan, json) {
   stdout.write(`staged_config=${plan.stagedConfig}\n`);
   stdout.write(`staged_metadata_file=${plan.stagedMetadataFile}\n`);
   stdout.write(`transaction_file=${plan.transactionFile}\n`);
+  stdout.write(`activate_runner=${plan.activateRunner}\n`);
+  if (plan.activateRunner) {
+    stdout.write(`bot_service_drop_in=${plan.botServiceDropIn}\n`);
+    stdout.write(`activation_receipt=${plan.activationReceipt}\n`);
+  }
   for (const [index, commandSpec] of allPlanCommands(plan).entries()) {
     const invocation = commandInvocation(commandSpec);
     stdout.write(`command_${index + 1}=${invocation.bin} ${invocation.args.map(shellQuoteForDisplay).join(' ')}\n`);
@@ -1928,6 +2107,9 @@ function serialisablePlan(plan) {
     transaction_file: plan.transactionFile,
     bot_code_dir: plan.botCodeDir,
     bot_bin: plan.botBin,
+    activate_runner: plan.activateRunner,
+    bot_service_drop_in: plan.botServiceDropIn,
+    activation_receipt: plan.activationReceipt,
     service: plan.service,
     lock_dir: plan.lockDir,
     service_action: plan.serviceAction,
@@ -1957,6 +2139,8 @@ function validateOptions(options) {
     'pythonBin',
     'botBin',
     'systemctlBin',
+    'botServiceDropIn',
+    'activationReceipt',
     'sshBin',
     'sshKey',
     'sshKnownHosts',
@@ -2080,6 +2264,10 @@ async function prepareFreshCheckout(plan, fsApi, { removeBackup = true } = {}) {
   await removeIfPresent(plan.candidateConfig, fsApi);
   if (removeBackup) {
     await removeIfPresent(plan.backupConfig, fsApi);
+    if (plan.activateRunner) {
+      await removeIfPresent(plan.botServiceDropInBackup, fsApi);
+      await removeIfPresent(plan.activationReceiptBackup, fsApi);
+    }
   }
 }
 
@@ -2091,9 +2279,16 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
     ['metadata directory', path.dirname(plan.metadataFile), false],
     ['bot code directory', plan.botCodeDir, true],
     ['bot binary directory', path.dirname(plan.botBin), true],
+    ['bot service drop-in', plan.botServiceDropIn, false],
     ['SSH key directory', path.dirname(plan.sshKey), true],
     ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts), true],
   ];
+  if (plan.activateRunner) {
+    paths.push(
+      ['bot service drop-in source directory', path.dirname(plan.botServiceDropInSource), true],
+      ['activation receipt', plan.activationReceipt, false],
+    );
+  }
   if (plan.prepare) {
     paths.splice(2, 0, ['staging directory', plan.stagingDir, false]);
   }
@@ -2325,6 +2520,31 @@ async function storePreparedConfig(plan, configRevision, fsApi) {
 }
 
 async function installCandidateConfig(plan, configRevision, fsApi) {
+  const installState = await prepareCandidateInstallState(plan, configRevision, fsApi);
+  let transactionWritten = false;
+  try {
+    await writeInstallTransaction(plan, installState, fsApi);
+    transactionWritten = true;
+    await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
+    await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+  } catch (error) {
+    if (transactionWritten) {
+      try {
+        await rollbackCandidateConfig(plan, installState, fsApi);
+      } catch (rollbackError) {
+        throw errorPreservingDeploymentStatus(
+          error,
+          `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
+          rollbackError,
+        );
+      }
+    }
+    throw error;
+  }
+  return installState;
+}
+
+async function prepareCandidateInstallState(plan, configRevision, fsApi) {
   const candidateStat = await fsApi.lstat(plan.candidateConfig);
   if (!candidateStat.isFile() || candidateStat.isSymbolicLink()) {
     throw new Error(`candidate config must be a regular file: ${plan.candidateConfig}`);
@@ -2353,48 +2573,240 @@ async function installCandidateConfig(plan, configRevision, fsApi) {
   }
 
   await syncFile(plan.candidateConfig, fsApi);
-  const installState = {
+  return {
     hadPrevious,
     configRevision,
     serviceRestartRequired: Boolean(plan.serviceCommand),
     phase: 'prepared',
     startedAt: new Date().toISOString(),
     committedAt: null,
+    runnerActivation: null,
   };
-  let transactionWritten = false;
+}
+
+async function prepareRunnerActivation(plan, configRevision, fsApi) {
+  await assertTrustedBotServiceDropInSource(plan.botServiceDropInSource, fsApi);
+  await createDirectoryDurably(path.dirname(plan.botServiceDropIn), 0o755, fsApi);
+  await assertTrustedPathAncestors(
+    plan.botServiceDropIn,
+    'bot service drop-in',
+    fsApi,
+  );
+  const installState = await prepareCandidateInstallState(plan, configRevision, fsApi);
+  let permissionHadPrevious = false;
+  let receiptHadPrevious = false;
   try {
+    permissionHadPrevious = await snapshotOptionalDeploymentFile(
+      plan.botServiceDropIn,
+      plan.botServiceDropInBackup,
+      (file, stat) => assertTrustedBotServiceDropIn(file, stat),
+      fsApi,
+    );
+    receiptHadPrevious = await snapshotOptionalDeploymentFile(
+      plan.activationReceipt,
+      plan.activationReceiptBackup,
+      (file, stat) => assertTrustedActivationReceiptMetadata(file, stat),
+      fsApi,
+    );
+    installState.runnerActivation = {
+      permissionHadPrevious,
+      receiptHadPrevious,
+    };
     await writeInstallTransaction(plan, installState, fsApi);
-    transactionWritten = true;
-    await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
-    await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
   } catch (error) {
-    if (transactionWritten) {
-      try {
-        await rollbackCandidateConfig(plan, installState, fsApi);
-      } catch (rollbackError) {
-        throw errorPreservingDeploymentStatus(
-          error,
-          `${error.message}; failed to restore config after install durability failure: ${rollbackError.message}`,
-          rollbackError,
-        );
-      }
-    }
+    await removeDurablyIfPresent(plan.botServiceDropInBackup, fsApi).catch(() => {});
+    await removeDurablyIfPresent(plan.activationReceiptBackup, fsApi).catch(() => {});
+    await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
     throw error;
   }
   return installState;
 }
 
+async function installRunnerActivationFiles(plan, fsApi) {
+  const source = await readStableTrustedFile(
+    plan.botServiceDropInSource,
+    1024,
+    (file, stat) => assertTrustedBotServiceDropInSourceMetadata(file, stat),
+    fsApi,
+  );
+  if (source.contents.toString('utf8') !== BOT_SERVICE_DROP_IN_CONTENT) {
+    throw new Error('bot service drop-in content does not match the fixed activation policy');
+  }
+  await fsApi.rename(plan.candidateConfig, plan.renderedConfig);
+  await syncDirectory(path.dirname(plan.renderedConfig), fsApi);
+  await writeFixedFileAtomically(
+    plan.botServiceDropIn,
+    BOT_SERVICE_DROP_IN_CONTENT,
+    0o644,
+    fsApi,
+  );
+}
+
+async function snapshotOptionalDeploymentFile(file, backup, validate, fsApi) {
+  let snapshot;
+  try {
+    snapshot = await readStableTrustedFile(file, MAX_ACTIVATION_RECEIPT_BYTES, validate, fsApi);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      await removeDurablyIfPresent(backup, fsApi).catch(() => {});
+      return false;
+    }
+    throw error;
+  }
+  await writeFixedFileAtomically(backup, snapshot.contents, snapshot.mode, fsApi);
+  return true;
+}
+
+async function readStableTrustedFile(file, maxBytes, validate, fsApi) {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+  const handle = await fsApi.open(file, flags);
+  try {
+    const before = await handle.stat();
+    validate(file, before);
+    if (before.size < 0 || before.size > maxBytes) {
+      throw new Error(`trusted file size is invalid: ${file}`);
+    }
+    const first = Buffer.alloc(before.size + 1);
+    const second = Buffer.alloc(before.size + 1);
+    const firstRead = await handle.read(first, 0, first.length, 0);
+    const secondRead = await handle.read(second, 0, second.length, 0);
+    const after = await handle.stat();
+    if (
+      firstRead.bytesRead !== before.size
+      || secondRead.bytesRead !== before.size
+      || !first.subarray(0, before.size).equals(second.subarray(0, before.size))
+      || !sameFileIdentity(before, after)
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+    ) {
+      throw new Error(`trusted file changed while being read: ${file}`);
+    }
+    return {
+      contents: first.subarray(0, before.size),
+      mode: before.mode & 0o7777,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeFixedFileAtomically(file, contents, mode, fsApi) {
+  const directory = path.dirname(file);
+  const temporary = path.join(
+    directory,
+    `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle = null;
+  try {
+    handle = await fsApi.open(temporary, 'wx', mode);
+    await handle.chmod(mode);
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fsApi.rename(temporary, file);
+    await syncDirectory(directory, fsApi);
+  } finally {
+    if (handle) {
+      await handle.close().catch(() => {});
+    }
+    await fsApi.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function assertTrustedBotServiceDropInSource(file, fsApi) {
+  const snapshot = await readStableTrustedFile(
+    file,
+    1024,
+    (candidate, stat) => assertTrustedBotServiceDropInSourceMetadata(candidate, stat),
+    fsApi,
+  );
+  if (snapshot.contents.toString('utf8') !== BOT_SERVICE_DROP_IN_CONTENT) {
+    throw new Error('bot service drop-in source does not match the fixed activation policy');
+  }
+}
+
+async function detectRunnerPermission(plan, fsApi) {
+  let snapshot;
+  try {
+    snapshot = await readStableTrustedFile(
+      plan.botServiceDropIn,
+      1024,
+      (file, stat) => assertTrustedBotServiceDropIn(file, stat),
+      fsApi,
+    );
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+  if (snapshot.contents.toString('utf8') !== BOT_SERVICE_DROP_IN_CONTENT) {
+    throw new Error('installed bot service drop-in does not match the fixed activation policy');
+  }
+  return true;
+}
+
+function assertTrustedBotServiceDropInSourceMetadata(file, stat) {
+  assertTrustedRegularFileMetadata(file, stat, 'bot service drop-in source');
+  if ((stat.mode & 0o022) !== 0) {
+    throw new Error(`bot service drop-in source mode is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedBotServiceDropIn(file, stat) {
+  assertTrustedRegularFileMetadata(file, stat, 'bot service drop-in');
+  if ((stat.mode & 0o7777) !== 0o644) {
+    throw new Error(`bot service drop-in mode is not trusted: ${file}`);
+  }
+}
+
+async function assertTrustedActivationReceipt(file, fsApi) {
+  await readStableTrustedFile(
+    file,
+    MAX_ACTIVATION_RECEIPT_BYTES,
+    (candidate, stat) => assertTrustedActivationReceiptMetadata(candidate, stat),
+    fsApi,
+  );
+}
+
+function assertTrustedActivationReceiptMetadata(file, stat) {
+  assertTrustedRegularFileMetadata(file, stat, 'activation receipt');
+  if ((stat.mode & 0o7777) !== 0o444 || stat.size <= 0) {
+    throw new Error(`activation receipt metadata is not trusted: ${file}`);
+  }
+}
+
+function assertTrustedRegularFileMetadata(file, stat, label) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Error(`${label} must be a single-link regular file: ${file}`);
+  }
+  const deploymentUid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+  const deploymentGid = typeof process.getgid === 'function' ? process.getgid() : stat.gid;
+  const rootUid = 0;
+  const rootGid = 0;
+  if (
+    (stat.uid !== deploymentUid && stat.uid !== rootUid)
+    || (stat.gid !== deploymentGid && stat.gid !== rootGid)
+  ) {
+    throw new Error(`${label} ownership is not trusted: ${file}`);
+  }
+}
+
 async function rollbackCandidateConfig(plan, installState, fsApi) {
-  const durabilityError = await restoreCandidateConfig(plan, installState, fsApi);
+  const durabilityError = await restoreDeploymentState(plan, installState, fsApi);
   if (durabilityError) {
     throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
   }
   await clearInstallTransaction(plan, fsApi);
-  await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+  await cleanupInstallBackups(plan, installState, fsApi).catch(() => {});
 }
 
 async function rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi) {
-  const durabilityError = await restoreCandidateConfig(plan, installState, fsApi);
+  if (installState.runnerActivation && installState.phase !== 'prepared') {
+    await stopActivationRenewal(plan, runner, parentEnv);
+  }
+  const durabilityError = await restoreDeploymentState(plan, installState, fsApi);
   if (installState.phase === 'service_transition_started') {
     try {
       await runServiceRollback(plan, installState, runner, parentEnv);
@@ -2413,7 +2825,7 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
     throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
   }
   await clearInstallTransaction(plan, fsApi);
-  await removeDurablyIfPresent(plan.backupConfig, fsApi).catch(() => {});
+  await cleanupInstallBackups(plan, installState, fsApi).catch(() => {});
 }
 
 async function runServiceRollback(plan, installState, runner, parentEnv) {
@@ -2430,10 +2842,96 @@ async function runServiceRollback(plan, installState, runner, parentEnv) {
   if (!plan.serviceStopCommand) {
     throw new Error('cannot restore an absent initial config without a configured stop command');
   }
+  if (plan.daemonReloadCommand) {
+    await runner(
+      plan.daemonReloadCommand,
+      scrubEnv(parentEnv, plan.daemonReloadCommand.env),
+    );
+  }
   await runner(
     plan.serviceStopCommand,
     scrubEnv(parentEnv, plan.serviceStopCommand.env),
   );
+}
+
+async function restoreDeploymentState(plan, installState, fsApi) {
+  let configDurabilityError = null;
+  let configRestoreError = null;
+  try {
+    configDurabilityError = await restoreCandidateConfig(plan, installState, fsApi);
+  } catch (error) {
+    configRestoreError = error;
+  }
+  let runnerRestoreError = null;
+  if (installState.runnerActivation) {
+    try {
+      await restoreRunnerActivationFiles(
+        plan,
+        installState.runnerActivation,
+        installState.phase,
+        fsApi,
+      );
+    } catch (error) {
+      runnerRestoreError = error;
+    }
+  }
+  if (configRestoreError || runnerRestoreError) {
+    const primary = configRestoreError ?? runnerRestoreError;
+    const secondary = configRestoreError ? runnerRestoreError : null;
+    if (secondary) {
+      throw errorPreservingDeploymentStatus(
+        primary,
+        `${primary.message}; runner activation rollback failed: ${secondary.message}`,
+        secondary,
+      );
+    }
+    throw primary;
+  }
+  return configDurabilityError;
+}
+
+async function restoreRunnerActivationFiles(plan, activationState, phase, fsApi) {
+  const errors = [];
+  const receiptCanBeRestored = phase !== 'activation_renewal_started';
+  for (const restore of [
+    () => restoreOptionalDeploymentFile(
+      plan.activationReceipt,
+      plan.activationReceiptBackup,
+      receiptCanBeRestored && activationState.receiptHadPrevious,
+      (file, stat) => assertTrustedActivationReceiptMetadata(file, stat),
+      fsApi,
+    ),
+    () => restoreOptionalDeploymentFile(
+      plan.botServiceDropIn,
+      plan.botServiceDropInBackup,
+      activationState.permissionHadPrevious,
+      (file, stat) => assertTrustedBotServiceDropIn(file, stat),
+      fsApi,
+    ),
+  ]) {
+    try {
+      await restore();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(errors.map((error) => error.message).join('; '));
+  }
+}
+
+async function restoreOptionalDeploymentFile(file, backup, hadPrevious, validate, fsApi) {
+  if (!hadPrevious) {
+    await removeDurablyIfPresent(file, fsApi);
+    return;
+  }
+  const snapshot = await readStableTrustedFile(
+    backup,
+    MAX_ACTIVATION_RECEIPT_BYTES,
+    validate,
+    fsApi,
+  );
+  await writeFixedFileAtomically(file, snapshot.contents, snapshot.mode, fsApi);
 }
 
 async function restoreCandidateConfig(plan, installState, fsApi) {
@@ -2461,7 +2959,7 @@ async function restoreCandidateConfig(plan, installState, fsApi) {
 
 async function writeInstallTransaction(plan, installState, fsApi) {
   const transaction = {
-    version: 1,
+    version: installState.runnerActivation ? 2 : 1,
     phase: installState.phase,
     had_previous: installState.hadPrevious,
     config_revision: installState.configRevision,
@@ -2474,6 +2972,18 @@ async function writeInstallTransaction(plan, installState, fsApi) {
     metadata_file: plan.metadataFile,
     started_at: installState.startedAt,
     committed_at: installState.committedAt,
+    ...(installState.runnerActivation
+      ? {
+          runner_activation: {
+            activation_receipt: plan.activationReceipt,
+            activation_receipt_backup: plan.activationReceiptBackup,
+            bot_service_drop_in: plan.botServiceDropIn,
+            bot_service_drop_in_backup: plan.botServiceDropInBackup,
+            permission_had_previous: installState.runnerActivation.permissionHadPrevious,
+            receipt_had_previous: installState.runnerActivation.receiptHadPrevious,
+          },
+        }
+      : {}),
   };
   await writeMetadataAtomically(
     plan.transactionFile,
@@ -2514,11 +3024,29 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
       'interrupted deployment requires service recovery; rerun without --skip-restart',
     );
   }
+  if (transaction.version === 2 && !plan.activateRunner) {
+    throw new Error(
+      'interrupted runner activation requires rerunning with --activate-runner',
+    );
+  }
   if (transaction.rendered_config !== plan.renderedConfig) {
     throw new Error('interrupted deployment rendered-config path does not match the current plan');
   }
   if (transaction.metadata_file !== plan.metadataFile) {
     throw new Error('interrupted deployment metadata path does not match the current plan');
+  }
+  if (transaction.runner_activation) {
+    const expectedActivationPaths = {
+      activation_receipt: plan.activationReceipt,
+      activation_receipt_backup: plan.activationReceiptBackup,
+      bot_service_drop_in: plan.botServiceDropIn,
+      bot_service_drop_in_backup: plan.botServiceDropInBackup,
+    };
+    for (const [key, expected] of Object.entries(expectedActivationPaths)) {
+      if (transaction.runner_activation[key] !== expected) {
+        throw new Error(`interrupted deployment ${key} does not match the current plan`);
+      }
+    }
   }
   const installState = {
     hadPrevious: transaction.had_previous,
@@ -2527,6 +3055,12 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
     phase: transaction.phase,
     startedAt: transaction.started_at,
     committedAt: transaction.committed_at,
+    runnerActivation: transaction.runner_activation
+      ? {
+          permissionHadPrevious: transaction.runner_activation.permission_had_previous,
+          receiptHadPrevious: transaction.runner_activation.receipt_had_previous,
+        }
+      : null,
   };
   if (transaction.phase === 'committed_pending_metadata') {
     try {
@@ -2547,7 +3081,7 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
       await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
       await clearInstallTransaction(plan, fsApi);
       try {
-        await removeDurablyIfPresent(plan.backupConfig, fsApi);
+        await cleanupInstallBackups(plan, installState, fsApi);
       } catch (error) {
         metadata.backup_cleanup_error = redact(error.message);
         await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
@@ -2572,6 +3106,13 @@ function deploymentMetadataFromInstallState(plan, installState) {
     service_action: plan.serviceAction,
     service_restart_skipped: plan.skipRestart,
     deployed_at: installState.committedAt,
+    runner_activation: Boolean(installState.runnerActivation),
+    ...(installState.runnerActivation
+      ? {
+          bot_service_drop_in: plan.botServiceDropIn,
+          activation_receipt: plan.activationReceipt,
+        }
+      : {}),
   };
 }
 
@@ -2705,7 +3246,9 @@ function validateInstallTransaction(transaction) {
     'service_restart_required',
     'started_at',
     'version',
+    ...(transaction.version === 2 ? ['runner_activation'] : []),
   ];
+  expectedKeys.sort();
   const actualKeys = Object.keys(transaction).sort();
   if (
     actualKeys.length !== expectedKeys.length
@@ -2714,13 +3257,25 @@ function validateInstallTransaction(transaction) {
     throw new Error('deployment transaction contains unexpected fields');
   }
   if (
-    transaction.version !== 1
-    || ![
-      'prepared',
-      'service_transition_started',
-      'committed_pending_metadata',
-    ].includes(transaction.phase)
+    ![1, 2].includes(transaction.version)
   ) {
+    throw new Error('deployment transaction has an unsupported version');
+  }
+  const allowedPhases = transaction.version === 2
+    ? [
+        'prepared',
+        'activation_renewal_started',
+        'activation_renewed',
+        'activation_files_installed',
+        'service_transition_started',
+        'committed_pending_metadata',
+      ]
+    : [
+        'prepared',
+        'service_transition_started',
+        'committed_pending_metadata',
+      ];
+  if (!allowedPhases.includes(transaction.phase)) {
     throw new Error('deployment transaction has an unsupported state');
   }
   if (typeof transaction.had_previous !== 'boolean') {
@@ -2737,6 +3292,12 @@ function validateInstallTransaction(transaction) {
     && !transaction.service_restart_required
   ) {
     throw new Error('deployment transaction service phase does not require a restart');
+  }
+  if (transaction.version === 2) {
+    if (!transaction.service_restart_required) {
+      throw new Error('runner activation transaction must require a service restart');
+    }
+    validateRunnerActivationTransaction(transaction.runner_activation);
   }
   try {
     validateService(transaction.service);
@@ -2777,6 +3338,46 @@ function validateInstallTransaction(transaction) {
   return transaction;
 }
 
+function validateRunnerActivationTransaction(activation) {
+  if (!activation || typeof activation !== 'object' || Array.isArray(activation)) {
+    throw new Error('deployment transaction has an invalid runner_activation');
+  }
+  const expectedKeys = [
+    'activation_receipt',
+    'activation_receipt_backup',
+    'bot_service_drop_in',
+    'bot_service_drop_in_backup',
+    'permission_had_previous',
+    'receipt_had_previous',
+  ];
+  const actualKeys = Object.keys(activation).sort();
+  if (
+    actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error('deployment transaction runner_activation contains unexpected fields');
+  }
+  for (const key of [
+    'activation_receipt',
+    'activation_receipt_backup',
+    'bot_service_drop_in',
+    'bot_service_drop_in_backup',
+  ]) {
+    if (
+      typeof activation[key] !== 'string'
+      || !path.isAbsolute(activation[key])
+      || path.resolve(activation[key]) !== activation[key]
+    ) {
+      throw new Error(`deployment transaction has an invalid runner_activation.${key}`);
+    }
+  }
+  for (const key of ['permission_had_previous', 'receipt_had_previous']) {
+    if (typeof activation[key] !== 'boolean') {
+      throw new Error(`deployment transaction has an invalid runner_activation.${key}`);
+    }
+  }
+}
+
 async function clearInstallTransaction(plan, fsApi) {
   await removeIfPresent(plan.transactionFile, fsApi);
   await syncDirectory(path.dirname(plan.transactionFile), fsApi);
@@ -2785,6 +3386,24 @@ async function clearInstallTransaction(plan, fsApi) {
 async function removeDurablyIfPresent(file, fsApi) {
   await removeIfPresent(file, fsApi);
   await syncDirectory(path.dirname(file), fsApi);
+}
+
+async function cleanupInstallBackups(plan, installState, fsApi) {
+  const backups = [plan.backupConfig];
+  if (installState?.runnerActivation) {
+    backups.push(plan.botServiceDropInBackup, plan.activationReceiptBackup);
+  }
+  let cleanupError = null;
+  for (const backup of backups) {
+    try {
+      await removeDurablyIfPresent(backup, fsApi);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+  }
+  if (cleanupError) {
+    throw cleanupError;
+  }
 }
 
 async function syncFile(file, fsApi) {
@@ -2962,14 +3581,20 @@ function assertConfigRevision(value) {
 }
 
 function allPlanCommands(plan) {
-  return plan.serviceCommand
-    ? [
-        ...plan.commands,
-        plan.serviceCommand,
-        ...plan.serviceVerificationCommands,
-        plan.serviceStopCommand,
-      ]
-    : plan.commands;
+  return [
+    ...plan.commands,
+    ...[
+      plan.activationRenewCommand,
+      plan.activationDaemonReloadCommand,
+      plan.activationStopCommand,
+      plan.activationStateCommand,
+      plan.activationConfigCheckCommand,
+      plan.daemonReloadCommand,
+      plan.serviceCommand,
+      ...plan.serviceVerificationCommands,
+      plan.serviceStopCommand,
+    ].filter(Boolean),
+  ];
 }
 
 function assertSafePlanPathTopology(plan) {
@@ -2984,6 +3609,14 @@ function assertSafePlanPathTopology(plan) {
     ['backup config', path.resolve(plan.backupConfig)],
     ['transaction file', path.resolve(plan.transactionFile)],
     ['metadata file', path.resolve(plan.metadataFile)],
+    ...(plan.activateRunner
+      ? [
+          ['bot service drop-in', path.resolve(plan.botServiceDropIn)],
+          ['bot service drop-in backup', path.resolve(plan.botServiceDropInBackup)],
+          ['activation receipt', path.resolve(plan.activationReceipt)],
+          ['activation receipt backup', path.resolve(plan.activationReceiptBackup)],
+        ]
+      : []),
     ...(!plan.prepare
       ? [['candidate config', path.resolve(plan.candidateConfig)]]
       : []),

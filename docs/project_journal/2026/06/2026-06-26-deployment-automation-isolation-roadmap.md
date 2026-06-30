@@ -93,6 +93,12 @@ superseded_by:
   a real-reboot challenge, and root-only atomic receipt renewal. It remains
   inactive and grants no bot launcher permission; PR 4c2b still owns the
   deployment transaction and production switch.
+- PR 4c2b implements explicit transactional runner activation with a strict
+  ephemeral-only staging policy, version 2 config/drop-in/receipt recovery,
+  bounded receipt renewal, bot host preflight, minimum launcher/pending access,
+  restart/readiness rollback, boot-time renewal ordering, and downgrade
+  prevention after permission activation. The production host still requires
+  a matching reviewed config and a successful real-reboot canary run.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -362,6 +368,9 @@ superseded_by:
   Codex config away from current-user execution, mint or renew the receipt,
   restart and health-check the service, and roll all three states back
   together. Bot launcher permission must never land in an earlier slice.
+  This slice is implemented; host activation remains a separate deployment
+  operation because the first reboot-cleanup challenge intentionally fails
+  until a real reboot occurs.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.

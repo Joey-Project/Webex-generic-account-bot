@@ -119,11 +119,6 @@ impl BotConfig {
         }
         self.validate_attempt_lease()?;
         self.validate_secret_boundaries()?;
-        if self.uses_ephemeral_linux_user() {
-            return Err(anyhow!(
-                "ephemeral-linux-user remains disabled until atomic launcher permission activation"
-            ));
-        }
         Ok(())
     }
 
@@ -1142,7 +1137,7 @@ prompt_template = "Follow up on {original_message_id}: {body}"
     }
 
     #[test]
-    fn rejects_ephemeral_user_until_atomic_permission_activation() {
+    fn accepts_ephemeral_user_policy() {
         let config: BotConfig = toml::from_str(
             r#"
 [server]
@@ -1164,13 +1159,7 @@ allow_all_senders = true
         )
         .unwrap();
 
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("remains disabled until atomic launcher permission activation")
-        );
+        config.validate().unwrap();
         assert!(config.uses_ephemeral_linux_user());
     }
 
@@ -1198,15 +1187,15 @@ allow_all_senders = true
         )
         .unwrap();
 
-        assert!(config.validate().is_err());
-        config.server.max_concurrent_requests = LAUNCHER_MAX_CONNECTIONS;
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("remains disabled until atomic launcher permission activation")
+                .contains("fixed launcher connection limit")
         );
+        config.server.max_concurrent_requests = LAUNCHER_MAX_CONNECTIONS;
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1289,7 +1278,7 @@ trusted_prompt_authors = true
     }
 
     #[test]
-    fn load_rejects_ephemeral_user_before_host_preflight() {
+    fn load_accepts_ephemeral_user_for_host_preflight() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now()
@@ -1322,13 +1311,10 @@ allow_all_senders = true
         )
         .unwrap();
 
-        let error = BotConfig::load(&path).unwrap_err().to_string();
+        let config = BotConfig::load(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
-        assert!(
-            error.contains("remains disabled until atomic launcher permission activation"),
-            "{error}"
-        );
+        assert!(config.uses_ephemeral_linux_user());
     }
 
     #[test]

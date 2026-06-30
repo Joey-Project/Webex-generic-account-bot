@@ -65,9 +65,15 @@
   trusted runtime-interior evidence, nonce-scoped host file and listener
   evidence, timeout and launcher owner-crash lifecycle checks, a pidfd-backed
   bot peer-exit supervisor check, a real-reboot challenge, and root-only atomic
-  receipt renewal. The renewal unit remains inactive by default, grants no bot
-  group access, and does not remove the ephemeral activation gate.
-  Transactional permission and configuration activation remains PR 4c2b.
+  receipt renewal. That slice grants no bot group access and does not remove
+  the ephemeral activation gate.
+- Runner PR 4c2b adds explicit `--apply --activate-runner` deployment,
+  backwards-compatible version 2 recovery journals, three-state
+  config/drop-in/receipt rollback, boot-gated receipt renewal, and permanent
+  post-activation downgrade prevention. The bot receives only launch-group and
+  pending-input access; config-worker access and mutating config commands remain
+  disabled. Production stays on `current-user` until the deployment host
+  completes the real-reboot challenge and activates a matching reviewed config.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -76,11 +82,10 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4c2b must run PR 4c2a2's opt-in root/systemd canaries against the installed
-  production image and host kernel, satisfy the real-reboot challenge, and
-  transactionally install bot permissions plus ephemeral-only configuration.
-  Static PR 4b preflight and unit-only evidence are not substitutes for that
-  deployment-host gate.
+- The deployment host must run PR 4c2b's explicit activation against the
+  installed production image and host kernel, satisfy the real-reboot
+  challenge, and activate a matching ephemeral-only config. Code and unit-test
+  evidence are not substitutes for that deployment-host gate.
 - Production config does not enable `ephemeral-linux-user`, `/config pull`,
   `/config reload`, or `/config sync` before PR 4c2 activation.
 
