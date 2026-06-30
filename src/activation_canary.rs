@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{Read, Write},
     os::{
         fd::AsRawFd,
@@ -53,6 +54,34 @@ const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEPENDENCY_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const REBOOT_CHALLENGE_VERSION: u16 = 1;
 const REBOOT_MARKER_CONTENTS: &[u8] = b"webex-runtime-reboot-canary-v1\n";
+
+pub async fn ensure_activation_receipt() -> Result<VerifiedActivation> {
+    ensure_root()?;
+    ensure_activation_receipt_with(
+        || activation::verify_activation_with(&activation::ActivationPaths::production()),
+        renew_activation_receipt,
+    )
+    .await
+}
+
+async fn ensure_activation_receipt_with<Verify, Renew, Renewal>(
+    verify: Verify,
+    renew: Renew,
+) -> Result<VerifiedActivation>
+where
+    Verify: FnOnce() -> Result<VerifiedActivation>,
+    Renew: FnOnce() -> Renewal,
+    Renewal: Future<Output = Result<VerifiedActivation>>,
+{
+    match verify() {
+        Ok(verified) => Ok(verified),
+        Err(verification_error) => renew().await.map_err(|renewal_error| {
+            anyhow!(
+                "activation receipt verification failed: {verification_error:#}; renewal failed: {renewal_error:#}"
+            )
+        }),
+    }
+}
 
 pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
     ensure_root()?;
@@ -1200,11 +1229,30 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         os::unix::net::UnixListener,
         sync::atomic::{AtomicU64, Ordering},
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn verified_activation(boot_id: &str) -> VerifiedActivation {
+        VerifiedActivation {
+            schema_version: 1,
+            boot_id: boot_id.to_owned(),
+            active_manifest_sha256: "a".repeat(64),
+            runtime_image_sha256: "b".repeat(64),
+            bot_executable_sha256: "c".repeat(64),
+            launcher_executable_sha256: "d".repeat(64),
+            runtime_executable_sha256: "e".repeat(64),
+            codex_version: "test".to_owned(),
+            model: "test".to_owned(),
+            canaries: REQUIRED_CANARIES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        }
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1228,6 +1276,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_reuses_a_valid_receipt_without_running_canaries() {
+        let existing = verified_activation("existing");
+        let renewal_called = Cell::new(false);
+
+        let verified = ensure_activation_receipt_with(
+            || Ok(existing.clone()),
+            || async {
+                renewal_called.set(true);
+                Ok(verified_activation("renewed"))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(verified, existing);
+        assert!(!renewal_called.get());
+    }
+
+    #[tokio::test]
+    async fn ensure_renews_a_missing_or_stale_receipt() {
+        let renewed = verified_activation("renewed");
+        let renewal_called = Cell::new(false);
+
+        let verified = ensure_activation_receipt_with(
+            || Err(anyhow!("missing receipt")),
+            || async {
+                renewal_called.set(true);
+                Ok(renewed.clone())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(verified, renewed);
+        assert!(renewal_called.get());
     }
 
     #[test]

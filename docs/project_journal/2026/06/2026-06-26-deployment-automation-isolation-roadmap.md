@@ -102,6 +102,11 @@ superseded_by:
   and later ordinary ephemeral-only config applies own subsequent lifecycle.
   Renewal stop verification cannot suppress three-state or old-service
   recovery, and an unresolved stop leaves the recovery journal in place.
+  Permission rollback precedes any config downgrade; a failed drop-in removal
+  leaves the ephemeral config and journal intact. The renewal unit is part of
+  the bot restart lifecycle and uses a fixed ensure command so a valid receipt
+  is a fast no-op while a missing or stale receipt runs the full canaries.
+  Ordinary active-runner apply ensures the receipt before config validation.
   Committed legacy apply recovery continues into an explicitly requested
   activation instead of returning ordinary deployment metadata as success.
   The production host still requires

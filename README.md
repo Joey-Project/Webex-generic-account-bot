@@ -376,23 +376,29 @@ budget, requires a root-owned mode `0444` receipt, and runs the installed bot's
 full `--check-config` host preflight. Only then does it install the ephemeral
 config followed by the exact minimal permission drop-in, run `daemon-reload`,
 restart the bot, and verify systemd plus `/healthz` readiness. Failure before
-the commit point stops and verifies the renewal unit, restores all three
-states, reloads systemd, and verifies the old service. A canary failure leaves
-no stale receipt. A renewal stop or inactive-verification failure does not
-skip three-state restoration or old-service recovery; the apply still fails
-and retains its journal for a later recovery retry. Version 1 deployment
-journals remain recoverable, and an explicit activation continues after
-finalising a committed ordinary deployment instead of treating it as an
-activated runner.
+the commit point stops and verifies the renewal unit, revokes the launcher
+drop-in before restoring a prior config, restores the receipt, reloads systemd,
+and verifies the old service. If permission revocation fails, rollback keeps
+the ephemeral config and recovery journal instead of exposing launcher access
+to a `current-user` config. A canary failure leaves no stale receipt. A renewal
+stop or inactive-verification failure does not skip three-state restoration or
+old-service recovery; the apply still fails and retains its journal for a later
+recovery retry. Version 1 deployment journals remain recoverable, and an
+explicit activation continues after finalising a committed ordinary deployment
+instead of treating it as an activated runner.
 
 The activation unit remains active after a successful oneshot. The bot drop-in
-requires it and orders bot startup after it, so a real boot regenerates the
-boot-scoped receipt before an ephemeral bot starts. The first activation on a
-new host intentionally fails while preparing the reboot-cleanup challenge;
-perform one real host reboot and rerun the same activation command. A service
-restart is not reboot evidence. After activation, ordinary apply detects the
-installed permission drop-in and rejects any candidate that would restore
-`current-user`, preventing inherited launcher access from becoming reachable
+requires it and orders bot startup after it, while `PartOf=` restarts the unit
+for every later bot restart. Its fixed `ensure` command reuses an already valid
+receipt without rerunning canaries and performs full renewal only when the
+receipt is missing or stale. A real boot therefore regenerates the boot-scoped
+receipt before an ephemeral bot starts. The first activation on a new host
+intentionally fails while preparing the reboot-cleanup challenge; perform one
+real host reboot and rerun the same activation command. A service restart is
+not reboot evidence. After activation, ordinary apply first ensures a valid
+receipt, then detects the installed permission drop-in and rejects any
+candidate that would restore `current-user`, preventing inherited launcher
+access from becoming reachable
 to prompt-controlled children.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,

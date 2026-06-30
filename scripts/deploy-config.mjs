@@ -538,11 +538,15 @@ export function buildDeployPlan(options) {
         ], { ...commandDefaults, validation: 'service-readiness' }),
       ];
 
-  const activationRenewCommand = options.activateRunner
+  const activationRenewCommand = options.apply
     ? command(
         options.systemctlBin,
         ['restart', '--', ACTIVATION_RENEWAL_UNIT],
-        { ...commandDefaults, timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS },
+        {
+          ...commandDefaults,
+          timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS,
+          condition: options.activateRunner ? undefined : 'runner-permission-active',
+        },
       )
     : null;
   const activationDaemonReloadCommand = options.activateRunner
@@ -567,7 +571,7 @@ export function buildDeployPlan(options) {
   const runnerPolicyCheckCommand = command(
     options.pythonBin,
     [trustedStaticCheckScript, '--require-ephemeral-linux-user', candidateConfig],
-    commandDefaults,
+    { ...commandDefaults, condition: 'runner-permission-active' },
   );
 
   const plan = {
@@ -838,6 +842,15 @@ export async function executePlan({
         'ephemeral runner permission is already active; use ordinary --apply for subsequent config updates',
       );
     }
+    if (runnerPermissionActive && !plan.activateRunner) {
+      await runner(
+        plan.activationRenewCommand,
+        scrubEnv(parentEnv, plan.activationRenewCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+      await assertTrustedActivationReceipt(plan.activationReceipt, fsApi);
+    }
     await prepareFreshCheckout(plan, fsApi);
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -945,7 +958,7 @@ export async function executePlan({
         if (rollbackError) {
           const failure = errorPreservingDeploymentStatus(
             error,
-            `${error.message}; failed to restore previous config: ${rollbackError.message}`,
+            `${error.message}; failed to restore previous deployment state: ${rollbackError.message}`,
             rollbackError,
           );
           await recordFailure(
@@ -1514,6 +1527,7 @@ function command(bin, args, options = {}) {
     optional: Boolean(options.optional),
     capture: options.capture,
     validation: options.validation,
+    condition: options.condition,
     env: options.env || {},
     timeoutMs: options.timeoutMs,
     outputLimitBytes: options.outputLimitBytes,
@@ -2104,6 +2118,9 @@ function writePlan(stdout, plan, json) {
   }
   for (const [index, commandSpec] of allPlanCommands(plan).entries()) {
     const invocation = commandInvocation(commandSpec);
+    if (commandSpec.condition) {
+      stdout.write(`command_${index + 1}_condition=${commandSpec.condition}\n`);
+    }
     stdout.write(`command_${index + 1}=${invocation.bin} ${invocation.args.map(shellQuoteForDisplay).join(' ')}\n`);
   }
 }
@@ -2932,32 +2949,55 @@ async function runServiceRollback(plan, installState, runner, parentEnv) {
 
 async function restoreDeploymentState(plan, installState, fsApi) {
   let configDurabilityError = null;
-  let configRestoreError = null;
-  try {
-    configDurabilityError = await restoreCandidateConfig(plan, installState, fsApi);
-  } catch (error) {
-    configRestoreError = error;
-  }
-  let runnerRestoreError = null;
+  let permissionRestoreError = null;
   if (installState.runnerActivation) {
     try {
-      await restoreRunnerActivationFiles(
+      await restoreRunnerActivationPermission(
+        plan,
+        installState.runnerActivation,
+        fsApi,
+      );
+    } catch (error) {
+      permissionRestoreError = error;
+    }
+  }
+  let configRestoreError = null;
+  if (!permissionRestoreError) {
+    try {
+      configDurabilityError = await restoreCandidateConfig(plan, installState, fsApi);
+    } catch (error) {
+      configRestoreError = error;
+    }
+  }
+  let receiptRestoreError = null;
+  if (installState.runnerActivation) {
+    try {
+      await restoreRunnerActivationReceipt(
         plan,
         installState.runnerActivation,
         installState.phase,
         fsApi,
       );
     } catch (error) {
-      runnerRestoreError = error;
+      receiptRestoreError = error;
     }
   }
-  if (configRestoreError || runnerRestoreError) {
-    const primary = configRestoreError ?? runnerRestoreError;
-    const secondary = configRestoreError ? runnerRestoreError : null;
-    if (secondary) {
+  const restoreFailures = [
+    permissionRestoreError
+      ? ['runner permission rollback', permissionRestoreError]
+      : null,
+    configRestoreError ? ['config rollback', configRestoreError] : null,
+    receiptRestoreError ? ['activation receipt rollback', receiptRestoreError] : null,
+  ].filter(Boolean);
+  if (restoreFailures.length > 0) {
+    const [, primary] = restoreFailures[0];
+    if (restoreFailures.length > 1) {
+      const [, secondary] = restoreFailures[1];
       throw errorPreservingDeploymentStatus(
         primary,
-        `${primary.message}; runner activation rollback failed: ${secondary.message}`,
+        restoreFailures
+          .map(([label, error]) => `${label} failed: ${error.message}`)
+          .join('; '),
         secondary,
       );
     }
@@ -2966,34 +3006,24 @@ async function restoreDeploymentState(plan, installState, fsApi) {
   return configDurabilityError;
 }
 
-async function restoreRunnerActivationFiles(plan, activationState, phase, fsApi) {
-  const errors = [];
-  const receiptCanBeRestored = phase !== 'activation_renewal_started';
-  for (const restore of [
-    () => restoreOptionalDeploymentFile(
-      plan.activationReceipt,
-      plan.activationReceiptBackup,
-      receiptCanBeRestored && activationState.receiptHadPrevious,
-      (file, stat) => assertTrustedActivationReceiptMetadata(file, stat),
-      fsApi,
-    ),
-    () => restoreOptionalDeploymentFile(
-      plan.botServiceDropIn,
-      plan.botServiceDropInBackup,
-      activationState.permissionHadPrevious,
-      (file, stat) => assertTrustedBotServiceDropIn(file, stat),
-      fsApi,
-    ),
-  ]) {
-    try {
-      await restore();
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (errors.length > 0) {
-    throw new Error(errors.map((error) => error.message).join('; '));
-  }
+async function restoreRunnerActivationPermission(plan, activationState, fsApi) {
+  await restoreOptionalDeploymentFile(
+    plan.botServiceDropIn,
+    plan.botServiceDropInBackup,
+    activationState.permissionHadPrevious,
+    (file, stat) => assertTrustedBotServiceDropIn(file, stat),
+    fsApi,
+  );
+}
+
+async function restoreRunnerActivationReceipt(plan, activationState, phase, fsApi) {
+  await restoreOptionalDeploymentFile(
+    plan.activationReceipt,
+    plan.activationReceiptBackup,
+    phase !== 'activation_renewal_started' && activationState.receiptHadPrevious,
+    (file, stat) => assertTrustedActivationReceiptMetadata(file, stat),
+    fsApi,
+  );
 }
 
 async function restoreOptionalDeploymentFile(file, backup, hadPrevious, validate, fsApi) {

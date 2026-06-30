@@ -217,6 +217,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'Before'), [
       'webex-generic-account-bot.service',
     ]);
+    assert.deepEqual(directiveValues(service, 'PartOf'), [
+      'webex-generic-account-bot.service',
+    ]);
     assert.deepEqual(directiveValues(service, 'ConditionPathExists'), [
       '/sys/fs/cgroup/cgroup.controllers',
     ]);
@@ -226,7 +229,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
     assert.deepEqual(directiveValues(service, 'WorkingDirectory'), ['/']);
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
-      '/opt/webex-generic-account-bot/bin/webex-codex-activation renew',
+      '/opt/webex-generic-account-bot/bin/webex-codex-activation ensure',
     ]);
     assert.deepEqual(directiveValues(service, 'Restart'), ['no']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['5400s']);
@@ -244,7 +247,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'WantedBy'), []);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
-    for (const directive of ['Requires', 'Wants', 'After', 'PartOf', 'WantedBy']) {
+    for (const directive of ['Requires', 'Wants', 'After', 'WantedBy']) {
       assert.equal(
         directiveValues(service, directive).some((value) =>
           value.split(/\s+/).includes('webex-generic-account-bot.service')

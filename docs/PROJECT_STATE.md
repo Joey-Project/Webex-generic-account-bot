@@ -72,7 +72,10 @@
   config/drop-in/receipt rollback, boot-gated receipt renewal, and permanent
   post-activation downgrade prevention. The explicit activation command is a
   one-time transition; committed recovery is idempotent and later reviewed
-  config updates use ordinary apply. The bot receives only launch-group and
+  config updates use ordinary apply. Bot restarts and ordinary active-runner
+  applies ensure a valid receipt, reusing a fresh receipt without rerunning
+  canaries. Rollback revokes launcher permission before any config downgrade.
+  The bot receives only launch-group and
   pending-input access; config-worker access and mutating config commands remain
   disabled. Production stays on `current-user` until the deployment host
   completes the real-reboot challenge and activates a matching reviewed config.
