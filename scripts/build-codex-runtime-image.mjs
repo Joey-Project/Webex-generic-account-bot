@@ -23,6 +23,11 @@ const SOURCE_DEFINITIONS = Object.freeze([
     mode: '0555',
   },
   {
+    source: '/opt/webex-generic-account-bot/bin/webex-codex-canary-probe',
+    destination: '/bin/webex-codex-canary-probe',
+    mode: '0555',
+  },
+  {
     source: '/etc/ssl/certs/ca-certificates.crt',
     destination: '/etc/ssl/certs/ca-certificates.crt',
     mode: '0444',
@@ -62,6 +67,7 @@ const MODE_PATTERN = /^0[45][0-7]{2}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const REQUIRED_FILES = new Set([
   '/bin/busybox',
+  '/bin/webex-codex-canary-probe',
   '/etc/ssl/certs/ca-certificates.crt',
   '/opt/codex/bin/codex',
   '/opt/codex/codex-path/rg',
@@ -70,6 +76,7 @@ const REQUIRED_FILES = new Set([
 ]);
 const REQUIRED_FILE_MODES = new Map([
   ['/bin/busybox', '0555'],
+  ['/bin/webex-codex-canary-probe', '0555'],
   ['/etc/ssl/certs/ca-certificates.crt', '0444'],
   ['/opt/codex/bin/codex', '0555'],
   ['/opt/codex/codex-path/rg', '0555'],

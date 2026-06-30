@@ -30,6 +30,8 @@ pub const BOT_EXECUTABLE_PATH: &str =
 pub const LAUNCHER_EXECUTABLE_PATH: &str =
     "/opt/webex-generic-account-bot/bin/webex-codex-launcher";
 pub const RUNTIME_EXECUTABLE_PATH: &str = "/opt/webex-generic-account-bot/bin/webex-codex-runtime";
+pub const CANARY_PROBE_EXECUTABLE_PATH: &str =
+    "/opt/webex-generic-account-bot/bin/webex-codex-canary-probe";
 pub const RUNTIME_SOURCE_MANIFEST_PATH: &str =
     "/etc/webex-generic-account-bot/codex-runtime-sources.json";
 
@@ -103,6 +105,7 @@ pub struct ActivationPaths {
     bot_executable: PathBuf,
     launcher_executable: PathBuf,
     runtime_executable: PathBuf,
+    canary_probe_executable: PathBuf,
     runtime_source_manifest: PathBuf,
     trusted_root: PathBuf,
     expected_uid: u32,
@@ -139,6 +142,7 @@ impl ActivationPaths {
             bot_executable: bot_executable.into(),
             launcher_executable: launcher_executable.into(),
             runtime_executable: runtime_executable.into(),
+            canary_probe_executable: PathBuf::from(CANARY_PROBE_EXECUTABLE_PATH),
             runtime_source_manifest: runtime_source_manifest.into(),
             trusted_root: PathBuf::from("/"),
             expected_uid: 0,
@@ -208,6 +212,10 @@ impl ActivationPaths {
         &self.runtime_executable
     }
 
+    pub fn canary_probe_executable(&self) -> &Path {
+        &self.canary_probe_executable
+    }
+
     pub fn runtime_source_manifest(&self) -> &Path {
         &self.runtime_source_manifest
     }
@@ -223,6 +231,7 @@ impl ActivationPaths {
             root.join("webex-codex-runtime"),
             root.join("codex-runtime-sources.json"),
         );
+        paths.canary_probe_executable = root.join("webex-codex-canary-probe");
         paths.trusted_root = root.to_path_buf();
         // SAFETY: these libc calls have no pointer arguments or side effects.
         paths.expected_uid = unsafe { libc::geteuid() };
@@ -286,6 +295,11 @@ const EXPECTED_RUNTIME_SOURCE_FILES: &[(&str, &str, &str)] = &[
     (
         "/bin/busybox",
         "/opt/webex-generic-account-bot/runtime-sources/busybox",
+        "0555",
+    ),
+    (
+        "/bin/webex-codex-canary-probe",
+        "/opt/webex-generic-account-bot/bin/webex-codex-canary-probe",
         "0555",
     ),
     (
@@ -521,13 +535,20 @@ fn load_activation_binding_with_deadline(
     let bot = hash_trusted_file(paths, &paths.bot_executable, deadline.clone())?;
     let launcher = hash_trusted_file(paths, &paths.launcher_executable, deadline.clone())?;
     let runtime = hash_trusted_file(paths, &paths.runtime_executable, deadline.clone())?;
+    let canary_probe = hash_trusted_file(paths, &paths.canary_probe_executable, deadline.clone())?;
     let source_manifest = read_trusted_file(
         paths,
         &paths.runtime_source_manifest,
         TrustedFileKind::ReadOnlyData,
         RUNTIME_SOURCE_MANIFEST_MAX_BYTES,
     )?;
-    validate_runtime_source_binding(paths, &manifest, &source_manifest.bytes, &runtime)?;
+    validate_runtime_source_binding(
+        paths,
+        &manifest,
+        &source_manifest.bytes,
+        &runtime,
+        &canary_probe,
+    )?;
     if let Some(deadline) = deadline.as_ref() {
         deadline.check("activation source manifest verification")?;
     }
@@ -546,6 +567,7 @@ fn load_activation_binding_with_deadline(
             (paths.bot_executable.clone(), bot.identity),
             (paths.launcher_executable.clone(), launcher.identity),
             (paths.runtime_executable.clone(), runtime.identity),
+            (paths.canary_probe_executable.clone(), canary_probe.identity),
             (
                 paths.runtime_source_manifest.clone(),
                 source_manifest.identity,
@@ -559,6 +581,7 @@ fn validate_runtime_source_binding(
     active: &ActiveRuntimeManifest,
     source_bytes: &[u8],
     runtime: &TrustedDigest,
+    canary_probe: &TrustedDigest,
 ) -> Result<()> {
     if sha256(source_bytes) != active.source_manifest_sha256 {
         return Err(anyhow!(
@@ -571,6 +594,10 @@ fn validate_runtime_source_binding(
         .runtime_executable
         .to_str()
         .ok_or_else(|| anyhow!("runtime executable path is not UTF-8"))?;
+    let canary_probe_source = paths
+        .canary_probe_executable
+        .to_str()
+        .ok_or_else(|| anyhow!("canary probe executable path is not UTF-8"))?;
     if source.version != 1
         || source.codex_version != active.codex_version
         || source.codex_target != active.codex_target
@@ -596,7 +623,9 @@ fn validate_runtime_source_binding(
         let entry = files
             .get(destination)
             .ok_or_else(|| anyhow!("runtime source manifest is missing a required file"))?;
-        if entry.source != *expected_source || entry.mode != *expected_mode {
+        if entry.mode != *expected_mode
+            || (*destination != "/bin/webex-codex-canary-probe" && entry.source != *expected_source)
+        {
             return Err(anyhow!("runtime source manifest file policy is invalid"));
         }
     }
@@ -610,6 +639,18 @@ fn validate_runtime_source_binding(
     {
         return Err(anyhow!(
             "runtime source manifest wrapper binding is invalid"
+        ));
+    }
+    let canary_probe_entry = files
+        .get("/bin/webex-codex-canary-probe")
+        .ok_or_else(|| anyhow!("runtime source manifest is missing the canary probe"))?;
+    if canary_probe_entry.source != canary_probe_source
+        || canary_probe_entry.mode != "0555"
+        || canary_probe_entry.sha256 != canary_probe.digest
+        || canary_probe_entry.size != canary_probe.identity.length
+    {
+        return Err(anyhow!(
+            "runtime source manifest canary probe binding is invalid"
         ));
     }
     let mut symlinks = BTreeMap::new();
@@ -1264,6 +1305,7 @@ mod tests {
     const BOOT_ID: &str = "11111111-2222-3333-4444-555555555555";
     const RUNTIME_IMAGE: &[u8] = b"hsqstest runtime image\n";
     const RUNTIME_EXECUTABLE: &[u8] = b"runtime executable\n";
+    const CANARY_PROBE_EXECUTABLE: &[u8] = b"canary probe executable\n";
 
     struct Fixture {
         root: PathBuf,
@@ -1291,6 +1333,11 @@ mod tests {
             write_mode(&paths.bot_executable, b"bot executable\n", 0o555);
             write_mode(&paths.launcher_executable, b"launcher executable\n", 0o555);
             write_mode(&paths.runtime_executable, RUNTIME_EXECUTABLE, 0o555);
+            write_mode(
+                &paths.canary_probe_executable,
+                CANARY_PROBE_EXECUTABLE,
+                0o555,
+            );
             let source_manifest = serde_json::to_vec_pretty(&source_manifest(&paths)).unwrap();
             write_mode(&paths.runtime_source_manifest, &source_manifest, 0o444);
             write_mode(
@@ -1358,13 +1405,23 @@ mod tests {
         let mut files = EXPECTED_RUNTIME_SOURCE_FILES
             .iter()
             .map(|(destination, source, mode)| {
-                json!({
-                    "source": source,
-                    "destination": destination,
-                    "size": 1,
-                    "sha256": "a".repeat(64),
-                    "mode": mode
-                })
+                if *destination == "/bin/webex-codex-canary-probe" {
+                    json!({
+                        "source": paths.canary_probe_executable.to_string_lossy(),
+                        "destination": destination,
+                        "size": CANARY_PROBE_EXECUTABLE.len(),
+                        "sha256": sha256(CANARY_PROBE_EXECUTABLE),
+                        "mode": mode
+                    })
+                } else {
+                    json!({
+                        "source": source,
+                        "destination": destination,
+                        "size": 1,
+                        "sha256": "a".repeat(64),
+                        "mode": mode
+                    })
+                }
             })
             .collect::<Vec<_>>();
         files.push(json!({
@@ -1608,6 +1665,7 @@ mod tests {
             &fixture.paths.bot_executable,
             &fixture.paths.launcher_executable,
             &fixture.paths.runtime_executable,
+            &fixture.paths.canary_probe_executable,
         ] {
             let original = fs::read(path).unwrap();
             replace_read_only(path, b"modified executable\n", 0o555);
@@ -1794,7 +1852,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_runtime_wrapper_source_and_image_binding_drift() {
+    fn rejects_runtime_probe_wrapper_source_and_image_binding_drift() {
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["source"] = json!("/tmp/untrusted-canary-probe");
+        });
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["mode"] = json!("0777");
+        });
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["sha256"] = json!("d".repeat(64));
+        });
+        assert_source_manifest_rejected(|source| {
+            let probe = source["files"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|file| file["destination"] == "/bin/webex-codex-canary-probe")
+                .unwrap();
+            probe["size"] = json!(CANARY_PROBE_EXECUTABLE.len() + 1);
+        });
         assert_source_manifest_rejected(|source| {
             source["files"][EXPECTED_RUNTIME_SOURCE_FILES.len()]["sha256"] = json!("d".repeat(64));
         });

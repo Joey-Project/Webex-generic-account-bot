@@ -14,6 +14,7 @@ import {
 
 const REQUIRED_FILE_DESTINATIONS = [
   '/bin/busybox',
+  '/bin/webex-codex-canary-probe',
   '/etc/ssl/certs/ca-certificates.crt',
   '/opt/codex/bin/codex',
   '/opt/codex/codex-path/rg',

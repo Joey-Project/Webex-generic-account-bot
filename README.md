@@ -562,14 +562,18 @@ static PIE before installing it at the fixed source path:
 
 ```bash
 cargo rustc --release --bin webex-codex-runtime -- -C target-feature=+crt-static
+cargo rustc --release --bin webex-codex-canary-probe -- -C target-feature=+crt-static
 file target/release/webex-codex-runtime
+file target/release/webex-codex-canary-probe
 ldd target/release/webex-codex-runtime
+ldd target/release/webex-codex-canary-probe
 ```
 
 The fixed root-owned source layout is:
 
 ```text
 /opt/webex-generic-account-bot/bin/webex-codex-runtime
+/opt/webex-generic-account-bot/bin/webex-codex-canary-probe
 /opt/webex-generic-account-bot/runtime-sources/busybox
 /opt/webex-generic-account-bot/runtime-sources/codex/bin/codex
 /opt/webex-generic-account-bot/runtime-sources/codex/codex-path/rg
@@ -808,6 +812,63 @@ fallback.
 
 PR 4c1c does not mint the receipt or activate production configuration. PR
 4c2 owns permission-capable production-image canaries and receipt creation.
+
+### PR 4c2a1 Runtime Canary Contract (Not Activated)
+
+PR 4c2a1 adds the versioned `runtime-boundary-v1` canary report contract and a
+static `/bin/webex-codex-canary-probe` inside the content-addressed production
+image. The report uses an exact allowlist of checks, a 32-byte lowercase hex
+nonce, a fixed final-line binding, one-line JSON framing, and a 16 KiB byte
+limit. Missing, unknown, false, duplicated, oversized, or malformed results are
+not successful canary evidence. The activation verifier independently hashes
+the root-owned host probe and requires its exact digest and size in the source
+manifest before a receipt can be minted or accepted.
+
+The probe performs direct filesystem, process, descriptor, capability,
+privilege, Unix-socket, and loopback TCP checks rather than delegating those
+checks to shell text. PR 4c2a2 will run it through Codex `exec --json` and trust
+only the pinned command-execution event, not the model's final prose. Host
+lifecycle canaries and receipt minting also remain in 4c2a2. PR 4c2b alone owns
+the deployment transaction that installs bot launcher access and removes the
+current-user configuration. This slice therefore keeps the activation receipt
+unminted, the bot drop-in absent, and `ephemeral-linux-user` rejected.
+
+A successful probe report is not standalone activation evidence. Before the
+4c2a2 harness starts Codex, it must use the nonce as the run ID, create a
+nonce-scoped protected regular file and nested read-only workspace fixture,
+verify the derived systemd credential file, create nonce-scoped regular files
+inside both private main-process homes, create a real final-output sibling
+fixture, verify live Unix/TCP listener fixtures, and pass the exact nonce and
+endpoints in the pinned command. The forbidden TCP listener must use a
+controlled non-loopback unicast address; the bot listener remains loopback.
+The inner probe must read the nested workspace fixture without opening it for
+write or creating files beside it, and must be denied read and write access to
+the exact derived credential, private-home, and final-output fixture files. It
+must also be unable to create sibling entries or unlink disposable fixtures in
+credential, private-home, protected, or workspace directories. After Codex
+exits, the harness must prove the files retained the same regular-file identity
+and contents, the listeners remained live, and denied listeners accepted zero
+connections. A missing, replaced, modified, unhealthy, or accepted fixture
+invalidates the run even if the inner probe reported `true`; the receipt writer
+must never consume the inner report without these host-side preconditions.
+
+The report binds the nonce, main PID, descriptor-secret digest, both TCP
+endpoints, and both nonce-derived host paths into `fixture_binding`. The final
+line carries that binding as well as the nonce. The library success validator
+requires matching host evidence with before/after liveness and zero accept
+counts for the instrumented host Unix and TCP fixtures. It also requires the
+credential, protected-path, and workspace fixtures to retain the same
+regular-file identity, requires private-home and workspace fixture contents to
+remain unchanged, requires the real final-output sibling fixture to retain its
+identity and contents, and requires the fixed launcher and config-worker
+sockets to remain live before and after the probe. The process boundary
+directly checks `ptrace`, `kcmp`, `process_vm_readv`, and `process_vm_writev`;
+parsing a boolean-only inner report can never establish success. The privilege check
+covers every prompt-executable image path: BusyBox, the canary probe, and
+`rg`. The absent final-output path must also reject an actual `create_new`
+attempt, so `NotFound` alone cannot prove output isolation. Socket connection
+timeouts are inconclusive and fail closed rather than being treated as access
+denial.
 
 ## Development
 

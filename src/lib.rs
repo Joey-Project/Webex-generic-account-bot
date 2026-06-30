@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 pub mod activation;
+pub mod canary_protocol;
 pub mod codex_launcher;
 pub mod config;
 pub mod config_actions;
