@@ -2405,6 +2405,18 @@ mod tests {
     }
 
     #[test]
+    fn canary_credential_path_tracks_the_transient_unit_name() {
+        const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            crate::canary_protocol::runtime_canary_credential_path(NONCE).unwrap(),
+            format!(
+                "{SYSTEMD_CREDENTIAL_ROOT}/{}/codex-auth.json",
+                transient_unit_name(NONCE)
+            )
+        );
+    }
+
+    #[test]
     fn launcher_cgroup_requires_the_explicit_system_slice_layout() {
         assert_eq!(
             parse_launcher_unit("0::/system.slice/webex-codex-launcher@42.service\n").unwrap(),

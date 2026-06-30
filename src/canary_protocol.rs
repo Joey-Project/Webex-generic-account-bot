@@ -14,6 +14,7 @@ pub const RUNTIME_CANARY_FINAL_PREFIX: &str = "WEBEX_CODEX_CANARY_OK";
 pub const RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT: &str = "/run/webex-codex-canary";
 pub const RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT: &str =
     "/var/lib/webex-generic-account-bot/canary-fixtures";
+pub const RUNTIME_CANARY_WORKSPACE_FIXTURE_ROOT: &str = "/workspace/.webex-codex-canary";
 pub const RUNTIME_CANARY_CHECKS: &[&str] = &[
     "bot_socket_denied",
     "capability_sets_empty",
@@ -48,8 +49,16 @@ pub struct RuntimeCanaryFixtureInputs {
 pub struct RuntimeCanaryHostEvidence {
     pub nonce: String,
     pub fixture_binding: String,
-    pub protected_path_present_before: bool,
-    pub protected_path_present_after: bool,
+    pub protected_path_regular_file_before: bool,
+    pub protected_path_regular_file_after: bool,
+    pub protected_path_identity_unchanged: bool,
+    pub credential_path_regular_file_before: bool,
+    pub credential_path_regular_file_after: bool,
+    pub credential_path_identity_unchanged: bool,
+    pub workspace_fixture_regular_file_before: bool,
+    pub workspace_fixture_regular_file_after: bool,
+    pub workspace_fixture_identity_unchanged: bool,
+    pub workspace_fixture_contents_unchanged: bool,
     pub host_unix_listener_live_before: bool,
     pub host_unix_listener_live_after: bool,
     pub host_unix_accept_count: u64,
@@ -71,8 +80,16 @@ impl RuntimeCanaryHostEvidence {
         validate_runtime_canary_fixture_binding(expected_fixture_binding)?;
         if self.nonce != expected_nonce
             || self.fixture_binding != expected_fixture_binding
-            || !self.protected_path_present_before
-            || !self.protected_path_present_after
+            || !self.protected_path_regular_file_before
+            || !self.protected_path_regular_file_after
+            || !self.protected_path_identity_unchanged
+            || !self.credential_path_regular_file_before
+            || !self.credential_path_regular_file_after
+            || !self.credential_path_identity_unchanged
+            || !self.workspace_fixture_regular_file_before
+            || !self.workspace_fixture_regular_file_after
+            || !self.workspace_fixture_identity_unchanged
+            || !self.workspace_fixture_contents_unchanged
             || !self.host_unix_listener_live_before
             || !self.host_unix_listener_live_after
             || self.host_unix_accept_count != 0
@@ -275,6 +292,22 @@ pub fn runtime_canary_fixture_binding(
     Ok(hex(digest(&SHA256, &encoded).as_ref()))
 }
 
+pub fn runtime_canary_credential_path(nonce: &str) -> Result<String> {
+    validate_runtime_canary_nonce(nonce)?;
+    let unit_digest = hex(digest(&SHA256, nonce.as_bytes()).as_ref());
+    Ok(format!(
+        "/run/credentials/webex-codex-run-{}.service/codex-auth.json",
+        &unit_digest[..24]
+    ))
+}
+
+pub fn runtime_canary_workspace_fixture_path(nonce: &str) -> Result<String> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(format!(
+        "{RUNTIME_CANARY_WORKSPACE_FIXTURE_ROOT}/{nonce}/probe.txt"
+    ))
+}
+
 pub fn validate_runtime_canary_nonce(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
@@ -342,8 +375,16 @@ mod tests {
         RuntimeCanaryHostEvidence {
             nonce: NONCE.to_owned(),
             fixture_binding: fixture_binding(),
-            protected_path_present_before: true,
-            protected_path_present_after: true,
+            protected_path_regular_file_before: true,
+            protected_path_regular_file_after: true,
+            protected_path_identity_unchanged: true,
+            credential_path_regular_file_before: true,
+            credential_path_regular_file_after: true,
+            credential_path_identity_unchanged: true,
+            workspace_fixture_regular_file_before: true,
+            workspace_fixture_regular_file_after: true,
+            workspace_fixture_identity_unchanged: true,
+            workspace_fixture_contents_unchanged: true,
             host_unix_listener_live_before: true,
             host_unix_listener_live_after: true,
             host_unix_accept_count: 0,
@@ -425,6 +466,30 @@ mod tests {
         accepted.forbidden_tcp_accept_count = 1;
         assert!(report.ensure_success(NONCE, &binding, &accepted).is_err());
 
+        let mut missing_credential = passing_host_evidence();
+        missing_credential.credential_path_regular_file_before = false;
+        assert!(
+            report
+                .ensure_success(NONCE, &binding, &missing_credential)
+                .is_err()
+        );
+
+        let mut changed_workspace = passing_host_evidence();
+        changed_workspace.workspace_fixture_contents_unchanged = false;
+        assert!(
+            report
+                .ensure_success(NONCE, &binding, &changed_workspace)
+                .is_err()
+        );
+
+        let mut replaced_protected_path = passing_host_evidence();
+        replaced_protected_path.protected_path_identity_unchanged = false;
+        assert!(
+            report
+                .ensure_success(NONCE, &binding, &replaced_protected_path)
+                .is_err()
+        );
+
         let mut wrong_binding = passing_host_evidence();
         wrong_binding.fixture_binding = "f".repeat(64);
         assert!(
@@ -463,6 +528,20 @@ mod tests {
         inputs.host_protected_path =
             "/var/lib/webex-generic-account-bot/canary-fixtures/other".to_owned();
         assert!(runtime_canary_fixture_binding(NONCE, &inputs).is_err());
+    }
+
+    #[test]
+    fn derives_nonce_bound_credential_and_workspace_fixture_paths() {
+        assert_eq!(
+            runtime_canary_credential_path(NONCE).unwrap(),
+            "/run/credentials/webex-codex-run-a8ae6e6ee929abea3afcfc52.service/codex-auth.json"
+        );
+        assert_eq!(
+            runtime_canary_workspace_fixture_path(NONCE).unwrap(),
+            format!("/workspace/.webex-codex-canary/{NONCE}/probe.txt")
+        );
+        assert!(runtime_canary_credential_path("invalid").is_err());
+        assert!(runtime_canary_workspace_fixture_path("invalid").is_err());
     }
 
     #[test]

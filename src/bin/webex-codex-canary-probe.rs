@@ -26,7 +26,8 @@ use webex_generic_account_bot::{
     canary_protocol::{
         RUNTIME_CANARY_CHECKS, RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT,
         RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT, RUNTIME_CANARY_SUITE, RuntimeCanaryFixtureInputs,
-        RuntimeCanaryReport, runtime_canary_fixture_binding, validate_runtime_canary_nonce,
+        RuntimeCanaryReport, runtime_canary_credential_path, runtime_canary_fixture_binding,
+        runtime_canary_workspace_fixture_path, validate_runtime_canary_nonce,
     },
     codex_launcher::LAUNCHER_SOCKET_PATH,
 };
@@ -108,7 +109,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "credential_path_denied".to_owned(),
-        path_denied(Path::new(CREDENTIAL_ROOT)),
+        credential_path_denied(&cli.nonce),
     );
     checks.insert(
         "final_output_denied".to_owned(),
@@ -255,6 +256,14 @@ fn path_denied(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn credential_path_denied(nonce: &str) -> bool {
+    let Ok(path) = runtime_canary_credential_path(nonce) else {
+        return false;
+    };
+    path_denied(Path::new(CREDENTIAL_ROOT)) && path_denied(Path::new(&path))
+}
+
+#[cfg(target_os = "linux")]
 fn access_denial_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -396,7 +405,41 @@ fn main_process_inspection_denied(pid: u32) -> bool {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::EPERM) | Some(libc::EACCES)
             );
-    file_boundaries && fd_boundary && ptrace_denied && kcmp_denied
+    file_boundaries && fd_boundary && ptrace_denied && kcmp_denied && process_vm_access_denied(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_vm_access_denied(pid: u32) -> bool {
+    process_vm_operation_denied(pid, false) && process_vm_operation_denied(pid, true)
+}
+
+#[cfg(target_os = "linux")]
+fn process_vm_operation_denied(pid: u32, write: bool) -> bool {
+    let mut local_byte = 0_u8;
+    let local = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(local_byte).cast(),
+        iov_len: 1,
+    };
+    let remote = libc::iovec {
+        iov_base: std::ptr::dangling_mut::<libc::c_void>(),
+        iov_len: 1,
+    };
+    // SAFETY: both iovec arrays are live for the syscall. The dangling remote
+    // pointer makes an unexpectedly permitted operation fail with EFAULT
+    // without touching useful target memory.
+    let result = unsafe {
+        if write {
+            libc::process_vm_writev(pid as libc::pid_t, &local, 1, &remote, 1, 0)
+        } else {
+            libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0)
+        }
+    };
+    syscall_permission_denied(result, std::io::Error::last_os_error().raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn syscall_permission_denied(result: isize, error: Option<i32>) -> bool {
+    result == -1 && matches!(error, Some(libc::EPERM) | Some(libc::EACCES))
 }
 
 #[cfg(target_os = "linux")]
@@ -517,6 +560,7 @@ fn sensitive_descriptors_denied(expected_digest: &str) -> bool {
     };
     let self_fd_directory = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
     let mut inspected = 0_usize;
+    let mut targets = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -538,11 +582,14 @@ fn sensitive_descriptors_denied(expected_digest: &str) -> bool {
         if open_fd_digest(&path).as_deref() == Some(expected_digest) {
             return false;
         }
-        if !inherited_descriptor_target_allowed(&target, &self_fd_directory) {
-            return false;
-        }
+        targets.push(target);
     }
-    true
+    descriptor_targets_are_only_the_scan(&targets, &self_fd_directory)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_targets_are_only_the_scan(targets: &[PathBuf], self_fd_directory: &Path) -> bool {
+    targets.len() == 1 && targets[0] == self_fd_directory
 }
 
 #[cfg(target_os = "linux")]
@@ -566,11 +613,6 @@ fn standard_input_sanitized(expected_digest: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn standard_input_target_allowed(target: &Path) -> bool {
     target == Path::new("/dev/null")
-}
-
-#[cfg(target_os = "linux")]
-fn inherited_descriptor_target_allowed(target: &Path, self_fd_directory: &Path) -> bool {
-    target == self_fd_directory
 }
 
 #[cfg(target_os = "linux")]
@@ -661,19 +703,49 @@ fn workspace_read_only(nonce: &str) -> bool {
     if fs::read_dir(WORKSPACE_PATH).is_err() {
         return false;
     }
-    let path = Path::new(WORKSPACE_PATH).join(format!("canary-write-{nonce}"));
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    let Ok(fixture) = runtime_canary_workspace_fixture_path(nonce) else {
+        return false;
+    };
+    let fixture = Path::new(&fixture);
+    let Some(parent) = fixture.parent() else {
+        return false;
+    };
+    if !fs::read(fixture).is_ok_and(|contents| contents == nonce.as_bytes()) {
+        return false;
+    }
+    write_open_denied(fixture)
+        && create_file_denied(&Path::new(WORKSPACE_PATH).join(format!("canary-write-{nonce}")))
+        && create_file_denied(&parent.join(format!("canary-nested-write-{nonce}")))
+}
+
+#[cfg(target_os = "linux")]
+fn write_open_denied(path: &Path) -> bool {
+    match OpenOptions::new().write(true).open(path) {
+        Ok(_) => false,
+        Err(error) => write_denial_error(&error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_file_denied(path: &Path) -> bool {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => {
             let _ = fs::remove_file(path);
             false
         }
-        Err(error) => {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-            ) || error.raw_os_error() == Some(libc::EROFS)
-        }
+        Err(error) => write_denial_error(&error),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn write_denial_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -768,16 +840,18 @@ mod tests {
         let self_fd_directory = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
         assert!(standard_input_target_allowed(Path::new("/dev/null")));
         assert!(!standard_input_target_allowed(Path::new("pipe:[123]")));
-        assert!(inherited_descriptor_target_allowed(
-            &self_fd_directory,
+        assert!(descriptor_targets_are_only_the_scan(
+            std::slice::from_ref(&self_fd_directory),
             &self_fd_directory
         ));
-        for target in ["socket:[123]", "pipe:[123]", "/tmp/secret"] {
-            assert!(!inherited_descriptor_target_allowed(
-                Path::new(target),
-                &self_fd_directory
-            ));
-        }
+        assert!(!descriptor_targets_are_only_the_scan(
+            &[self_fd_directory.clone(), self_fd_directory.clone()],
+            &self_fd_directory
+        ));
+        assert!(!descriptor_targets_are_only_the_scan(
+            &[self_fd_directory, PathBuf::from("socket:[123]")],
+            Path::new(&format!("/proc/{}/fd", std::process::id()))
+        ));
 
         let mut pipe_fds = [-1; 2];
         // SAFETY: pipe_fds is a live two-element out-buffer and the returned
@@ -794,6 +868,15 @@ mod tests {
 
         let (_left, _right) = UnixStream::pair().unwrap();
         assert!(!sensitive_descriptors_denied(NONCE));
+    }
+
+    #[test]
+    fn process_vm_probe_accepts_only_explicit_permission_denial() {
+        assert!(syscall_permission_denied(-1, Some(libc::EPERM)));
+        assert!(syscall_permission_denied(-1, Some(libc::EACCES)));
+        assert!(!syscall_permission_denied(-1, Some(libc::EFAULT)));
+        assert!(!syscall_permission_denied(-1, Some(libc::ESRCH)));
+        assert!(!syscall_permission_denied(0, None));
     }
 
     #[test]

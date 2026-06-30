@@ -832,21 +832,30 @@ current-user configuration. This slice therefore keeps the activation receipt
 unminted, the bot drop-in absent, and `ephemeral-linux-user` rejected.
 
 A successful probe report is not standalone activation evidence. Before the
-4c2a2 harness starts Codex, it must create nonce-scoped protected path and live
-Unix/TCP listener fixtures, verify each fixture is healthy, and pass the exact
-nonce and endpoints in the pinned command. After Codex exits, it must prove the
-same fixtures remained live and that the denied listeners accepted zero
-connections. A missing, replaced, unhealthy, or accepted fixture invalidates
-the run even if the inner probe reported `true`; the receipt writer must never
-consume the inner report without these host-side preconditions.
+4c2a2 harness starts Codex, it must use the nonce as the run ID, create a
+nonce-scoped protected regular file and nested read-only workspace fixture,
+verify the derived systemd credential file and live Unix/TCP listener fixtures,
+and pass the exact nonce and endpoints in the pinned command. The inner probe
+must read the nested workspace fixture without opening it for write or creating
+files beside it, and must be denied the exact derived credential file. After
+Codex exits, the harness must prove the files retained the same regular-file
+identity, the workspace fixture contents did not change, the listeners remained
+live, and denied listeners accepted zero connections. A missing, replaced,
+modified, unhealthy, or accepted fixture invalidates the run even if the inner
+probe reported `true`; the receipt writer must never consume the inner report
+without these host-side preconditions.
 
 The report binds the nonce, main PID, descriptor-secret digest, both TCP
 endpoints, and both nonce-derived host paths into `fixture_binding`. The final
 line carries that binding as well as the nonce. The library success validator
 requires matching host evidence with before/after liveness and zero accept
 counts for the instrumented host Unix and TCP fixtures. It also requires the
+credential, protected-path, and workspace fixtures to retain the same
+regular-file identity, the workspace contents to remain unchanged, and the
 fixed launcher and config-worker sockets to remain live before and after the
-probe; parsing a boolean-only inner report can never establish success.
+probe. The process boundary directly checks `ptrace`, `kcmp`,
+`process_vm_readv`, and `process_vm_writev`; parsing a boolean-only inner report
+can never establish success.
 
 ## Development
 
