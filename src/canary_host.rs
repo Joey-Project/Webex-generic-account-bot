@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
         net::UnixListener,
@@ -485,33 +485,37 @@ fn remove_owned_socket_path(path: &Path, expected: SocketPathIdentity) -> Result
 }
 
 pub(crate) struct InstrumentedTcpListener {
-    bound_endpoint: SocketAddrV4,
+    bound_endpoint: SocketAddr,
     monitor: ListenerMonitor,
 }
 
 impl InstrumentedTcpListener {
-    pub(crate) fn bind(endpoint: SocketAddrV4) -> Result<Self> {
-        ensure_unicast_ipv4(*endpoint.ip())?;
+    pub(crate) fn bind(endpoint: SocketAddr) -> Result<Self> {
+        ensure_unicast_ip(endpoint.ip())?;
         let listener = TcpListener::bind(endpoint)
             .with_context(|| format!("failed to bind TCP canary listener {endpoint}"))?;
         listener
             .set_nonblocking(true)
             .context("failed to make TCP canary listener nonblocking")?;
-        let bound_endpoint = match listener
+        let bound_endpoint = listener
             .local_addr()
-            .context("failed to read bound TCP canary endpoint")?
-        {
-            SocketAddr::V4(endpoint) => endpoint,
-            SocketAddr::V6(_) => bail!("TCP canary listener unexpectedly bound IPv6"),
-        };
+            .context("failed to read bound TCP canary endpoint")?;
         ensure!(
             bound_endpoint.ip() == endpoint.ip(),
-            "TCP canary listener did not bind the requested IPv4 address"
+            "TCP canary listener did not bind the requested IP address"
         );
         ensure!(
             endpoint.port() == 0 || bound_endpoint.port() == endpoint.port(),
             "TCP canary listener did not bind the requested port"
         );
+        match (endpoint, bound_endpoint) {
+            (SocketAddr::V4(_), SocketAddr::V4(_)) => {}
+            (SocketAddr::V6(requested), SocketAddr::V6(bound)) => ensure!(
+                requested.scope_id() == bound.scope_id(),
+                "TCP canary listener did not bind the requested IPv6 scope"
+            ),
+            _ => bail!("TCP canary listener changed address family while binding"),
+        }
         let monitor =
             ListenerMonitor::spawn(ListenerKind::Tcp(listener), "webex-canary-tcp-listener")?;
         Ok(Self {
@@ -520,7 +524,7 @@ impl InstrumentedTcpListener {
         })
     }
 
-    pub(crate) fn bound_endpoint(&self) -> SocketAddrV4 {
+    pub(crate) fn bound_endpoint(&self) -> SocketAddr {
         self.bound_endpoint
     }
 
@@ -547,7 +551,7 @@ impl InstrumentedTcpListener {
     }
 }
 
-pub(crate) fn assigned_non_loopback_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
+pub(crate) fn assigned_non_loopback_socket_addresses() -> Result<Vec<SocketAddr>> {
     let mut interfaces = ptr::null_mut();
     // SAFETY: getifaddrs initializes `interfaces` on success; the guard frees that list once.
     if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
@@ -571,7 +575,16 @@ pub(crate) fn assigned_non_loopback_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
                 let socket_address = unsafe { &*(interface.ifa_addr.cast::<libc::sockaddr_in>()) };
                 let address = Ipv4Addr::from(socket_address.sin_addr.s_addr.to_ne_bytes());
                 if is_unicast_non_loopback_ipv4(address) {
-                    addresses.insert(address);
+                    addresses.insert(SocketAddr::V4(SocketAddrV4::new(address, 0)));
+                }
+            } else if family == libc::AF_INET6 {
+                // SAFETY: AF_INET6 identifies a sockaddr_in6 at ifa_addr.
+                let socket_address = unsafe { &*(interface.ifa_addr.cast::<libc::sockaddr_in6>()) };
+                let address = Ipv6Addr::from(socket_address.sin6_addr.s6_addr);
+                // The canary protocol uses the canonical SocketAddr text form, which
+                // intentionally excludes interface-scoped IPv6 endpoints.
+                if is_unicast_non_loopback_ipv6(address) && socket_address.sin6_scope_id == 0 {
+                    addresses.insert(SocketAddr::V6(SocketAddrV6::new(address, 0, 0, 0)));
                 }
             }
         }
@@ -580,6 +593,17 @@ pub(crate) fn assigned_non_loopback_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
     }
 
     Ok(addresses.into_iter().collect())
+}
+
+#[cfg(test)]
+pub(crate) fn assigned_non_loopback_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
+    Ok(assigned_non_loopback_socket_addresses()?
+        .into_iter()
+        .filter_map(|endpoint| match endpoint {
+            SocketAddr::V4(endpoint) => Some(*endpoint.ip()),
+            SocketAddr::V6(_) => None,
+        })
+        .collect())
 }
 
 struct IfAddrsGuard(*mut libc::ifaddrs);
@@ -591,6 +615,7 @@ impl Drop for IfAddrsGuard {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn select_assigned_non_loopback_ipv4() -> Result<Ipv4Addr> {
     assigned_non_loopback_ipv4_addresses()?
         .into_iter()
@@ -598,6 +623,26 @@ pub(crate) fn select_assigned_non_loopback_ipv4() -> Result<Ipv4Addr> {
         .ok_or_else(|| anyhow!("no assigned non-loopback unicast IPv4 address is available"))
 }
 
+fn select_preferred_non_loopback_endpoint(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Option<SocketAddr> {
+    let mut ipv6 = None;
+    for address in addresses {
+        match address {
+            SocketAddr::V4(_) => return Some(address),
+            SocketAddr::V6(_) if ipv6.is_none() => ipv6 = Some(address),
+            SocketAddr::V6(_) => {}
+        }
+    }
+    ipv6
+}
+
+pub(crate) fn select_assigned_non_loopback_endpoint() -> Result<SocketAddr> {
+    select_preferred_non_loopback_endpoint(assigned_non_loopback_socket_addresses()?)
+        .ok_or_else(|| anyhow!("no assigned non-loopback unicast IP address is available"))
+}
+
+#[cfg(test)]
 pub(crate) fn bind_controlled_non_loopback_listener(
     address: Ipv4Addr,
 ) -> Result<InstrumentedTcpListener> {
@@ -609,16 +654,26 @@ pub(crate) fn bind_controlled_non_loopback_listener(
         assigned_non_loopback_ipv4_addresses()?.contains(&address),
         "controlled canary IPv4 address is not assigned to this host"
     );
-    InstrumentedTcpListener::bind(SocketAddrV4::new(address, 0))
+    InstrumentedTcpListener::bind(SocketAddr::V4(SocketAddrV4::new(address, 0)))
 }
 
 pub(crate) fn bind_assigned_non_loopback_listener() -> Result<InstrumentedTcpListener> {
-    let address = select_assigned_non_loopback_ipv4()?;
-    bind_controlled_non_loopback_listener(address)
+    InstrumentedTcpListener::bind(select_assigned_non_loopback_endpoint()?)
 }
 
 pub(crate) fn bind_loopback_bot_listener() -> Result<InstrumentedTcpListener> {
-    InstrumentedTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    InstrumentedTcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+}
+
+fn ensure_unicast_ip(address: IpAddr) -> Result<()> {
+    match address {
+        IpAddr::V4(address) => ensure_unicast_ipv4(address)?,
+        IpAddr::V6(address) => ensure!(
+            !address.is_unspecified() && !address.is_multicast(),
+            "TCP canary listener requires a concrete unicast IPv6 address"
+        ),
+    }
+    Ok(())
 }
 
 fn ensure_unicast_ipv4(address: Ipv4Addr) -> Result<()> {
@@ -631,6 +686,10 @@ fn ensure_unicast_ipv4(address: Ipv4Addr) -> Result<()> {
 
 fn is_unicast_non_loopback_ipv4(address: Ipv4Addr) -> bool {
     ensure_unicast_ipv4(address).is_ok() && !address.is_loopback()
+}
+
+fn is_unicast_non_loopback_ipv6(address: Ipv6Addr) -> bool {
+    !address.is_unspecified() && !address.is_multicast() && !address.is_loopback()
 }
 
 #[cfg(test)]
@@ -849,7 +908,7 @@ mod tests {
         let mut listener = bind_loopback_bot_listener().unwrap();
         let endpoint = listener.bound_endpoint();
 
-        assert_eq!(*endpoint.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(endpoint.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_ne!(endpoint.port(), 0);
         assert!(listener.is_live());
         assert!(listener.verify_zero_accepts().is_err());
@@ -860,7 +919,11 @@ mod tests {
     #[test]
     fn tcp_listener_counts_connections_and_rejects_wildcard_binding() {
         assert!(
-            InstrumentedTcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).is_err()
+            InstrumentedTcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                0,
+            )))
+            .is_err()
         );
         let mut listener = bind_loopback_bot_listener().unwrap();
         let connection = TcpStream::connect(listener.bound_endpoint()).unwrap();
@@ -882,7 +945,7 @@ mod tests {
         if let Some(address) = addresses.first().copied() {
             assert_eq!(select_assigned_non_loopback_ipv4().unwrap(), address);
             let mut listener = bind_controlled_non_loopback_listener(address).unwrap();
-            assert_eq!(*listener.bound_endpoint().ip(), address);
+            assert_eq!(listener.bound_endpoint().ip(), IpAddr::V4(address));
             listener.shutdown_and_verify_zero_accepts().unwrap();
         } else {
             assert!(select_assigned_non_loopback_ipv4().is_err());
@@ -891,5 +954,31 @@ mod tests {
 
         assert!(bind_controlled_non_loopback_listener(Ipv4Addr::LOCALHOST).is_err());
         assert!(bind_controlled_non_loopback_listener(Ipv4Addr::UNSPECIFIED).is_err());
+    }
+
+    #[test]
+    fn endpoint_selection_prefers_ipv4_and_falls_back_to_ipv6() {
+        let ipv4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 0));
+        let ipv6 = SocketAddr::V6(SocketAddrV6::new("2001:db8::10".parse().unwrap(), 0, 0, 0));
+
+        assert_eq!(select_preferred_non_loopback_endpoint([ipv6]), Some(ipv6));
+        assert_eq!(
+            select_preferred_non_loopback_endpoint([ipv6, ipv4]),
+            Some(ipv4)
+        );
+        assert_eq!(select_preferred_non_loopback_endpoint([]), None);
+    }
+
+    #[test]
+    fn tcp_listener_supports_ipv6() {
+        let endpoint = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+        let mut listener = InstrumentedTcpListener::bind(endpoint).unwrap();
+
+        assert_eq!(
+            listener.bound_endpoint().ip(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        assert_ne!(listener.bound_endpoint().port(), 0);
+        listener.shutdown_and_verify_zero_accepts().unwrap();
     }
 }

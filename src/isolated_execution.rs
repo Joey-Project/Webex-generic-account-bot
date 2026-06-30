@@ -1373,6 +1373,9 @@ fn build_runtime_canary_plan(
         .ok_or_else(|| anyhow!("runtime canary plan has no fixed runtime executable"))?;
     let extra_properties = [
         format!(
+            "TemporaryFileSystem={RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT}:rw,nosuid,nodev,noexec,size=1M,mode=0755"
+        ),
+        format!(
             "BindReadOnlyPaths={0}:{0}",
             RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT
         ),
@@ -2727,6 +2730,9 @@ mod tests {
             .collect::<Vec<_>>();
         for required in [
             format!("BindsTo={ACTIVATION_RENEWAL_UNIT}"),
+            format!(
+                "TemporaryFileSystem={RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT}:rw,nosuid,nodev,noexec,size=1M,mode=0755"
+            ),
             format!(
                 "BindReadOnlyPaths={0}:{0}",
                 RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT

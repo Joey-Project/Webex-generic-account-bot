@@ -217,6 +217,7 @@ describe('Codex runtime image contract', () => {
         'etc/hosts',
         'etc/nsswitch.conf',
         'etc/resolv.conf',
+        'run/webex-codex-canary',
         'tmp',
         'var/lib/webex-generic-account-bot/canary-fixtures',
         'var/tmp',

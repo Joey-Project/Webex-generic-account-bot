@@ -97,6 +97,7 @@ const GENERATED_FILES = new Map([
   ['/etc/resolv.conf', 'runtime placeholder\n'],
 ]);
 const REQUIRED_DIRECTORIES = new Set([
+  '/run/webex-codex-canary',
   '/tmp',
   '/var',
   '/var/lib/webex-generic-account-bot/canary-fixtures',
