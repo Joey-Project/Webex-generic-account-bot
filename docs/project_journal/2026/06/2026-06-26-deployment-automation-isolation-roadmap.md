@@ -107,6 +107,9 @@ superseded_by:
   the bot restart lifecycle and uses a fixed ensure command so a valid receipt
   is a fast no-op while a missing or stale receipt runs the full canaries.
   Ordinary active-runner apply ensures the receipt before config validation.
+  Ordinary apply enforces current-user policy while permission is absent and
+  ephemeral-only policy while it is present, leaving explicit activation as
+  the only mode transition.
   Committed legacy apply recovery continues into an explicitly requested
   activation instead of returning ordinary deployment metadata as success.
   The production host still requires

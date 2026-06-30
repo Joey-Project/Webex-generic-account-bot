@@ -75,6 +75,8 @@
   config updates use ordinary apply. Bot restarts and ordinary active-runner
   applies ensure a valid receipt, reusing a fresh receipt without rerunning
   canaries. Rollback revokes launcher permission before any config downgrade.
+  Ordinary apply requires current-user policy before permission activation and
+  ephemeral-only policy afterwards; only explicit activation may cross modes.
   The bot receives only launch-group and
   pending-input access; config-worker access and mutating config commands remain
   disabled. Production stays on `current-user` until the deployment host

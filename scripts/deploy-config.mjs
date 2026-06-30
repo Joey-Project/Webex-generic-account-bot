@@ -538,7 +538,7 @@ export function buildDeployPlan(options) {
         ], { ...commandDefaults, validation: 'service-readiness' }),
       ];
 
-  const activationRenewCommand = options.apply
+  const activationRenewCommand = options.apply || options.activateRunner
     ? command(
         options.systemctlBin,
         ['restart', '--', ACTIVATION_RENEWAL_UNIT],
@@ -572,6 +572,11 @@ export function buildDeployPlan(options) {
     options.pythonBin,
     [trustedStaticCheckScript, '--require-ephemeral-linux-user', candidateConfig],
     { ...commandDefaults, condition: 'runner-permission-active' },
+  );
+  const currentUserPolicyCheckCommand = command(
+    options.pythonBin,
+    [trustedStaticCheckScript, '--require-current-user', candidateConfig],
+    { ...commandDefaults, condition: 'runner-permission-inactive' },
   );
 
   const plan = {
@@ -607,6 +612,7 @@ export function buildDeployPlan(options) {
     activationConfigCheckCommand,
     daemonReloadCommand,
     runnerPolicyCheckCommand,
+    currentUserPolicyCheckCommand,
     skipRestart: options.skipRestart,
     serviceAction: options.skipRestart ? null : 'restart',
     sshKey: path.resolve(options.sshKey),
@@ -862,10 +868,13 @@ export async function executePlan({
       }
     }
     assertConfigRevision(captures.configRevision);
-    if (runnerPermissionActive && !plan.activateRunner) {
+    if (!plan.activateRunner) {
+      const policyCheckCommand = runnerPermissionActive
+        ? plan.runnerPolicyCheckCommand
+        : plan.currentUserPolicyCheckCommand;
       await runner(
-        plan.runnerPolicyCheckCommand,
-        scrubEnv(parentEnv, plan.runnerPolicyCheckCommand.env),
+        policyCheckCommand,
+        scrubEnv(parentEnv, policyCheckCommand.env),
         signal,
       );
       throwIfAborted(signal);
@@ -2337,10 +2346,12 @@ async function assertPlanHasNoSymlinkAncestors(plan, fsApi) {
     ['SSH key directory', path.dirname(plan.sshKey), true],
     ['SSH known-hosts directory', path.dirname(plan.sshKnownHosts), true],
   ];
+  if (!plan.prepare) {
+    paths.push(['activation receipt', plan.activationReceipt, false]);
+  }
   if (plan.activateRunner) {
     paths.push(
       ['bot service drop-in source directory', path.dirname(plan.botServiceDropInSource), true],
-      ['activation receipt', plan.activationReceipt, false],
     );
   }
   if (plan.prepare) {
@@ -3697,7 +3708,9 @@ function allPlanCommands(plan) {
       plan.activationStopCommand,
       plan.activationStateCommand,
       plan.activationConfigCheckCommand,
-      plan.runnerPolicyCheckCommand,
+      ...(plan.activateRunner
+        ? []
+        : [plan.runnerPolicyCheckCommand, plan.currentUserPolicyCheckCommand]),
       plan.daemonReloadCommand,
       plan.serviceCommand,
       ...plan.serviceVerificationCommands,

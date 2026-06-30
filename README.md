@@ -398,7 +398,10 @@ real host reboot and rerun the same activation command. A service restart is
 not reboot evidence. After activation, ordinary apply first ensures a valid
 receipt, then detects the installed permission drop-in and rejects any
 candidate that would restore `current-user`, preventing inherited launcher
-access from becoming reachable
+access from becoming reachable. Before activation, ordinary apply applies the
+opposite host gate and rejects any ephemeral candidate, so only the explicit
+version 2 activation transaction can cross the permission boundary. Dry-run
+output labels both mode checks with their permission-state conditions.
 to prompt-controlled children.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,

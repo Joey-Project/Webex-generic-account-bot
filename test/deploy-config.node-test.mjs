@@ -425,6 +425,7 @@ describe('deploy-config plan', () => {
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
     assert.equal(plan.activationRenewCommand.condition, 'runner-permission-active');
+    assert.equal(plan.currentUserPolicyCheckCommand.condition, 'runner-permission-inactive');
     assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
     assert.deepEqual(
@@ -954,13 +955,15 @@ describe('trusted config policy', () => {
     await fs.rm(temp, { recursive: true, force: true });
   });
 
-  it('requires every effective Codex policy to be ephemeral before activation', async () => {
+  it('requires every effective Codex policy to match the deployment mode', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-runner-policy-test-'));
     const configPath = path.join(temp, 'production.toml');
     const current = await staticPolicyRenderedConfig(
       '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
     );
     await fs.writeFile(configPath, current, 'utf8');
+    const currentAccepted = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(currentAccepted.status, 0, currentAccepted.stderr);
     const rejected = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
     assert.equal(rejected.status, 1);
     assert.match(rejected.stderr, /codex\.isolation\.mode must be 'ephemeral-linux-user'/);
@@ -971,12 +974,28 @@ describe('trusted config policy', () => {
     await fs.writeFile(configPath, ephemeral, 'utf8');
     const accepted = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
     assert.equal(accepted.status, 0, accepted.stderr);
+    const ephemeralRejected = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(ephemeralRejected.status, 1);
+    assert.match(ephemeralRejected.stderr, /codex\.isolation\.mode must be 'current-user'/);
 
     const downgradedRoom = `${ephemeral}\n[rooms.codex.isolation]\nmode = "current-user"\ntrusted_prompt_authors = true\n`;
     await fs.writeFile(configPath, downgradedRoom, 'utf8');
     const downgraded = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
     assert.equal(downgraded.status, 1);
     assert.match(downgraded.stderr, /rooms\[1\]\.codex\.isolation\.mode/);
+
+    const elevatedRoom = `${current}\n[rooms.codex.isolation]\nmode = "ephemeral-linux-user"\ntrusted_prompt_authors = false\n`;
+    await fs.writeFile(configPath, elevatedRoom, 'utf8');
+    const elevated = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(elevated.status, 1);
+    assert.match(elevated.stderr, /rooms\[1\]\.codex\.isolation\.mode/);
+
+    const conflicting = runStaticConfigPolicy(
+      configPath,
+      '--require-current-user',
+      '--require-ephemeral-linux-user',
+    );
+    assert.equal(conflicting.status, 2);
   });
 
   it('rejects rooms that are not explicitly allowlisted by host policy', async () => {
@@ -2328,6 +2347,27 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(runnerPolicyCommand.condition, 'runner-permission-active');
     assert.match(stdout, /command_\d+_condition=runner-permission-active/);
     assert.equal(executed, false);
+
+    let activationDryRun = '';
+    const activationDryRunStatus = await runCli({
+      argv: ['--dry-run', '--activate-runner', '--json'],
+      stdout: writer((chunk) => {
+        activationDryRun += chunk;
+      }),
+      stderr: writer(),
+      runner: async () => {
+        executed = true;
+      },
+    });
+    const activationPlan = JSON.parse(activationDryRun).plan;
+    const renewalCommand = activationPlan.commands.find(
+      (command) => command.args.includes('webex-codex-activation-renew.service'),
+    );
+    assert.equal(activationDryRunStatus, 0);
+    assert(renewalCommand);
+    assert.equal(renewalCommand.args[0], 'restart');
+    assert.equal(renewalCommand.condition, undefined);
+    assert.equal(executed, false);
   });
 
   it('prepare CLI emits machine-readable staged metadata', async () => {
@@ -3327,6 +3367,115 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('applies an ephemeral update on an already activated host', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-update-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    const calls = [];
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push(command);
+        if (command === plan.activationRenewCommand) {
+          await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+          await fs.chmod(plan.activationReceipt, 0o444);
+        }
+        if (command.bin === '/usr/bin/bash') {
+          assert(calls.includes(plan.activationRenewCommand));
+          await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'e'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, false);
+    assert(calls.includes(plan.runnerPolicyCheckCommand));
+    assert(calls.includes(plan.serviceCommand));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"renewed"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects an ephemeral update while runner permission is absent', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-inactive-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"pre-existing"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let policyChecked = false;
+    let serviceRestarted = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'unactivated ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.currentUserPolicyCheckCommand) {
+            policyChecked = true;
+            throw new Error('inactive runner policy rejected');
+          }
+          if (command === plan.serviceCommand) serviceRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'e'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /inactive runner policy rejected/,
+    );
+
+    assert.equal(policyChecked, true);
+    assert.equal(serviceRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects a symlinked activation receipt ancestor during ordinary apply', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-link-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    const receiptParent = path.dirname(plan.activationReceipt);
+    const receiptTarget = path.join(temp, 'real-activation-state');
+    await fs.mkdir(path.dirname(receiptParent), { recursive: true, mode: 0o755 });
+    await fs.mkdir(receiptTarget, { recursive: true, mode: 0o755 });
+    await fs.symlink(receiptTarget, receiptParent);
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /activation receipt must not contain symlink ancestors/,
+    );
+
+    assert.equal(commandRan, false);
+    await assert.rejects(() => fs.access(plan.lockDir), /ENOENT/);
+  });
+
   it('rejects prepare when the live output directory is worker-owned mode 0555', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-prepare-live-test-'));
     const plan = buildDeployPlan(
@@ -3759,7 +3908,8 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(metadata.status, 'installed_without_restart');
     assert.equal(metadata.service_restart_skipped, true);
     assert.equal(metadata.config_revision, 'a'.repeat(40));
-    assert.equal(calls.length, plan.commands.length);
+    assert.equal(calls.length, plan.commands.length + 1);
+    assert.equal(calls.at(-1).command, plan.currentUserPolicyCheckCommand);
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
     assert(calls.every((call) => call.env.PATH === '/usr/bin:/bin'));
