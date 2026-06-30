@@ -359,6 +359,7 @@ pub fn runtime_canary_forbidden_ip_allowed(ip: IpAddr) -> bool {
         && !ip.is_unspecified()
         && !ip.is_multicast()
         && !matches!(ip, IpAddr::V4(ipv4) if ipv4.is_broadcast())
+        && !matches!(ip, IpAddr::V6(ipv6) if ipv6.to_ipv4().is_some())
 }
 
 fn runtime_canary_private_home_fixture_path(root: &str, nonce: &str) -> Result<String> {
@@ -649,6 +650,9 @@ mod tests {
         ));
         assert!(!runtime_canary_forbidden_ip_allowed(
             "127.0.0.1".parse().unwrap()
+        ));
+        assert!(!runtime_canary_forbidden_ip_allowed(
+            "::ffff:127.0.0.1".parse().unwrap()
         ));
         assert!(runtime_canary_credential_path("invalid").is_err());
         assert!(runtime_canary_workspace_fixture_path("invalid").is_err());

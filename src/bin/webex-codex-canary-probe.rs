@@ -876,6 +876,7 @@ mod tests {
         mismatched.host_unix = PathBuf::from("/run/webex-codex-canary/other.sock");
         assert!(validate_host_fixture_paths(&mismatched).is_err());
         assert!(validate_forbidden_address("127.0.0.1:41001").is_err());
+        assert!(validate_forbidden_address("[::ffff:127.0.0.1]:41001").is_err());
         assert!(validate_forbidden_address("0.0.0.0:41001").is_err());
         assert!(validate_forbidden_address("192.0.2.10:41001").is_ok());
         assert!(validate_loopback_address("0.0.0.0:1").is_err());
