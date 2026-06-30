@@ -829,7 +829,7 @@ export async function executePlan({
     throwIfAborted(signal);
     const recovery = await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
     throwIfAborted(signal);
-    if (plan.activateRunner && recovery?.committed) {
+    if (plan.activateRunner && recovery?.committed && recovery.metadata.runner_activation) {
       return recovery.metadata;
     }
     runnerPermissionActive = await detectRunnerPermission(plan, fsApi);
@@ -921,15 +921,26 @@ export async function executePlan({
       } catch (error) {
         const rollbackState = installState;
         installState = null;
+        let renewalStopError = null;
         let rollbackError = null;
         let rollbackDurabilityError = null;
-        try {
-          if (rollbackState.runnerActivation) {
+        if (rollbackState.runnerActivation) {
+          try {
             await stopActivationRenewal(plan, runner, parentEnv);
+          } catch (stopError) {
+            renewalStopError = stopError;
           }
+        }
+        try {
           rollbackDurabilityError = await restoreDeploymentState(plan, rollbackState, fsApi);
         } catch (restoreError) {
-          rollbackError = restoreError;
+          rollbackError = renewalStopError
+            ? errorPreservingDeploymentStatus(
+                restoreError,
+                `${restoreError.message}; failed to stop or verify activation renewal: ${renewalStopError.message}`,
+                renewalStopError,
+              )
+            : restoreError;
         }
         if (rollbackError) {
           const failure = errorPreservingDeploymentStatus(
@@ -954,14 +965,32 @@ export async function executePlan({
           const durabilityFailure = rollbackDurabilityError
             ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
             : '';
+          const renewalStopFailure = renewalStopError
+            ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+            : '';
           const failure = errorPreservingDeploymentStatus(
             error,
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${durabilityFailure}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${renewalStopFailure}${durabilityFailure}`,
             restoreError,
           );
           await recordFailure(
             'failed_restart_rollback_restart_failed',
             failure.message,
+            undefined,
+            failure,
+          );
+          throw failure;
+        }
+        if (renewalStopError) {
+          const reason = `${error.message}; restored previous config and service but failed to stop or verify activation renewal: ${renewalStopError.message}`;
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            reason,
+            renewalStopError,
+          );
+          await recordFailure(
+            'failed_restart_rollback_failed',
+            reason,
             undefined,
             failure,
           );
@@ -2811,23 +2840,62 @@ async function rollbackCandidateConfig(plan, installState, fsApi) {
 }
 
 async function rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi) {
+  let renewalStopError = null;
   if (installState.runnerActivation && installState.phase !== 'prepared') {
-    await stopActivationRenewal(plan, runner, parentEnv);
+    try {
+      await stopActivationRenewal(plan, runner, parentEnv);
+    } catch (error) {
+      renewalStopError = error;
+    }
   }
-  const durabilityError = await restoreDeploymentState(plan, installState, fsApi);
+  let durabilityError = null;
+  let restoreError = null;
+  try {
+    durabilityError = await restoreDeploymentState(plan, installState, fsApi);
+  } catch (error) {
+    restoreError = error;
+  }
+  if (restoreError) {
+    if (renewalStopError) {
+      throw errorPreservingDeploymentStatus(
+        restoreError,
+        `${restoreError.message}; failed to stop or verify activation renewal: ${renewalStopError.message}`,
+        renewalStopError,
+      );
+    }
+    throw restoreError;
+  }
   if (installState.phase === 'service_transition_started') {
     try {
       await runServiceRollback(plan, installState, runner, parentEnv);
     } catch (error) {
-      if (durabilityError) {
+      const rollbackFailures = [
+        renewalStopError
+          ? `activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+          : null,
+        durabilityError
+          ? `config rollback durability also failed: ${durabilityError.message}`
+          : null,
+      ].filter(Boolean);
+      if (rollbackFailures.length > 0) {
         throw errorPreservingDeploymentStatus(
           error,
-          `${error.message}; config rollback durability also failed: ${durabilityError.message}`,
-          durabilityError,
+          `${error.message}; ${rollbackFailures.join('; ')}`,
+          renewalStopError ?? durabilityError,
         );
       }
       throw error;
     }
+  }
+  if (renewalStopError) {
+    const durabilityFailure = durabilityError
+      ? `; config rollback durability also failed: ${durabilityError.message}`
+      : '';
+    throw errorPreservingDeploymentStatus(
+      renewalStopError,
+      `failed to stop or verify activation renewal during rollback: ${renewalStopError.message}${durabilityFailure}`,
+      durabilityError,
+    );
   }
   if (durabilityError) {
     throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
@@ -3599,6 +3667,7 @@ function allPlanCommands(plan) {
       plan.activationStopCommand,
       plan.activationStateCommand,
       plan.activationConfigCheckCommand,
+      plan.runnerPolicyCheckCommand,
       plan.daemonReloadCommand,
       plan.serviceCommand,
       ...plan.serviceVerificationCommands,

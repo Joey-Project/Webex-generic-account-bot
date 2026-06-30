@@ -100,6 +100,10 @@ superseded_by:
   prevention after permission activation. The explicit command refuses a
   repeated activation once the permission drop-in is installed; boot renewal
   and later ordinary ephemeral-only config applies own subsequent lifecycle.
+  Renewal stop verification cannot suppress three-state or old-service
+  recovery, and an unresolved stop leaves the recovery journal in place.
+  Committed legacy apply recovery continues into an explicitly requested
+  activation instead of returning ordinary deployment metadata as success.
   The production host still requires
   a matching reviewed config and a successful real-reboot canary run.
 

@@ -378,7 +378,12 @@ config followed by the exact minimal permission drop-in, run `daemon-reload`,
 restart the bot, and verify systemd plus `/healthz` readiness. Failure before
 the commit point stops and verifies the renewal unit, restores all three
 states, reloads systemd, and verifies the old service. A canary failure leaves
-no stale receipt. Version 1 deployment journals remain recoverable.
+no stale receipt. A renewal stop or inactive-verification failure does not
+skip three-state restoration or old-service recovery; the apply still fails
+and retains its journal for a later recovery retry. Version 1 deployment
+journals remain recoverable, and an explicit activation continues after
+finalising a committed ordinary deployment instead of treating it as an
+activated runner.
 
 The activation unit remains active after a successful oneshot. The bot drop-in
 requires it and orders bot startup after it, so a real boot regenerates the
