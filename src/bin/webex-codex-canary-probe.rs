@@ -27,7 +27,8 @@ use webex_generic_account_bot::{
         RUNTIME_CANARY_CHECKS, RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT,
         RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT, RUNTIME_CANARY_SUITE, RuntimeCanaryFixtureInputs,
         RuntimeCanaryReport, runtime_canary_codex_home_fixture_path,
-        runtime_canary_credential_path, runtime_canary_fixture_binding,
+        runtime_canary_credential_path, runtime_canary_final_output_fixture_path,
+        runtime_canary_fixture_binding, runtime_canary_forbidden_ip_allowed,
         runtime_canary_main_home_fixture_path, runtime_canary_workspace_fixture_path,
         validate_runtime_canary_nonce,
     },
@@ -72,7 +73,7 @@ struct Cli {
     main_pid: u32,
     #[arg(long, value_parser = validate_digest)]
     fd_secret_sha256: String,
-    #[arg(long, value_parser = validate_loopback_address)]
+    #[arg(long, value_parser = validate_forbidden_address)]
     forbidden_tcp: SocketAddr,
     #[arg(long, value_parser = validate_loopback_address)]
     bot_tcp: SocketAddr,
@@ -117,7 +118,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "final_output_denied".to_owned(),
-        final_output_path_denied(Path::new(FINAL_OUTPUT_PATH)),
+        final_output_path_denied(Path::new(FINAL_OUTPUT_PATH), &cli.nonce),
     );
     checks.insert(
         "forbidden_network_denied".to_owned(),
@@ -205,6 +206,23 @@ fn validate_loopback_address(value: &str) -> std::result::Result<SocketAddr, Str
         .map_err(|_| "canary TCP endpoint is invalid".to_owned())?;
     if !address.ip().is_loopback() || address.port() == 0 {
         return Err("canary TCP endpoint must be a nonzero loopback address".to_owned());
+    }
+    Ok(address)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_forbidden_address(value: &str) -> std::result::Result<SocketAddr, String> {
+    let address = value
+        .parse::<SocketAddr>()
+        .map_err(|_| "forbidden canary TCP endpoint is invalid".to_owned())?;
+    if address.port() == 0 || !runtime_canary_forbidden_ip_allowed(address.ip()) {
+        return Err(
+            "forbidden canary TCP endpoint must be a nonzero non-loopback unicast address"
+                .to_owned(),
+        );
+    }
+    if address.to_string() != value {
+        return Err("forbidden canary TCP endpoint must be canonical".to_owned());
     }
     Ok(address)
 }
@@ -303,8 +321,14 @@ fn protected_file_boundary_denied(path: &Path, nonce: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn final_output_path_denied(path: &Path) -> bool {
-    path_denied(path) && create_file_denied(path)
+fn final_output_path_denied(path: &Path, nonce: &str) -> bool {
+    let Ok(fixture) = runtime_canary_final_output_fixture_path(nonce) else {
+        return false;
+    };
+    path_denied(path)
+        && create_file_denied(path)
+        && file_access_denied(Path::new(&fixture))
+        && remove_file_denied(Path::new(&fixture))
 }
 
 #[cfg(target_os = "linux")]
@@ -825,7 +849,7 @@ mod tests {
     const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn cli_accepts_only_the_fixed_suite_and_loopback_endpoints() {
+    fn cli_accepts_only_fixed_non_loopback_and_loopback_endpoints() {
         let cli = Cli::try_parse_from([
             "probe",
             RUNTIME_CANARY_SUITE,
@@ -836,7 +860,7 @@ mod tests {
             "--fd-secret-sha256",
             NONCE,
             "--forbidden-tcp",
-            "127.0.0.1:41001",
+            "192.0.2.10:41001",
             "--bot-tcp",
             "127.0.0.1:41002",
             "--host-unix",
@@ -851,6 +875,9 @@ mod tests {
         let mut mismatched = cli;
         mismatched.host_unix = PathBuf::from("/run/webex-codex-canary/other.sock");
         assert!(validate_host_fixture_paths(&mismatched).is_err());
+        assert!(validate_forbidden_address("127.0.0.1:41001").is_err());
+        assert!(validate_forbidden_address("0.0.0.0:41001").is_err());
+        assert!(validate_forbidden_address("192.0.2.10:41001").is_ok());
         assert!(validate_loopback_address("0.0.0.0:1").is_err());
         assert!(validate_loopback_address("127.0.0.1:0").is_err());
         assert!(validate_suite("other").is_err());
@@ -885,7 +912,7 @@ mod tests {
             std::process::id()
         ));
         assert!(path_denied(&missing));
-        assert!(!final_output_path_denied(&missing));
+        assert!(!final_output_path_denied(&missing, NONCE));
         assert!(!missing.exists());
         fs::write(&missing, NONCE).unwrap();
         assert!(!remove_file_denied(&missing));

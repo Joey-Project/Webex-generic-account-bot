@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+};
 
 use anyhow::{Result, anyhow};
 use ring::digest::{SHA256, digest};
@@ -65,6 +68,10 @@ pub struct RuntimeCanaryHostEvidence {
     pub codex_home_fixture_regular_file_after: bool,
     pub codex_home_fixture_identity_unchanged: bool,
     pub codex_home_fixture_contents_unchanged: bool,
+    pub final_output_fixture_regular_file_before: bool,
+    pub final_output_fixture_regular_file_after: bool,
+    pub final_output_fixture_identity_unchanged: bool,
+    pub final_output_fixture_contents_unchanged: bool,
     pub workspace_fixture_regular_file_before: bool,
     pub workspace_fixture_regular_file_after: bool,
     pub workspace_fixture_identity_unchanged: bool,
@@ -106,6 +113,10 @@ impl RuntimeCanaryHostEvidence {
             || !self.codex_home_fixture_regular_file_after
             || !self.codex_home_fixture_identity_unchanged
             || !self.codex_home_fixture_contents_unchanged
+            || !self.final_output_fixture_regular_file_before
+            || !self.final_output_fixture_regular_file_after
+            || !self.final_output_fixture_identity_unchanged
+            || !self.final_output_fixture_contents_unchanged
             || !self.workspace_fixture_regular_file_before
             || !self.workspace_fixture_regular_file_after
             || !self.workspace_fixture_identity_unchanged
@@ -284,7 +295,7 @@ pub fn runtime_canary_fixture_binding(
     let expected_host_unix = format!("{RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT}/{nonce}.sock");
     let expected_host_protected = format!("{RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT}/{nonce}");
     if !(2..=i32::MAX as u32).contains(&inputs.main_pid)
-        || !forbidden_tcp.ip().is_loopback()
+        || !runtime_canary_forbidden_ip_allowed(forbidden_tcp.ip())
         || forbidden_tcp.port() == 0
         || inputs.forbidden_tcp != forbidden_tcp.to_string()
         || !bot_tcp.ip().is_loopback()
@@ -334,6 +345,20 @@ pub fn runtime_canary_main_home_fixture_path(nonce: &str) -> Result<String> {
 
 pub fn runtime_canary_codex_home_fixture_path(nonce: &str) -> Result<String> {
     runtime_canary_private_home_fixture_path("/tmp/webex-codex-main", nonce)
+}
+
+pub fn runtime_canary_final_output_fixture_path(nonce: &str) -> Result<String> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(format!(
+        "/tmp/webex-codex-main/.webex-codex-final-output-canary-{nonce}"
+    ))
+}
+
+pub fn runtime_canary_forbidden_ip_allowed(ip: IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, IpAddr::V4(ipv4) if ipv4.is_broadcast())
 }
 
 fn runtime_canary_private_home_fixture_path(root: &str, nonce: &str) -> Result<String> {
@@ -391,7 +416,7 @@ mod tests {
         RuntimeCanaryFixtureInputs {
             main_pid: 42,
             fd_secret_sha256: "1".repeat(64),
-            forbidden_tcp: "127.0.0.1:41001".to_owned(),
+            forbidden_tcp: "192.0.2.10:41001".to_owned(),
             bot_tcp: "127.0.0.1:41002".to_owned(),
             host_unix: format!("/run/webex-codex-canary/{NONCE}.sock"),
             host_protected_path: format!(
@@ -424,6 +449,10 @@ mod tests {
             codex_home_fixture_regular_file_after: true,
             codex_home_fixture_identity_unchanged: true,
             codex_home_fixture_contents_unchanged: true,
+            final_output_fixture_regular_file_before: true,
+            final_output_fixture_regular_file_after: true,
+            final_output_fixture_identity_unchanged: true,
+            final_output_fixture_contents_unchanged: true,
             workspace_fixture_regular_file_before: true,
             workspace_fixture_regular_file_after: true,
             workspace_fixture_identity_unchanged: true,
@@ -533,6 +562,14 @@ mod tests {
                 .is_err()
         );
 
+        let mut missing_final_output_fixture = passing_host_evidence();
+        missing_final_output_fixture.final_output_fixture_regular_file_before = false;
+        assert!(
+            report
+                .ensure_success(NONCE, &binding, &missing_final_output_fixture)
+                .is_err()
+        );
+
         let mut replaced_protected_path = passing_host_evidence();
         replaced_protected_path.protected_path_identity_unchanged = false;
         assert!(
@@ -568,6 +605,10 @@ mod tests {
         assert!(runtime_canary_fixture_binding(NONCE, &inputs).is_err());
 
         let mut inputs = fixture_inputs();
+        inputs.forbidden_tcp = "127.0.0.1:41001".to_owned();
+        assert!(runtime_canary_fixture_binding(NONCE, &inputs).is_err());
+
+        let mut inputs = fixture_inputs();
         inputs.bot_tcp = inputs.forbidden_tcp.clone();
         assert!(runtime_canary_fixture_binding(NONCE, &inputs).is_err());
 
@@ -599,10 +640,21 @@ mod tests {
             runtime_canary_codex_home_fixture_path(NONCE).unwrap(),
             format!("/tmp/webex-codex-main/.webex-codex-canary-{NONCE}")
         );
+        assert_eq!(
+            runtime_canary_final_output_fixture_path(NONCE).unwrap(),
+            format!("/tmp/webex-codex-main/.webex-codex-final-output-canary-{NONCE}")
+        );
+        assert!(runtime_canary_forbidden_ip_allowed(
+            "192.0.2.10".parse().unwrap()
+        ));
+        assert!(!runtime_canary_forbidden_ip_allowed(
+            "127.0.0.1".parse().unwrap()
+        ));
         assert!(runtime_canary_credential_path("invalid").is_err());
         assert!(runtime_canary_workspace_fixture_path("invalid").is_err());
         assert!(runtime_canary_main_home_fixture_path("invalid").is_err());
         assert!(runtime_canary_codex_home_fixture_path("invalid").is_err());
+        assert!(runtime_canary_final_output_fixture_path("invalid").is_err());
     }
 
     #[test]

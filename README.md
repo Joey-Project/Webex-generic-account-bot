@@ -837,18 +837,20 @@ A successful probe report is not standalone activation evidence. Before the
 4c2a2 harness starts Codex, it must use the nonce as the run ID, create a
 nonce-scoped protected regular file and nested read-only workspace fixture,
 verify the derived systemd credential file, create nonce-scoped regular files
-inside both private main-process homes, verify live Unix/TCP listener fixtures,
-and pass the exact nonce and endpoints in the pinned command. The inner probe
-must read the nested workspace fixture without opening it for write or creating
-files beside it, and must be denied read and write access to the exact derived
-credential and private-home files. It must also be unable to create sibling
-entries or unlink disposable fixtures in credential, private-home, protected,
-or workspace directories. After Codex exits, the harness must prove the files
-retained the same regular-file identity and contents, the listeners remained
-live, and denied listeners accepted zero connections. A missing, replaced,
-modified, unhealthy, or accepted fixture invalidates the run even if the inner
-probe reported `true`; the receipt writer must never consume the inner report
-without these host-side preconditions.
+inside both private main-process homes, create a real final-output sibling
+fixture, verify live Unix/TCP listener fixtures, and pass the exact nonce and
+endpoints in the pinned command. The forbidden TCP listener must use a
+controlled non-loopback unicast address; the bot listener remains loopback.
+The inner probe must read the nested workspace fixture without opening it for
+write or creating files beside it, and must be denied read and write access to
+the exact derived credential, private-home, and final-output fixture files. It
+must also be unable to create sibling entries or unlink disposable fixtures in
+credential, private-home, protected, or workspace directories. After Codex
+exits, the harness must prove the files retained the same regular-file identity
+and contents, the listeners remained live, and denied listeners accepted zero
+connections. A missing, replaced, modified, unhealthy, or accepted fixture
+invalidates the run even if the inner probe reported `true`; the receipt writer
+must never consume the inner report without these host-side preconditions.
 
 The report binds the nonce, main PID, descriptor-secret digest, both TCP
 endpoints, and both nonce-derived host paths into `fixture_binding`. The final
@@ -857,10 +859,11 @@ requires matching host evidence with before/after liveness and zero accept
 counts for the instrumented host Unix and TCP fixtures. It also requires the
 credential, protected-path, and workspace fixtures to retain the same
 regular-file identity, requires private-home and workspace fixture contents to
-remain unchanged, and requires the fixed launcher and config-worker sockets to
-remain live before and after the probe. The process boundary directly checks
-`ptrace`, `kcmp`, `process_vm_readv`, and `process_vm_writev`; parsing a
-boolean-only inner report can never establish success. The privilege check
+remain unchanged, requires the real final-output sibling fixture to retain its
+identity and contents, and requires the fixed launcher and config-worker
+sockets to remain live before and after the probe. The process boundary
+directly checks `ptrace`, `kcmp`, `process_vm_readv`, and `process_vm_writev`;
+parsing a boolean-only inner report can never establish success. The privilege check
 covers every prompt-executable image path: BusyBox, the canary probe, and
 `rg`. The absent final-output path must also reject an actual `create_new`
 attempt, so `NotFound` alone cannot prove output isolation. Socket connection
