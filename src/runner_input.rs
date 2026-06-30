@@ -22,6 +22,7 @@ use ring::{
 };
 
 use crate::{
+    canary_protocol::validate_runtime_canary_nonce,
     input_sealer::{CODEX_PENDING_INPUT_ROOT, ensure_posix_acl_absent},
     isolated_execution::production_codex_group_ids,
     launcher_protocol::{
@@ -134,7 +135,41 @@ pub(crate) async fn stage_workspace(
                 effective_uid(),
                 groups.launch,
                 &message_id,
+                None,
                 evidence_root.as_deref(),
+                Limits {
+                    deadline: Some(deadline),
+                    ..Limits::default()
+                },
+            )
+        },
+    )
+    .await?
+}
+
+pub(crate) async fn stage_runtime_canary_workspace(
+    run_id: &str,
+    evidence_root: &Path,
+) -> Result<PendingWorkspace> {
+    validate_runtime_canary_nonce(run_id)?;
+    let run_id = run_id.to_owned();
+    let evidence_root = evidence_root.to_path_buf();
+    let deadline = WorkBudget::after(std::time::Duration::from_secs(
+        INPUT_STAGING_WORK_TIMEOUT_SECONDS,
+    ));
+    run_blocking_with_process_watchdog(
+        "runtime canary workspace staging",
+        std::time::Duration::from_secs(INPUT_STAGING_PROCESS_TIMEOUT_SECONDS),
+        move || {
+            let groups = production_codex_group_ids()?;
+            stage_workspace_at(
+                Path::new(CODEX_PENDING_INPUT_ROOT),
+                0,
+                effective_uid(),
+                groups.launch,
+                "runtime-canary",
+                Some(&run_id),
+                Some(&evidence_root),
                 Limits {
                     deadline: Some(deadline),
                     ..Limits::default()
@@ -253,6 +288,7 @@ fn stage_workspace_at(
     source_uid: u32,
     launch_gid: u32,
     message_id: &str,
+    requested_run_id: Option<&str>,
     evidence_root: Option<&Path>,
     limits: Limits,
 ) -> Result<PendingWorkspace> {
@@ -282,8 +318,13 @@ fn stage_workspace_at(
         }
     }
 
-    let (run_id, workspace_name, workspace, workspace_identity) =
-        create_run_directory(&pending_root, message_id, source_uid, launch_gid)?;
+    let (run_id, workspace_name, workspace, workspace_identity) = create_run_directory(
+        &pending_root,
+        message_id,
+        requested_run_id,
+        source_uid,
+        launch_gid,
+    )?;
     let result = (|| {
         if let Some(source) = &source {
             let mut state = CopyState {
@@ -380,55 +421,72 @@ fn validate_pending_root(
 fn create_run_directory(
     pending_root: &File,
     message_id: &str,
+    requested_run_id: Option<&str>,
     source_uid: u32,
     launch_gid: u32,
 ) -> Result<(String, CString, File, ObjectIdentity)> {
+    if let Some(run_id) = requested_run_id {
+        validate_runtime_canary_nonce(run_id)?;
+        return create_named_run_directory(pending_root, run_id, source_uid, launch_gid);
+    }
     let random = SystemRandom::new();
     for _ in 0..RUN_ID_ATTEMPTS {
         let run_id = generate_run_id(message_id, &random)?;
-        let name = CString::new(run_id.as_bytes()).expect("generated run id contains no NUL");
-        // SAFETY: the held parent descriptor and generated component are valid.
-        if unsafe {
-            libc::mkdirat(
-                pending_root.as_raw_fd(),
-                name.as_ptr(),
-                PRIVATE_DIRECTORY_MODE,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
+        match create_named_run_directory(pending_root, &run_id, source_uid, launch_gid) {
+            Ok(created) => return Ok(created),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error)
+                    == Some(libc::EEXIST) =>
+            {
                 continue;
             }
-            return Err(error).context("failed to create a pending workspace");
+            Err(error) => return Err(error),
         }
-
-        let setup = (|| {
-            let workspace = open_directory_at(pending_root.as_raw_fd(), &name, true)?;
-            set_mode(workspace.as_raw_fd(), PRIVATE_DIRECTORY_MODE)?;
-            validate_destination_directory(
-                &workspace,
-                source_uid,
-                launch_gid,
-                PRIVATE_DIRECTORY_MODE,
-            )?;
-            let identity = stat_fd(workspace.as_raw_fd())?.identity();
-            Ok((workspace, identity))
-        })();
-        return match setup {
-            Ok((workspace, identity)) => Ok((run_id, name, workspace, identity)),
-            Err(error) => {
-                let cleanup = unlink_at(pending_root.as_raw_fd(), &name, libc::AT_REMOVEDIR);
-                match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(anyhow!(
-                        "{error:#}; failed to clean new pending workspace: {cleanup_error}"
-                    )),
-                }
-            }
-        };
     }
     bail!("failed to allocate a unique pending workspace")
+}
+
+fn create_named_run_directory(
+    pending_root: &File,
+    run_id: &str,
+    source_uid: u32,
+    launch_gid: u32,
+) -> Result<(String, CString, File, ObjectIdentity)> {
+    let name = CString::new(run_id.as_bytes()).map_err(|_| anyhow!("run id contains NUL"))?;
+    // SAFETY: the held parent descriptor and generated component are valid.
+    if unsafe {
+        libc::mkdirat(
+            pending_root.as_raw_fd(),
+            name.as_ptr(),
+            PRIVATE_DIRECTORY_MODE,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(error).context("failed to create a pending workspace");
+    }
+
+    let setup = (|| {
+        let workspace = open_directory_at(pending_root.as_raw_fd(), &name, true)?;
+        set_mode(workspace.as_raw_fd(), PRIVATE_DIRECTORY_MODE)?;
+        validate_destination_directory(&workspace, source_uid, launch_gid, PRIVATE_DIRECTORY_MODE)?;
+        let identity = stat_fd(workspace.as_raw_fd())?.identity();
+        Ok((workspace, identity))
+    })();
+    match setup {
+        Ok((workspace, identity)) => Ok((run_id.to_owned(), name, workspace, identity)),
+        Err(error) => {
+            let cleanup = unlink_at(pending_root.as_raw_fd(), &name, libc::AT_REMOVEDIR);
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(anyhow!(
+                    "{error:#}; failed to clean new pending workspace: {cleanup_error}"
+                )),
+            }
+        }
+    }
 }
 
 fn generate_run_id(message_id: &str, random: &SystemRandom) -> Result<String> {
@@ -1022,6 +1080,19 @@ mod tests {
             self.stage_with_limits(message_id, evidence, Limits::default())
         }
 
+        fn stage_runtime_canary(&self, run_id: &str, evidence: &Path) -> Result<PendingWorkspace> {
+            stage_workspace_at(
+                &self.pending,
+                self.uid,
+                self.uid,
+                self.gid,
+                "runtime-canary",
+                Some(run_id),
+                Some(evidence),
+                Limits::default(),
+            )
+        }
+
         fn stage_with_limits(
             &self,
             message_id: &str,
@@ -1034,6 +1105,7 @@ mod tests {
                 self.uid,
                 self.gid,
                 message_id,
+                None,
                 evidence,
                 limits,
             )
@@ -1102,6 +1174,26 @@ mod tests {
             );
             assert!(!run_id.contains("same-message"));
         }
+    }
+
+    #[test]
+    fn runtime_canary_uses_only_the_validated_nonce_as_its_run_id() {
+        const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let fixture = Fixture::new();
+        let evidence = fixture.evidence("runtime-canary-evidence");
+        fs::write(evidence.join("probe.txt"), b"runtime canary\n").unwrap();
+
+        let staged = fixture.stage_runtime_canary(NONCE, &evidence).unwrap();
+        assert_eq!(staged.run_id(), NONCE);
+        assert_eq!(
+            fs::read(staged.pending_path().join("probe.txt")).unwrap(),
+            b"runtime canary\n"
+        );
+        assert!(
+            fixture
+                .stage_runtime_canary("run-invalid", &evidence)
+                .is_err()
+        );
     }
 
     #[test]

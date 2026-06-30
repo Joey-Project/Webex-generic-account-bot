@@ -97,8 +97,10 @@ const GENERATED_FILES = new Map([
   ['/etc/resolv.conf', 'runtime placeholder\n'],
 ]);
 const REQUIRED_DIRECTORIES = new Set([
+  '/run/webex-codex-canary',
   '/tmp',
   '/var',
+  '/var/lib/webex-generic-account-bot/canary-fixtures',
   '/var/tmp',
   '/workspace',
 ]);
@@ -930,6 +932,7 @@ async function fsyncFile(file) {
 function expectedDirectories(manifest) {
   const directories = new Set(REQUIRED_DIRECTORIES);
   const destinations = [
+    ...directories,
     ...manifest.files.map((entry) => entry.destination),
     ...manifest.symlinks.map((entry) => entry.destination),
     ...GENERATED_FILES.keys(),

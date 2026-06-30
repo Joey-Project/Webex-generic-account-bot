@@ -60,10 +60,14 @@
   `current-user` until PR 4c2 mints a receipt after live capability canaries
   pass and atomically installs the minimum launcher/pending-path access.
 - Runner PR 4c2a1 adds the exact runtime-boundary canary report schema and a
-  static syscall probe to the immutable image allowlist. It does not yet parse
-  Codex JSONL, run host lifecycle canaries, mint a receipt, install bot
-  permissions, or remove the ephemeral activation gate. Those remain split
-  between PR 4c2a2 and PR 4c2b.
+  static syscall probe to the immutable image allowlist.
+- Runner PR 4c2a2 adds strict pinned-Codex JSONL command-event validation,
+  trusted runtime-interior evidence, nonce-scoped host file and listener
+  evidence, timeout and launcher owner-crash lifecycle checks, a pidfd-backed
+  bot peer-exit supervisor check, a real-reboot challenge, and root-only atomic
+  receipt renewal. The renewal unit remains inactive by default, grants no bot
+  group access, and does not remove the ephemeral activation gate.
+  Transactional permission and configuration activation remains PR 4c2b.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
@@ -72,14 +76,11 @@
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- PR 4c2a2 and PR 4c2b must still deliver live production canaries and
-  transactional activation. They must
-  prove the inner
-  Codex/bwrap credential, post-exec process
-  memory and `/proc`, inherited descriptor, and network boundaries against the
-  production image and host kernel policy before activating the runner. Static
-  PR 4b preflight and the unused 4c1b sealer are not substitutes for those
-  canaries.
+- PR 4c2b must run PR 4c2a2's opt-in root/systemd canaries against the installed
+  production image and host kernel, satisfy the real-reboot challenge, and
+  transactionally install bot permissions plus ephemeral-only configuration.
+  Static PR 4b preflight and unit-only evidence are not substitutes for that
+  deployment-host gate.
 - Production config does not enable `ephemeral-linux-user`, `/config pull`,
   `/config reload`, or `/config sync` before PR 4c2 activation.
 

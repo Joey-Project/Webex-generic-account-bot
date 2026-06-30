@@ -18,6 +18,10 @@ const ACTIVATION_TMPFILES_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-codex-activation.tmpfiles.conf',
 );
+const ACTIVATION_RENEW_SERVICE_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-codex-activation-renew.service',
+);
 const INPUT_STAGING_TMPFILES_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-codex-input-staging.tmpfiles.conf',
@@ -185,11 +189,136 @@ describe('Codex launcher systemd boundary', () => {
     );
   });
 
-  it('provisions only the root-owned boot-scoped activation directory', async () => {
+  it('provisions only the root-owned activation and canary fixture roots', async () => {
     const tmpfiles = await fs.readFile(ACTIVATION_TMPFILES_PATH, 'utf8');
 
-    assert.equal(tmpfiles, 'd /run/webex-codex-activation 0755 root root -\n');
+    assert.equal(
+      tmpfiles,
+      [
+        'd /run/webex-codex-activation 0755 root root -',
+        'd /run/webex-codex-canary 0700 root root -',
+        'd /var/lib/webex-generic-account-bot/canary-fixtures 0700 root root -',
+        '',
+      ].join('\n'),
+    );
     assert.doesNotMatch(tmpfiles, /receipt\.json/);
+  });
+
+  it('keeps activation renewal root-only, bounded, and inactive by default', async () => {
+    const service = await fs.readFile(ACTIVATION_RENEW_SERVICE_PATH, 'utf8');
+
+    assert.deepEqual(directiveValues(service, 'Wants'), ['network-online.target']);
+    assert.deepEqual(directiveValues(service, 'Requires'), [
+      'webex-codex-launcher.socket webex-config-pull-worker.service',
+    ]);
+    assert.deepEqual(directiveValues(service, 'After'), [
+      'network-online.target systemd-tmpfiles-setup.service webex-codex-launcher.socket webex-config-pull-worker.service',
+    ]);
+    assert.deepEqual(directiveValues(service, 'Before'), [
+      'webex-generic-account-bot.service',
+    ]);
+    assert.deepEqual(directiveValues(service, 'ConditionPathExists'), [
+      '/sys/fs/cgroup/cgroup.controllers',
+    ]);
+    assert.deepEqual(directiveValues(service, 'Type'), ['oneshot']);
+    assert.deepEqual(directiveValues(service, 'RemainAfterExit'), ['no']);
+    assert.deepEqual(directiveValues(service, 'User'), ['root']);
+    assert.deepEqual(directiveValues(service, 'Group'), ['root']);
+    assert.deepEqual(directiveValues(service, 'WorkingDirectory'), ['/']);
+    assert.deepEqual(directiveValues(service, 'ExecStart'), [
+      '/opt/webex-generic-account-bot/bin/webex-codex-activation renew',
+    ]);
+    assert.deepEqual(directiveValues(service, 'Restart'), ['no']);
+    assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['5400s']);
+    assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);
+    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['5400s']);
+    assert.deepEqual(directiveValues(service, 'KillMode'), ['control-group']);
+    assert.deepEqual(directiveValues(service, 'OOMPolicy'), ['kill']);
+    assert.deepEqual(directiveValues(service, 'UMask'), ['0077']);
+    assert.deepEqual(directiveValues(service, 'StandardInput'), ['null']);
+    assert.deepEqual(directiveValues(service, 'StandardOutput'), ['journal']);
+    assert.deepEqual(directiveValues(service, 'StandardError'), ['journal']);
+    assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), [
+      'webex-config-pull',
+    ]);
+    assert.deepEqual(directiveValues(service, 'WantedBy'), []);
+    assert.doesNotMatch(service, /^EnvironmentFile=/m);
+    assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
+    for (const directive of ['Requires', 'Wants', 'After', 'PartOf', 'WantedBy']) {
+      assert.equal(
+        directiveValues(service, directive).some((value) =>
+          value.split(/\s+/).includes('webex-generic-account-bot.service')
+        ),
+        false,
+        `${directive} must not pull in the bot service`,
+      );
+    }
+    assert.doesNotMatch(service, /^WantedBy=.*\.target$/m);
+    assert.doesNotMatch(service, /^\[Install\]$/m);
+  });
+
+  it('hardens renewal without hiding host canary evidence or manager access', async () => {
+    const service = await fs.readFile(ACTIVATION_RENEW_SERVICE_PATH, 'utf8');
+    const requiredHardening = {
+      NoNewPrivileges: 'true',
+      ProtectSystem: 'strict',
+      ProtectHome: 'true',
+      PrivateTmp: 'true',
+      PrivateDevices: 'true',
+      PrivateIPC: 'true',
+      PrivateNetwork: 'false',
+      ProtectClock: 'true',
+      ProtectControlGroups: 'true',
+      ProtectHostname: 'true',
+      ProtectKernelLogs: 'true',
+      ProtectKernelModules: 'true',
+      ProtectKernelTunables: 'true',
+      ProtectProc: 'default',
+      ProcSubset: 'all',
+      RestrictNamespaces: 'true',
+      RestrictRealtime: 'true',
+      RestrictSUIDSGID: 'true',
+      LockPersonality: 'true',
+      MemoryDenyWriteExecute: 'true',
+      CapabilityBoundingSet: 'CAP_CHOWN',
+      AmbientCapabilities: '',
+      SystemCallArchitectures: 'native',
+      KeyringMode: 'private',
+    };
+    for (const [directive, value] of Object.entries(requiredHardening)) {
+      assert.deepEqual(directiveValues(service, directive), [value], directive);
+    }
+
+    assert.deepEqual(directiveValues(service, 'ReadOnlyPaths'), [
+      '/proc',
+      '/run/systemd',
+    ]);
+    assert.deepEqual(directiveValues(service, 'ReadWritePaths'), [
+      '/run/webex-codex-activation',
+      '/run/webex-codex-canary',
+      '/var/lib/webex-generic-account-bot/codex-input-staging',
+      '/var/lib/webex-generic-account-bot/canary-fixtures',
+      '/var/lib/webex-codex-runtime-inputs',
+    ]);
+    assert.deepEqual(directiveValues(service, 'BindPaths'), []);
+    assert.deepEqual(directiveValues(service, 'BindReadOnlyPaths'), []);
+    assert.deepEqual(directiveValues(service, 'RestrictAddressFamilies'), []);
+    assert.deepEqual(directiveValues(service, 'IPAddressAllow'), []);
+    assert.deepEqual(directiveValues(service, 'IPAddressDeny'), []);
+    assert.deepEqual(directiveValues(service, 'NetworkNamespacePath'), []);
+    assert.doesNotMatch(service, /^InaccessiblePaths=.*(?:\/proc|\/run\/systemd)/m);
+    assert.doesNotMatch(service, /^PrivateUsers=true$/m);
+    assert.doesNotMatch(
+      service,
+      /^(?:RuntimeDirectory|StateDirectory|CacheDirectory|LogsDirectory)=/m,
+    );
+    assert.deepEqual(directiveValues(service, 'TasksMax'), ['128']);
+    assert.deepEqual(directiveValues(service, 'CPUQuota'), ['200%']);
+    assert.deepEqual(directiveValues(service, 'LimitNOFILE'), ['256']);
+    assert.deepEqual(directiveValues(service, 'LimitNPROC'), ['128']);
+    assert.deepEqual(directiveValues(service, 'LimitFSIZE'), ['64M']);
+    assert.deepEqual(directiveValues(service, 'MemoryMax'), ['512M']);
+    assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });
 
   it('keeps systemd and process verification visible without writable host paths', async () => {
@@ -292,6 +421,8 @@ describe('Codex launcher systemd boundary', () => {
           RUNTIME_SYSUSERS_PATH,
           RUNTIME_TMPFILES_PATH,
           INPUT_STAGING_TMPFILES_PATH,
+          ACTIVATION_TMPFILES_PATH,
+          ACTIVATION_RENEW_SERVICE_PATH,
         ].map((file) => fs.readFile(file, 'utf8')),
       ),
       readTextFilesRecursively(BOT_DROP_IN_ROOT),
@@ -336,6 +467,10 @@ describe('Codex launcher systemd boundary', () => {
     )[0];
     const productionLauncherModule = launcherModule.split(
       '#[cfg(all(test, target_os = "linux"))]',
+      1,
+    )[0];
+    const productionIsolatedExecution = isolatedExecution.split(
+      '#[cfg(all(test, target_os = "linux"))]\nmod tests {',
       1,
     )[0];
 
@@ -392,7 +527,11 @@ describe('Codex launcher systemd boundary', () => {
     );
     assert.match(isolatedExecution, /Command::new\(plan\.executable\)/);
     assert.match(isolatedExecution, /Command::new\(SYSTEMCTL_PATH\)/);
-    assert.equal((isolatedExecution.match(/Command::new\(/g) ?? []).length, 2);
+    assert.equal(
+      (productionIsolatedExecution.match(/Command::new\(plan\.executable\)/g) ?? []).length,
+      2,
+    );
+    assert.equal((productionIsolatedExecution.match(/Command::new\(/g) ?? []).length, 3);
     assert.match(isolatedExecution, /\.stdin\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stdout\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stderr\(Stdio::piped\(\)\)/);
