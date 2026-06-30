@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as _, MapAccess, Visitor},
+};
 
 pub const RUNTIME_CANARY_SCHEMA_VERSION: u16 = 1;
 pub const RUNTIME_CANARY_SUITE: &str = "runtime-boundary-v1";
@@ -31,8 +34,43 @@ pub struct RuntimeCanaryReport {
     pub schema_version: u16,
     pub suite: String,
     pub nonce: String,
+    #[serde(deserialize_with = "deserialize_runtime_canary_checks")]
     pub checks: BTreeMap<String, bool>,
     pub final_line: String,
+}
+
+fn deserialize_runtime_canary_checks<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RuntimeCanaryChecksVisitor;
+
+    impl<'de> Visitor<'de> for RuntimeCanaryChecksVisitor {
+        type Value = BTreeMap<String, bool>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("the exact runtime canary check map without duplicate keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut checks = BTreeMap::new();
+            while let Some((name, passed)) = map.next_entry::<String, bool>()? {
+                if checks.insert(name.clone(), passed).is_some() {
+                    return Err(A::Error::custom(format!(
+                        "runtime canary check `{name}` is duplicated"
+                    )));
+                }
+            }
+            Ok(checks)
+        }
+    }
+
+    deserializer.deserialize_map(RuntimeCanaryChecksVisitor)
 }
 
 impl RuntimeCanaryReport {
@@ -193,5 +231,12 @@ mod tests {
         let mut unknown = serde_json::to_vec(&value).unwrap();
         unknown.push(b'\n');
         assert!(parse_runtime_canary_report(&unknown, NONCE).is_err());
+
+        let encoded = String::from_utf8(report.to_json_line().unwrap()).unwrap();
+        let first_check = r#""bot_socket_denied":true"#;
+        let duplicated =
+            encoded.replacen(first_check, &format!(r#"{first_check},{first_check}"#), 1);
+        assert_ne!(duplicated, encoded);
+        assert!(parse_runtime_canary_report(duplicated.as_bytes(), NONCE).is_err());
     }
 }
