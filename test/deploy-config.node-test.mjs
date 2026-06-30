@@ -424,7 +424,13 @@ describe('deploy-config plan', () => {
     assert(commands.some(([bin, args]) => bin === '/usr/bin/bash' && args.includes('--source-root')));
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
-    assert.equal(plan.activationRenewCommand.condition, 'runner-permission-active');
+    assert.equal(plan.activationRenewCommand, null);
+    assert.deepEqual(plan.activationEnsureCommand.args, [
+      'reload',
+      '--',
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.equal(plan.activationEnsureCommand.condition, 'runner-permission-active');
     assert.equal(plan.currentUserPolicyCheckCommand.condition, 'runner-permission-inactive');
     assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
@@ -2345,6 +2351,12 @@ describe('deploy-config CLI and execution', () => {
     );
     assert(runnerPolicyCommand);
     assert.equal(runnerPolicyCommand.condition, 'runner-permission-active');
+    const receiptEnsureCommand = serialised.plan.commands.find(
+      (command) => command.args.includes('webex-codex-activation-renew.service'),
+    );
+    assert(receiptEnsureCommand);
+    assert.equal(receiptEnsureCommand.args[0], 'reload');
+    assert.equal(receiptEnsureCommand.condition, 'runner-permission-active');
     assert.match(stdout, /command_\d+_condition=runner-permission-active/);
     assert.equal(executed, false);
 
@@ -2743,6 +2755,52 @@ describe('deploy-config CLI and execution', () => {
         },
       }),
       /activation canary failed/,
+    );
+
+    assert.equal(renewalStopped, true);
+    assert.equal(botRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rolls back a renewed receipt when activation config preflight fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-preflight-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let renewalStopped = false;
+    let botRestarted = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationConfigCheckCommand) {
+            throw new Error('activation config preflight failed');
+          }
+          if (command === plan.activationStopCommand) renewalStopped = true;
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) botRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /activation config preflight failed/,
     );
 
     assert.equal(renewalStopped, true);
@@ -3336,7 +3394,8 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         runner: async (command) => {
-          if (command === plan.activationRenewCommand) {
+          if (command === plan.activationEnsureCommand) {
+            assert.equal(command.args[0], 'reload');
             receiptEnsured = true;
             await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
             await fs.chmod(plan.activationReceipt, 0o444);
@@ -3382,12 +3441,13 @@ describe('deploy-config CLI and execution', () => {
       plan,
       runner: async (command) => {
         calls.push(command);
-        if (command === plan.activationRenewCommand) {
+        if (command === plan.activationEnsureCommand) {
+          assert.equal(command.args[0], 'reload');
           await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
           await fs.chmod(plan.activationReceipt, 0o444);
         }
         if (command.bin === '/usr/bin/bash') {
-          assert(calls.includes(plan.activationRenewCommand));
+          assert(calls.includes(plan.activationEnsureCommand));
           await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
         }
         return {

@@ -231,6 +231,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
       '/opt/webex-generic-account-bot/bin/webex-codex-activation ensure',
     ]);
+    assert.deepEqual(directiveValues(service, 'ExecReload'), [
+      '/opt/webex-generic-account-bot/bin/webex-codex-activation ensure',
+    ]);
     assert.deepEqual(directiveValues(service, 'Restart'), ['no']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['5400s']);
     assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);

@@ -538,14 +538,24 @@ export function buildDeployPlan(options) {
         ], { ...commandDefaults, validation: 'service-readiness' }),
       ];
 
-  const activationRenewCommand = options.apply || options.activateRunner
+  const activationRenewCommand = options.activateRunner
     ? command(
         options.systemctlBin,
         ['restart', '--', ACTIVATION_RENEWAL_UNIT],
         {
           ...commandDefaults,
           timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS,
-          condition: options.activateRunner ? undefined : 'runner-permission-active',
+        },
+      )
+    : null;
+  const activationEnsureCommand = !options.activateRunner && !options.prepare
+    ? command(
+        options.systemctlBin,
+        ['reload', '--', ACTIVATION_RENEWAL_UNIT],
+        {
+          ...commandDefaults,
+          timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS,
+          condition: 'runner-permission-active',
         },
       )
     : null;
@@ -606,6 +616,7 @@ export function buildDeployPlan(options) {
     serviceStopCommand,
     serviceVerificationCommands,
     activationRenewCommand,
+    activationEnsureCommand,
     activationDaemonReloadCommand,
     activationStopCommand,
     activationStateCommand,
@@ -850,8 +861,8 @@ export async function executePlan({
     }
     if (runnerPermissionActive && !plan.activateRunner) {
       await runner(
-        plan.activationRenewCommand,
-        scrubEnv(parentEnv, plan.activationRenewCommand.env),
+        plan.activationEnsureCommand,
+        scrubEnv(parentEnv, plan.activationEnsureCommand.env),
         signal,
       );
       throwIfAborted(signal);
@@ -3704,6 +3715,7 @@ function allPlanCommands(plan) {
     ...plan.commands,
     ...[
       plan.activationRenewCommand,
+      plan.activationEnsureCommand,
       plan.activationDaemonReloadCommand,
       plan.activationStopCommand,
       plan.activationStateCommand,
