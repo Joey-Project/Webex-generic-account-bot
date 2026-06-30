@@ -456,26 +456,23 @@ async fn wait_for_unix_listener_live(
 
 async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
     let unit = lifecycle_unit_name("timeout", nonce);
-    let status = run_command(
-        SYSTEMD_RUN_PATH,
-        &[
-            "--quiet".into(),
-            "--wait".into(),
-            "--collect".into(),
-            "--service-type=exec".into(),
-            format!("--unit={unit}"),
-            format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}"),
-            format!("--property=After={ACTIVATION_RENEWAL_UNIT}"),
-            "--property=RuntimeMaxSec=2s".into(),
-            "--property=TimeoutStopSec=5s".into(),
-            "--property=KillMode=control-group".into(),
-            SHELL_PATH.into(),
-            "-c".into(),
-            "exec sleep 30".into(),
-        ],
-        COMMAND_TIMEOUT,
-    )
-    .await?;
+    let mut args = vec![
+        "--quiet".into(),
+        "--wait".into(),
+        "--collect".into(),
+        "--service-type=exec".into(),
+        format!("--unit={unit}"),
+    ];
+    args.extend(activation_owner_properties());
+    args.extend([
+        "--property=RuntimeMaxSec=2s".into(),
+        "--property=TimeoutStopSec=5s".into(),
+        "--property=KillMode=control-group".into(),
+        SHELL_PATH.into(),
+        "-c".into(),
+        "exec sleep 30".into(),
+    ]);
+    let status = run_command(SYSTEMD_RUN_PATH, &args, COMMAND_TIMEOUT).await?;
     ensure!(!status.success(), "timeout canary unexpectedly completed");
     wait_for_unit_inactive(&unit).await
 }
@@ -483,22 +480,15 @@ async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
 async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> {
     let anchor = lifecycle_unit_name(&format!("{owner}-anchor"), nonce);
     let child = lifecycle_unit_name(&format!("{owner}-child"), nonce);
-    let start_anchor = run_command(
-        SYSTEMD_RUN_PATH,
-        &[
-            "--quiet".into(),
-            "--collect".into(),
-            "--service-type=exec".into(),
-            format!("--unit={anchor}"),
-            format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}"),
-            format!("--property=After={ACTIVATION_RENEWAL_UNIT}"),
-            SHELL_PATH.into(),
-            "-c".into(),
-            "exec sleep 30".into(),
-        ],
-        COMMAND_TIMEOUT,
-    )
-    .await?;
+    let mut anchor_args = vec![
+        "--quiet".into(),
+        "--collect".into(),
+        "--service-type=exec".into(),
+        format!("--unit={anchor}"),
+    ];
+    anchor_args.extend(activation_owner_properties());
+    anchor_args.extend([SHELL_PATH.into(), "-c".into(), "exec sleep 30".into()]);
+    let start_anchor = run_command(SYSTEMD_RUN_PATH, &anchor_args, COMMAND_TIMEOUT).await?;
     ensure!(start_anchor.success(), "lifecycle anchor failed to start");
     let start_child = run_command(
         SYSTEMD_RUN_PATH,
@@ -525,6 +515,10 @@ async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> 
     let inactive_result = wait_for_unit_inactive(&child).await;
     let _ = stop_unit(&child).await;
     stop_result.and(inactive_result)
+}
+
+fn activation_owner_properties() -> [String; 1] {
+    [format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}")]
 }
 
 async fn run_command(
@@ -864,6 +858,20 @@ mod tests {
             "webex-codex-canary-launcher-anchor-0123456789abcdef.service"
         );
         assert!(unit.len() < 128);
+    }
+
+    #[test]
+    fn activation_owned_transients_bind_without_waiting_for_the_oneshot() {
+        let properties = activation_owner_properties();
+        assert_eq!(
+            properties,
+            [format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}")]
+        );
+        assert!(
+            properties
+                .iter()
+                .all(|property| !property.starts_with("--property=After="))
+        );
     }
 
     #[test]

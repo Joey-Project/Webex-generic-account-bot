@@ -1268,9 +1268,11 @@ fn build_transient_run_plan(
         format!("--unit={unit}").into(),
         "--working-directory=/workspace".into(),
     ];
-    for property in [
-        format!("BindsTo={launcher_unit}"),
-        format!("After={launcher_unit}"),
+    let mut properties = vec![format!("BindsTo={launcher_unit}")];
+    if launcher_unit != ACTIVATION_RENEWAL_UNIT {
+        properties.push(format!("After={launcher_unit}"));
+    }
+    properties.extend([
         "DynamicUser=yes".to_owned(),
         format!("RootImage={image}"),
         "RootImageOptions=root:ro,nosuid,nodev".to_owned(),
@@ -1326,7 +1328,8 @@ fn build_transient_run_plan(
         "BindReadOnlyPaths=/etc/resolv.conf".to_owned(),
         "BindReadOnlyPaths=/etc/hosts".to_owned(),
         "BindReadOnlyPaths=/etc/nsswitch.conf".to_owned(),
-    ] {
+    ]);
+    for property in properties {
         args.push("--property".into());
         args.push(property.into());
     }
@@ -2734,6 +2737,11 @@ mod tests {
             assert!(args.iter().any(|value| value == &required), "{required}");
         }
         assert!(args.iter().any(|value| value == "CapabilityBoundingSet="));
+        assert!(
+            !args
+                .iter()
+                .any(|value| value == &format!("After={ACTIVATION_RENEWAL_UNIT}"))
+        );
         assert!(
             args.iter()
                 .any(|value| value == "SystemCallErrorNumber=EPERM")
