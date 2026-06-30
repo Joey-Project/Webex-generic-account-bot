@@ -5,7 +5,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     net::SocketAddr,
-    os::unix::{fs::MetadataExt, io::AsRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -33,7 +36,7 @@ use crate::{
         RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT, RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT,
         runtime_canary_forbidden_ip_allowed, validate_runtime_canary_nonce,
     },
-    codex_launcher::AuthorisedPeer,
+    codex_launcher::{AuthorisedPeer, pidfd_is_alive},
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
         ExecuteRequest, LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS, LAUNCHER_CLEANUP_STEP_SECONDS,
@@ -81,6 +84,8 @@ const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const RUNTIME_CANARY_CAPTURE_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const RUNTIME_CANARY_TIMEOUT_SECONDS: u64 = 600;
+#[cfg(target_os = "linux")]
+const BOT_PEER_EXIT_CANARY_TIMEOUT_SECONDS: u64 = 30;
 #[cfg(target_os = "linux")]
 pub(crate) const ACTIVATION_RENEWAL_UNIT: &str = "webex-codex-activation-renew.service";
 #[cfg(target_os = "linux")]
@@ -211,6 +216,60 @@ pub struct TransientRunPlan {
     pub executable: &'static str,
     pub args: Vec<OsString>,
     pub workspace: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+trait PeerLiveness {
+    fn ensure_alive(&self) -> Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+impl PeerLiveness for AuthorisedPeer {
+    fn ensure_alive(&self) -> Result<()> {
+        AuthorisedPeer::ensure_alive(self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ProcessCanaryPeer {
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessCanaryPeer {
+    fn open(pid: u32) -> Result<Self> {
+        if pid <= 1 {
+            return Err(anyhow!("bot peer-exit canary PID is invalid"));
+        }
+        // SAFETY: pidfd_open does not dereference userspace pointers.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open bot peer-exit canary pidfd");
+        }
+        // SAFETY: pidfd_open returned a new descriptor owned by this value.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to protect bot peer-exit canary pidfd");
+        }
+        pidfd_is_alive(pidfd.as_raw_fd())?;
+        Ok(Self { pidfd })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PeerLiveness for ProcessCanaryPeer {
+    fn ensure_alive(&self) -> Result<()> {
+        pidfd_is_alive(self.pidfd.as_raw_fd())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, thiserror::Error)]
+#[error("authorised bot caller exited {phase}")]
+struct AuthorisedPeerExited {
+    phase: &'static str,
 }
 
 #[cfg(target_os = "linux")]
@@ -1408,6 +1467,64 @@ fn build_runtime_canary_plan(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn bot_peer_exit_canary_unit_name(nonce: &str) -> Result<String> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(format!(
+        "webex-codex-canary-bot-peer-{}.service",
+        &nonce[..16]
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn build_bot_peer_exit_canary_plan(nonce: &str) -> Result<TransientRunPlan> {
+    let unit = bot_peer_exit_canary_unit_name(nonce)?;
+    Ok(TransientRunPlan {
+        unit: unit.clone(),
+        executable: SYSTEMD_RUN_PATH,
+        args: vec![
+            "--quiet".into(),
+            "--wait".into(),
+            "--pipe".into(),
+            "--service-type=exec".into(),
+            format!("--unit={unit}").into(),
+            format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}").into(),
+            "--property=KillMode=control-group".into(),
+            "--property=TimeoutStopSec=5s".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            "exec sleep 30".into(),
+        ],
+        workspace: PathBuf::from("/"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn execute_bot_peer_exit_cleanup_canary(
+    nonce: &str,
+    peer_pid: u32,
+    cancellation: &ExecutionCancellation,
+) -> Result<()> {
+    let peer = ProcessCanaryPeer::open(peer_pid)?;
+    let plan = build_bot_peer_exit_canary_plan(nonce)?;
+    let result = run_transient_with_peer(
+        plan,
+        "bot-peer-exit-canary\n",
+        BOT_PEER_EXIT_CANARY_TIMEOUT_SECONDS,
+        1024,
+        &peer,
+        cancellation,
+    )
+    .await;
+    match result {
+        Err(error) if error.downcast_ref::<AuthorisedPeerExited>().is_some() => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "bot peer-exit canary completed without detecting peer exit"
+        )),
+        Err(error) => Err(error).context("bot peer-exit canary failed before peer exit"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn run_transient(
     plan: TransientRunPlan,
     request: &ExecuteRequest,
@@ -1415,12 +1532,32 @@ async fn run_transient(
     cancellation: &ExecutionCancellation,
     _workspace: &VerifiedWorkspace,
 ) -> Result<IsolatedRunResult> {
+    run_transient_with_peer(
+        plan,
+        &request.prompt,
+        request.timeout_seconds,
+        request.output_char_limit,
+        peer,
+        cancellation,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn run_transient_with_peer<P: PeerLiveness + ?Sized>(
+    plan: TransientRunPlan,
+    prompt: &str,
+    timeout_seconds: u64,
+    output_char_limit: u64,
+    peer: &P,
+    cancellation: &ExecutionCancellation,
+) -> Result<IsolatedRunResult> {
     if cancellation.is_cancelled() {
         return Err(WorkBudgetError::cancelled("isolated Codex execution before start").into());
     }
     peer.ensure_alive()
         .context("authorised bot caller exited before Codex execution")?;
-    let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let mut command = Command::new(plan.executable);
     command
         .args(&plan.args)
@@ -1452,7 +1589,7 @@ async fn run_transient(
     let stderr_task = tokio::spawn(read_limited(stderr, STDERR_CAPTURE_BYTES));
     let write_outcome = {
         let prompt_write = async {
-            stdin.write_all(request.prompt.as_bytes()).await?;
+            stdin.write_all(prompt.as_bytes()).await?;
             stdin.shutdown().await
         };
         tokio::pin!(prompt_write);
@@ -1484,9 +1621,10 @@ async fn run_transient(
         PromptWriteOutcome::PeerExited => {
             terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
                 .await?;
-            return Err(anyhow!(
-                "authorised bot caller exited during Codex prompt delivery"
-            ));
+            return Err(AuthorisedPeerExited {
+                phase: "during Codex prompt delivery",
+            }
+            .into());
         }
         PromptWriteOutcome::Cancelled => {
             terminate_and_discard_captures(&plan.unit, &mut child, stdout_task, stderr_task)
@@ -1534,7 +1672,10 @@ async fn run_transient(
                         stderr_task,
                     )
                     .await?;
-                    return Err(anyhow!("authorised bot caller exited during Codex execution"));
+                    return Err(AuthorisedPeerExited {
+                        phase: "during Codex execution",
+                    }
+                    .into());
                 }
                 if Instant::now() >= deadline {
                     terminate_and_discard_captures(
@@ -1570,7 +1711,7 @@ async fn run_transient(
         return Ok(IsolatedRunResult::Failed);
     }
     let mut output = output.to_owned();
-    let character_limit = request.output_char_limit as usize;
+    let character_limit = output_char_limit as usize;
     let character_truncated = output.chars().count() > character_limit;
     if character_truncated {
         output = output.chars().take(character_limit).collect();
@@ -2760,6 +2901,66 @@ mod tests {
         );
         assert!(!args.iter().any(|value| value == "--model"));
         assert!(!args.iter().any(|value| value == &execute.prompt));
+    }
+
+    #[test]
+    fn bot_peer_exit_canary_plan_exercises_the_supervised_unit_path() {
+        const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plan = build_bot_peer_exit_canary_plan(NONCE).unwrap();
+        let args = plan
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            plan.unit,
+            "webex-codex-canary-bot-peer-0123456789abcdef.service"
+        );
+        for required in [
+            "--wait",
+            "--pipe",
+            "--service-type=exec",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=5s",
+            "/bin/sh",
+            "-c",
+            "exec sleep 30",
+        ] {
+            assert!(args.iter().any(|value| value == required), "{required}");
+        }
+        assert!(
+            args.iter()
+                .any(|value| value == &format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}"))
+        );
+        assert!(!args.iter().any(|value| value == "--collect"));
+        assert!(
+            !args
+                .iter()
+                .any(|value| value.starts_with("--property=After="))
+        );
+        assert!(bot_peer_exit_canary_unit_name("invalid").is_err());
+    }
+
+    #[test]
+    fn process_canary_peer_reports_process_exit() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let peer = ProcessCanaryPeer::open(child.id()).unwrap();
+        peer.ensure_alive().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while peer.ensure_alive().is_ok() {
+            assert!(Instant::now() < deadline, "pidfd did not report peer exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -63,11 +63,11 @@
   static syscall probe to the immutable image allowlist.
 - Runner PR 4c2a2 adds strict pinned-Codex JSONL command-event validation,
   trusted runtime-interior evidence, nonce-scoped host file and listener
-  evidence, timeout/owner-crash lifecycle checks, a real-reboot challenge, and
-  root-only atomic receipt renewal. The renewal unit remains inactive by
-  default, grants no bot group access, and does not remove the ephemeral
-  activation gate. Transactional permission and configuration activation
-  remains PR 4c2b.
+  evidence, timeout and launcher owner-crash lifecycle checks, a pidfd-backed
+  bot peer-exit supervisor check, a real-reboot challenge, and root-only atomic
+  receipt renewal. The renewal unit remains inactive by default, grants no bot
+  group access, and does not remove the ephemeral activation gate.
+  Transactional permission and configuration activation remains PR 4c2b.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

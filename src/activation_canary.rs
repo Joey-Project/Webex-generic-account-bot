@@ -63,7 +63,7 @@ pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
         let runtime = run_runtime_boundary_canary(&candidate).await?;
         run_timeout_cleanup_canary(&runtime.nonce).await?;
         run_owner_crash_cleanup_canary(&runtime.nonce, "launcher").await?;
-        run_owner_crash_cleanup_canary(&runtime.nonce, "bot").await?;
+        run_bot_peer_exit_cleanup_canary(&runtime.nonce).await?;
         let canaries = passing_receipt_canaries(&runtime);
         activation::commit_activation_receipt(&candidate, canaries)
     }
@@ -673,6 +673,64 @@ async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> 
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(anyhow!(
             "{error:#}; failed to clean owner lifecycle canary units: {cleanup_error:#}"
+        )),
+    }
+}
+
+async fn run_bot_peer_exit_cleanup_canary(nonce: &str) -> Result<()> {
+    let unit = crate::isolated_execution::bot_peer_exit_canary_unit_name(nonce)?;
+    let mut peer_process = Command::new(SHELL_PATH);
+    peer_process
+        .args(["-c", "exec sleep 30"])
+        .env_clear()
+        .env("LANG", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut peer_process = peer_process
+        .spawn()
+        .context("failed to start bot peer-exit canary process")?;
+    let peer_pid = peer_process
+        .id()
+        .ok_or_else(|| anyhow!("bot peer-exit canary process has no PID"))?;
+    let cancellation = ExecutionCancellation::new();
+
+    let execution = crate::isolated_execution::execute_bot_peer_exit_cleanup_canary(
+        nonce,
+        peer_pid,
+        &cancellation,
+    );
+    let terminate_peer = async {
+        let readiness = wait_for_unit_active(&unit).await;
+        let termination = peer_process
+            .start_kill()
+            .context("failed to terminate bot peer-exit canary process");
+        let reaped = peer_process
+            .wait()
+            .await
+            .context("failed to reap bot peer-exit canary process");
+        readiness?;
+        termination?;
+        reaped?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let (execution, termination) = tokio::join!(execution, terminate_peer);
+    let result = async {
+        execution?;
+        termination?;
+        wait_for_unit_inactive(&unit).await
+    }
+    .await;
+    let cleanup = cleanup_lifecycle_unit(&unit).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; failed to clean bot peer-exit canary unit: {cleanup_error:#}"
         )),
     }
 }

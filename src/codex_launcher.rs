@@ -470,7 +470,7 @@ fn pidfd_process_id(pidfd: RawFd) -> Result<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn pidfd_is_alive(pidfd: RawFd) -> Result<()> {
+pub(crate) fn pidfd_is_alive(pidfd: RawFd) -> Result<()> {
     let mut descriptor = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,

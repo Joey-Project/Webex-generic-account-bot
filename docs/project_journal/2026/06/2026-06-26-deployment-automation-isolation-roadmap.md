@@ -88,10 +88,11 @@ superseded_by:
   ready trees remain group-inaccessible until consumed, and tmpfiles remains
   the crash fallback.
 - PR 4c2a2 implements the pinned Codex JSONL event validator, trusted runtime
-  interior evidence, nonce-scoped host fixtures/listeners, timeout and
-  owner-crash lifecycle checks, a real-reboot challenge, and root-only atomic
-  receipt renewal. It remains inactive and grants no bot launcher permission;
-  PR 4c2b still owns the deployment transaction and production switch.
+  interior evidence, nonce-scoped host fixtures/listeners, timeout and launcher
+  owner-crash lifecycle checks, a pidfd-backed bot peer-exit supervisor check,
+  a real-reboot challenge, and root-only atomic receipt renewal. It remains
+  inactive and grants no bot launcher permission; PR 4c2b still owns the
+  deployment transaction and production switch.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

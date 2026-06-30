@@ -889,11 +889,14 @@ the protected file and live Unix/TCP listeners open, requires unchanged file
 identity and contents, requires the launcher and config-worker sockets to stay
 live, and rejects any accepted denied connection.
 
-Timeout and owner-crash canaries use fixed `systemd-run`/`systemctl` argv and
-must converge to inactive units. Reboot cleanup uses a persistent root-owned
-challenge plus a `/run` marker: the first renewal prepares the challenge and
-fails closed until one real reboot has removed the marker. A service restart
-is not accepted as reboot evidence.
+Timeout and launcher owner-crash canaries use fixed `systemd-run`/`systemctl`
+argv and must converge to inactive units. The bot crash canary terminates a
+controlled pidfd-backed peer while the production transient supervisor is
+running and requires that supervisor to detect the peer exit and stop its
+unit. Reboot cleanup uses a persistent root-owned challenge plus a `/run`
+marker: the first renewal prepares the challenge and fails closed until one
+real reboot has removed the marker. A service restart is not accepted as
+reboot evidence.
 
 This slice remains non-deploying. It does not add the bot to launcher or input
 groups, install a bot drop-in, switch production away from `current-user`, or

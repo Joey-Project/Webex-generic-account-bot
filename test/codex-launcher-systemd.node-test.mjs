@@ -469,6 +469,10 @@ describe('Codex launcher systemd boundary', () => {
       '#[cfg(all(test, target_os = "linux"))]',
       1,
     )[0];
+    const productionIsolatedExecution = isolatedExecution.split(
+      '#[cfg(all(test, target_os = "linux"))]\nmod tests {',
+      1,
+    )[0];
 
     assert.doesNotMatch(
       launcherSources,
@@ -524,10 +528,10 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(isolatedExecution, /Command::new\(plan\.executable\)/);
     assert.match(isolatedExecution, /Command::new\(SYSTEMCTL_PATH\)/);
     assert.equal(
-      (isolatedExecution.match(/Command::new\(plan\.executable\)/g) ?? []).length,
+      (productionIsolatedExecution.match(/Command::new\(plan\.executable\)/g) ?? []).length,
       2,
     );
-    assert.equal((isolatedExecution.match(/Command::new\(/g) ?? []).length, 3);
+    assert.equal((productionIsolatedExecution.match(/Command::new\(/g) ?? []).length, 3);
     assert.match(isolatedExecution, /\.stdin\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stdout\(Stdio::piped\(\)\)/);
     assert.match(isolatedExecution, /\.stderr\(Stdio::piped\(\)\)/);
