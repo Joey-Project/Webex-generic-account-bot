@@ -840,6 +840,14 @@ connections. A missing, replaced, unhealthy, or accepted fixture invalidates
 the run even if the inner probe reported `true`; the receipt writer must never
 consume the inner report without these host-side preconditions.
 
+The report binds the nonce, main PID, descriptor-secret digest, both TCP
+endpoints, and both nonce-derived host paths into `fixture_binding`. The final
+line carries that binding as well as the nonce. The library success validator
+requires matching host evidence with before/after liveness and zero accept
+counts for the instrumented host Unix and TCP fixtures. It also requires the
+fixed launcher and config-worker sockets to remain live before and after the
+probe; parsing a boolean-only inner report can never establish success.
+
 ## Development
 
 Generated CI runs:

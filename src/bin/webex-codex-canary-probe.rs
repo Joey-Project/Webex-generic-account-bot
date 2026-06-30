@@ -13,7 +13,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -24,8 +24,9 @@ use ring::digest::{SHA256, digest};
 #[cfg(target_os = "linux")]
 use webex_generic_account_bot::{
     canary_protocol::{
-        RUNTIME_CANARY_CHECKS, RUNTIME_CANARY_SUITE, RuntimeCanaryReport,
-        validate_runtime_canary_nonce,
+        RUNTIME_CANARY_CHECKS, RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT,
+        RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT, RUNTIME_CANARY_SUITE, RuntimeCanaryFixtureInputs,
+        RuntimeCanaryReport, runtime_canary_fixture_binding, validate_runtime_canary_nonce,
     },
     codex_launcher::LAUNCHER_SOCKET_PATH,
 };
@@ -39,15 +40,13 @@ const MAIN_HOME: &str = "/tmp/webex-codex-main-home";
 #[cfg(target_os = "linux")]
 const CODEX_HOME: &str = "/tmp/webex-codex-main";
 #[cfg(target_os = "linux")]
+const CODEX_AUTH_PATH: &str = "/tmp/webex-codex-main/auth.json";
+#[cfg(target_os = "linux")]
 const FINAL_OUTPUT_PATH: &str = "/tmp/webex-codex-main/final-message.txt";
 #[cfg(target_os = "linux")]
 const TOOL_HOME: &str = "/tmp/webex-codex-tool-home";
 #[cfg(target_os = "linux")]
 const WORKSPACE_PATH: &str = "/workspace";
-#[cfg(target_os = "linux")]
-const HOST_UNIX_FIXTURE_ROOT: &str = "/run/webex-codex-canary";
-#[cfg(target_os = "linux")]
-const HOST_PROTECTED_FIXTURE_ROOT: &str = "/var/lib/webex-generic-account-bot/canary-fixtures";
 #[cfg(target_os = "linux")]
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
@@ -85,7 +84,9 @@ fn main() -> Result<()> {
         return Err(anyhow!("canary TCP endpoints must be distinct"));
     }
     validate_host_fixture_paths(&cli)?;
-    let report = RuntimeCanaryReport::new(cli.nonce.clone(), collect_checks(&cli))?;
+    let fixture_binding = fixture_binding(&cli)?;
+    let report =
+        RuntimeCanaryReport::new(cli.nonce.clone(), fixture_binding, collect_checks(&cli))?;
     use std::io::Write;
     std::io::stdout()
         .lock()
@@ -131,7 +132,9 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "main_home_denied".to_owned(),
-        path_denied(Path::new(MAIN_HOME)) && path_denied(Path::new(CODEX_HOME)),
+        path_denied(Path::new(MAIN_HOME))
+            && path_denied(Path::new(CODEX_HOME))
+            && path_denied(Path::new(CODEX_AUTH_PATH)),
     );
     checks.insert(
         "main_process_inspection_denied".to_owned(),
@@ -208,14 +211,38 @@ fn validate_loopback_address(value: &str) -> std::result::Result<SocketAddr, Str
 
 #[cfg(target_os = "linux")]
 fn validate_host_fixture_paths(cli: &Cli) -> Result<()> {
-    let expected_unix = Path::new(HOST_UNIX_FIXTURE_ROOT).join(format!("{}.sock", cli.nonce));
-    let expected_protected = Path::new(HOST_PROTECTED_FIXTURE_ROOT).join(&cli.nonce);
+    let expected_unix =
+        Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("{}.sock", cli.nonce));
+    let expected_protected = Path::new(RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT).join(&cli.nonce);
     if cli.host_unix != expected_unix || cli.host_protected_path != expected_protected {
         return Err(anyhow!(
             "host canary fixture paths must be derived from the report nonce"
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_binding(cli: &Cli) -> Result<String> {
+    let host_unix = cli
+        .host_unix
+        .to_str()
+        .ok_or_else(|| anyhow!("host Unix fixture path must be UTF-8"))?;
+    let host_protected_path = cli
+        .host_protected_path
+        .to_str()
+        .ok_or_else(|| anyhow!("host protected fixture path must be UTF-8"))?;
+    runtime_canary_fixture_binding(
+        &cli.nonce,
+        &RuntimeCanaryFixtureInputs {
+            main_pid: cli.main_pid,
+            fd_secret_sha256: cli.fd_secret_sha256.clone(),
+            forbidden_tcp: cli.forbidden_tcp.to_string(),
+            bot_tcp: cli.bot_tcp.to_string(),
+            host_unix: host_unix.to_owned(),
+            host_protected_path: host_protected_path.to_owned(),
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -237,9 +264,27 @@ fn access_denial_error(error: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn unix_socket_denied(path: &Path) -> bool {
-    match UnixStream::connect(path) {
-        Ok(_) => false,
-        Err(error) => unix_connection_denial_error(&error),
+    // The child contains a blocking connect to a stale or backlog-saturated
+    // socket. The parent always kills and reaps it at the fixed deadline.
+    // SAFETY: the probe is single-threaded and the child exits without running
+    // inherited Rust destructors.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return false;
+    }
+    if child == 0 {
+        let denied = match UnixStream::connect(path) {
+            Ok(_) => false,
+            Err(error) => unix_connection_denial_error(&error),
+        };
+        // SAFETY: _exit terminates only the isolated connect child.
+        unsafe { libc::_exit(i32::from(!denied)) };
+    }
+    match wait_child(child, NETWORK_TIMEOUT) {
+        ChildWaitOutcome::Exited(0) => true,
+        ChildWaitOutcome::Exited(_) | ChildWaitOutcome::TimedOut | ChildWaitOutcome::Failed => {
+            false
+        }
     }
 }
 
@@ -403,6 +448,62 @@ fn check_child_succeeded(child: libc::pid_t) -> bool {
             continue;
         }
         return false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum ChildWaitOutcome {
+    Exited(i32),
+    TimedOut,
+    Failed,
+}
+
+#[cfg(target_os = "linux")]
+fn wait_child(child: libc::pid_t, timeout: Duration) -> ChildWaitOutcome {
+    let deadline = Instant::now() + timeout;
+    let mut status = 0;
+    loop {
+        // SAFETY: child is a PID returned by fork, WNOHANG is nonblocking, and
+        // status is a live out-pointer.
+        let result = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if result == child {
+            return if libc::WIFEXITED(status) {
+                ChildWaitOutcome::Exited(libc::WEXITSTATUS(status))
+            } else {
+                ChildWaitOutcome::Failed
+            };
+        }
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return ChildWaitOutcome::Failed;
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: child is the still-running PID returned by fork.
+            if unsafe { libc::kill(child, libc::SIGKILL) } != 0 {
+                return ChildWaitOutcome::Failed;
+            }
+            let reaped = loop {
+                // SAFETY: reap the same child after the kill attempt.
+                let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+                if reaped == child {
+                    break true;
+                }
+                if reaped < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                    continue;
+                }
+                break false;
+            };
+            return if reaped {
+                ChildWaitOutcome::TimedOut
+            } else {
+                ChildWaitOutcome::Failed
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -619,6 +720,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.suite, RUNTIME_CANARY_SUITE);
         validate_host_fixture_paths(&cli).unwrap();
+        assert_eq!(fixture_binding(&cli).unwrap().len(), 64);
         let mut mismatched = cli;
         mismatched.host_unix = PathBuf::from("/run/webex-codex-canary/other.sock");
         assert!(validate_host_fixture_paths(&mismatched).is_err());
@@ -658,7 +760,7 @@ mod tests {
             .iter()
             .map(|name| ((*name).to_owned(), false))
             .collect();
-        RuntimeCanaryReport::new(NONCE.to_owned(), checks).unwrap();
+        RuntimeCanaryReport::new(NONCE.to_owned(), "1".repeat(64), checks).unwrap();
     }
 
     #[test]
@@ -692,5 +794,52 @@ mod tests {
 
         let (_left, _right) = UnixStream::pair().unwrap();
         assert!(!sensitive_descriptors_denied(NONCE));
+    }
+
+    #[test]
+    fn child_wait_enforces_its_deadline_and_reaps() {
+        // SAFETY: the child calls only pause and _exit; the parent reaps it in
+        // wait_child.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            loop {
+                // SAFETY: pause has no pointer arguments and the timeout path
+                // terminates this child with SIGKILL.
+                unsafe { libc::pause() };
+            }
+        }
+        assert_eq!(
+            wait_child(child, Duration::from_millis(20)),
+            ChildWaitOutcome::TimedOut
+        );
+
+        // SAFETY: this child exits immediately with a fixed status and is reaped.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: terminate only this isolated test child.
+            unsafe { libc::_exit(7) };
+        }
+        assert_eq!(
+            wait_child(child, Duration::from_secs(1)),
+            ChildWaitOutcome::Exited(7)
+        );
+
+        // SAFETY: this child waits for the parent to terminate and reap it.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            loop {
+                // SAFETY: pause has no pointer arguments.
+                unsafe { libc::pause() };
+            }
+        }
+        // SAFETY: signal only this isolated test child.
+        assert_eq!(unsafe { libc::kill(child, libc::SIGTERM) }, 0);
+        assert_eq!(
+            wait_child(child, Duration::from_secs(1)),
+            ChildWaitOutcome::Failed
+        );
     }
 }

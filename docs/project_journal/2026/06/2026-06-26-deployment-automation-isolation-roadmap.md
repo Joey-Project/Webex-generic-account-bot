@@ -335,10 +335,13 @@ superseded_by:
   command-execution event. Its host harness must create nonce-scoped protected
   path and live Unix/TCP listener fixtures before launch, verify them before
   and after Codex, and require zero accepted denied connections; an inner
-  `true` is never sufficient when a fixture is missing or unhealthy. It also
-  runs host timeout/crash/reboot canaries and owns the root-only boot receipt
-  helper and renewal unit. It still grants no bot launcher access and does not
-  enable production configuration.
+  `true` is never sufficient when a fixture is missing or unhealthy. The
+  report and final line bind the nonce, process, descriptor secret, endpoints,
+  and fixture paths; the success validator also requires matching host
+  evidence with before/after liveness and zero accepts. It also runs host
+  timeout/crash/reboot canaries and owns the root-only boot receipt helper and
+  renewal unit. It still grants no bot launcher access and does not enable
+  production configuration.
 - PR 4c2b extends the existing deploy-config recovery transaction to install
   only the launch-group/pending-path bot permission, switch every effective
   Codex config away from current-user execution, mint or renew the receipt,
