@@ -656,6 +656,11 @@ async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> 
         let _ = stop_unit(&anchor).await;
         bail!("lifecycle child failed to start");
     }
+    if let Err(error) = wait_for_unit_active(&child).await {
+        let _ = stop_unit(&anchor).await;
+        let _ = stop_unit(&child).await;
+        return Err(error).context("lifecycle child never became active");
+    }
     let stop_result = stop_unit(&anchor).await;
     let inactive_result = wait_for_unit_inactive(&child).await;
     let _ = stop_unit(&child).await;
@@ -700,6 +705,36 @@ async fn stop_unit(unit: &str) -> Result<()> {
 }
 
 async fn wait_for_unit_inactive(unit: &str) -> Result<()> {
+    wait_for_unit_state(unit, RequiredUnitState::Inactive).await
+}
+
+async fn wait_for_unit_active(unit: &str) -> Result<()> {
+    wait_for_unit_state(unit, RequiredUnitState::Active).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequiredUnitState {
+    Active,
+    Inactive,
+}
+
+impl RequiredUnitState {
+    fn reached(self, is_active: bool) -> bool {
+        match self {
+            Self::Active => is_active,
+            Self::Inactive => !is_active,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+async fn wait_for_unit_state(unit: &str, required: RequiredUnitState) -> Result<()> {
     let deadline = tokio::time::Instant::now() + UNIT_STATE_TIMEOUT;
     loop {
         let status = run_command(
@@ -708,11 +743,14 @@ async fn wait_for_unit_inactive(unit: &str) -> Result<()> {
             COMMAND_TIMEOUT,
         )
         .await?;
-        if !status.success() {
+        if required.reached(status.success()) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("lifecycle canary unit did not become inactive");
+            bail!(
+                "lifecycle canary unit did not become {}",
+                required.description()
+            );
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -1017,6 +1055,14 @@ mod tests {
                 .iter()
                 .all(|property| !property.starts_with("--property=After="))
         );
+    }
+
+    #[test]
+    fn lifecycle_state_targets_require_the_requested_state() {
+        assert!(RequiredUnitState::Active.reached(true));
+        assert!(!RequiredUnitState::Active.reached(false));
+        assert!(RequiredUnitState::Inactive.reached(false));
+        assert!(!RequiredUnitState::Inactive.reached(true));
     }
 
     #[test]
