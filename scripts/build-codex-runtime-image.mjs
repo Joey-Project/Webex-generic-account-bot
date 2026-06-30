@@ -99,6 +99,7 @@ const GENERATED_FILES = new Map([
 const REQUIRED_DIRECTORIES = new Set([
   '/tmp',
   '/var',
+  '/var/lib/webex-generic-account-bot/canary-fixtures',
   '/var/tmp',
   '/workspace',
 ]);
@@ -930,6 +931,7 @@ async function fsyncFile(file) {
 function expectedDirectories(manifest) {
   const directories = new Set(REQUIRED_DIRECTORIES);
   const destinations = [
+    ...directories,
     ...manifest.files.map((entry) => entry.destination),
     ...manifest.symlinks.map((entry) => entry.destination),
     ...GENERATED_FILES.keys(),

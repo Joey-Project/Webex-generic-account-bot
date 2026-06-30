@@ -1372,7 +1372,10 @@ fn build_runtime_canary_plan(
         .position(|argument| argument.as_os_str() == OsStr::new(RUNTIME_EXECUTABLE_PATH))
         .ok_or_else(|| anyhow!("runtime canary plan has no fixed runtime executable"))?;
     let extra_properties = [
-        format!("BindReadOnlyPaths={0}:{0}", request.host_protected_path),
+        format!(
+            "BindReadOnlyPaths={0}:{0}",
+            RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT
+        ),
         format!("BindReadOnlyPaths={0}:{0}", request.host_unix),
     ];
     let property_arg_count = extra_properties.len() * 2;
@@ -2724,7 +2727,10 @@ mod tests {
             .collect::<Vec<_>>();
         for required in [
             format!("BindsTo={ACTIVATION_RENEWAL_UNIT}"),
-            format!("BindReadOnlyPaths={0}:{0}", request.host_protected_path),
+            format!(
+                "BindReadOnlyPaths={0}:{0}",
+                RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT
+            ),
             format!("BindReadOnlyPaths={0}:{0}", request.host_unix),
             "--runtime-canary".to_owned(),
             "--nonce".to_owned(),
