@@ -957,6 +957,7 @@ export async function executePlan({
         let renewalStopError = null;
         let rollbackError = null;
         let rollbackDurabilityError = null;
+        let rollbackReceiptError = null;
         if (rollbackState.runnerActivation) {
           try {
             await stopActivationRenewal(plan, runner, parentEnv);
@@ -965,7 +966,9 @@ export async function executePlan({
           }
         }
         try {
-          rollbackDurabilityError = await restoreDeploymentState(plan, rollbackState, fsApi);
+          const rollbackResult = await restoreDeploymentState(plan, rollbackState, fsApi);
+          rollbackDurabilityError = rollbackResult.durabilityError;
+          rollbackReceiptError = rollbackResult.receiptRestoreError;
         } catch (restoreError) {
           rollbackError = renewalStopError
             ? errorPreservingDeploymentStatus(
@@ -1001,9 +1004,12 @@ export async function executePlan({
           const renewalStopFailure = renewalStopError
             ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
             : '';
+          const receiptFailure = rollbackReceiptError
+            ? `; activation receipt rollback also failed: ${rollbackReceiptError.message}`
+            : '';
           const failure = errorPreservingDeploymentStatus(
             error,
-            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${renewalStopFailure}${durabilityFailure}`,
+            `${error.message}; restored previous config but ${rollbackAction} also failed: ${restoreError.message}${renewalStopFailure}${receiptFailure}${durabilityFailure}`,
             restoreError,
           );
           await recordFailure(
@@ -1015,11 +1021,35 @@ export async function executePlan({
           throw failure;
         }
         if (renewalStopError) {
-          const reason = `${error.message}; restored previous config and service but failed to stop or verify activation renewal: ${renewalStopError.message}`;
+          const receiptFailure = rollbackReceiptError
+            ? `; activation receipt rollback also failed: ${rollbackReceiptError.message}`
+            : '';
+          const durabilityFailure = rollbackDurabilityError
+            ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
+            : '';
+          const reason = `${error.message}; restored previous config and service but failed to stop or verify activation renewal: ${renewalStopError.message}${receiptFailure}${durabilityFailure}`;
           const failure = errorPreservingDeploymentStatus(
             error,
             reason,
             renewalStopError,
+          );
+          await recordFailure(
+            'failed_restart_rollback_failed',
+            reason,
+            undefined,
+            failure,
+          );
+          throw failure;
+        }
+        if (rollbackReceiptError) {
+          const durabilityFailure = rollbackDurabilityError
+            ? `; config rollback durability also failed: ${rollbackDurabilityError.message}`
+            : '';
+          const reason = `${error.message}; restored previous config and service but failed to restore activation receipt: ${rollbackReceiptError.message}${durabilityFailure}`;
+          const failure = errorPreservingDeploymentStatus(
+            error,
+            reason,
+            rollbackReceiptError,
           );
           await recordFailure(
             'failed_restart_rollback_failed',
@@ -2870,7 +2900,14 @@ function assertTrustedRegularFileMetadata(file, stat, label) {
 }
 
 async function rollbackCandidateConfig(plan, installState, fsApi) {
-  const durabilityError = await restoreDeploymentState(plan, installState, fsApi);
+  const { durabilityError, receiptRestoreError } = await restoreDeploymentState(
+    plan,
+    installState,
+    fsApi,
+  );
+  if (receiptRestoreError) {
+    throw new Error(`failed to restore activation receipt: ${receiptRestoreError.message}`);
+  }
   if (durabilityError) {
     throw new Error(`failed to make config rollback durable: ${durabilityError.message}`);
   }
@@ -2888,9 +2925,12 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
     }
   }
   let durabilityError = null;
+  let receiptRestoreError = null;
   let restoreError = null;
   try {
-    durabilityError = await restoreDeploymentState(plan, installState, fsApi);
+    const restoreResult = await restoreDeploymentState(plan, installState, fsApi);
+    durabilityError = restoreResult.durabilityError;
+    receiptRestoreError = restoreResult.receiptRestoreError;
   } catch (error) {
     restoreError = error;
   }
@@ -2915,24 +2955,40 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
         durabilityError
           ? `config rollback durability also failed: ${durabilityError.message}`
           : null,
+        receiptRestoreError
+          ? `activation receipt rollback also failed: ${receiptRestoreError.message}`
+          : null,
       ].filter(Boolean);
       if (rollbackFailures.length > 0) {
         throw errorPreservingDeploymentStatus(
           error,
           `${error.message}; ${rollbackFailures.join('; ')}`,
-          renewalStopError ?? durabilityError,
+          renewalStopError ?? receiptRestoreError ?? durabilityError,
         );
       }
       throw error;
     }
   }
   if (renewalStopError) {
+    const receiptFailure = receiptRestoreError
+      ? `; activation receipt rollback also failed: ${receiptRestoreError.message}`
+      : '';
     const durabilityFailure = durabilityError
       ? `; config rollback durability also failed: ${durabilityError.message}`
       : '';
     throw errorPreservingDeploymentStatus(
       renewalStopError,
-      `failed to stop or verify activation renewal during rollback: ${renewalStopError.message}${durabilityFailure}`,
+      `failed to stop or verify activation renewal during rollback: ${renewalStopError.message}${receiptFailure}${durabilityFailure}`,
+      receiptRestoreError ?? durabilityError,
+    );
+  }
+  if (receiptRestoreError) {
+    const durabilityFailure = durabilityError
+      ? `; config rollback durability also failed: ${durabilityError.message}`
+      : '';
+    throw errorPreservingDeploymentStatus(
+      receiptRestoreError,
+      `failed to restore activation receipt during rollback: ${receiptRestoreError.message}${durabilityFailure}`,
       durabilityError,
     );
   }
@@ -3004,14 +3060,16 @@ async function restoreDeploymentState(plan, installState, fsApi) {
       receiptRestoreError = error;
     }
   }
-  const restoreFailures = [
+  const blockingRestoreFailures = [
     permissionRestoreError
       ? ['runner permission rollback', permissionRestoreError]
       : null,
     configRestoreError ? ['config rollback', configRestoreError] : null,
-    receiptRestoreError ? ['activation receipt rollback', receiptRestoreError] : null,
   ].filter(Boolean);
-  if (restoreFailures.length > 0) {
+  if (blockingRestoreFailures.length > 0) {
+    const restoreFailures = receiptRestoreError
+      ? [...blockingRestoreFailures, ['activation receipt rollback', receiptRestoreError]]
+      : blockingRestoreFailures;
     const [, primary] = restoreFailures[0];
     if (restoreFailures.length > 1) {
       const [, secondary] = restoreFailures[1];
@@ -3025,7 +3083,10 @@ async function restoreDeploymentState(plan, installState, fsApi) {
     }
     throw primary;
   }
-  return configDurabilityError;
+  return {
+    durabilityError: configDurabilityError,
+    receiptRestoreError,
+  };
 }
 
 async function restoreRunnerActivationPermission(plan, activationState, fsApi) {

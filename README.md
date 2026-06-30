@@ -383,7 +383,9 @@ the ephemeral config and recovery journal instead of exposing launcher access
 to a `current-user` config. A canary failure leaves no stale receipt. A renewal
 stop or inactive-verification failure does not skip three-state restoration or
 old-service recovery; the apply still fails and retains its journal for a later
-recovery retry. Version 1 deployment journals remain recoverable, and an
+recovery retry. Once permission and config are restored, a receipt-only cleanup
+failure also leaves the journal and reports failure but does not prevent the
+old service from restarting. Version 1 deployment journals remain recoverable, and an
 explicit activation continues after finalising a committed ordinary deployment
 instead of treating it as an activated runner.
 

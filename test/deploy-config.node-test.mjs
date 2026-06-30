@@ -2981,6 +2981,70 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('restarts the old service when activation receipt rollback fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let rollbackStarted = false;
+    let serviceRestarts = 0;
+    let readinessChecks = 0;
+    const fsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (rollbackStarted && file === plan.activationReceipt) {
+          throw new Error('receipt removal failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) {
+              rollbackStarted = true;
+              throw new Error('new service is not ready');
+            }
+            return { stdout: '200', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /restored previous config and service but failed to restore activation receipt: receipt removal failed/,
+    );
+
+    assert.equal(serviceRestarts, 2);
+    assert.equal(readinessChecks, 2);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('recovers an interrupted runner activation before fetching a new revision', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-recovery-test-'));
     const plan = await createRunnerActivationTestPlan(temp);
@@ -3076,6 +3140,62 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.equal(serviceRestarts, 1);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restarts the old service when recovery cannot remove the activation receipt', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"uncommitted"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'service_transition_started',
+    });
+    const fsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (file === plan.activationReceipt) {
+          throw new Error('receipt removal failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarts += 1;
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+            await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+          }
+          return {
+            stdout: command.bin === '/usr/bin/curl' ? '200' : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore activation receipt during rollback: receipt removal failed/,
+    );
+
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"uncommitted"}\n');
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
     await assertLockReleased(plan.lockDir);
   });
 
