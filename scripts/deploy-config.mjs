@@ -551,7 +551,7 @@ export function buildDeployPlan(options) {
   const activationEnsureCommand = !options.activateRunner && !options.prepare
     ? command(
         options.systemctlBin,
-        ['reload', '--', ACTIVATION_RENEWAL_UNIT],
+        ['reload-or-restart', '--', ACTIVATION_RENEWAL_UNIT],
         {
           ...commandDefaults,
           timeoutMs: ACTIVATION_RENEW_TIMEOUT_MS,

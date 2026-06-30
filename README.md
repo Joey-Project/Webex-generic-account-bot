@@ -403,9 +403,10 @@ candidate that would restore `current-user`, preventing inherited launcher
 access from becoming reachable. Before activation, ordinary apply applies the
 opposite host gate and rejects any ephemeral candidate, so only the explicit
 version 2 activation transaction can cross the permission boundary. Active-host
-ordinary apply reloads the still-active renewal unit to ensure the receipt
-without stopping or restarting the bot; dry-run output labels conditional
-steps with their permission-state conditions.
+ordinary apply uses `reload-or-restart` on the renewal unit to ensure the
+receipt: an active unit reloads without stopping or restarting the bot, while
+an already inactive unit starts again before deployment continues. Dry-run
+output labels conditional steps with their permission-state conditions.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,

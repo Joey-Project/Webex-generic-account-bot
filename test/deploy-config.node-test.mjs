@@ -426,7 +426,7 @@ describe('deploy-config plan', () => {
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
     assert.equal(plan.activationRenewCommand, null);
     assert.deepEqual(plan.activationEnsureCommand.args, [
-      'reload',
+      'reload-or-restart',
       '--',
       'webex-codex-activation-renew.service',
     ]);
@@ -2355,7 +2355,7 @@ describe('deploy-config CLI and execution', () => {
       (command) => command.args.includes('webex-codex-activation-renew.service'),
     );
     assert(receiptEnsureCommand);
-    assert.equal(receiptEnsureCommand.args[0], 'reload');
+    assert.equal(receiptEnsureCommand.args[0], 'reload-or-restart');
     assert.equal(receiptEnsureCommand.condition, 'runner-permission-active');
     assert.match(stdout, /command_\d+_condition=runner-permission-active/);
     assert.equal(executed, false);
@@ -3515,7 +3515,7 @@ describe('deploy-config CLI and execution', () => {
         plan,
         runner: async (command) => {
           if (command === plan.activationEnsureCommand) {
-            assert.equal(command.args[0], 'reload');
+            assert.equal(command.args[0], 'reload-or-restart');
             receiptEnsured = true;
             await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
             await fs.chmod(plan.activationReceipt, 0o444);
@@ -3546,7 +3546,7 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
-  it('applies an ephemeral update on an already activated host', async () => {
+  it('starts an inactive renewal unit before applying an active-runner update', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-update-test-'));
     const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
@@ -3556,18 +3556,22 @@ describe('deploy-config CLI and execution', () => {
     await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
     await fs.chmod(plan.botServiceDropIn, 0o644);
     const calls = [];
+    let renewalUnitActive = false;
 
     const metadata = await executePlan({
       plan,
       runner: async (command) => {
         calls.push(command);
         if (command === plan.activationEnsureCommand) {
-          assert.equal(command.args[0], 'reload');
+          assert.equal(renewalUnitActive, false);
+          assert.equal(command.args[0], 'reload-or-restart');
+          renewalUnitActive = true;
           await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
           await fs.chmod(plan.activationReceipt, 0o444);
         }
         if (command.bin === '/usr/bin/bash') {
           assert(calls.includes(plan.activationEnsureCommand));
+          assert.equal(renewalUnitActive, true);
           await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
         }
         return {

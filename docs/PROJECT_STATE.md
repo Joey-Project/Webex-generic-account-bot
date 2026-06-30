@@ -74,10 +74,11 @@
   one-time transition; committed recovery is idempotent and later reviewed
   config updates use ordinary apply. Bot restarts and ordinary active-runner
   applies ensure a valid receipt, reusing a fresh receipt without rerunning
-  canaries. Ordinary apply reloads the active renewal unit, so receipt checks
-  do not stop or restart the bot. Rollback revokes launcher permission before
-  any config downgrade; receipt-only cleanup failures retain the journal but do
-  not block old-service recovery.
+  canaries. Ordinary apply reloads an active renewal unit without disrupting
+  the bot, or starts the renewal unit when the bot and renewal unit are already
+  inactive. Rollback revokes launcher permission before any config downgrade;
+  receipt-only cleanup failures retain the journal but do not block old-service
+  recovery.
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
   The bot receives only launch-group and
