@@ -820,7 +820,9 @@ static `/bin/webex-codex-canary-probe` inside the content-addressed production
 image. The report uses an exact allowlist of checks, a 32-byte lowercase hex
 nonce, a fixed final-line binding, one-line JSON framing, and a 16 KiB byte
 limit. Missing, unknown, false, duplicated, oversized, or malformed results are
-not successful canary evidence.
+not successful canary evidence. The activation verifier independently hashes
+the root-owned host probe and requires its exact digest and size in the source
+manifest before a receipt can be minted or accepted.
 
 The probe performs direct filesystem, process, descriptor, capability,
 privilege, Unix-socket, and loopback TCP checks rather than delegating those
@@ -855,7 +857,8 @@ regular-file identity, the workspace contents to remain unchanged, and the
 fixed launcher and config-worker sockets to remain live before and after the
 probe. The process boundary directly checks `ptrace`, `kcmp`,
 `process_vm_readv`, and `process_vm_writev`; parsing a boolean-only inner report
-can never establish success.
+can never establish success. Socket connection timeouts are inconclusive and
+fail closed rather than being treated as access denial.
 
 ## Development
 

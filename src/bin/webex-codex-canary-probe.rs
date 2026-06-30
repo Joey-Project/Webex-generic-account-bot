@@ -322,15 +322,12 @@ fn unix_connection_denial_error(error: &std::io::Error) -> bool {
 fn tcp_connection_denial_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::PermissionDenied
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::TimedOut
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ConnectionRefused
     ) || matches!(
         error.raw_os_error(),
         Some(libc::EPERM)
             | Some(libc::EACCES)
             | Some(libc::ECONNREFUSED)
-            | Some(libc::ETIMEDOUT)
             | Some(libc::ENETUNREACH)
             | Some(libc::EHOSTUNREACH)
     )
@@ -808,6 +805,13 @@ mod tests {
         assert!(tcp_connection_denial_error(
             &std::io::Error::from_raw_os_error(libc::ENETUNREACH)
         ));
+        assert!(!tcp_connection_denial_error(
+            &std::io::Error::from_raw_os_error(libc::ETIMEDOUT)
+        ));
+        assert!(!tcp_connection_denial_error(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "inconclusive timeout"
+        )));
         assert!(!unix_connection_denial_error(
             &std::io::Error::from_raw_os_error(libc::EINVAL)
         ));
