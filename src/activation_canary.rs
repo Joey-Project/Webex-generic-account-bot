@@ -637,46 +637,69 @@ async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
 async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> {
     let anchor = lifecycle_unit_name(&format!("{owner}-anchor"), nonce);
     let child = lifecycle_unit_name(&format!("{owner}-child"), nonce);
-    let mut anchor_args = vec![
+    let mut anchor_may_exist = false;
+    let mut child_may_exist = false;
+    let result = async {
+        anchor_may_exist = true;
+        let start_anchor = run_command(
+            SYSTEMD_RUN_PATH,
+            &owner_anchor_args(&anchor),
+            COMMAND_TIMEOUT,
+        )
+        .await?;
+        ensure!(start_anchor.success(), "lifecycle anchor failed to start");
+
+        child_may_exist = true;
+        let start_child = run_command(
+            SYSTEMD_RUN_PATH,
+            &owner_child_args(&anchor, &child),
+            COMMAND_TIMEOUT,
+        )
+        .await?;
+        ensure!(start_child.success(), "lifecycle child failed to start");
+        wait_for_unit_active(&child)
+            .await
+            .context("lifecycle child never became active")?;
+        stop_unit(&anchor).await?;
+        wait_for_unit_inactive(&child).await
+    }
+    .await;
+
+    let cleanup =
+        cleanup_owner_lifecycle_units(&anchor, anchor_may_exist, &child, child_may_exist).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; failed to clean owner lifecycle canary units: {cleanup_error:#}"
+        )),
+    }
+}
+
+fn owner_anchor_args(anchor: &str) -> Vec<String> {
+    let mut args = vec![
         "--quiet".into(),
-        "--collect".into(),
         "--service-type=exec".into(),
         format!("--unit={anchor}"),
     ];
-    anchor_args.extend(activation_owner_properties());
-    anchor_args.extend([SHELL_PATH.into(), "-c".into(), "exec sleep 30".into()]);
-    let start_anchor = run_command(SYSTEMD_RUN_PATH, &anchor_args, COMMAND_TIMEOUT).await?;
-    ensure!(start_anchor.success(), "lifecycle anchor failed to start");
-    let start_child = run_command(
-        SYSTEMD_RUN_PATH,
-        &[
-            "--quiet".into(),
-            "--collect".into(),
-            "--service-type=exec".into(),
-            format!("--unit={child}"),
-            format!("--property=BindsTo={anchor}"),
-            format!("--property=After={anchor}"),
-            "--property=KillMode=control-group".into(),
-            SHELL_PATH.into(),
-            "-c".into(),
-            "exec sleep 30".into(),
-        ],
-        COMMAND_TIMEOUT,
-    )
-    .await?;
-    if !start_child.success() {
-        let _ = stop_unit(&anchor).await;
-        bail!("lifecycle child failed to start");
-    }
-    if let Err(error) = wait_for_unit_active(&child).await {
-        let _ = stop_unit(&anchor).await;
-        let _ = stop_unit(&child).await;
-        return Err(error).context("lifecycle child never became active");
-    }
-    let stop_result = stop_unit(&anchor).await;
-    let inactive_result = wait_for_unit_inactive(&child).await;
-    let _ = stop_unit(&child).await;
-    stop_result.and(inactive_result)
+    args.extend(activation_owner_properties());
+    args.extend([SHELL_PATH.into(), "-c".into(), "exec sleep 30".into()]);
+    args
+}
+
+fn owner_child_args(anchor: &str, child: &str) -> Vec<String> {
+    vec![
+        "--quiet".into(),
+        "--service-type=exec".into(),
+        format!("--unit={child}"),
+        format!("--property=BindsTo={anchor}"),
+        format!("--property=After={anchor}"),
+        "--property=KillMode=control-group".into(),
+        SHELL_PATH.into(),
+        "-c".into(),
+        "exec sleep 30".into(),
+    ]
 }
 
 fn activation_owner_properties() -> [String; 1] {
@@ -751,6 +774,30 @@ async fn cleanup_lifecycle_unit(unit: &str) -> Result<()> {
         (Err(stop_error), Err(reset_error)) => Err(anyhow!(
             "{stop_error:#}; failed to reset lifecycle canary unit: {reset_error:#}"
         )),
+    }
+}
+
+async fn cleanup_owner_lifecycle_units(
+    anchor: &str,
+    anchor_may_exist: bool,
+    child: &str,
+    child_may_exist: bool,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    if child_may_exist {
+        if let Err(error) = cleanup_lifecycle_unit(child).await {
+            errors.push(format!("child cleanup failed: {error:#}"));
+        }
+    }
+    if anchor_may_exist {
+        if let Err(error) = cleanup_lifecycle_unit(anchor).await {
+            errors.push(format!("anchor cleanup failed: {error:#}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
     }
 }
 
@@ -1147,6 +1194,33 @@ mod tests {
             properties
                 .iter()
                 .all(|property| !property.starts_with("--property=After="))
+        );
+    }
+
+    #[test]
+    fn owner_lifecycle_units_remain_loaded_until_explicit_cleanup() {
+        let anchor = "webex-codex-canary-owner-anchor.service";
+        let child = "webex-codex-canary-owner-child.service";
+        let anchor_args = owner_anchor_args(anchor);
+        let child_args = owner_child_args(anchor, child);
+
+        assert!(!anchor_args.iter().any(|argument| argument == "--collect"));
+        assert!(!child_args.iter().any(|argument| argument == "--collect"));
+        assert!(
+            anchor_args
+                .iter()
+                .any(|argument| argument
+                    == "--property=BindsTo=webex-codex-activation-renew.service")
+        );
+        assert!(
+            child_args
+                .iter()
+                .any(|argument| argument == &format!("--property=BindsTo={anchor}"))
+        );
+        assert!(
+            child_args
+                .iter()
+                .any(|argument| argument == &format!("--property=After={anchor}"))
         );
     }
 
