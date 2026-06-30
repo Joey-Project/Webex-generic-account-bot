@@ -2835,30 +2835,55 @@ describe('deploy-config CLI and execution', () => {
     });
     const calls = [];
 
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push([command.bin, command.args[0]]);
+        return { stdout: '', stderr: '' };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, true);
+    assert.equal(metadata.config_revision, 'f'.repeat(40));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed ephemeral config\n');
+    await fs.access(plan.botServiceDropIn);
+    await fs.access(plan.activationReceipt);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
+    assert.deepEqual(calls, []);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects repeated runner activation without touching active state', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-repeat-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'active ephemeral config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"active"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let commandRan = false;
+
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async (command) => {
-          calls.push([command.bin, command.args[0]]);
-          if (command.bin === '/usr/bin/git') {
-            const metadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
-            assert.equal(metadata.status, 'deployed');
-            assert.equal(metadata.runner_activation, true);
-            assert.equal(metadata.config_revision, 'f'.repeat(40));
-            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed ephemeral config\n');
-            await fs.access(plan.botServiceDropIn);
-            await fs.access(plan.activationReceipt);
-            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
-            await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
-            throw new Error('stop after committed runner recovery');
-          }
+        runner: async () => {
+          commandRan = true;
           return { stdout: '', stderr: '' };
         },
       }),
-      /stop after committed runner recovery/,
+      /permission is already active; use ordinary --apply/,
     );
 
-    assert.deepEqual(calls, [['/usr/bin/git', '-c']]);
+    assert.equal(commandRan, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'active ephemeral config\n');
+    assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"active"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
     await assertLockReleased(plan.lockDir);
   });
 

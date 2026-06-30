@@ -827,9 +827,17 @@ export async function executePlan({
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
-    await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
+    const recovery = await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
     throwIfAborted(signal);
+    if (plan.activateRunner && recovery?.committed) {
+      return recovery.metadata;
+    }
     runnerPermissionActive = await detectRunnerPermission(plan, fsApi);
+    if (plan.activateRunner && runnerPermissionActive) {
+      throw new Error(
+        'ephemeral runner permission is already active; use ordinary --apply for subsequent config updates',
+      );
+    }
     await prepareFreshCheckout(plan, fsApi);
     throwIfAborted(signal);
     for (const commandSpec of plan.commands) {
@@ -3008,7 +3016,7 @@ async function updateInstallTransactionPhase(plan, installState, phase, fsApi) {
 async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
   const transaction = await readInstallTransaction(plan, fsApi);
   if (!transaction) {
-    return;
+    return null;
   }
   if (transaction.service !== plan.service) {
     throw new Error(
@@ -3063,8 +3071,9 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
       : null,
   };
   if (transaction.phase === 'committed_pending_metadata') {
+    let metadata;
     try {
-      const metadata = deploymentMetadataFromInstallState(
+      metadata = deploymentMetadataFromInstallState(
         {
           ...plan,
           configRepo: transaction.config_repo,
@@ -3089,9 +3098,10 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
     } catch (error) {
       throw new CommittedRecoveryError(error.message, transaction.config_revision);
     }
-    return;
+    return { committed: true, metadata };
   }
   await rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi);
+  return { committed: false, metadata: null };
 }
 
 function deploymentMetadataFromInstallState(plan, installState) {

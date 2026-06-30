@@ -97,7 +97,10 @@ superseded_by:
   ephemeral-only staging policy, version 2 config/drop-in/receipt recovery,
   bounded receipt renewal, bot host preflight, minimum launcher/pending access,
   restart/readiness rollback, boot-time renewal ordering, and downgrade
-  prevention after permission activation. The production host still requires
+  prevention after permission activation. The explicit command refuses a
+  repeated activation once the permission drop-in is installed; boot renewal
+  and later ordinary ephemeral-only config applies own subsequent lifecycle.
+  The production host still requires
   a matching reviewed config and a successful real-reboot canary run.
 
 ## Delivery Rules
