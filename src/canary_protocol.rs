@@ -17,6 +17,8 @@ pub const RUNTIME_CANARY_CHECKS: &[&str] = &[
     "credential_path_denied",
     "final_output_denied",
     "forbidden_network_denied",
+    "host_protected_path_denied",
+    "host_unix_socket_denied",
     "launcher_socket_denied",
     "main_home_denied",
     "main_process_inspection_denied",
@@ -108,7 +110,8 @@ impl RuntimeCanaryReport {
         Ok(())
     }
 
-    pub fn ensure_success(&self) -> Result<()> {
+    pub fn ensure_success(&self, expected_nonce: &str) -> Result<()> {
+        self.validate_shape(expected_nonce)?;
         if self.checks.values().any(|passed| !passed) {
             return Err(anyhow!("runtime canary report contains a failed check"));
         }
@@ -181,7 +184,7 @@ mod tests {
         let parsed = parse_runtime_canary_report(&encoded, NONCE).unwrap();
 
         assert_eq!(parsed, report);
-        parsed.ensure_success().unwrap();
+        parsed.ensure_success(NONCE).unwrap();
     }
 
     #[test]
@@ -190,16 +193,22 @@ mod tests {
         failed
             .checks
             .insert(RUNTIME_CANARY_CHECKS[0].to_owned(), false);
-        failed.ensure_success().unwrap_err();
+        failed.ensure_success(NONCE).unwrap_err();
 
         let mut missing = failed.clone();
         missing.checks.remove(RUNTIME_CANARY_CHECKS[0]);
         assert!(missing.validate_shape(NONCE).is_err());
+        assert!(missing.ensure_success(NONCE).is_err());
 
         let mut unknown = failed.clone();
         unknown.checks.remove(RUNTIME_CANARY_CHECKS[0]);
         unknown.checks.insert("unknown".to_owned(), true);
         assert!(unknown.validate_shape(NONCE).is_err());
+        assert!(unknown.ensure_success(NONCE).is_err());
+
+        let mut empty = failed.clone();
+        empty.checks.clear();
+        assert!(empty.ensure_success(NONCE).is_err());
 
         let mut wrong_final = failed;
         wrong_final.final_line = "other".to_owned();

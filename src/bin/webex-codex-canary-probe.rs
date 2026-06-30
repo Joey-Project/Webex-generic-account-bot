@@ -45,6 +45,10 @@ const TOOL_HOME: &str = "/tmp/webex-codex-tool-home";
 #[cfg(target_os = "linux")]
 const WORKSPACE_PATH: &str = "/workspace";
 #[cfg(target_os = "linux")]
+const HOST_UNIX_FIXTURE_ROOT: &str = "/run/webex-codex-canary";
+#[cfg(target_os = "linux")]
+const HOST_PROTECTED_FIXTURE_ROOT: &str = "/var/lib/webex-generic-account-bot/canary-fixtures";
+#[cfg(target_os = "linux")]
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const FD_INSPECTION_LIMIT: usize = 256;
@@ -68,6 +72,10 @@ struct Cli {
     forbidden_tcp: SocketAddr,
     #[arg(long, value_parser = validate_loopback_address)]
     bot_tcp: SocketAddr,
+    #[arg(long)]
+    host_unix: PathBuf,
+    #[arg(long)]
+    host_protected_path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -76,6 +84,7 @@ fn main() -> Result<()> {
     if cli.forbidden_tcp == cli.bot_tcp {
         return Err(anyhow!("canary TCP endpoints must be distinct"));
     }
+    validate_host_fixture_paths(&cli)?;
     let report = RuntimeCanaryReport::new(cli.nonce.clone(), collect_checks(&cli))?;
     use std::io::Write;
     std::io::stdout()
@@ -107,6 +116,14 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     checks.insert(
         "forbidden_network_denied".to_owned(),
         tcp_connection_denied(cli.forbidden_tcp),
+    );
+    checks.insert(
+        "host_protected_path_denied".to_owned(),
+        path_denied(&cli.host_protected_path),
+    );
+    checks.insert(
+        "host_unix_socket_denied".to_owned(),
+        unix_socket_denied(&cli.host_unix),
     );
     checks.insert(
         "launcher_socket_denied".to_owned(),
@@ -187,6 +204,18 @@ fn validate_loopback_address(value: &str) -> std::result::Result<SocketAddr, Str
         return Err("canary TCP endpoint must be a nonzero loopback address".to_owned());
     }
     Ok(address)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_host_fixture_paths(cli: &Cli) -> Result<()> {
+    let expected_unix = Path::new(HOST_UNIX_FIXTURE_ROOT).join(format!("{}.sock", cli.nonce));
+    let expected_protected = Path::new(HOST_PROTECTED_FIXTURE_ROOT).join(&cli.nonce);
+    if cli.host_unix != expected_unix || cli.host_protected_path != expected_protected {
+        return Err(anyhow!(
+            "host canary fixture paths must be derived from the report nonce"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -582,9 +611,17 @@ mod tests {
             "127.0.0.1:41001",
             "--bot-tcp",
             "127.0.0.1:41002",
+            "--host-unix",
+            "/run/webex-codex-canary/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.sock",
+            "--host-protected-path",
+            "/var/lib/webex-generic-account-bot/canary-fixtures/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ])
         .unwrap();
         assert_eq!(cli.suite, RUNTIME_CANARY_SUITE);
+        validate_host_fixture_paths(&cli).unwrap();
+        let mut mismatched = cli;
+        mismatched.host_unix = PathBuf::from("/run/webex-codex-canary/other.sock");
+        assert!(validate_host_fixture_paths(&mismatched).is_err());
         assert!(validate_loopback_address("0.0.0.0:1").is_err());
         assert!(validate_loopback_address("127.0.0.1:0").is_err());
         assert!(validate_suite("other").is_err());
