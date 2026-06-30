@@ -4,6 +4,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::Read,
+    net::SocketAddr,
     os::unix::{fs::MetadataExt, io::AsRawFd},
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -28,6 +29,10 @@ use tokio::{
 #[cfg(target_os = "linux")]
 use crate::{
     activation::{self, ActivationPaths, VerifiedActivation},
+    canary_protocol::{
+        RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT, RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT,
+        runtime_canary_forbidden_ip_allowed, validate_runtime_canary_nonce,
+    },
     codex_launcher::AuthorisedPeer,
     input_sealer::{self, ensure_posix_acl_absent},
     launcher_protocol::{
@@ -72,6 +77,12 @@ const CODEX_AUTH_MAX_BYTES: u64 = 1024 * 1024;
 const OUTPUT_CAPTURE_BYTES: usize = OUTPUT_MAX_BYTES + 1024;
 #[cfg(target_os = "linux")]
 const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const RUNTIME_CANARY_CAPTURE_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const RUNTIME_CANARY_TIMEOUT_SECONDS: u64 = 600;
+#[cfg(target_os = "linux")]
+pub(crate) const ACTIVATION_RENEWAL_UNIT: &str = "webex-codex-activation-renew.service";
 #[cfg(target_os = "linux")]
 const PEER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
@@ -200,6 +211,52 @@ pub struct TransientRunPlan {
     pub executable: &'static str,
     pub args: Vec<OsString>,
     pub workspace: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeCanaryLaunchRequest {
+    pub nonce: String,
+    pub forbidden_tcp: String,
+    pub bot_tcp: String,
+    pub host_unix: String,
+    pub host_protected_path: String,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeCanaryLaunchRequest {
+    fn validate(&self) -> Result<()> {
+        validate_runtime_canary_nonce(&self.nonce)?;
+        let forbidden = self
+            .forbidden_tcp
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("runtime canary forbidden TCP endpoint is invalid"))?;
+        let bot = self
+            .bot_tcp
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("runtime canary bot TCP endpoint is invalid"))?;
+        let expected_unix = format!(
+            "{RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT}/{}.sock",
+            self.nonce
+        );
+        let expected_protected = format!(
+            "{RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT}/{}",
+            self.nonce
+        );
+        if forbidden.port() == 0
+            || !runtime_canary_forbidden_ip_allowed(forbidden.ip())
+            || self.forbidden_tcp != forbidden.to_string()
+            || bot.port() == 0
+            || !bot.ip().is_loopback()
+            || self.bot_tcp != bot.to_string()
+            || forbidden == bot
+            || self.host_unix != expected_unix
+            || self.host_protected_path != expected_protected
+        {
+            return Err(anyhow!("runtime canary launch request is invalid"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -342,6 +399,98 @@ pub async fn execute(
     .await
     .and_then(|result| result);
     finalise_execution(execution, cleanup)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn execute_runtime_canary(
+    request: RuntimeCanaryLaunchRequest,
+    candidate: VerifiedActivation,
+    cancellation: &ExecutionCancellation,
+) -> Result<String> {
+    request.validate()?;
+    let request_for_preparation = request.clone();
+    let deadline = WorkBudget::with_cancellation(
+        Duration::from_secs(LAUNCHER_PREPARATION_WORK_TIMEOUT_SECONDS),
+        cancellation.inner.clone(),
+    );
+    let prepared = run_blocking_with_process_watchdog(
+        "runtime canary preparation",
+        Duration::from_secs(LAUNCHER_PREPARATION_PROCESS_TIMEOUT_SECONDS),
+        move || prepare_runtime_canary(&request_for_preparation, &candidate, deadline),
+    )
+    .await??;
+    let PreparedRuntimeCanary { plan, workspace } = prepared;
+    let execution = run_runtime_canary_transient(plan, cancellation).await;
+    let cleanup = run_blocking_with_process_watchdog(
+        "runtime canary workspace cleanup",
+        Duration::from_secs(LAUNCHER_CLEANUP_PROCESS_TIMEOUT_SECONDS),
+        move || {
+            let mut workspace = workspace;
+            workspace.cleanup()
+        },
+    )
+    .await
+    .and_then(|result| result);
+    match (execution, cleanup) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("failed to clean runtime canary workspace"),
+        (Err(execution_error), Err(cleanup_error)) => Err(anyhow!(
+            "{execution_error:#}; failed to clean runtime canary workspace: {cleanup_error:#}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedRuntimeCanary {
+    plan: TransientRunPlan,
+    workspace: VerifiedWorkspace,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_runtime_canary(
+    request: &RuntimeCanaryLaunchRequest,
+    candidate: &VerifiedActivation,
+    deadline: WorkBudget,
+) -> Result<PreparedRuntimeCanary> {
+    deadline.check("runtime canary preparation")?;
+    request.validate()?;
+    let paths = RuntimePaths::default();
+    let runtime = verify_runtime_with_deadline(&paths, 0, candidate, Some(deadline.clone()))?;
+    let execute_request = runtime_canary_execute_request(request);
+    let sealed_workspace =
+        input_sealer::seal_workspace_with_deadline(&request.nonce, 0, Some(deadline.clone()))?;
+    let workspace = verify_workspace(
+        &paths.input_root,
+        &paths.consumed_input_root,
+        &execute_request,
+        runtime.input_gid,
+        Some(deadline),
+        sealed_workspace,
+    )?;
+    let plan = build_runtime_canary_plan(
+        request,
+        &execute_request,
+        &runtime,
+        &workspace.path,
+        &workspace.bind_source,
+    )?;
+    Ok(PreparedRuntimeCanary { plan, workspace })
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_canary_execute_request(request: &RuntimeCanaryLaunchRequest) -> ExecuteRequest {
+    ExecuteRequest {
+        run_id: request.nonce.clone(),
+        message_id: format!("runtime-canary-{}", &request.nonce[..16]),
+        prompt: "runtime canary is generated by the fixed runtime wrapper".to_owned(),
+        workspace: Path::new(CODEX_INPUT_ROOT).join(&request.nonce),
+        model: Some("gpt-5.5".to_owned()),
+        reasoning_effort: Some(ReasoningEffort::Xhigh),
+        timeout_seconds: RUNTIME_CANARY_TIMEOUT_SECONDS,
+        output_char_limit: RUNTIME_CANARY_CAPTURE_BYTES as u64,
+        skip_git_repo_check: true,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1099,7 +1248,7 @@ fn build_transient_run_plan(
     launcher_unit: &str,
 ) -> Result<TransientRunPlan> {
     validate_execution_policy(request)?;
-    validate_launcher_unit(launcher_unit)?;
+    validate_transient_owner_unit(launcher_unit)?;
     validate_workspace_bind_source(workspace_bind_source)?;
     let unit = transient_unit_name(&request.run_id);
     let runtime_timeout = request
@@ -1196,6 +1345,57 @@ fn build_transient_run_plan(
         args,
         workspace: workspace.to_owned(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn build_runtime_canary_plan(
+    request: &RuntimeCanaryLaunchRequest,
+    execute_request: &ExecuteRequest,
+    runtime: &VerifiedRuntime,
+    workspace: &Path,
+    workspace_bind_source: &str,
+) -> Result<TransientRunPlan> {
+    request.validate()?;
+    let mut plan = build_transient_run_plan(
+        execute_request,
+        runtime,
+        workspace,
+        workspace_bind_source,
+        ACTIVATION_RENEWAL_UNIT,
+    )?;
+    let executable_index = plan
+        .args
+        .iter()
+        .position(|argument| argument.as_os_str() == OsStr::new(RUNTIME_EXECUTABLE_PATH))
+        .ok_or_else(|| anyhow!("runtime canary plan has no fixed runtime executable"))?;
+    let extra_properties = [
+        format!("BindReadOnlyPaths={0}:{0}", request.host_protected_path),
+        format!("BindReadOnlyPaths={0}:{0}", request.host_unix),
+    ];
+    let property_arg_count = extra_properties.len() * 2;
+    let mut properties = Vec::with_capacity(extra_properties.len() * 2);
+    for property in extra_properties {
+        properties.push(OsString::from("--property"));
+        properties.push(property.into());
+    }
+    plan.args
+        .splice(executable_index..executable_index, properties);
+    let executable_index = executable_index + property_arg_count;
+    plan.args.truncate(executable_index + 1);
+    plan.args.extend([
+        OsString::from("--runtime-canary"),
+        OsString::from("--nonce"),
+        OsString::from(&request.nonce),
+        OsString::from("--forbidden-tcp"),
+        OsString::from(&request.forbidden_tcp),
+        OsString::from("--bot-tcp"),
+        OsString::from(&request.bot_tcp),
+        OsString::from("--host-unix"),
+        OsString::from(&request.host_unix),
+        OsString::from("--host-protected-path"),
+        OsString::from(&request.host_protected_path),
+    ]);
+    Ok(plan)
 }
 
 #[cfg(target_os = "linux")]
@@ -1373,6 +1573,97 @@ async fn run_transient(
 }
 
 #[cfg(target_os = "linux")]
+async fn run_runtime_canary_transient(
+    plan: TransientRunPlan,
+    cancellation: &ExecutionCancellation,
+) -> Result<String> {
+    if cancellation.is_cancelled() {
+        return Err(WorkBudgetError::cancelled("runtime canary before start").into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(RUNTIME_CANARY_TIMEOUT_SECONDS);
+    let mut command = Command::new(plan.executable);
+    command
+        .args(&plan.args)
+        .env_clear()
+        .env("LANG", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("failed to start the fixed runtime canary unit")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("runtime canary stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("runtime canary stderr is unavailable"))?;
+    let stdout_task = tokio::spawn(read_limited(stdout, RUNTIME_CANARY_CAPTURE_BYTES));
+    let stderr_task = tokio::spawn(read_limited(stderr, STDERR_CAPTURE_BYTES));
+    let status = loop {
+        tokio::select! {
+            result = child.wait() => match result {
+                Ok(status) => break status,
+                Err(error) => {
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
+                    return Err(error).context("failed while waiting for runtime canary unit");
+                }
+            },
+            _ = sleep(PEER_POLL_INTERVAL) => {
+                if cancellation.is_cancelled() {
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
+                    return Err(WorkBudgetError::cancelled("runtime canary execution").into());
+                }
+                if Instant::now() >= deadline {
+                    terminate_and_discard_captures(
+                        &plan.unit,
+                        &mut child,
+                        stdout_task,
+                        stderr_task,
+                    )
+                    .await?;
+                    return Err(anyhow!("runtime canary execution timed out"));
+                }
+            }
+        }
+    };
+    if Instant::now() >= deadline {
+        discard_captures(stdout_task, stderr_task).await;
+        return Err(anyhow!("runtime canary execution reached its deadline"));
+    }
+    let (stdout_result, stderr_result) = tokio::join!(
+        collect_capture(stdout_task, "runtime canary stdout"),
+        collect_capture(stderr_task, "runtime canary stderr")
+    );
+    let (stdout, stdout_truncated) = stdout_result?;
+    let (_stderr, stderr_truncated) = stderr_result?;
+    if !status.success() || stdout_truncated || stderr_truncated || stdout.trim().is_empty() {
+        return Err(anyhow!(
+            "runtime canary unit failed or produced incomplete bounded output"
+        ));
+    }
+    Ok(stdout)
+}
+
+#[cfg(target_os = "linux")]
 enum PromptWriteOutcome {
     Completed(std::io::Result<()>),
     Cancelled,
@@ -1512,6 +1803,14 @@ fn validate_launcher_unit(unit: &str) -> Result<()> {
         return Err(anyhow!("launcher systemd unit is invalid"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_transient_owner_unit(unit: &str) -> Result<()> {
+    if unit == ACTIVATION_RENEWAL_UNIT {
+        return Ok(());
+    }
+    validate_launcher_unit(unit)
 }
 
 #[cfg(target_os = "linux")]
@@ -2394,6 +2693,53 @@ mod tests {
                 .iter()
                 .any(|value| value.contains("systemd-run") && value != SYSTEMD_RUN_PATH)
         );
+    }
+
+    #[test]
+    fn runtime_canary_plan_reuses_the_hardened_image_without_a_receipt_owner() {
+        const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let request = RuntimeCanaryLaunchRequest {
+            nonce: NONCE.to_owned(),
+            forbidden_tcp: "192.0.2.10:41001".to_owned(),
+            bot_tcp: "127.0.0.1:41002".to_owned(),
+            host_unix: format!("{RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT}/{NONCE}.sock"),
+            host_protected_path: format!("{RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT}/{NONCE}"),
+        };
+        let execute = runtime_canary_execute_request(&request);
+        let plan = build_runtime_canary_plan(
+            &request,
+            &execute,
+            &runtime(),
+            &execute.workspace,
+            "/proc/123/fd/7",
+        )
+        .unwrap();
+        let args = plan
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        for required in [
+            format!("BindsTo={ACTIVATION_RENEWAL_UNIT}"),
+            format!("BindReadOnlyPaths={0}:{0}", request.host_protected_path),
+            format!("BindReadOnlyPaths={0}:{0}", request.host_unix),
+            "--runtime-canary".to_owned(),
+            "--nonce".to_owned(),
+            NONCE.to_owned(),
+            "--forbidden-tcp".to_owned(),
+            request.forbidden_tcp.clone(),
+            "--bot-tcp".to_owned(),
+            request.bot_tcp.clone(),
+        ] {
+            assert!(args.iter().any(|value| value == &required), "{required}");
+        }
+        assert!(args.iter().any(|value| value == "CapabilityBoundingSet="));
+        assert!(
+            args.iter()
+                .any(|value| value == "SystemCallErrorNumber=EPERM")
+        );
+        assert!(!args.iter().any(|value| value == "--model"));
+        assert!(!args.iter().any(|value| value == &execute.prompt));
     }
 
     #[test]

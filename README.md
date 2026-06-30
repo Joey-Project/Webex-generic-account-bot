@@ -870,6 +870,37 @@ attempt, so `NotFound` alone cannot prove output isolation. Socket connection
 timeouts are inconclusive and fail closed rather than being treated as access
 denial.
 
+### PR 4c2a2 Runtime and Host Canaries (Not Activated)
+
+PR 4c2a2 adds the root-only
+`/opt/webex-generic-account-bot/bin/webex-codex-activation renew` helper and an
+inactive `webex-codex-activation-renew.service` oneshot. The helper invalidates
+any old receipt before testing, locks renewal to one process, snapshots the
+candidate image and executable identities, and writes a new receipt only when
+the same artifact binding remains current after every canary succeeds.
+
+The production runtime has a separate fixed `--runtime-canary` mode. It runs
+the pinned Codex `0.142.3` `exec --json` path, accepts exactly one matching
+command-execution event for the static probe, validates the one-line report and
+bound final message, and independently checks the systemd credential, both
+private homes, the real final-output sibling, the sealed workspace fixture,
+and a CLOEXEC descriptor secret before and after Codex. The host helper keeps
+the protected file and live Unix/TCP listeners open, requires unchanged file
+identity and contents, requires the launcher and config-worker sockets to stay
+live, and rejects any accepted denied connection.
+
+Timeout and owner-crash canaries use fixed `systemd-run`/`systemctl` argv and
+must converge to inactive units. Reboot cleanup uses a persistent root-owned
+challenge plus a `/run` marker: the first renewal prepares the challenge and
+fails closed until one real reboot has removed the marker. A service restart
+is not accepted as reboot evidence.
+
+This slice remains non-deploying. It does not add the bot to launcher or input
+groups, install a bot drop-in, switch production away from `current-user`, or
+enable `/config pull`, `/config reload`, or `/config sync`. Those permission
+and configuration changes remain transactional work for PR 4c2b and the later
+configuration-command PRs.
+
 ## Development
 
 Generated CI runs:

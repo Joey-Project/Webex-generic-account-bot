@@ -3,7 +3,7 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-06-28
+updated: 2026-06-30
 branch: codex/roadmap-deploy-isolation
 pr:
 supersedes: []
@@ -87,6 +87,11 @@ superseded_by:
   remove ready, source-quarantine, and consumed sealed trees by verified inode;
   ready trees remain group-inaccessible until consumed, and tmpfiles remains
   the crash fallback.
+- PR 4c2a2 implements the pinned Codex JSONL event validator, trusted runtime
+  interior evidence, nonce-scoped host fixtures/listeners, timeout and
+  owner-crash lifecycle checks, a real-reboot challenge, and root-only atomic
+  receipt renewal. It remains inactive and grants no bot launcher permission;
+  PR 4c2b still owns the deployment transaction and production switch.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.

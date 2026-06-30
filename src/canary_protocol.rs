@@ -13,6 +13,7 @@ use serde::{
 pub const RUNTIME_CANARY_SCHEMA_VERSION: u16 = 1;
 pub const RUNTIME_CANARY_SUITE: &str = "runtime-boundary-v1";
 pub const RUNTIME_CANARY_REPORT_MAX_BYTES: usize = 16 * 1024;
+pub const RUNTIME_CANARY_RUNTIME_EVIDENCE_MAX_BYTES: usize = 32 * 1024;
 pub const RUNTIME_CANARY_FINAL_PREFIX: &str = "WEBEX_CODEX_CANARY_OK";
 pub const RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT: &str = "/run/webex-codex-canary";
 pub const RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT: &str =
@@ -140,6 +141,94 @@ impl RuntimeCanaryHostEvidence {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCanaryRuntimeEvidence {
+    pub nonce: String,
+    pub fixture_binding: String,
+    pub report: RuntimeCanaryReport,
+    pub main_pid: u32,
+    pub fd_secret_sha256: String,
+    pub credential_path_regular_file_before: bool,
+    pub credential_path_regular_file_after: bool,
+    pub credential_path_identity_unchanged: bool,
+    pub credential_path_contents_unchanged: bool,
+    pub main_home_fixture_regular_file_before: bool,
+    pub main_home_fixture_regular_file_after: bool,
+    pub main_home_fixture_identity_unchanged: bool,
+    pub main_home_fixture_contents_unchanged: bool,
+    pub codex_home_fixture_regular_file_before: bool,
+    pub codex_home_fixture_regular_file_after: bool,
+    pub codex_home_fixture_identity_unchanged: bool,
+    pub codex_home_fixture_contents_unchanged: bool,
+    pub final_output_fixture_regular_file_before: bool,
+    pub final_output_fixture_regular_file_after: bool,
+    pub final_output_fixture_identity_unchanged: bool,
+    pub final_output_fixture_contents_unchanged: bool,
+    pub workspace_fixture_regular_file_before: bool,
+    pub workspace_fixture_regular_file_after: bool,
+    pub workspace_fixture_identity_unchanged: bool,
+    pub workspace_fixture_contents_unchanged: bool,
+}
+
+impl RuntimeCanaryRuntimeEvidence {
+    pub fn validate(
+        &self,
+        expected_nonce: &str,
+        expected_fixture_binding: &str,
+        expected_inputs: &RuntimeCanaryFixtureInputs,
+    ) -> Result<()> {
+        validate_runtime_canary_nonce(expected_nonce)?;
+        validate_runtime_canary_fixture_binding(expected_fixture_binding)?;
+        let derived_binding = runtime_canary_fixture_binding(expected_nonce, expected_inputs)?;
+        self.report
+            .validate_shape(expected_nonce, expected_fixture_binding)?;
+        if derived_binding != expected_fixture_binding
+            || self.nonce != expected_nonce
+            || self.fixture_binding != expected_fixture_binding
+            || self.main_pid != expected_inputs.main_pid
+            || self.fd_secret_sha256 != expected_inputs.fd_secret_sha256
+            || self.report.checks.values().any(|passed| !passed)
+            || !self.credential_path_regular_file_before
+            || !self.credential_path_regular_file_after
+            || !self.credential_path_identity_unchanged
+            || !self.credential_path_contents_unchanged
+            || !self.main_home_fixture_regular_file_before
+            || !self.main_home_fixture_regular_file_after
+            || !self.main_home_fixture_identity_unchanged
+            || !self.main_home_fixture_contents_unchanged
+            || !self.codex_home_fixture_regular_file_before
+            || !self.codex_home_fixture_regular_file_after
+            || !self.codex_home_fixture_identity_unchanged
+            || !self.codex_home_fixture_contents_unchanged
+            || !self.final_output_fixture_regular_file_before
+            || !self.final_output_fixture_regular_file_after
+            || !self.final_output_fixture_identity_unchanged
+            || !self.final_output_fixture_contents_unchanged
+            || !self.workspace_fixture_regular_file_before
+            || !self.workspace_fixture_regular_file_after
+            || !self.workspace_fixture_identity_unchanged
+            || !self.workspace_fixture_contents_unchanged
+        {
+            return Err(anyhow!(
+                "runtime canary runtime evidence does not match its fixed contract"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_json_line(&self) -> Result<Vec<u8>> {
+        let mut output = serde_json::to_vec(self)?;
+        output.push(b'\n');
+        if output.len() > RUNTIME_CANARY_RUNTIME_EVIDENCE_MAX_BYTES {
+            return Err(anyhow!(
+                "runtime canary runtime evidence exceeds its byte limit"
+            ));
+        }
+        Ok(output)
     }
 }
 
@@ -276,6 +365,27 @@ pub fn parse_runtime_canary_report(
     let report: RuntimeCanaryReport = serde_json::from_slice(&input[..input.len() - 1])?;
     report.validate_shape(expected_nonce, expected_fixture_binding)?;
     Ok(report)
+}
+
+pub fn parse_runtime_canary_runtime_evidence(
+    input: &[u8],
+    expected_nonce: &str,
+    expected_fixture_binding: &str,
+    expected_inputs: &RuntimeCanaryFixtureInputs,
+) -> Result<RuntimeCanaryRuntimeEvidence> {
+    if input.is_empty()
+        || input.len() > RUNTIME_CANARY_RUNTIME_EVIDENCE_MAX_BYTES
+        || !input.ends_with(b"\n")
+        || input[..input.len() - 1].contains(&b'\n')
+        || input.contains(&b'\r')
+    {
+        return Err(anyhow!(
+            "runtime canary runtime evidence framing is invalid"
+        ));
+    }
+    let evidence: RuntimeCanaryRuntimeEvidence = serde_json::from_slice(&input[..input.len() - 1])?;
+    evidence.validate(expected_nonce, expected_fixture_binding, expected_inputs)?;
+    Ok(evidence)
 }
 
 pub fn runtime_canary_fixture_binding(
@@ -474,6 +584,37 @@ mod tests {
         }
     }
 
+    fn passing_runtime_evidence() -> RuntimeCanaryRuntimeEvidence {
+        let binding = fixture_binding();
+        RuntimeCanaryRuntimeEvidence {
+            nonce: NONCE.to_owned(),
+            fixture_binding: binding.clone(),
+            report: RuntimeCanaryReport::new(NONCE.to_owned(), binding, passing_checks()).unwrap(),
+            main_pid: fixture_inputs().main_pid,
+            fd_secret_sha256: fixture_inputs().fd_secret_sha256,
+            credential_path_regular_file_before: true,
+            credential_path_regular_file_after: true,
+            credential_path_identity_unchanged: true,
+            credential_path_contents_unchanged: true,
+            main_home_fixture_regular_file_before: true,
+            main_home_fixture_regular_file_after: true,
+            main_home_fixture_identity_unchanged: true,
+            main_home_fixture_contents_unchanged: true,
+            codex_home_fixture_regular_file_before: true,
+            codex_home_fixture_regular_file_after: true,
+            codex_home_fixture_identity_unchanged: true,
+            codex_home_fixture_contents_unchanged: true,
+            final_output_fixture_regular_file_before: true,
+            final_output_fixture_regular_file_after: true,
+            final_output_fixture_identity_unchanged: true,
+            final_output_fixture_contents_unchanged: true,
+            workspace_fixture_regular_file_before: true,
+            workspace_fixture_regular_file_after: true,
+            workspace_fixture_identity_unchanged: true,
+            workspace_fixture_contents_unchanged: true,
+        }
+    }
+
     #[test]
     fn round_trips_the_exact_success_contract() {
         let binding = fixture_binding();
@@ -485,6 +626,66 @@ mod tests {
 
         assert_eq!(parsed, report);
         parsed.ensure_success(NONCE, &binding, &evidence).unwrap();
+    }
+
+    #[test]
+    fn round_trips_and_validates_runtime_evidence() {
+        let inputs = fixture_inputs();
+        let binding = fixture_binding();
+        let evidence = passing_runtime_evidence();
+        evidence.validate(NONCE, &binding, &inputs).unwrap();
+
+        let encoded = evidence.to_json_line().unwrap();
+        let parsed =
+            parse_runtime_canary_runtime_evidence(&encoded, NONCE, &binding, &inputs).unwrap();
+        assert_eq!(parsed, evidence);
+
+        let mut unknown = serde_json::to_value(&evidence).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("credential_contents".to_owned(), json!("forbidden"));
+        let mut unknown = serde_json::to_vec(&unknown).unwrap();
+        unknown.push(b'\n');
+        assert!(parse_runtime_canary_runtime_evidence(&unknown, NONCE, &binding, &inputs).is_err());
+    }
+
+    #[test]
+    fn runtime_evidence_rejects_failed_or_mismatched_interior_evidence() {
+        let inputs = fixture_inputs();
+        let binding = fixture_binding();
+
+        let mut changed = passing_runtime_evidence();
+        changed.final_output_fixture_contents_unchanged = false;
+        assert!(changed.validate(NONCE, &binding, &inputs).is_err());
+
+        let mut changed_workspace = passing_runtime_evidence();
+        changed_workspace.workspace_fixture_identity_unchanged = false;
+        assert!(
+            changed_workspace
+                .validate(NONCE, &binding, &inputs)
+                .is_err()
+        );
+
+        let mut failed_report = passing_runtime_evidence();
+        failed_report
+            .report
+            .checks
+            .insert(RUNTIME_CANARY_CHECKS[0].to_owned(), false);
+        assert!(failed_report.validate(NONCE, &binding, &inputs).is_err());
+
+        let mut wrong_pid = passing_runtime_evidence();
+        wrong_pid.main_pid += 1;
+        assert!(wrong_pid.validate(NONCE, &binding, &inputs).is_err());
+
+        let mut wrong_digest = passing_runtime_evidence();
+        wrong_digest.fd_secret_sha256 = "f".repeat(64);
+        assert!(wrong_digest.validate(NONCE, &binding, &inputs).is_err());
+
+        let oversized = vec![b'x'; RUNTIME_CANARY_RUNTIME_EVIDENCE_MAX_BYTES + 1];
+        assert!(
+            parse_runtime_canary_runtime_evidence(&oversized, NONCE, &binding, &inputs).is_err()
+        );
     }
 
     #[test]

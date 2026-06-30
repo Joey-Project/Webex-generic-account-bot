@@ -452,17 +452,117 @@ pub(crate) fn verify_activation_with_deadline(
     Ok(verified)
 }
 
-pub fn build_activation_receipt(canaries: BTreeMap<String, bool>) -> Result<ActivationReceipt> {
-    build_activation_receipt_with(&ActivationPaths::production(), canaries)
+fn verify_activation_candidate_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
+    let binding = load_activation_binding(paths)?;
+    for (path, identity) in &binding.identities {
+        ensure_path_identity(paths, path, identity)?;
+    }
+    Ok(VerifiedActivation {
+        schema_version: ACTIVATION_SCHEMA_VERSION,
+        boot_id: binding.boot_id,
+        active_manifest_sha256: binding.active_manifest_sha256,
+        runtime_image_sha256: binding.runtime_image_sha256,
+        bot_executable_sha256: binding.bot_executable_sha256,
+        launcher_executable_sha256: binding.launcher_executable_sha256,
+        runtime_executable_sha256: binding.runtime_executable_sha256,
+        codex_version: SUPPORTED_CODEX_VERSION.to_owned(),
+        model: SUPPORTED_MODEL.to_owned(),
+        canaries: Vec::new(),
+    })
 }
 
-pub fn write_activation_receipt(receipt: &ActivationReceipt) -> Result<()> {
+pub(crate) fn begin_activation_renewal() -> Result<VerifiedActivation> {
     ensure_linux()?;
     ensure_root(unsafe { libc::geteuid() })?;
-    let paths = ActivationPaths::production();
-    write_activation_receipt_with(&paths, receipt)?;
-    verify_activation_with(&paths)?;
+    begin_activation_renewal_with(&ActivationPaths::production())
+}
+
+pub(crate) fn abort_activation_renewal() -> Result<()> {
+    ensure_linux()?;
+    ensure_root(unsafe { libc::geteuid() })?;
+    invalidate_activation_receipt_with(&ActivationPaths::production())
+}
+
+fn begin_activation_renewal_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
+    invalidate_activation_receipt_with(paths)?;
+    verify_activation_candidate_with(paths)
+}
+
+pub(crate) fn commit_activation_receipt(
+    expected: &VerifiedActivation,
+    canaries: BTreeMap<String, bool>,
+) -> Result<VerifiedActivation> {
+    ensure_linux()?;
+    ensure_root(unsafe { libc::geteuid() })?;
+    commit_activation_receipt_with(&ActivationPaths::production(), expected, canaries)
+}
+
+fn commit_activation_receipt_with(
+    paths: &ActivationPaths,
+    expected: &VerifiedActivation,
+    canaries: BTreeMap<String, bool>,
+) -> Result<VerifiedActivation> {
+    let result = (|| {
+        let current = verify_activation_candidate_with(paths)?;
+        ensure_same_activation_binding(expected, &current)?;
+        let receipt = build_activation_receipt_with(paths, canaries)?;
+        write_activation_receipt_with(paths, &receipt)?;
+        let verified = verify_activation_with(paths)?;
+        ensure_same_activation_binding(expected, &verified)?;
+        Ok(verified)
+    })();
+    match result {
+        Ok(verified) => Ok(verified),
+        Err(error) => match invalidate_activation_receipt_with(paths) {
+            Ok(()) => Err(error),
+            Err(invalidation_error) => Err(anyhow!(
+                "{error:#}; failed to invalidate activation receipt: {invalidation_error:#}"
+            )),
+        },
+    }
+}
+
+fn ensure_same_activation_binding(
+    expected: &VerifiedActivation,
+    actual: &VerifiedActivation,
+) -> Result<()> {
+    if expected.schema_version != actual.schema_version
+        || expected.boot_id != actual.boot_id
+        || expected.active_manifest_sha256 != actual.active_manifest_sha256
+        || expected.runtime_image_sha256 != actual.runtime_image_sha256
+        || expected.bot_executable_sha256 != actual.bot_executable_sha256
+        || expected.launcher_executable_sha256 != actual.launcher_executable_sha256
+        || expected.runtime_executable_sha256 != actual.runtime_executable_sha256
+        || expected.codex_version != actual.codex_version
+        || expected.model != actual.model
+    {
+        return Err(anyhow!(
+            "activation artifacts changed while production canaries were running"
+        ));
+    }
     Ok(())
+}
+
+fn invalidate_activation_receipt_with(paths: &ActivationPaths) -> Result<()> {
+    validate_trusted_ancestors(paths, &paths.receipt)?;
+    match fs::symlink_metadata(&paths.receipt) {
+        Ok(metadata) => {
+            validate_file_metadata(
+                paths,
+                &metadata,
+                TrustedFileKind::ReadOnlyData,
+                RECEIPT_MAX_BYTES,
+            )?;
+            fs::remove_file(&paths.receipt)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = paths
+        .receipt
+        .parent()
+        .ok_or_else(|| anyhow!("activation receipt path has no parent"))?;
+    sync_directory(paths, parent)
 }
 
 fn build_activation_receipt_with(
@@ -1604,6 +1704,43 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+    }
+
+    #[test]
+    fn renewal_invalidates_the_old_receipt_before_committing_the_candidate() {
+        let fixture = Fixture::new();
+        fixture.install(&fixture.receipt());
+
+        let candidate = begin_activation_renewal_with(&fixture.paths).unwrap();
+        assert!(candidate.canaries.is_empty());
+        assert!(!fixture.paths.receipt.exists());
+
+        let verified =
+            commit_activation_receipt_with(&fixture.paths, &candidate, passing_canaries()).unwrap();
+        assert_eq!(verified.canaries.len(), REQUIRED_CANARIES.len());
+        assert!(fixture.paths.receipt.exists());
+    }
+
+    #[test]
+    fn renewal_leaves_no_receipt_when_canaries_fail_or_artifacts_drift() {
+        let fixture = Fixture::new();
+        let candidate = begin_activation_renewal_with(&fixture.paths).unwrap();
+        let mut failed = passing_canaries();
+        failed.insert(REQUIRED_CANARIES[0].to_owned(), false);
+        assert!(commit_activation_receipt_with(&fixture.paths, &candidate, failed).is_err());
+        assert!(!fixture.paths.receipt.exists());
+
+        let candidate = begin_activation_renewal_with(&fixture.paths).unwrap();
+        replace_read_only(
+            &fixture.paths.runtime_executable,
+            b"replacement runtime executable\n",
+            0o555,
+        );
+        assert!(
+            commit_activation_receipt_with(&fixture.paths, &candidate, passing_canaries(),)
+                .is_err()
+        );
+        assert!(!fixture.paths.receipt.exists());
     }
 
     #[test]

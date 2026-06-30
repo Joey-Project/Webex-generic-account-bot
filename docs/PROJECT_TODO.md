@@ -20,8 +20,10 @@
 - [completed] Implement PR 4c1c's gated runner wiring.
 - [completed] Implement PR 4c2a1's exact canary contract, static syscall probe,
   and immutable image allowlist entry.
-- [pending] Implement PR 4c2a2's deterministic production-image and host
-  lifecycle canaries and PR 4c2b's transactional permission/config activation;
+- [completed] Implement PR 4c2a2's deterministic production-image and host
+  lifecycle canaries plus root-only receipt renewal without granting bot
+  launcher access or enabling production configuration.
+- [pending] Implement PR 4c2b's transactional permission/config activation;
   then separately grant config-worker socket access and enable `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or

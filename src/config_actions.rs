@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-const CONFIG_ACTION_SOCKET: &str = "/run/webex-config-pull/config-pull.sock";
+pub(crate) const CONFIG_ACTION_SOCKET: &str = "/run/webex-config-pull/config-pull.sock";
 #[cfg(unix)]
 const CONFIG_ACTION_WORKER_USER: &str = "webex-config-deploy";
 #[cfg(unix)]

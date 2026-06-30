@@ -1,0 +1,887 @@
+#![cfg(target_os = "linux")]
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
+use tokio::{process::Command, time::sleep};
+
+use crate::{
+    activation::{self, REQUIRED_CANARIES, VerifiedActivation},
+    canary_host::{
+        BoundedRegularFileSnapshot, InstrumentedTcpListener, InstrumentedUnixListener,
+        bind_assigned_non_loopback_listener, bind_loopback_bot_listener,
+    },
+    canary_protocol::{
+        RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT, RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT,
+        RuntimeCanaryFixtureInputs, RuntimeCanaryHostEvidence, RuntimeCanaryRuntimeEvidence,
+        parse_runtime_canary_runtime_evidence, runtime_canary_fixture_binding,
+        validate_runtime_canary_nonce,
+    },
+    codex_launcher::LAUNCHER_SOCKET_PATH,
+    config_actions::CONFIG_ACTION_SOCKET,
+    isolated_execution::{
+        ACTIVATION_RENEWAL_UNIT, ExecutionCancellation, RuntimeCanaryLaunchRequest,
+        execute_runtime_canary,
+    },
+    runner_input::stage_runtime_canary_workspace,
+};
+
+const ACTIVATION_LOCK_PATH: &str = "/run/webex-codex-activation/renew.lock";
+const REBOOT_CHALLENGE_PATH: &str =
+    "/var/lib/webex-generic-account-bot/canary-fixtures/reboot-challenge.json";
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const SYSTEMD_RUN_PATH: &str = "/usr/bin/systemd-run";
+const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+const SHELL_PATH: &str = "/bin/sh";
+const FIXTURE_MAX_BYTES: u64 = 64 * 1024;
+const CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(15);
+const REBOOT_CHALLENGE_VERSION: u16 = 1;
+const REBOOT_MARKER_CONTENTS: &[u8] = b"webex-runtime-reboot-canary-v1\n";
+
+pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
+    ensure_root()?;
+    let _lock = RenewalLock::acquire()?;
+    let candidate = activation::begin_activation_renewal()?;
+    let result = async {
+        verify_reboot_cleanup_challenge()?;
+        let runtime = run_runtime_boundary_canary(&candidate).await?;
+        run_timeout_cleanup_canary(&runtime.nonce).await?;
+        run_owner_crash_cleanup_canary(&runtime.nonce, "launcher").await?;
+        run_owner_crash_cleanup_canary(&runtime.nonce, "bot").await?;
+        let canaries = passing_receipt_canaries(&runtime);
+        activation::commit_activation_receipt(&candidate, canaries)
+    }
+    .await;
+    match result {
+        Ok(verified) => Ok(verified),
+        Err(error) => match activation::abort_activation_renewal() {
+            Ok(()) => Err(error),
+            Err(abort_error) => Err(anyhow!(
+                "{error:#}; failed to preserve the invalid activation state: {abort_error:#}"
+            )),
+        },
+    }
+}
+
+struct RenewalLock(File);
+
+impl RenewalLock {
+    fn acquire() -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(ACTIVATION_LOCK_PATH)
+            .context("failed to open the activation renewal lock")?;
+        validate_private_root_file(&file.metadata()?, "activation renewal lock")?;
+        // SAFETY: flock operates only on the live lock descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                bail!("activation renewal is already in progress");
+            }
+            return Err(error).context("failed to lock activation renewal");
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RenewalLock {
+    fn drop(&mut self) {
+        // SAFETY: this unlocks only the descriptor owned by the guard.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+struct RuntimeBoundaryResult {
+    nonce: String,
+    report: crate::canary_protocol::RuntimeCanaryReport,
+}
+
+async fn run_runtime_boundary_canary(
+    candidate: &VerifiedActivation,
+) -> Result<RuntimeBoundaryResult> {
+    let nonce = random_nonce()?;
+    let mut fixtures = HostFixtureSet::create(&nonce)?;
+    ensure!(
+        unix_listener_live(Path::new(LAUNCHER_SOCKET_PATH))?,
+        "launcher socket is not live before the runtime canary"
+    );
+    ensure!(
+        unix_listener_live(Path::new(CONFIG_ACTION_SOCKET))?,
+        "config worker socket is not live before the runtime canary"
+    );
+
+    let pending = stage_runtime_canary_workspace(&nonce, &fixtures.workspace_root).await?;
+    let launch = RuntimeCanaryLaunchRequest {
+        nonce: nonce.clone(),
+        forbidden_tcp: fixtures.forbidden.bound_endpoint().to_string(),
+        bot_tcp: fixtures.bot.bound_endpoint().to_string(),
+        host_unix: fixtures.unix.bound_path().to_string_lossy().into_owned(),
+        host_protected_path: fixtures.protected.path().to_string_lossy().into_owned(),
+    };
+    let cancellation = ExecutionCancellation::new();
+    let execution = execute_runtime_canary(launch.clone(), candidate.clone(), &cancellation).await;
+    let cleanup = pending.cleanup().await;
+    let output = match (execution, cleanup) {
+        (Ok(output), Ok(())) => output,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error).context("failed to clean canary input"),
+        (Err(execution_error), Err(cleanup_error)) => {
+            return Err(anyhow!(
+                "{execution_error:#}; failed to clean canary input: {cleanup_error:#}"
+            ));
+        }
+    };
+
+    let runtime = parse_runtime_evidence(&output, &launch)?;
+    fixtures.protected.verify_path_identity_unchanged()?;
+    fixtures.protected.verify_contents_unchanged()?;
+    fixtures.workspace.verify_path_identity_unchanged()?;
+    fixtures.workspace.verify_contents_unchanged()?;
+
+    let launcher_live_after = unix_listener_live(Path::new(LAUNCHER_SOCKET_PATH))?;
+    let config_live_after = unix_listener_live(Path::new(CONFIG_ACTION_SOCKET))?;
+    let host_evidence = RuntimeCanaryHostEvidence {
+        nonce: nonce.clone(),
+        fixture_binding: runtime.fixture_binding.clone(),
+        protected_path_regular_file_before: true,
+        protected_path_regular_file_after: true,
+        protected_path_identity_unchanged: true,
+        protected_path_contents_unchanged: true,
+        credential_path_regular_file_before: runtime.credential_path_regular_file_before,
+        credential_path_regular_file_after: runtime.credential_path_regular_file_after,
+        credential_path_identity_unchanged: runtime.credential_path_identity_unchanged,
+        credential_path_contents_unchanged: runtime.credential_path_contents_unchanged,
+        main_home_fixture_regular_file_before: runtime.main_home_fixture_regular_file_before,
+        main_home_fixture_regular_file_after: runtime.main_home_fixture_regular_file_after,
+        main_home_fixture_identity_unchanged: runtime.main_home_fixture_identity_unchanged,
+        main_home_fixture_contents_unchanged: runtime.main_home_fixture_contents_unchanged,
+        codex_home_fixture_regular_file_before: runtime.codex_home_fixture_regular_file_before,
+        codex_home_fixture_regular_file_after: runtime.codex_home_fixture_regular_file_after,
+        codex_home_fixture_identity_unchanged: runtime.codex_home_fixture_identity_unchanged,
+        codex_home_fixture_contents_unchanged: runtime.codex_home_fixture_contents_unchanged,
+        final_output_fixture_regular_file_before: runtime.final_output_fixture_regular_file_before,
+        final_output_fixture_regular_file_after: runtime.final_output_fixture_regular_file_after,
+        final_output_fixture_identity_unchanged: runtime.final_output_fixture_identity_unchanged,
+        final_output_fixture_contents_unchanged: runtime.final_output_fixture_contents_unchanged,
+        workspace_fixture_regular_file_before: runtime.workspace_fixture_regular_file_before,
+        workspace_fixture_regular_file_after: runtime.workspace_fixture_regular_file_after,
+        workspace_fixture_identity_unchanged: runtime.workspace_fixture_identity_unchanged,
+        workspace_fixture_contents_unchanged: runtime.workspace_fixture_contents_unchanged,
+        host_unix_listener_live_before: true,
+        host_unix_listener_live_after: fixtures.unix.is_live(),
+        host_unix_accept_count: fixtures.unix.accept_count(),
+        forbidden_tcp_listener_live_before: true,
+        forbidden_tcp_listener_live_after: fixtures.forbidden.is_live(),
+        forbidden_tcp_accept_count: fixtures.forbidden.accept_count(),
+        bot_tcp_listener_live_before: true,
+        bot_tcp_listener_live_after: fixtures.bot.is_live(),
+        bot_tcp_accept_count: fixtures.bot.accept_count(),
+        config_worker_socket_live_before: true,
+        config_worker_socket_live_after: config_live_after,
+        launcher_socket_live_before: true,
+        launcher_socket_live_after: launcher_live_after,
+    };
+    runtime
+        .report
+        .ensure_success(&nonce, &runtime.fixture_binding, &host_evidence)?;
+    fixtures.shutdown_listeners()?;
+    fixtures.cleanup_files()?;
+    Ok(RuntimeBoundaryResult {
+        nonce,
+        report: runtime.report,
+    })
+}
+
+fn parse_runtime_evidence(
+    output: &str,
+    launch: &RuntimeCanaryLaunchRequest,
+) -> Result<RuntimeCanaryRuntimeEvidence> {
+    if output.is_empty() || !output.ends_with('\n') || output[..output.len() - 1].contains('\n') {
+        bail!("runtime canary evidence framing is invalid");
+    }
+    let preliminary: RuntimeCanaryRuntimeEvidence =
+        serde_json::from_slice(&output.as_bytes()[..output.len() - 1])
+            .context("runtime canary evidence is invalid JSON")?;
+    let inputs = RuntimeCanaryFixtureInputs {
+        main_pid: preliminary.main_pid,
+        fd_secret_sha256: preliminary.fd_secret_sha256.clone(),
+        forbidden_tcp: launch.forbidden_tcp.clone(),
+        bot_tcp: launch.bot_tcp.clone(),
+        host_unix: launch.host_unix.clone(),
+        host_protected_path: launch.host_protected_path.clone(),
+    };
+    let binding = runtime_canary_fixture_binding(&launch.nonce, &inputs)?;
+    parse_runtime_canary_runtime_evidence(output.as_bytes(), &launch.nonce, &binding, &inputs)
+}
+
+fn passing_receipt_canaries(runtime: &RuntimeBoundaryResult) -> BTreeMap<String, bool> {
+    debug_assert!(runtime.report.checks.values().all(|passed| *passed));
+    let mut canaries = BTreeMap::new();
+    for name in REQUIRED_CANARIES {
+        canaries.insert((*name).to_owned(), true);
+    }
+    canaries
+}
+
+struct HostFixtureSet {
+    protected: BoundedRegularFileSnapshot,
+    workspace: BoundedRegularFileSnapshot,
+    workspace_root: PathBuf,
+    workspace_nonce_root: PathBuf,
+    workspace_canary_root: PathBuf,
+    unix: InstrumentedUnixListener,
+    forbidden: InstrumentedTcpListener,
+    bot: InstrumentedTcpListener,
+    files_cleaned: bool,
+}
+
+impl HostFixtureSet {
+    fn create(nonce: &str) -> Result<Self> {
+        validate_runtime_canary_nonce(nonce)?;
+        validate_root_directory(
+            Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT),
+            0o700,
+            "runtime canary root",
+        )?;
+        validate_root_directory(
+            Path::new(RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT),
+            0o700,
+            "protected canary root",
+        )?;
+        let protected_path = Path::new(RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT).join(nonce);
+        create_private_fixture(&protected_path, &random_fixture_contents()?)?;
+        let protected = BoundedRegularFileSnapshot::capture(&protected_path, FIXTURE_MAX_BYTES)?;
+
+        let workspace_root =
+            Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("{nonce}.workspace"));
+        let workspace_canary_root = workspace_root.join(".webex-codex-canary");
+        let workspace_nonce_root = workspace_canary_root.join(nonce);
+        create_private_directory(&workspace_root)?;
+        create_private_directory(&workspace_canary_root)?;
+        create_private_directory(&workspace_nonce_root)?;
+        let workspace_path = workspace_nonce_root.join("probe.txt");
+        create_private_fixture(&workspace_path, &random_fixture_contents()?)?;
+        let workspace = BoundedRegularFileSnapshot::capture(&workspace_path, FIXTURE_MAX_BYTES)?;
+
+        let unix_path =
+            Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("{nonce}.sock"));
+        let unix = InstrumentedUnixListener::bind(unix_path)?;
+        let forbidden = bind_assigned_non_loopback_listener()?;
+        let bot = bind_loopback_bot_listener()?;
+        Ok(Self {
+            protected,
+            workspace,
+            workspace_root,
+            workspace_nonce_root,
+            workspace_canary_root,
+            unix,
+            forbidden,
+            bot,
+            files_cleaned: false,
+        })
+    }
+
+    fn shutdown_listeners(&mut self) -> Result<()> {
+        let unix = self.unix.shutdown_and_verify_zero_accepts();
+        let forbidden = self.forbidden.shutdown_and_verify_zero_accepts();
+        let bot = self.bot.shutdown_and_verify_zero_accepts();
+        unix.and(forbidden).and(bot)
+    }
+
+    fn cleanup_files(&mut self) -> Result<()> {
+        self.protected.verify_path_identity_unchanged()?;
+        self.workspace.verify_path_identity_unchanged()?;
+        fs::remove_file(self.protected.path())?;
+        fs::remove_file(self.workspace.path())?;
+        fs::remove_dir(&self.workspace_nonce_root)?;
+        fs::remove_dir(&self.workspace_canary_root)?;
+        fs::remove_dir(&self.workspace_root)?;
+        self.files_cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for HostFixtureSet {
+    fn drop(&mut self) {
+        if !self.files_cleaned && self.cleanup_files().is_err() {
+            tracing::error!(nonce = %self.protected.path().display(), "runtime canary fixtures require manual cleanup");
+        }
+    }
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir(path)
+        .with_context(|| format!("failed to create canary directory {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        bail!("created canary directory metadata is invalid");
+    }
+    Ok(())
+}
+
+fn create_private_fixture(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to create canary fixture {}", path.display()))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    validate_private_root_file(&file.metadata()?, "canary fixture")
+}
+
+fn validate_private_root_file(metadata: &fs::Metadata, description: &str) -> Result<()> {
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        bail!("{description} metadata is invalid");
+    }
+    Ok(())
+}
+
+fn validate_root_directory(path: &Path, mode: u32, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{description} is unavailable: {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o7777 != mode
+    {
+        bail!("{description} metadata is invalid");
+    }
+    Ok(())
+}
+
+fn random_fixture_contents() -> Result<Vec<u8>> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow!("failed to obtain canary fixture randomness"))?;
+    Ok(format!("webex-runtime-canary-v1:{}\n", hex(&bytes)).into_bytes())
+}
+
+fn random_nonce() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow!("failed to obtain runtime canary nonce"))?;
+    Ok(hex(&bytes))
+}
+
+fn unix_listener_live(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(false);
+    }
+    let table = fs::read_to_string("/proc/net/unix")?;
+    if table.len() > 1024 * 1024 {
+        bail!("Unix socket table is oversized");
+    }
+    let expected = path
+        .to_str()
+        .ok_or_else(|| anyhow!("fixed Unix socket path is not UTF-8"))?;
+    for line in table.lines().skip(1) {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 8 && fields[7] == expected {
+            let flags = u32::from_str_radix(fields[3], 16)
+                .context("Unix socket table contains invalid flags")?;
+            return Ok(flags & 0x0001_0000 != 0 && fields[5] == "01");
+        }
+    }
+    Ok(false)
+}
+
+async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
+    let unit = lifecycle_unit_name("timeout", nonce);
+    let status = run_command(
+        SYSTEMD_RUN_PATH,
+        &[
+            "--quiet".into(),
+            "--wait".into(),
+            "--collect".into(),
+            "--service-type=exec".into(),
+            format!("--unit={unit}"),
+            format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}"),
+            format!("--property=After={ACTIVATION_RENEWAL_UNIT}"),
+            "--property=RuntimeMaxSec=2s".into(),
+            "--property=TimeoutStopSec=5s".into(),
+            "--property=KillMode=control-group".into(),
+            SHELL_PATH.into(),
+            "-c".into(),
+            "exec sleep 30".into(),
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    ensure!(!status.success(), "timeout canary unexpectedly completed");
+    wait_for_unit_inactive(&unit).await
+}
+
+async fn run_owner_crash_cleanup_canary(nonce: &str, owner: &str) -> Result<()> {
+    let anchor = lifecycle_unit_name(&format!("{owner}-anchor"), nonce);
+    let child = lifecycle_unit_name(&format!("{owner}-child"), nonce);
+    let start_anchor = run_command(
+        SYSTEMD_RUN_PATH,
+        &[
+            "--quiet".into(),
+            "--collect".into(),
+            "--service-type=exec".into(),
+            format!("--unit={anchor}"),
+            format!("--property=BindsTo={ACTIVATION_RENEWAL_UNIT}"),
+            format!("--property=After={ACTIVATION_RENEWAL_UNIT}"),
+            SHELL_PATH.into(),
+            "-c".into(),
+            "exec sleep 30".into(),
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    ensure!(start_anchor.success(), "lifecycle anchor failed to start");
+    let start_child = run_command(
+        SYSTEMD_RUN_PATH,
+        &[
+            "--quiet".into(),
+            "--collect".into(),
+            "--service-type=exec".into(),
+            format!("--unit={child}"),
+            format!("--property=BindsTo={anchor}"),
+            format!("--property=After={anchor}"),
+            "--property=KillMode=control-group".into(),
+            SHELL_PATH.into(),
+            "-c".into(),
+            "exec sleep 30".into(),
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    if !start_child.success() {
+        let _ = stop_unit(&anchor).await;
+        bail!("lifecycle child failed to start");
+    }
+    let stop_result = stop_unit(&anchor).await;
+    let inactive_result = wait_for_unit_inactive(&child).await;
+    let _ = stop_unit(&child).await;
+    stop_result.and(inactive_result)
+}
+
+async fn run_command(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .env("LANG", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(timeout, command.status())
+        .await
+        .map_err(|_| anyhow!("fixed lifecycle command timed out"))?
+        .with_context(|| format!("failed to run fixed lifecycle command {program}"))
+}
+
+async fn stop_unit(unit: &str) -> Result<()> {
+    let status = run_command(
+        SYSTEMCTL_PATH,
+        &["--no-ask-password".into(), "stop".into(), unit.into()],
+        COMMAND_TIMEOUT,
+    )
+    .await?;
+    ensure!(status.success(), "failed to stop lifecycle canary unit");
+    Ok(())
+}
+
+async fn wait_for_unit_inactive(unit: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + UNIT_STATE_TIMEOUT;
+    loop {
+        let status = run_command(
+            SYSTEMCTL_PATH,
+            &["--quiet".into(), "is-active".into(), unit.into()],
+            COMMAND_TIMEOUT,
+        )
+        .await?;
+        if !status.success() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("lifecycle canary unit did not become inactive");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn lifecycle_unit_name(kind: &str, nonce: &str) -> String {
+    format!("webex-codex-canary-{kind}-{}.service", &nonce[..16])
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebootChallenge {
+    version: u16,
+    challenge_boot_id: String,
+    marker_nonce: String,
+    validated_boot_id: Option<String>,
+}
+
+fn verify_reboot_cleanup_challenge() -> Result<()> {
+    let current_boot = read_boot_id()?;
+    let challenge = read_reboot_challenge()?;
+    match challenge {
+        None => {
+            write_new_reboot_challenge(&current_boot, None)?;
+            bail!("runtime activation requires one real reboot to validate cleanup");
+        }
+        Some(challenge) if challenge.challenge_boot_id == current_boot => {
+            if challenge.validated_boot_id.as_deref() != Some(&current_boot) {
+                bail!("runtime activation reboot challenge has not crossed a real boot");
+            }
+            validate_reboot_marker(&reboot_marker_path(&challenge.marker_nonce)?)
+        }
+        Some(challenge) => {
+            let marker = reboot_marker_path(&challenge.marker_nonce)?;
+            ensure!(
+                path_is_absent(&marker)?,
+                "pre-reboot runtime marker survived the boot boundary"
+            );
+            write_new_reboot_challenge(&current_boot, Some(current_boot.clone()))
+        }
+    }
+}
+
+fn write_new_reboot_challenge(boot_id: &str, validated_boot_id: Option<String>) -> Result<()> {
+    let marker_nonce = random_nonce()?;
+    let marker = reboot_marker_path(&marker_nonce)?;
+    create_private_fixture(&marker, REBOOT_MARKER_CONTENTS)?;
+    let challenge = RebootChallenge {
+        version: REBOOT_CHALLENGE_VERSION,
+        challenge_boot_id: boot_id.to_owned(),
+        marker_nonce,
+        validated_boot_id,
+    };
+    let mut payload = serde_json::to_vec(&challenge)?;
+    payload.push(b'\n');
+    ensure!(payload.len() as u64 <= CHALLENGE_MAX_BYTES);
+    let result = atomic_write_private(Path::new(REBOOT_CHALLENGE_PATH), &payload);
+    if result.is_err() {
+        let _ = remove_private_root_file(&marker, "reboot marker");
+    }
+    result
+}
+
+fn read_reboot_challenge() -> Result<Option<RebootChallenge>> {
+    let path = Path::new(REBOOT_CHALLENGE_PATH);
+    if path_is_absent(path)? {
+        return Ok(None);
+    }
+    let payload = read_private_root_file(path, CHALLENGE_MAX_BYTES, "reboot challenge")?;
+    let challenge: RebootChallenge = serde_json::from_slice(&payload)?;
+    if challenge.version != REBOOT_CHALLENGE_VERSION
+        || challenge.challenge_boot_id.trim().is_empty()
+        || validate_runtime_canary_nonce(&challenge.marker_nonce).is_err()
+    {
+        bail!("reboot challenge is invalid");
+    }
+    Ok(Some(challenge))
+}
+
+fn validate_reboot_marker(path: &Path) -> Result<()> {
+    let payload = read_private_root_file(
+        path,
+        REBOOT_MARKER_CONTENTS.len() as u64,
+        "current-boot reboot marker",
+    )?;
+    ensure!(
+        payload == REBOOT_MARKER_CONTENTS,
+        "current-boot reboot marker contents are invalid"
+    );
+    Ok(())
+}
+
+fn atomic_write_private(path: &Path, payload: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private file has no parent"))?;
+    validate_root_directory(parent, 0o700, "private file parent")?;
+    if !path_is_absent(path)? {
+        let metadata = fs::symlink_metadata(path)?;
+        validate_private_root_file(&metadata, "existing private file")?;
+    }
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        file.write_all(payload)?;
+        file.sync_all()?;
+        validate_private_root_file(&file.metadata()?, "temporary private file")?;
+        fs::rename(&temporary, path)?;
+        ensure!(
+            read_private_root_file(path, payload.len() as u64, "written private file")? == payload,
+            "written private file contents are invalid"
+        );
+        validate_root_directory(parent, 0o700, "private file parent")?;
+        let directory = File::open(parent)?;
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivateFileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+}
+
+impl PrivateFileIdentity {
+    fn capture(metadata: &fs::Metadata, max_bytes: u64, description: &str) -> Result<Self> {
+        validate_private_root_file(metadata, description)?;
+        ensure!(
+            metadata.len() <= max_bytes,
+            "{description} exceeds its size limit"
+        );
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.len(),
+        })
+    }
+}
+
+fn read_private_root_file(path: &Path, max_bytes: u64, description: &str) -> Result<Vec<u8>> {
+    let expected =
+        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    ensure!(
+        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description)? == expected,
+        "{description} identity changed while opening"
+    );
+    let mut payload = Vec::new();
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut payload)?;
+    ensure!(payload.len() as u64 <= max_bytes);
+    ensure!(
+        payload.len() as u64 == expected.size,
+        "{description} size changed while reading"
+    );
+    ensure!(
+        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description)? == expected,
+        "{description} identity changed while reading"
+    );
+    ensure!(
+        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description)?
+            == expected,
+        "{description} path changed while reading"
+    );
+    Ok(payload)
+}
+
+fn remove_private_root_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_private_root_file(&metadata, description)?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn reboot_marker_path(nonce: &str) -> Result<PathBuf> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("reboot-{nonce}.marker")))
+}
+
+fn path_is_absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_boot_id() -> Result<String> {
+    let value = fs::read_to_string(BOOT_ID_PATH)?;
+    let value = value.trim();
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23)
+                    && byte.is_ascii_hexdigit()
+                    && !byte.is_ascii_uppercase()
+        })
+    {
+        bail!("kernel boot ID is invalid");
+    }
+    Ok(value.to_owned())
+}
+
+fn ensure_root() -> Result<()> {
+    // SAFETY: geteuid has no arguments or side effects.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("activation canary helper must run as root");
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        os::unix::net::UnixListener,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "webex-activation-canary-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn lifecycle_unit_names_are_fixed_and_bounded() {
+        let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let unit = lifecycle_unit_name("launcher-anchor", nonce);
+        assert_eq!(
+            unit,
+            "webex-codex-canary-launcher-anchor-0123456789abcdef.service"
+        );
+        assert!(unit.len() < 128);
+    }
+
+    #[test]
+    fn receipt_canary_map_is_exact() {
+        let report = RuntimeBoundaryResult {
+            nonce: "0".repeat(64),
+            report: crate::canary_protocol::RuntimeCanaryReport::new(
+                "0".repeat(64),
+                "1".repeat(64),
+                crate::canary_protocol::RUNTIME_CANARY_CHECKS
+                    .iter()
+                    .map(|name| ((*name).to_owned(), true))
+                    .collect(),
+            )
+            .unwrap(),
+        };
+        let canaries = passing_receipt_canaries(&report);
+        assert_eq!(canaries.len(), REQUIRED_CANARIES.len());
+        assert!(
+            REQUIRED_CANARIES
+                .iter()
+                .all(|name| canaries.get(*name) == Some(&true))
+        );
+    }
+
+    #[test]
+    fn reboot_marker_path_is_derived_only_from_a_valid_nonce() {
+        let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            reboot_marker_path(nonce).unwrap(),
+            Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("reboot-{nonce}.marker"))
+        );
+        assert!(reboot_marker_path("../outside").is_err());
+    }
+
+    #[test]
+    fn proc_unix_probe_distinguishes_a_live_listener() {
+        let directory = TestDirectory::new("proc-unix");
+        let path = directory.join("listener.sock");
+        assert!(!unix_listener_live(&path).unwrap());
+
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(unix_listener_live(&path).unwrap());
+
+        drop(listener);
+        assert!(!unix_listener_live(&path).unwrap());
+    }
+}
