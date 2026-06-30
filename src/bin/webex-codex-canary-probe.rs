@@ -26,8 +26,10 @@ use webex_generic_account_bot::{
     canary_protocol::{
         RUNTIME_CANARY_CHECKS, RUNTIME_CANARY_HOST_PROTECTED_FIXTURE_ROOT,
         RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT, RUNTIME_CANARY_SUITE, RuntimeCanaryFixtureInputs,
-        RuntimeCanaryReport, runtime_canary_credential_path, runtime_canary_fixture_binding,
-        runtime_canary_workspace_fixture_path, validate_runtime_canary_nonce,
+        RuntimeCanaryReport, runtime_canary_codex_home_fixture_path,
+        runtime_canary_credential_path, runtime_canary_fixture_binding,
+        runtime_canary_main_home_fixture_path, runtime_canary_workspace_fixture_path,
+        validate_runtime_canary_nonce,
     },
     codex_launcher::LAUNCHER_SOCKET_PATH,
 };
@@ -121,7 +123,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "host_protected_path_denied".to_owned(),
-        path_denied(&cli.host_protected_path),
+        file_access_denied(&cli.host_protected_path),
     );
     checks.insert(
         "host_unix_socket_denied".to_owned(),
@@ -131,12 +133,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
         "launcher_socket_denied".to_owned(),
         unix_socket_denied(Path::new(LAUNCHER_SOCKET_PATH)),
     );
-    checks.insert(
-        "main_home_denied".to_owned(),
-        path_denied(Path::new(MAIN_HOME))
-            && path_denied(Path::new(CODEX_HOME))
-            && path_denied(Path::new(CODEX_AUTH_PATH)),
-    );
+    checks.insert("main_home_denied".to_owned(), main_home_denied(&cli.nonce));
     checks.insert(
         "main_process_inspection_denied".to_owned(),
         main_process_inspection_denied(cli.main_pid),
@@ -260,7 +257,22 @@ fn credential_path_denied(nonce: &str) -> bool {
     let Ok(path) = runtime_canary_credential_path(nonce) else {
         return false;
     };
-    path_denied(Path::new(CREDENTIAL_ROOT)) && path_denied(Path::new(&path))
+    path_denied(Path::new(CREDENTIAL_ROOT)) && file_access_denied(Path::new(&path))
+}
+
+#[cfg(target_os = "linux")]
+fn main_home_denied(nonce: &str) -> bool {
+    let (Ok(main_fixture), Ok(codex_fixture)) = (
+        runtime_canary_main_home_fixture_path(nonce),
+        runtime_canary_codex_home_fixture_path(nonce),
+    ) else {
+        return false;
+    };
+    path_denied(Path::new(MAIN_HOME))
+        && path_denied(Path::new(CODEX_HOME))
+        && file_access_denied(Path::new(CODEX_AUTH_PATH))
+        && file_access_denied(Path::new(&main_fixture))
+        && file_access_denied(Path::new(&codex_fixture))
 }
 
 #[cfg(target_os = "linux")]
@@ -721,6 +733,11 @@ fn write_open_denied(path: &Path) -> bool {
         Ok(_) => false,
         Err(error) => write_denial_error(&error),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn file_access_denied(path: &Path) -> bool {
+    path_denied(path) && write_open_denied(path)
 }
 
 #[cfg(target_os = "linux")]

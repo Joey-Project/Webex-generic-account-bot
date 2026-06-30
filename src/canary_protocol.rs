@@ -52,9 +52,19 @@ pub struct RuntimeCanaryHostEvidence {
     pub protected_path_regular_file_before: bool,
     pub protected_path_regular_file_after: bool,
     pub protected_path_identity_unchanged: bool,
+    pub protected_path_contents_unchanged: bool,
     pub credential_path_regular_file_before: bool,
     pub credential_path_regular_file_after: bool,
     pub credential_path_identity_unchanged: bool,
+    pub credential_path_contents_unchanged: bool,
+    pub main_home_fixture_regular_file_before: bool,
+    pub main_home_fixture_regular_file_after: bool,
+    pub main_home_fixture_identity_unchanged: bool,
+    pub main_home_fixture_contents_unchanged: bool,
+    pub codex_home_fixture_regular_file_before: bool,
+    pub codex_home_fixture_regular_file_after: bool,
+    pub codex_home_fixture_identity_unchanged: bool,
+    pub codex_home_fixture_contents_unchanged: bool,
     pub workspace_fixture_regular_file_before: bool,
     pub workspace_fixture_regular_file_after: bool,
     pub workspace_fixture_identity_unchanged: bool,
@@ -83,9 +93,19 @@ impl RuntimeCanaryHostEvidence {
             || !self.protected_path_regular_file_before
             || !self.protected_path_regular_file_after
             || !self.protected_path_identity_unchanged
+            || !self.protected_path_contents_unchanged
             || !self.credential_path_regular_file_before
             || !self.credential_path_regular_file_after
             || !self.credential_path_identity_unchanged
+            || !self.credential_path_contents_unchanged
+            || !self.main_home_fixture_regular_file_before
+            || !self.main_home_fixture_regular_file_after
+            || !self.main_home_fixture_identity_unchanged
+            || !self.main_home_fixture_contents_unchanged
+            || !self.codex_home_fixture_regular_file_before
+            || !self.codex_home_fixture_regular_file_after
+            || !self.codex_home_fixture_identity_unchanged
+            || !self.codex_home_fixture_contents_unchanged
             || !self.workspace_fixture_regular_file_before
             || !self.workspace_fixture_regular_file_after
             || !self.workspace_fixture_identity_unchanged
@@ -308,6 +328,19 @@ pub fn runtime_canary_workspace_fixture_path(nonce: &str) -> Result<String> {
     ))
 }
 
+pub fn runtime_canary_main_home_fixture_path(nonce: &str) -> Result<String> {
+    runtime_canary_private_home_fixture_path("/tmp/webex-codex-main-home", nonce)
+}
+
+pub fn runtime_canary_codex_home_fixture_path(nonce: &str) -> Result<String> {
+    runtime_canary_private_home_fixture_path("/tmp/webex-codex-main", nonce)
+}
+
+fn runtime_canary_private_home_fixture_path(root: &str, nonce: &str) -> Result<String> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(format!("{root}/.webex-codex-canary-{nonce}"))
+}
+
 pub fn validate_runtime_canary_nonce(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
@@ -378,9 +411,19 @@ mod tests {
             protected_path_regular_file_before: true,
             protected_path_regular_file_after: true,
             protected_path_identity_unchanged: true,
+            protected_path_contents_unchanged: true,
             credential_path_regular_file_before: true,
             credential_path_regular_file_after: true,
             credential_path_identity_unchanged: true,
+            credential_path_contents_unchanged: true,
+            main_home_fixture_regular_file_before: true,
+            main_home_fixture_regular_file_after: true,
+            main_home_fixture_identity_unchanged: true,
+            main_home_fixture_contents_unchanged: true,
+            codex_home_fixture_regular_file_before: true,
+            codex_home_fixture_regular_file_after: true,
+            codex_home_fixture_identity_unchanged: true,
+            codex_home_fixture_contents_unchanged: true,
             workspace_fixture_regular_file_before: true,
             workspace_fixture_regular_file_after: true,
             workspace_fixture_identity_unchanged: true,
@@ -482,6 +525,14 @@ mod tests {
                 .is_err()
         );
 
+        let mut missing_main_home_fixture = passing_host_evidence();
+        missing_main_home_fixture.main_home_fixture_regular_file_before = false;
+        assert!(
+            report
+                .ensure_success(NONCE, &binding, &missing_main_home_fixture)
+                .is_err()
+        );
+
         let mut replaced_protected_path = passing_host_evidence();
         replaced_protected_path.protected_path_identity_unchanged = false;
         assert!(
@@ -540,8 +591,18 @@ mod tests {
             runtime_canary_workspace_fixture_path(NONCE).unwrap(),
             format!("/workspace/.webex-codex-canary/{NONCE}/probe.txt")
         );
+        assert_eq!(
+            runtime_canary_main_home_fixture_path(NONCE).unwrap(),
+            format!("/tmp/webex-codex-main-home/.webex-codex-canary-{NONCE}")
+        );
+        assert_eq!(
+            runtime_canary_codex_home_fixture_path(NONCE).unwrap(),
+            format!("/tmp/webex-codex-main/.webex-codex-canary-{NONCE}")
+        );
         assert!(runtime_canary_credential_path("invalid").is_err());
         assert!(runtime_canary_workspace_fixture_path("invalid").is_err());
+        assert!(runtime_canary_main_home_fixture_path("invalid").is_err());
+        assert!(runtime_canary_codex_home_fixture_path("invalid").is_err());
     }
 
     #[test]

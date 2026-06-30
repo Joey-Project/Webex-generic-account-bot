@@ -335,15 +335,15 @@ superseded_by:
 - PR 4c2a2 validates the probe through the pinned Codex `exec --json`
   command-execution event. Its host harness must create nonce-scoped protected
   regular file, nested read-only workspace file, and live Unix/TCP listener
-  fixtures before launch, use the nonce as the transient run ID, verify the
-  derived credential and all fixtures before and after Codex, require every
-  regular-file fixture to retain its identity and the workspace contents to
-  remain unchanged, and require zero accepted denied connections; an inner
-  `true` is never sufficient when a fixture is missing, replaced, modified, or
-  unhealthy. The report and final line bind the nonce, process, descriptor
-  secret, endpoints, and fixture paths; the success validator also requires
-  matching host evidence with before/after liveness, regular-file identity,
-  and zero accepts. It also runs host
+  fixtures before launch, use the nonce as the transient run ID, create exact
+  nonce-scoped files in both private main-process homes, verify the derived
+  credential and all fixtures before and after Codex, require every
+  regular-file fixture to retain its identity and contents, and require zero
+  accepted denied connections; an inner `true` is never sufficient when a
+  fixture is missing, replaced, modified, or unhealthy. The report and final
+  line bind the nonce, process, descriptor secret, endpoints, and fixture
+  paths; the success validator also requires matching host evidence with
+  before/after liveness, regular-file identity, and zero accepts. It also runs host
   timeout/crash/reboot canaries and owns the root-only boot receipt helper and
   renewal unit. It still grants no bot launcher access and does not enable
   production configuration.
