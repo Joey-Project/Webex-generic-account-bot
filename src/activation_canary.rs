@@ -50,6 +50,7 @@ const FIXTURE_MAX_BYTES: u64 = 64 * 1024;
 const CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEPENDENCY_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const REBOOT_CHALLENGE_VERSION: u16 = 1;
 const REBOOT_MARKER_CONTENTS: &[u8] = b"webex-runtime-reboot-canary-v1\n";
 
@@ -119,15 +120,19 @@ async fn run_runtime_boundary_canary(
     candidate: &VerifiedActivation,
 ) -> Result<RuntimeBoundaryResult> {
     let nonce = random_nonce()?;
+    wait_for_unix_listener_live(
+        Path::new(LAUNCHER_SOCKET_PATH),
+        "launcher socket",
+        DEPENDENCY_SOCKET_READY_TIMEOUT,
+    )
+    .await?;
+    wait_for_unix_listener_live(
+        Path::new(CONFIG_ACTION_SOCKET),
+        "config worker socket",
+        DEPENDENCY_SOCKET_READY_TIMEOUT,
+    )
+    .await?;
     let mut fixtures = HostFixtureSet::create(&nonce)?;
-    ensure!(
-        unix_listener_live(Path::new(LAUNCHER_SOCKET_PATH))?,
-        "launcher socket is not live before the runtime canary"
-    );
-    ensure!(
-        unix_listener_live(Path::new(CONFIG_ACTION_SOCKET))?,
-        "config worker socket is not live before the runtime canary"
-    );
 
     let pending = stage_runtime_canary_workspace(&nonce, &fixtures.workspace_root).await?;
     let launch = RuntimeCanaryLaunchRequest {
@@ -279,7 +284,7 @@ impl HostFixtureSet {
         create_private_directory(&workspace_canary_root)?;
         create_private_directory(&workspace_nonce_root)?;
         let workspace_path = workspace_nonce_root.join("probe.txt");
-        create_private_fixture(&workspace_path, &random_fixture_contents()?)?;
+        create_private_fixture(&workspace_path, &workspace_probe_payload(nonce)?)?;
         let workspace = BoundedRegularFileSnapshot::capture(&workspace_path, FIXTURE_MAX_BYTES)?;
 
         let unix_path =
@@ -392,6 +397,11 @@ fn random_fixture_contents() -> Result<Vec<u8>> {
     Ok(format!("webex-runtime-canary-v1:{}\n", hex(&bytes)).into_bytes())
 }
 
+fn workspace_probe_payload(nonce: &str) -> Result<Vec<u8>> {
+    validate_runtime_canary_nonce(nonce)?;
+    Ok(nonce.as_bytes().to_vec())
+}
+
 fn random_nonce() -> Result<String> {
     let mut bytes = [0_u8; 32];
     SystemRandom::new()
@@ -425,6 +435,23 @@ fn unix_listener_live(path: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+async fn wait_for_unix_listener_live(
+    path: &Path,
+    description: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if unix_listener_live(path)? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("{description} did not become live before the runtime canary");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn run_timeout_cleanup_canary(nonce: &str) -> Result<()> {
@@ -873,6 +900,13 @@ mod tests {
     }
 
     #[test]
+    fn workspace_probe_payload_is_the_exact_nonce() {
+        let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(workspace_probe_payload(nonce).unwrap(), nonce.as_bytes());
+        assert!(workspace_probe_payload("not-a-nonce").is_err());
+    }
+
+    #[test]
     fn proc_unix_probe_distinguishes_a_live_listener() {
         let directory = TestDirectory::new("proc-unix");
         let path = directory.join("listener.sock");
@@ -883,5 +917,25 @@ mod tests {
 
         drop(listener);
         assert!(!unix_listener_live(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_accepts_live_and_rejects_missing_listeners() {
+        let directory = TestDirectory::new("socket-ready");
+        let path = directory.join("listener.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        wait_for_unix_listener_live(&path, "test listener", Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for_unix_listener_live(
+                &directory.join("missing.sock"),
+                "missing listener",
+                Duration::ZERO,
+            )
+            .await
+            .is_err()
+        );
     }
 }

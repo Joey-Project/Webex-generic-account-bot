@@ -238,7 +238,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'StandardInput'), ['null']);
     assert.deepEqual(directiveValues(service, 'StandardOutput'), ['journal']);
     assert.deepEqual(directiveValues(service, 'StandardError'), ['journal']);
-    assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), []);
+    assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), [
+      'webex-config-pull',
+    ]);
     assert.deepEqual(directiveValues(service, 'WantedBy'), []);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);

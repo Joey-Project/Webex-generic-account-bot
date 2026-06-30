@@ -12,6 +12,7 @@ Type=oneshot
 RemainAfterExit=no
 User=root
 Group=root
+SupplementaryGroups=webex-config-pull
 WorkingDirectory=/
 ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-activation renew
 Restart=no
