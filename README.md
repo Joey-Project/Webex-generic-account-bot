@@ -841,12 +841,14 @@ inside both private main-process homes, verify live Unix/TCP listener fixtures,
 and pass the exact nonce and endpoints in the pinned command. The inner probe
 must read the nested workspace fixture without opening it for write or creating
 files beside it, and must be denied read and write access to the exact derived
-credential and private-home files. After Codex exits, the harness must prove
-the files retained the same regular-file identity and contents, the listeners
-remained live, and denied listeners accepted zero connections. A missing,
-replaced, modified, unhealthy, or accepted fixture invalidates the run even if
-the inner probe reported `true`; the receipt writer must never consume the
-inner report without these host-side preconditions.
+credential and private-home files. It must also be unable to create sibling
+entries or unlink disposable fixtures in credential, private-home, protected,
+or workspace directories. After Codex exits, the harness must prove the files
+retained the same regular-file identity and contents, the listeners remained
+live, and denied listeners accepted zero connections. A missing, replaced,
+modified, unhealthy, or accepted fixture invalidates the run even if the inner
+probe reported `true`; the receipt writer must never consume the inner report
+without these host-side preconditions.
 
 The report binds the nonce, main PID, descriptor-secret digest, both TCP
 endpoints, and both nonce-derived host paths into `fixture_binding`. The final
@@ -858,10 +860,12 @@ regular-file identity, requires private-home and workspace fixture contents to
 remain unchanged, and requires the fixed launcher and config-worker sockets to
 remain live before and after the probe. The process boundary directly checks
 `ptrace`, `kcmp`, `process_vm_readv`, and `process_vm_writev`; parsing a
-boolean-only inner report can never establish success. The absent final-output
-path must also reject an actual `create_new` attempt, so `NotFound` alone cannot
-prove output isolation. Socket connection timeouts are inconclusive and fail
-closed rather than being treated as access denial.
+boolean-only inner report can never establish success. The privilege check
+covers every prompt-executable image path: BusyBox, the canary probe, and
+`rg`. The absent final-output path must also reject an actual `create_new`
+attempt, so `NotFound` alone cannot prove output isolation. Socket connection
+timeouts are inconclusive and fail closed rather than being treated as access
+denial.
 
 ## Development
 

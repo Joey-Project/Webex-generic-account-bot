@@ -47,6 +47,8 @@ const CODEX_AUTH_PATH: &str = "/tmp/webex-codex-main/auth.json";
 #[cfg(target_os = "linux")]
 const FINAL_OUTPUT_PATH: &str = "/tmp/webex-codex-main/final-message.txt";
 #[cfg(target_os = "linux")]
+const RG_PATH: &str = "/opt/codex/codex-path/rg";
+#[cfg(target_os = "linux")]
 const TOOL_HOME: &str = "/tmp/webex-codex-tool-home";
 #[cfg(target_os = "linux")]
 const WORKSPACE_PATH: &str = "/workspace";
@@ -123,7 +125,7 @@ fn collect_checks(cli: &Cli) -> BTreeMap<String, bool> {
     );
     checks.insert(
         "host_protected_path_denied".to_owned(),
-        file_access_denied(&cli.host_protected_path),
+        protected_file_boundary_denied(&cli.host_protected_path, &cli.nonce),
     );
     checks.insert(
         "host_unix_socket_denied".to_owned(),
@@ -257,7 +259,16 @@ fn credential_path_denied(nonce: &str) -> bool {
     let Ok(path) = runtime_canary_credential_path(nonce) else {
         return false;
     };
-    path_denied(Path::new(CREDENTIAL_ROOT)) && file_access_denied(Path::new(&path))
+    let root = Path::new(CREDENTIAL_ROOT);
+    let path = Path::new(&path);
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path_denied(root)
+        && create_file_denied(&root.join(format!(".webex-codex-canary-create-{nonce}")))
+        && create_file_denied(&parent.join(format!(".webex-codex-canary-create-{nonce}")))
+        && file_access_denied(path)
+        && remove_file_denied(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -268,11 +279,27 @@ fn main_home_denied(nonce: &str) -> bool {
     ) else {
         return false;
     };
-    path_denied(Path::new(MAIN_HOME))
-        && path_denied(Path::new(CODEX_HOME))
+    private_home_boundary_denied(Path::new(MAIN_HOME), Path::new(&main_fixture), nonce)
+        && private_home_boundary_denied(Path::new(CODEX_HOME), Path::new(&codex_fixture), nonce)
         && file_access_denied(Path::new(CODEX_AUTH_PATH))
-        && file_access_denied(Path::new(&main_fixture))
-        && file_access_denied(Path::new(&codex_fixture))
+}
+
+#[cfg(target_os = "linux")]
+fn private_home_boundary_denied(root: &Path, fixture: &Path, nonce: &str) -> bool {
+    path_denied(root)
+        && create_file_denied(&root.join(format!(".webex-codex-canary-create-{nonce}")))
+        && file_access_denied(fixture)
+        && remove_file_denied(fixture)
+}
+
+#[cfg(target_os = "linux")]
+fn protected_file_boundary_denied(path: &Path, nonce: &str) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    file_access_denied(path)
+        && create_file_denied(&parent.join(format!(".webex-codex-canary-create-{nonce}")))
+        && remove_file_denied(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -650,7 +677,7 @@ fn open_fd_digest(path: &Path) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn setid_and_file_capabilities_absent() -> bool {
-    ["/bin/busybox", "/bin/webex-codex-canary-probe"]
+    ["/bin/busybox", "/bin/webex-codex-canary-probe", RG_PATH]
         .iter()
         .all(|path| trusted_unprivileged_executable(Path::new(path)))
 }
@@ -730,6 +757,7 @@ fn workspace_read_only(nonce: &str) -> bool {
     write_open_denied(fixture)
         && create_file_denied(&Path::new(WORKSPACE_PATH).join(format!("canary-write-{nonce}")))
         && create_file_denied(&parent.join(format!("canary-nested-write-{nonce}")))
+        && remove_file_denied(fixture)
 }
 
 #[cfg(target_os = "linux")]
@@ -743,6 +771,14 @@ fn write_open_denied(path: &Path) -> bool {
 #[cfg(target_os = "linux")]
 fn file_access_denied(path: &Path) -> bool {
     path_denied(path) && write_open_denied(path)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_file_denied(path: &Path) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => false,
+        Err(error) => write_denial_error(&error),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -850,6 +886,9 @@ mod tests {
         ));
         assert!(path_denied(&missing));
         assert!(!final_output_path_denied(&missing));
+        assert!(!missing.exists());
+        fs::write(&missing, NONCE).unwrap();
+        assert!(!remove_file_denied(&missing));
         assert!(!missing.exists());
         assert!(!path_denied(Path::new("/proc/self/status")));
     }

@@ -339,12 +339,14 @@ superseded_by:
   fixtures before launch, use the nonce as the transient run ID, create exact
   nonce-scoped files in both private main-process homes, verify the derived
   credential and all fixtures before and after Codex, require every
-  regular-file fixture to retain its identity and contents, and require zero
-  accepted denied connections; an inner `true` is never sufficient when a
-  fixture is missing, replaced, modified, or unhealthy. The report and final
-  line bind the nonce, process, descriptor secret, endpoints, and fixture
+  regular-file fixture to retain its identity and contents, prove the tool
+  cannot create siblings or unlink disposable fixtures in protected roots, and
+  require zero accepted denied connections; an inner `true` is never sufficient
+  when a fixture is missing, replaced, modified, or unhealthy. The report and
+  final line bind the nonce, process, descriptor secret, endpoints, and fixture
   paths; the success validator also requires matching host evidence with
-  before/after liveness, regular-file identity, and zero accepts. It also runs host
+  before/after liveness, regular-file identity, and zero accepts. It also runs
+  host
   timeout/crash/reboot canaries and owns the root-only boot receipt helper and
   renewal unit. It still grants no bot launcher access and does not enable
   production configuration.
