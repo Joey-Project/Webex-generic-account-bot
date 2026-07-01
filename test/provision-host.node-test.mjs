@@ -333,6 +333,15 @@ describe('guarded host provisioner policy', () => {
       })),
       /managed group has shadow administrators or members: webex-codex-input/,
     );
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        '',
+        '',
+        {},
+        'webex-codex-launch:$6$usable:administrator:member\n',
+      )),
+      /managed group has an orphan shadow credential: webex-codex-launch/,
+    );
   });
 
   it('enumerates static identities from files and permits only DynamicUser', async () => {
@@ -394,6 +403,16 @@ describe('guarded host provisioner policy', () => {
       readSystemIdentitySnapshot(
         runCommand,
         systemIdentityFs({ staticUserdbEntry: '9000.user' }),
+      ),
+      /static systemd userdb records are not supported/,
+    );
+    await assert.rejects(
+      readSystemIdentitySnapshot(
+        runCommand,
+        systemIdentityFs({
+          staticUserdbDirectory: '/usr/local/lib/userdb',
+          staticUserdbEntry: '9001.user',
+        }),
       ),
       /static systemd userdb records are not supported/,
     );
@@ -648,12 +667,16 @@ describe('guarded host provisioner execution', () => {
     assert.equal(stateQueries, 0);
   });
 
-  it('rejects unloaded launcher policy before querying systemd', async () => {
+  it('rejects unloaded managed-unit policy before querying systemd', async () => {
     for (const policyName of [
+      'webex-codex-launcher@unloaded.service',
       'webex-codex-launcher@unloaded.service.d',
       'webex-codex-launcher@unloaded.service.wants',
       'webex-codex-launcher@unloaded.service.requires',
       'webex-codex-launcher@.service.wants',
+      'webex-generic-account-bot.service.d',
+      'webex-generic-account-bot.service.wants',
+      'webex-config-pull-worker.service.requires',
     ]) {
       let commandCalls = 0;
       await assert.rejects(
@@ -669,7 +692,7 @@ describe('guarded host provisioner execution', () => {
             ]],
           ])),
         ),
-        new RegExp(`unexpected launcher instance policy.*${policyName.replaceAll('.', '\\.')}`),
+        new RegExp(`unexpected managed unit policy.*${policyName.replaceAll('.', '\\.')}`),
       );
       assert.equal(commandCalls, 0);
     }
@@ -1482,6 +1505,7 @@ function groupRecord(name, gid, members = []) {
 function systemIdentityFs({
   dynamicUserProvider = false,
   providerName = null,
+  staticUserdbDirectory = '/etc/userdb',
   staticUserdbEntry = null,
 } = {}) {
   const nsswitch = Buffer.from('passwd: files systemd\ngroup: files systemd\n');
@@ -1492,13 +1516,14 @@ function systemIdentityFs({
     directoryEntries.set('/run/systemd/userdb', [directoryEntry(provider, true)]);
   }
   if (staticUserdbEntry) {
-    directoryEntries.set('/etc/userdb', [directoryEntry(staticUserdbEntry, false)]);
+    directoryEntries.set(staticUserdbDirectory, [directoryEntry(staticUserdbEntry, false)]);
   }
   const optionalDirectories = new Set([
     '/run/systemd/userdb',
     '/etc/userdb',
     '/run/userdb',
     '/run/host/userdb',
+    '/usr/local/lib/userdb',
     '/usr/lib/userdb',
   ]);
   const directoryStat = Object.freeze({

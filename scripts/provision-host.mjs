@@ -58,6 +58,7 @@ const STATIC_USERDB_DIRECTORIES = Object.freeze([
   '/etc/userdb',
   '/run/userdb',
   '/run/host/userdb',
+  '/usr/local/lib/userdb',
   '/usr/lib/userdb',
 ]);
 const MANAGED_ACCOUNTS = Object.freeze({
@@ -91,6 +92,13 @@ export const MANAGED_UNITS = Object.freeze([
   'webex-codex-launcher@.service',
   'webex-codex-activation-renew.service',
 ]);
+const MANAGED_UNIT_POLICY_DIRECTORY_NAMES = Object.freeze(
+  MANAGED_UNITS.flatMap((unit) => [
+    `${unit}.d`,
+    `${unit}.wants`,
+    `${unit}.requires`,
+  ]),
+);
 
 export const ARTIFACTS = Object.freeze([
   policyArtifact(
@@ -361,7 +369,13 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
 
   for (const groupName of controlledGroups) {
     const group = snapshot.groups.get(groupName);
-    if (!group) continue;
+    const shadowGroup = snapshot.shadowGroups.get(groupName);
+    if (!group) {
+      if (shadowGroup) {
+        throw new Error(`managed group has an orphan shadow credential: ${groupName}`);
+      }
+      continue;
+    }
     if (group.gid > MAX_MANAGED_ID) {
       throw new Error(`managed group ID is outside the local range: ${groupName}`);
     }
@@ -374,7 +388,7 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
     if (group.members.length !== 0) {
       throw new Error(`managed group has static members: ${groupName}`);
     }
-    assertManagedGroupCredentialLocked(group, snapshot.shadowGroups.get(groupName));
+    assertManagedGroupCredentialLocked(group, shadowGroup);
     const primaryUsers = [...snapshot.users.values()]
       .filter((user) => user.gid === group.gid)
       .map((user) => user.name);
@@ -1486,7 +1500,7 @@ export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, f
 }
 
 export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
-  await assertNoLauncherInstancePolicy(fsApi);
+  await assertNoUnexpectedManagedUnitPolicy(fsApi);
   const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
@@ -1536,7 +1550,7 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
   return states;
 }
 
-async function assertNoLauncherInstancePolicy(fsApi) {
+async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
   let scannedEntries = 0;
   for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
     if (directory === '/lib/systemd/system' && await isUsrMergedLib(fsApi)) continue;
@@ -1551,9 +1565,10 @@ async function assertNoLauncherInstancePolicy(fsApi) {
       const policyDirectory =
         /^webex-codex-launcher@(?:[^@/\s]+)?\.service(?:\.d|\.wants|\.requires)$/
           .test(entry.name);
-      if (instanceUnit || policyDirectory) {
+      const managedUnitPolicyDirectory = MANAGED_UNIT_POLICY_DIRECTORY_NAMES.includes(entry.name);
+      if (instanceUnit || policyDirectory || managedUnitPolicyDirectory) {
         throw new Error(
-          `unexpected launcher instance policy in systemd unit path: ${path.join(directory, entry.name)}`,
+          `unexpected managed unit policy in systemd unit path: ${path.join(directory, entry.name)}`,
         );
       }
     }

@@ -167,8 +167,9 @@ superseded_by:
   locked-group-credential checks, dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
-  no-drop-in checks, fixed-path scanning for unloaded template and instance
-  policy including dependency directories and exact usr-merge compatibility,
+  no-drop-in checks, fixed-path scanning for unloaded policy and dependency
+  directories across all managed units plus template and instance launcher
+  overrides, with exact usr-merge compatibility,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, fail-closed recovery with full target-directory durability,
@@ -227,8 +228,9 @@ superseded_by:
   first-run lock state, then require tmpfiles to converge and revalidate the held
   inode before success. Require each loaded unit and instance to use the fixed
   managed fragment without any
-  drop-ins, and reject unloaded template or instance unit overrides, drop-ins,
-  wants, and requires from every fixed systemd system-unit load path while
+  drop-ins, and reject unloaded unit overrides, drop-ins, wants, and requires
+  for every managed unit and launcher instance from every fixed systemd
+  system-unit load path while
   accepting only the exact root-owned `/lib -> usr/lib` compatibility link. If
   a later sysusers, tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an

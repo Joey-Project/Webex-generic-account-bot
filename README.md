@@ -223,12 +223,12 @@ the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
-launcher template units. It rejects unloaded template or instance launcher
-overrides and dependency directories from every fixed systemd system-unit load
-path, accepts only the exact root-owned `/lib -> usr/lib` compatibility link,
-and requires every loaded managed unit to use the fixed `/etc/systemd/system`
-fragment with no drop-ins. The same
-host-wide `flock` used by config deployment serialises the complete apply, and
+launcher template units. It rejects unloaded policy and dependency directories
+for every fixed managed unit, plus template or instance launcher overrides,
+from every fixed systemd system-unit load path. It accepts only the exact
+root-owned `/lib -> usr/lib` compatibility link and requires every loaded
+managed unit to use the fixed `/etc/systemd/system` fragment with no drop-ins.
+The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in its root-owned half-migrated state. Apply must then prove

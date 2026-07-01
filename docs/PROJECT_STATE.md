@@ -99,8 +99,9 @@
   identity enumeration, a DynamicUser-only systemd userdb boundary,
   identity-drift and locked-group-credential checks, bounded dormant-unit
   preflight, device-bound kernel lock verification shared with config
-  deployment, exact loaded-fragment and no-drop-in checks, bounded template and
-  instance policy-path scanning with usr-merge handling, trusted re-exec paths,
+  deployment, exact loaded-fragment and no-drop-in checks, bounded policy-path
+  scanning for every managed unit and launcher instance with usr-merge handling,
+  trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional
   root-owned policy installation without unsafe post-unlink rollback, explicit
