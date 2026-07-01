@@ -113,10 +113,30 @@ superseded_by:
   drop-in installed outside the transaction fails closed unless the live
   rendered config is already fully ephemeral. Every apply reloads the systemd
   manager before permission detection so stale loaded drop-in state cannot
-  select the wrong isolation policy. Version 2 journals require that launcher
-  permission did not predate activation. Rollback reloads the manager after
-  permission removal and before config downgrade; reload failure preserves the
-  ephemeral config and recovery journal.
+  select the wrong isolation policy. Permission-relevant reloads reject any
+  other loadable unit, prefix, or service-wide drop-in across systemd's control,
+  runtime, generator, local, and vendor paths, and verify the fixed managed
+  drop-in state both before and after reload. Version 2 journals may record the
+  exact reviewed launcher-only policy that predates migration, and rollback
+  restores only that byte-matched legacy policy. Rollback reloads the manager
+  after permission removal and before config downgrade; reload failure preserves
+  the ephemeral config and recovery journal. When a crash journal records that a
+  service transition started or completed pending metadata, any startup
+  permission preflight failure stops the bot and verifies it inactive before
+  leaving the journal for recovery.
+  Recovery mode rejection, including ordinary apply over a version 2 journal
+  or skip-restart over a service transition, applies the same containment.
+  Recovery records `activation_files_installing` before writing the new config
+  and drop-in. Both that phase and `activation_files_installed` contain startup
+  preflight failures and stop the bot before rollback, covering a reboot that
+  loaded the new group policy before the service-transition phase was recorded.
+  After restoring an existing old config, recovery restarts and verifies the
+  old service before continuing.
+  A failed new-service transition, from activation or an ordinary active-runner
+  update, stops and verifies the bot before restoring permission or config, so
+  a crash cannot leave inherited groups in a process after the on-disk policy
+  has rolled back. Recovery from `committed_pending_metadata` renews any active
+  runner receipt and re-verifies service readiness before clearing the journal.
   Receipt-only rollback failures retain the journal and fail the action after
   restoring the prior config and service.
   Ordinary apply enforces current-user policy while permission is absent and

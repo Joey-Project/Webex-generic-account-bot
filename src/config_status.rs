@@ -67,6 +67,7 @@ const TRANSACTION_V2_PHASES: &[&str] = &[
     "prepared",
     "activation_renewal_started",
     "activation_renewed",
+    "activation_files_installing",
     "activation_files_installed",
     "service_transition_started",
     "committed_pending_metadata",
@@ -612,15 +613,6 @@ fn validate_runner_activation_transaction(value: &Value) -> Result<()> {
             ));
         }
     }
-    if object
-        .get("permission_had_previous")
-        .and_then(Value::as_bool)
-        != Some(false)
-    {
-        return Err(anyhow!(
-            "deployment transaction runner_activation.permission_had_previous must be false"
-        ));
-    }
     Ok(())
 }
 
@@ -1051,10 +1043,6 @@ mod tests {
             malformed.push(invalid_boolean);
         }
 
-        let mut previous_permission = deployment_transaction_v2("prepared");
-        previous_permission["runner_activation"]["permission_had_previous"] = Value::Bool(true);
-        malformed.push(previous_permission);
-
         let mut restart_not_required = deployment_transaction_v2("prepared");
         restart_not_required["service_restart_required"] = Value::Bool(false);
         malformed.push(restart_not_required);
@@ -1064,6 +1052,25 @@ mod tests {
                 parse_deployment_transaction(&serde_json::to_vec(&transaction).unwrap()).is_err()
             );
         }
+    }
+
+    #[test]
+    fn accepts_legacy_permission_migration_transaction() {
+        let mut transaction = deployment_transaction_v2("activation_files_installing");
+        transaction["runner_activation"]["permission_had_previous"] = Value::Bool(true);
+
+        let snapshot =
+            parse_deployment_transaction(&serde_json::to_vec(&transaction).unwrap()).unwrap();
+
+        assert_eq!(snapshot.status, "recovery_required");
+        assert_eq!(
+            snapshot.config_revision.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            snapshot.transaction_phase.as_deref(),
+            Some("activation_files_installing")
+        );
     }
 
     #[cfg(unix)]

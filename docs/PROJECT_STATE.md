@@ -81,14 +81,16 @@
   before permission detection. Rollback revokes launcher permission and reloads
   the manager before any config downgrade; a reload failure preserves the
   ephemeral config and journal. Receipt-only cleanup failures retain the journal
-  but do not block old-service recovery. Version 2 journals reject any claim that
-  launcher permission predated activation.
+  but do not block old-service recovery. Version 2 journals accept a predating
+  launcher permission only when the saved drop-in matches the exact reviewed
+  legacy policy required by the migration.
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
-  The bot receives only launch-group and
-  pending-input access; config-worker access and mutating config commands remain
-  disabled. Production stays on `current-user` until the deployment host
-  completes the real-reboot challenge and activates a matching reviewed config.
+  The fixed bot drop-in grants the launch and config-worker socket groups plus
+  pending-input access. Production config commands remain disabled until the
+  reviewed admin Space is pinned, and `reload` and `sync` remain invalid.
+  Production stays on `current-user` until the deployment host completes the
+  real-reboot challenge and activates a matching reviewed config.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

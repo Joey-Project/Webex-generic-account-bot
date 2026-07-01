@@ -58,11 +58,30 @@ const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
 const ACTIVATION_RENEWAL_UNIT = 'webex-codex-activation-renew.service';
 const ACTIVATION_RENEW_TIMEOUT_MS = 5_500_000;
 const BOT_SERVICE_DROP_IN_RELATIVE = 'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf';
+const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
+  'etc/systemd/system.control',
+  'run/systemd/system.control',
+  'run/systemd/transient',
+  'run/systemd/generator.early',
+  'etc/systemd/system',
+  'etc/systemd/system.attached',
+  'run/systemd/system',
+  'run/systemd/system.attached',
+  'run/systemd/generator',
+  'usr/local/lib/systemd/system',
+  'usr/lib/systemd/system',
+  'lib/systemd/system',
+  'run/systemd/generator.late',
+]);
 const LEGACY_BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
 const BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch webex-config-pull\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
 const RUNNER_PERMISSION_INACTIVE = 'inactive';
 const RUNNER_PERMISSION_LEGACY = 'legacy-launcher-only';
 const RUNNER_PERMISSION_CURRENT = 'current';
+const ACTIVATION_FILES_MAY_BE_INSTALLED_PHASES = new Set([
+  'activation_files_installing',
+  'activation_files_installed',
+]);
 const FLOCK_BIN = '/usr/bin/flock';
 const FLOCK_CHILD_FD = '3';
 const FLOCK_TIMEOUT_MS = 5000;
@@ -190,10 +209,13 @@ class UsageError extends Error {
 }
 
 class CommittedRecoveryError extends Error {
-  constructor(message, configRevision) {
+  constructor(message, configRevision, { cause = null } = {}) {
     super(message);
     this.name = 'CommittedRecoveryError';
     this.configRevision = configRevision;
+    if (cause) {
+      this.cause = cause;
+    }
   }
 }
 
@@ -403,6 +425,10 @@ export function buildDeployPlan(options) {
   const botCodeDir = path.resolve(options.botCodeDir);
   const botServiceDropInSource = path.join(botCodeDir, BOT_SERVICE_DROP_IN_RELATIVE);
   const botServiceDropIn = path.resolve(options.botServiceDropIn);
+  const botServiceDropInSearchDirectories = systemdDropInSearchDirectories(
+    botServiceDropIn,
+    options.service,
+  );
   const botServiceDropInBackup = `${renderedConfig}.bot-service-drop-in.previous`;
   const activationReceipt = path.resolve(options.activationReceipt);
   const activationReceiptBackup = `${renderedConfig}.activation-receipt.previous`;
@@ -507,10 +533,10 @@ export function buildDeployPlan(options) {
   const serviceCommand = options.skipRestart
     ? null
     : command(options.systemctlBin, ['restart', '--', options.service], commandDefaults);
-  const serviceStopCommand = options.skipRestart
+  const serviceStopCommand = options.prepare
     ? null
     : command(options.systemctlBin, ['stop', '--', options.service], commandDefaults);
-  const serviceInactiveStateCommand = options.skipRestart
+  const serviceInactiveStateCommand = options.prepare
     ? null
     : command(
         options.systemctlBin,
@@ -580,10 +606,10 @@ export function buildDeployPlan(options) {
   const activationDaemonReloadCommand = options.activateRunner
     ? command(options.systemctlBin, ['daemon-reload'], commandDefaults)
     : null;
-  const activationStopCommand = options.activateRunner
+  const activationStopCommand = !options.prepare
     ? command(options.systemctlBin, ['stop', '--', ACTIVATION_RENEWAL_UNIT], commandDefaults)
     : null;
-  const activationStateCommand = options.activateRunner
+  const activationStateCommand = !options.prepare
     ? command(
         options.systemctlBin,
         ['show', '--property=ActiveState', '--value', '--', ACTIVATION_RENEWAL_UNIT],
@@ -627,6 +653,7 @@ export function buildDeployPlan(options) {
     botCodeDir,
     botServiceDropInSource,
     botServiceDropIn,
+    botServiceDropInSearchDirectories,
     botServiceDropInBackup,
     activationReceipt,
     activationReceiptBackup,
@@ -729,10 +756,11 @@ export async function runCli({
     writeStatus(stdout, result, options.json);
     return 0;
   } catch (error) {
+    const deploymentStatusError = findDeploymentStatusError(error);
     const status = error instanceof UsageError
       ? 2
-      : error instanceof DeploymentStatusError
-        ? error.exitStatus
+      : deploymentStatusError
+        ? deploymentStatusError.exitStatus
         : 1;
     stderr.write(`${redact(String(error.message))}\n`);
     if (error instanceof UsageError) {
@@ -876,21 +904,45 @@ export async function executePlan({
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
-    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
-    await runner(
-      plan.permissionStateReloadCommand,
-      scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
-      signal,
-    );
-    throwIfAborted(signal);
-    runnerPermission = await detectAndValidateRunnerPermission(
+    const interruptedTransaction = await readInstallTransaction(plan, fsApi);
+    try {
+      const permissionStateBeforeReload = await detectRunnerPermission(plan, fsApi);
+      await reloadSystemdWithVerifiedRunnerPermission(
+        plan,
+        plan.permissionStateReloadCommand,
+        permissionStateBeforeReload,
+        runner,
+        parentEnv,
+        fsApi,
+        signal,
+      );
+      throwIfAborted(signal);
+      runnerPermission = await detectAndValidateRunnerPermission(
+        plan,
+        runner,
+        parentEnv,
+        fsApi,
+        signal,
+        permissionStateBeforeReload,
+      );
+    } catch (error) {
+      await throwInterruptedServicePreflightFailure(
+        plan,
+        interruptedTransaction,
+        runner,
+        parentEnv,
+        error,
+      );
+    }
+    const recovery = await recoverInterruptedInstall(
       plan,
       runner,
       parentEnv,
       fsApi,
+      interruptedTransaction,
+      runnerPermission.state,
       signal,
     );
-    const recovery = await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
     throwIfAborted(signal);
     if (plan.activateRunner && recovery?.committed && recovery.metadata.runner_activation) {
       return recovery.metadata;
@@ -946,17 +998,20 @@ export async function executePlan({
       throwIfAborted(signal);
     }
     if (plan.activateRunner) {
-      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
+      await assertRunnerPermissionState(plan, runnerPermission.state, fsApi);
       installState = await prepareRunnerActivation(
         plan,
         captures.configRevision,
         fsApi,
         { migrateLegacyPermission: runnerPermission.legacy },
       );
-      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
-      await runner(
+      await reloadSystemdWithVerifiedRunnerPermission(
+        plan,
         plan.activationDaemonReloadCommand,
-        scrubEnv(parentEnv, plan.activationDaemonReloadCommand.env),
+        runnerPermission.state,
+        runner,
+        parentEnv,
+        fsApi,
         signal,
       );
       throwIfAborted(signal);
@@ -985,6 +1040,12 @@ export async function executePlan({
         signal,
       );
       throwIfAborted(signal);
+      installState = await updateInstallTransactionPhase(
+        plan,
+        installState,
+        'activation_files_installing',
+        fsApi,
+      );
       await installRunnerActivationFiles(plan, fsApi);
       installState = await updateInstallTransactionPhase(
         plan,
@@ -1008,7 +1069,14 @@ export async function executePlan({
         fsApi,
       );
       try {
-        await runServiceTransition(plan, runner, parentEnv, fsApi, signal);
+        await runServiceTransition(
+          plan,
+          runner,
+          parentEnv,
+          fsApi,
+          RUNNER_PERMISSION_CURRENT,
+          signal,
+        );
       } catch (error) {
         const rollbackState = installState;
         installState = null;
@@ -1016,6 +1084,9 @@ export async function executePlan({
         let rollbackError = null;
         let rollbackDurabilityError = null;
         let rollbackReceiptError = null;
+        const botContainmentRequired = Boolean(
+          rollbackState.runnerActivation || runnerPermission.active,
+        );
         if (rollbackState.runnerActivation) {
           try {
             await stopActivationRenewal(plan, runner, parentEnv);
@@ -1023,29 +1094,44 @@ export async function executePlan({
             renewalStopError = stopError;
           }
         }
-        try {
-          const rollbackResult = await restoreDeploymentState(
-            plan,
-            rollbackState,
-            fsApi,
-            runner,
-            parentEnv,
-          );
-          rollbackDurabilityError = rollbackResult.durabilityError;
-          rollbackReceiptError = rollbackResult.receiptRestoreError;
-        } catch (restoreError) {
-          rollbackError = renewalStopError
-            ? errorPreservingDeploymentStatus(
-                restoreError,
-                `${restoreError.message}; failed to stop or verify activation renewal: ${renewalStopError.message}`,
-                renewalStopError,
-              )
-            : restoreError;
+        if (botContainmentRequired) {
+          try {
+            await stopServiceForContainment(plan, runner, parentEnv);
+          } catch (containmentError) {
+            rollbackError = renewalStopError
+              ? errorPreservingDeploymentStatus(
+                  containmentError,
+                  `${containmentError.message}; failed to stop or verify activation renewal: ${renewalStopError.message}`,
+                  renewalStopError,
+                )
+              : containmentError;
+          }
+        }
+        if (!rollbackError) {
+          try {
+            const rollbackResult = await restoreDeploymentState(
+              plan,
+              rollbackState,
+              fsApi,
+              runner,
+              parentEnv,
+            );
+            rollbackDurabilityError = rollbackResult.durabilityError;
+            rollbackReceiptError = rollbackResult.receiptRestoreError;
+          } catch (restoreError) {
+            rollbackError = renewalStopError
+              ? errorPreservingDeploymentStatus(
+                  restoreError,
+                  `${restoreError.message}; failed to stop or verify activation renewal: ${renewalStopError.message}`,
+                  renewalStopError,
+                )
+              : restoreError;
+          }
         }
         if (rollbackError) {
           let containedRollbackError = rollbackError;
           let containmentStatus = '';
-          if (rollbackState.runnerActivation) {
+          if (botContainmentRequired) {
             try {
               await stopServiceForContainment(plan, runner, parentEnv);
               containmentStatus = '; bot service stopped after rollback failure';
@@ -1282,13 +1368,23 @@ export async function executePlan({
   }
 }
 
-async function runServiceTransition(plan, runner, parentEnv, fsApi, signal = null) {
+async function runServiceTransition(
+  plan,
+  runner,
+  parentEnv,
+  fsApi,
+  expectedRunnerPermissionState,
+  signal = null,
+) {
   throwIfAborted(signal);
   if (plan.daemonReloadCommand) {
-    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
-    await runner(
+    await reloadSystemdWithVerifiedRunnerPermission(
+      plan,
       plan.daemonReloadCommand,
-      scrubEnv(parentEnv, plan.daemonReloadCommand.env),
+      expectedRunnerPermissionState,
+      runner,
+      parentEnv,
+      fsApi,
       signal,
     );
     throwIfAborted(signal);
@@ -1334,6 +1430,77 @@ async function stopActivationRenewal(plan, runner, parentEnv) {
   await runner(
     plan.activationStateCommand,
     scrubEnv(parentEnv, plan.activationStateCommand.env),
+  );
+}
+
+async function throwInterruptedServicePreflightFailure(
+  plan,
+  transaction,
+  runner,
+  parentEnv,
+  primaryError,
+) {
+  await throwInterruptedTransactionFailure(
+    plan,
+    transaction,
+    runner,
+    parentEnv,
+    primaryError,
+    'interrupted recovery preflight failure',
+  );
+}
+
+function interruptedTransactionMayHaveStartedBot(transaction) {
+  const serviceTransitionMayHaveStarted = (
+    [
+      'service_transition_started',
+      'committed_pending_metadata',
+    ].includes(transaction?.phase)
+    && transaction.service_restart_required
+  );
+  const installedActivationMayHaveStartedAfterReboot = (
+    transaction?.version === 2
+    && ACTIVATION_FILES_MAY_BE_INSTALLED_PHASES.has(transaction.phase)
+  );
+  return serviceTransitionMayHaveStarted || installedActivationMayHaveStartedAfterReboot;
+}
+
+async function throwInterruptedTransactionFailure(
+  plan,
+  transaction,
+  runner,
+  parentEnv,
+  primaryError,
+  context,
+) {
+  if (!interruptedTransactionMayHaveStartedBot(transaction)) {
+    throw primaryError;
+  }
+  let renewalStopError = null;
+  try {
+    await stopActivationRenewal(plan, runner, parentEnv);
+  } catch (error) {
+    renewalStopError = error;
+  }
+  try {
+    await stopServiceForContainment(plan, runner, parentEnv);
+  } catch (containmentError) {
+    const renewalFailure = renewalStopError
+      ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+      : '';
+    throw errorPreservingDeploymentStatus(
+      primaryError,
+      `${primaryError.message}; failed to stop the bot after ${context}: ${containmentError.message}${renewalFailure}`,
+      containmentError,
+    );
+  }
+  const renewalFailure = renewalStopError
+    ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+    : '';
+  throw errorPreservingDeploymentStatus(
+    primaryError,
+    `${primaryError.message}; bot service stopped after ${context}${renewalFailure}`,
+    renewalStopError,
   );
 }
 
@@ -2949,8 +3116,53 @@ async function assertTrustedBotServiceDropInSource(file, fsApi) {
   }
 }
 
+function systemdDropInSearchDirectories(managedDropIn, service) {
+  const managedDirectory = path.dirname(managedDropIn);
+  const managedName = path.basename(managedDropIn);
+  const expectedManagedName = path.basename(DEFAULTS.botServiceDropIn);
+  if (managedName !== expectedManagedName) {
+    throw new UsageError(`bot-service-drop-in must use the fixed name ${expectedManagedName}`);
+  }
+  const managedDirectorySuffix = path.join(
+    'etc',
+    'systemd',
+    'system',
+    `${service}.service.d`,
+  );
+  const rootedSuffix = `${path.sep}${managedDirectorySuffix}`;
+  if (
+    managedDirectory !== rootedSuffix
+    && !managedDirectory.endsWith(rootedSuffix)
+  ) {
+    throw new UsageError(
+      `bot-service-drop-in must be under etc/systemd/system/${service}.service.d`,
+    );
+  }
+  const hostRoot = managedDirectory === rootedSuffix
+    ? path.parse(managedDirectory).root
+    : managedDirectory.slice(0, -rootedSuffix.length);
+  const directoryNames = systemdUnitDropInDirectoryNames(service);
+  return SYSTEMD_SYSTEM_UNIT_LOAD_PATHS.flatMap((loadPath) => (
+    directoryNames.map((directoryName) => path.join(hostRoot, loadPath, directoryName))
+  ));
+}
+
+function systemdUnitDropInDirectoryNames(service) {
+  const names = [`${service}.service.d`];
+  let prefix = service;
+  for (;;) {
+    const dash = prefix.lastIndexOf('-');
+    if (dash < 0) break;
+    prefix = prefix.slice(0, dash + 1);
+    names.push(`${prefix}.service.d`);
+    prefix = prefix.slice(0, -1);
+  }
+  names.push('service.d');
+  return names;
+}
+
 async function detectRunnerPermission(plan, fsApi) {
-  await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
+  await assertNoUnexpectedBotServiceDropIns(plan, fsApi);
   let snapshot;
   try {
     snapshot = await readStableTrustedFile(
@@ -2975,23 +3187,52 @@ async function detectRunnerPermission(plan, fsApi) {
   throw new Error('installed bot service drop-in does not match a fixed activation policy');
 }
 
-async function assertNoUnexpectedBotServiceDropIns(managedDropIn, fsApi) {
-  const directory = path.dirname(managedDropIn);
-  let entries;
-  try {
-    entries = await fsApi.readdir(directory, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') return;
-    throw error;
-  }
-  const managedName = path.basename(managedDropIn);
-  for (const entry of entries) {
-    if (entry.name !== managedName && entry.name.endsWith('.conf')) {
+async function assertNoUnexpectedBotServiceDropIns(plan, fsApi) {
+  for (const directory of plan.botServiceDropInSearchDirectories) {
+    let entries;
+    try {
+      entries = await fsApi.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.name.endsWith('.conf')) continue;
+      const candidate = path.join(directory, entry.name);
+      if (candidate === plan.botServiceDropIn) continue;
       throw new Error(
-        `unexpected bot service drop-in blocks runner permission detection: ${JSON.stringify(entry.name)}`,
+        `unexpected bot service drop-in blocks runner permission detection: ${JSON.stringify(entry.name)} (${candidate})`,
       );
     }
   }
+}
+
+async function assertRunnerPermissionState(plan, expectedState, fsApi) {
+  const actualState = await detectRunnerPermission(plan, fsApi);
+  if (actualState !== expectedState) {
+    throw new Error(
+      `bot service drop-in changed across systemd reload: expected ${expectedState}, found ${actualState}`,
+    );
+  }
+}
+
+async function reloadSystemdWithVerifiedRunnerPermission(
+  plan,
+  reloadCommand,
+  expectedState,
+  runner,
+  parentEnv,
+  fsApi,
+  signal = null,
+) {
+  await assertRunnerPermissionState(plan, expectedState, fsApi);
+  await runner(
+    reloadCommand,
+    scrubEnv(parentEnv, reloadCommand.env),
+    signal,
+  );
+  throwIfAborted(signal);
+  await assertRunnerPermissionState(plan, expectedState, fsApi);
 }
 
 async function detectAndValidateRunnerPermission(
@@ -3000,10 +3241,16 @@ async function detectAndValidateRunnerPermission(
   parentEnv,
   fsApi,
   signal,
+  expectedState = null,
 ) {
   const state = await detectRunnerPermission(plan, fsApi);
+  if (expectedState !== null && state !== expectedState) {
+    throw new Error(
+      `bot service drop-in changed after systemd reload: expected ${expectedState}, found ${state}`,
+    );
+  }
   if (state === RUNNER_PERMISSION_INACTIVE) {
-    return { active: false, legacy: false };
+    return { active: false, legacy: false, state };
   }
   await runner(
     plan.liveRunnerPolicyCheckCommand,
@@ -3014,6 +3261,7 @@ async function detectAndValidateRunnerPermission(
   return {
     active: true,
     legacy: state === RUNNER_PERMISSION_LEGACY,
+    state,
   };
 }
 
@@ -3081,11 +3329,35 @@ async function rollbackCandidateConfig(plan, installState, fsApi) {
 
 async function rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi) {
   let renewalStopError = null;
+  const botContainmentRequiredBeforeRestore = (
+    (
+      installState.phase === 'service_transition_started'
+      && installState.serviceRestartRequired
+    )
+    || (
+      installState.runnerActivation
+      && ACTIVATION_FILES_MAY_BE_INSTALLED_PHASES.has(installState.phase)
+    )
+  );
   if (installState.runnerActivation && installState.phase !== 'prepared') {
     try {
       await stopActivationRenewal(plan, runner, parentEnv);
     } catch (error) {
       renewalStopError = error;
+    }
+  }
+  if (botContainmentRequiredBeforeRestore) {
+    try {
+      await stopServiceForContainment(plan, runner, parentEnv);
+    } catch (containmentError) {
+      const renewalFailure = renewalStopError
+        ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+        : '';
+      throw errorPreservingDeploymentStatus(
+        containmentError,
+        `failed to stop the bot before rolling back interrupted deployment state: ${containmentError.message}${renewalFailure}`,
+        renewalStopError,
+      );
     }
   }
   let durabilityError = null;
@@ -3105,10 +3377,7 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
     restoreError = error;
   }
   if (restoreError) {
-    if (
-      installState.runnerActivation
-      && installState.phase === 'service_transition_started'
-    ) {
+    if (botContainmentRequiredBeforeRestore) {
       try {
         await stopServiceForContainment(plan, runner, parentEnv);
       } catch (containmentError) {
@@ -3128,7 +3397,7 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
     }
     throw restoreError;
   }
-  if (installState.phase === 'service_transition_started') {
+  if (botContainmentRequiredBeforeRestore) {
     try {
       await runServiceRollback(plan, installState, runner, parentEnv, fsApi);
     } catch (error) {
@@ -3187,12 +3456,21 @@ async function runServiceRollback(plan, installState, runner, parentEnv, fsApi) 
   if (!installState.serviceRestartRequired) {
     return;
   }
+  const restoredRunnerPermissionState = installState.runnerActivation?.permissionHadPrevious
+    ? RUNNER_PERMISSION_LEGACY
+    : RUNNER_PERMISSION_INACTIVE;
   if (installState.hadPrevious) {
     if (!plan.serviceCommand) {
       throw new Error('cannot restore service state without a configured restart command');
     }
     try {
-      await runServiceTransition(plan, runner, parentEnv, fsApi);
+      await runServiceTransition(
+        plan,
+        runner,
+        parentEnv,
+        fsApi,
+        restoredRunnerPermissionState,
+      );
     } catch (error) {
       try {
         await stopServiceForContainment(plan, runner, parentEnv);
@@ -3209,10 +3487,13 @@ async function runServiceRollback(plan, installState, runner, parentEnv, fsApi) 
   }
   await stopServiceForContainment(plan, runner, parentEnv);
   if (plan.daemonReloadCommand) {
-    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
-    await runner(
+    await reloadSystemdWithVerifiedRunnerPermission(
+      plan,
       plan.daemonReloadCommand,
-      scrubEnv(parentEnv, plan.daemonReloadCommand.env),
+      restoredRunnerPermissionState,
+      runner,
+      parentEnv,
+      fsApi,
     );
   }
 }
@@ -3236,10 +3517,16 @@ async function restoreDeploymentState(
       if (!runner) {
         throw new Error('runner permission rollback requires systemd manager synchronisation');
       }
-      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
-      await runner(
+      const restoredRunnerPermissionState = installState.runnerActivation.permissionHadPrevious
+        ? RUNNER_PERMISSION_LEGACY
+        : RUNNER_PERMISSION_INACTIVE;
+      await reloadSystemdWithVerifiedRunnerPermission(
+        plan,
         plan.permissionStateReloadCommand,
-        scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
+        restoredRunnerPermissionState,
+        runner,
+        parentEnv,
+        fsApi,
       );
     } catch (error) {
       permissionRestoreError = error;
@@ -3412,8 +3699,18 @@ async function updateInstallTransactionPhase(plan, installState, phase, fsApi) {
   return nextState;
 }
 
-async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
-  const transaction = await readInstallTransaction(plan, fsApi);
+async function recoverInterruptedInstall(
+  plan,
+  runner,
+  parentEnv,
+  fsApi,
+  transaction = undefined,
+  expectedRunnerPermissionState = RUNNER_PERMISSION_INACTIVE,
+  signal = null,
+) {
+  if (transaction === undefined) {
+    transaction = await readInstallTransaction(plan, fsApi);
+  }
   if (!transaction) {
     return null;
   }
@@ -3423,17 +3720,30 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
     );
   }
   if (
-    transaction.phase === 'service_transition_started'
+    [
+      'service_transition_started',
+      'committed_pending_metadata',
+    ].includes(transaction.phase)
     && transaction.service_restart_required
     && !plan.serviceCommand
   ) {
-    throw new Error(
-      'interrupted deployment requires service recovery; rerun without --skip-restart',
+    await throwInterruptedTransactionFailure(
+      plan,
+      transaction,
+      runner,
+      parentEnv,
+      new Error('interrupted deployment requires service recovery; rerun without --skip-restart'),
+      'interrupted recovery mode rejection',
     );
   }
   if (transaction.version === 2 && !plan.activateRunner) {
-    throw new Error(
-      'interrupted runner activation requires rerunning with --activate-runner',
+    await throwInterruptedTransactionFailure(
+      plan,
+      transaction,
+      runner,
+      parentEnv,
+      new Error('interrupted runner activation requires rerunning with --activate-runner'),
+      'interrupted recovery mode rejection',
     );
   }
   if (transaction.rendered_config !== plan.renderedConfig) {
@@ -3472,6 +3782,15 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
   if (transaction.phase === 'committed_pending_metadata') {
     let metadata;
     try {
+      await recoverCommittedService(
+        plan,
+        transaction,
+        expectedRunnerPermissionState,
+        runner,
+        parentEnv,
+        fsApi,
+        signal,
+      );
       metadata = deploymentMetadataFromInstallState(
         {
           ...plan,
@@ -3495,12 +3814,87 @@ async function recoverInterruptedInstall(plan, runner, parentEnv, fsApi) {
         await writeMetadataAtomically(plan.metadataFile, metadata, fsApi);
       }
     } catch (error) {
-      throw new CommittedRecoveryError(error.message, transaction.config_revision);
+      throw new CommittedRecoveryError(
+        error.message,
+        transaction.config_revision,
+        { cause: error },
+      );
     }
     return { committed: true, metadata };
   }
   await rollbackInstalledCandidate(plan, installState, runner, parentEnv, fsApi);
   return { committed: false, metadata: null };
+}
+
+async function recoverCommittedService(
+  plan,
+  transaction,
+  expectedRunnerPermissionState,
+  runner,
+  parentEnv,
+  fsApi,
+  signal,
+) {
+  if (!transaction.service_restart_required) return;
+  try {
+    if (!plan.serviceCommand) {
+      throw new Error('cannot verify a committed service without a configured restart command');
+    }
+    if (
+      transaction.version === 2
+      && expectedRunnerPermissionState !== RUNNER_PERMISSION_CURRENT
+    ) {
+      throw new Error('committed runner activation no longer has the current permission policy');
+    }
+    if (expectedRunnerPermissionState !== RUNNER_PERMISSION_INACTIVE) {
+      const renewalCommand = plan.activationEnsureCommand ?? plan.activationRenewCommand;
+      if (!renewalCommand) {
+        throw new Error('cannot renew activation while recovering a committed service');
+      }
+      await runner(
+        renewalCommand,
+        scrubEnv(parentEnv, renewalCommand.env),
+        signal,
+      );
+      throwIfAborted(signal);
+      await assertTrustedActivationReceipt(plan.activationReceipt, fsApi);
+    }
+    await runServiceTransition(
+      plan,
+      runner,
+      parentEnv,
+      fsApi,
+      expectedRunnerPermissionState,
+      signal,
+    );
+  } catch (error) {
+    let renewalStopError = null;
+    try {
+      await stopActivationRenewal(plan, runner, parentEnv);
+    } catch (stopError) {
+      renewalStopError = stopError;
+    }
+    try {
+      await stopServiceForContainment(plan, runner, parentEnv);
+    } catch (containmentError) {
+      const renewalFailure = renewalStopError
+        ? `; activation renewal stop or inactive verification also failed: ${renewalStopError.message}`
+        : '';
+      throw errorPreservingDeploymentStatus(
+        error,
+        `${error.message}; failed to stop the bot after committed service recovery failure: ${containmentError.message}${renewalFailure}`,
+        containmentError,
+      );
+    }
+    if (renewalStopError) {
+      throw errorPreservingDeploymentStatus(
+        error,
+        `${error.message}; bot service stopped but activation renewal stop or inactive verification failed: ${renewalStopError.message}`,
+        renewalStopError,
+      );
+    }
+    throw error;
+  }
 }
 
 function deploymentMetadataFromInstallState(plan, installState) {
@@ -3675,6 +4069,7 @@ function validateInstallTransaction(transaction) {
         'prepared',
         'activation_renewal_started',
         'activation_renewed',
+        'activation_files_installing',
         'activation_files_installed',
         'service_transition_started',
         'committed_pending_metadata',
