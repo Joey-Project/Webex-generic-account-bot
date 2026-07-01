@@ -207,8 +207,9 @@ superseded_by:
   Require an exact `files systemd` NSS policy, enumerate static identities from
   `files`, reject static systemd userdb records and managed IDs in the
   DynamicUser range, and permit only the trusted DynamicUser provider. Fsync
-  every target directory before clearing a recovery journal. Serialise the full
-  apply with a PID/device/inode-bound kernel lock, validate every re-exec path
+  every target directory and re-verify the complete old target set before
+  clearing a recovery journal. Serialise the full apply with a
+  PID/device/inode-bound kernel lock, validate every re-exec path
   ancestor, stream a bounded scan that removes only trusted stale candidates,
   and bound and reject active launcher template instances as well as active
   template units. If a later sysusers, tmpfiles, manager-reload, or

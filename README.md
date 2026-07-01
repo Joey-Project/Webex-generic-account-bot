@@ -236,8 +236,9 @@ under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
 Rollback and recovery classify every managed target, accept only the recorded
 old or desired digest, and fail closed on an administrator-modified third
 state. Recovery fsyncs every target directory before removing the journal,
-including targets that already match their recorded old state. Dry-run reports
-recovery required, and
+including targets that already match their recorded old state, and then
+re-verifies the complete old target set before clearing recovery state. Dry-run
+reports recovery required, and
 the next apply restores the old set before
 reapplying. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command

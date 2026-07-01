@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -681,6 +682,108 @@ describe('guarded host provisioner execution', () => {
     }
   });
 
+  it('refuses a target change while preparing its recovery candidate', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const desired = Buffer.from('interrupted desired policy\n');
+    const existing = Buffer.from('recorded old policy\n');
+    await writeRecoveryTransaction(fixture, artifact, desired, existing);
+    const candidatePrefix = path.join(
+      path.dirname(artifact.target),
+      `.${path.basename(artifact.target)}.provision-`,
+    );
+    let injected = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'open') return target[property];
+        return async (...args) => {
+          const handle = await target.open(...args);
+          if (!String(args[0]).startsWith(candidatePrefix) || injected) return handle;
+          return new Proxy(handle, {
+            get(handleTarget, handleProperty) {
+              if (handleProperty === 'close') {
+                return async () => {
+                  await handleTarget.close();
+                  injected = true;
+                  const replacement = `${artifact.target}.administrator`;
+                  await target.writeFile(replacement, 'concurrent administrator state\n', {
+                    mode: 0o644,
+                  });
+                  await target.rename(replacement, artifact.target);
+                };
+              }
+              const value = handleTarget[handleProperty];
+              return typeof value === 'function' ? value.bind(handleTarget) : value;
+            },
+          });
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /policy target changed during installation/,
+    );
+    assert.equal(await fs.readFile(artifact.target, 'utf8'), 'concurrent administrator state\n');
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
+  it('keeps the journal when a removed target is recreated before recovery commits', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const desired = Buffer.from('interrupted desired policy\n');
+    await writeRecoveryTransaction(fixture, artifact, desired, null);
+    const directory = path.dirname(artifact.target);
+    let removed = false;
+    let injected = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'rm') {
+          return async (...args) => {
+            const result = await target.rm(...args);
+            if (args[0] === artifact.target) removed = true;
+            return result;
+          };
+        }
+        if (property !== 'open') return target[property];
+        return async (...args) => {
+          const handle = await target.open(...args);
+          if (args[0] !== directory || !removed || injected) return handle;
+          return new Proxy(handle, {
+            get(handleTarget, handleProperty) {
+              if (handleProperty === 'sync') {
+                return async () => {
+                  await handleTarget.sync();
+                  injected = true;
+                  await target.writeFile(
+                    artifact.target,
+                    'concurrent administrator state\n',
+                    { mode: 0o644 },
+                  );
+                };
+              }
+              const value = handleTarget[handleProperty];
+              return typeof value === 'function' ? value.bind(handleTarget) : value;
+            },
+          });
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /policy target changed after recovery/,
+    );
+    assert.equal(await fs.readFile(artifact.target, 'utf8'), 'concurrent administrator state\n');
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
   it('resyncs every old-state target directory before removing the journal', async (context) => {
     const fixture = await provisionFixture(context);
     await writeNullTransaction(fixture);
@@ -894,6 +997,37 @@ async function writeNullTransaction(fixture) {
       target,
       desired_sha256: '0'.repeat(64),
       existing: null,
+    })),
+  };
+  await fs.writeFile(
+    fixture.plan.transactionFile,
+    `${JSON.stringify(transaction)}\n`,
+    { mode: 0o600 },
+  );
+  await fs.chmod(fixture.plan.transactionFile, 0o600);
+}
+
+async function writeRecoveryTransaction(fixture, selected, desired, existing) {
+  for (const directory of new Set(
+    fixture.plan.artifacts.map(({ target }) => path.dirname(target)),
+  )) {
+    await fs.mkdir(directory, { recursive: true, mode: 0o755 });
+  }
+  await fs.writeFile(selected.target, desired, { mode: 0o644 });
+  await fs.chmod(selected.target, 0o644);
+  const transaction = {
+    version: 1,
+    artifacts: fixture.plan.artifacts.map(({ target }) => ({
+      target,
+      desired_sha256: target === selected.target
+        ? createHash('sha256').update(desired).digest('hex')
+        : '0'.repeat(64),
+      existing: target === selected.target && existing
+        ? {
+          contents_base64: existing.toString('base64'),
+          sha256: createHash('sha256').update(existing).digest('hex'),
+        }
+        : null,
     })),
   };
   await fs.writeFile(

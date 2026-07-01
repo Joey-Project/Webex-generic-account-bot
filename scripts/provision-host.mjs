@@ -1142,10 +1142,6 @@ async function recoverPolicyTransaction(transaction, plan, deps) {
   for (const entry of recovery.reverse()) {
     if (!entry.restore) continue;
     const { artifact } = entry;
-    await assertTargetUnchanged(
-      { target: artifact.target, existing: entry.current },
-      deps.fsApi,
-    );
     if (artifact.existing) {
       const temporary = await writeCandidate(
         artifact.target,
@@ -1153,18 +1149,44 @@ async function recoverPolicyTransaction(transaction, plan, deps) {
         deps,
       );
       try {
+        await assertTargetUnchanged(
+          { target: artifact.target, existing: entry.current },
+          deps.fsApi,
+        );
         await deps.fsApi.rename(temporary, artifact.target);
       } catch (error) {
         await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
         throw error;
       }
     } else {
+      await assertTargetUnchanged(
+        { target: artifact.target, existing: entry.current },
+        deps.fsApi,
+      );
       await deps.fsApi.rm(artifact.target, { force: true });
     }
     await syncDirectory(path.dirname(artifact.target), deps.fsApi);
   }
   for (const directory of directories) {
     await syncDirectory(directory, deps.fsApi);
+  }
+  for (const artifact of transaction.artifacts) {
+    const current = await readOptionalTrustedFile(
+      artifact.target,
+      deps.targetUid,
+      deps.targetGid,
+      FILE_MODE,
+      deps.fsApi,
+    );
+    const existingSha256 = artifact.existing
+      ? createHash('sha256').update(artifact.existing.contents).digest('hex')
+      : null;
+    const matchesOldState = artifact.existing
+      ? current?.sha256 === existingSha256
+      : !current;
+    if (!matchesOldState) {
+      throw new Error(`policy target changed after recovery: ${artifact.target}`);
+    }
   }
   await removeProvisionTransaction(plan, deps);
 }
