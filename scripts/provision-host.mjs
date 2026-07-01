@@ -237,7 +237,12 @@ export function buildProvisionPlan({
   });
 }
 
-export function parseIdentityDatabases(passwdText, groupText, effectiveGroups = {}) {
+export function parseIdentityDatabases(
+  passwdText,
+  groupText,
+  effectiveGroups = {},
+  gshadowText = '',
+) {
   const users = new Map();
   for (const line of String(passwdText).split('\n').filter(Boolean)) {
     const fields = line.split(':');
@@ -262,14 +267,28 @@ export function parseIdentityDatabases(passwdText, groupText, effectiveGroups = 
       throw new Error('group database is malformed or contains duplicate groups');
     }
     const gid = parseDatabaseId(fields[2], 'group GID');
-    const members = fields[3] === '' ? [] : fields[3].split(',');
-    if (members.some((member) => member === '') || new Set(members).size !== members.length) {
-      throw new Error(`group member list is malformed: ${fields[0]}`);
-    }
+    const members = parseGroupMemberList(fields[3], fields[0], 'member');
     groups.set(fields[0], Object.freeze({
       name: fields[0],
+      password: fields[1],
       gid,
       members: Object.freeze([...members]),
+    }));
+  }
+
+  const shadowGroups = new Map();
+  for (const line of String(gshadowText).split('\n').filter(Boolean)) {
+    const fields = line.split(':');
+    if (fields.length !== 4 || shadowGroups.has(fields[0])) {
+      throw new Error('gshadow database is malformed or contains duplicate groups');
+    }
+    const administrators = parseGroupMemberList(fields[2], fields[0], 'administrator');
+    const members = parseGroupMemberList(fields[3], fields[0], 'shadow member');
+    shadowGroups.set(fields[0], Object.freeze({
+      name: fields[0],
+      password: fields[1],
+      administrators,
+      members,
     }));
   }
 
@@ -280,7 +299,7 @@ export function parseIdentityDatabases(passwdText, groupText, effectiveGroups = 
     }
     effective.set(user, new Set(gids));
   }
-  return Object.freeze({ users, groups, effectiveGroups: effective });
+  return Object.freeze({ users, groups, shadowGroups, effectiveGroups: effective });
 }
 
 export function validateNsswitchPolicy(contents) {
@@ -355,6 +374,7 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
     if (group.members.length !== 0) {
       throw new Error(`managed group has static members: ${groupName}`);
     }
+    assertManagedGroupCredentialLocked(group, snapshot.shadowGroups.get(groupName));
     const primaryUsers = [...snapshot.users.values()]
       .filter((user) => user.gid === group.gid)
       .map((user) => user.name);
@@ -384,8 +404,8 @@ export async function provisionHost(options, dependencies = {}) {
   if (plan.targetRoot !== '/' && !deps.allowTestRoot) {
     throw new Error('non-production target roots are test-only');
   }
-  if (options.apply && deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
-    throw new Error('--apply requires root');
+  if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
+    throw new Error('host provisioning requires root, including dry-run');
   }
 
   if (options.apply) await cleanupStaleCandidates(plan, deps);
@@ -394,10 +414,22 @@ export async function provisionHost(options, dependencies = {}) {
   if (transaction && !options.apply) {
     throw new Error('host policy recovery is required; run --apply');
   }
+  const commands = [];
   if (transaction) {
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS);
     assertUnitsDormant(recoveryUnitStates, plan, { requireLoaded: false });
-    await recoverPolicyTransaction(transaction, plan, deps);
+    await recoverPolicyTransaction(transaction, plan, deps, { removeTransaction: false });
+    try {
+      commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
+      const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+      assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
+      await removeProvisionTransaction(plan, deps);
+    } catch (error) {
+      throw new Error(
+        `host policy recovery finalisation failed; rerun --apply after correction: ${error.message}`,
+        { cause: error },
+      );
+    }
   }
 
   const identityBefore = await deps.readIdentitySnapshot();
@@ -412,7 +444,6 @@ export async function provisionHost(options, dependencies = {}) {
 
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
-  const commands = [];
   try {
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
     validateIdentityPolicy(await deps.readIdentitySnapshot(), { requireAccounts: true });
@@ -700,7 +731,6 @@ async function installPolicySetAtomically(inspected, plan, deps) {
       await syncDirectory(path.dirname(entry.artifact.target), deps.fsApi);
     }
     await verifyInstalledArtifacts(inspected, deps);
-    await removeProvisionTransaction(plan, deps);
   } catch (error) {
     try {
       await recoverPolicyTransaction(rollbackTransaction, plan, deps);
@@ -715,6 +745,14 @@ async function installPolicySetAtomically(inspected, plan, deps) {
     await Promise.allSettled(staged
       .filter(({ temporary }) => temporary)
       .map(({ temporary }) => deps.fsApi.rm(temporary, { force: true })));
+  }
+  try {
+    await removeProvisionTransaction(plan, deps);
+  } catch (error) {
+    throw new Error(
+      `policy files are installed but transaction cleanup failed; rerun --apply after correction: ${error.message}`,
+      { cause: error },
+    );
   }
   return changed.map(({ target }) => target);
 }
@@ -1205,7 +1243,12 @@ async function writeProvisionTransaction(inspected, plan, deps) {
   }
 }
 
-async function recoverPolicyTransaction(transaction, plan, deps) {
+async function recoverPolicyTransaction(
+  transaction,
+  plan,
+  deps,
+  { removeTransaction = true } = {},
+) {
   const directories = new Set(
     transaction.artifacts.map(({ target }) => path.dirname(target)),
   );
@@ -1288,7 +1331,7 @@ async function recoverPolicyTransaction(transaction, plan, deps) {
       throw new Error(`policy target changed after recovery: ${artifact.target}`);
     }
   }
-  await removeProvisionTransaction(plan, deps);
+  if (removeTransaction) await removeProvisionTransaction(plan, deps);
 }
 
 async function removeProvisionTransaction(plan, deps) {
@@ -1418,11 +1461,16 @@ export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, f
   );
   validateNsswitchPolicy(nsswitch.contents.toString('utf8'));
   await validateSystemdUserdbBoundary(fsApi);
-  const [passwd, group] = await Promise.all([
+  const [passwd, group, gshadow] = await Promise.all([
     runCommand('/usr/bin/getent', ['-s', 'files', 'passwd']),
     runCommand('/usr/bin/getent', ['-s', 'files', 'group']),
+    runCommand(
+      '/usr/bin/getent',
+      ['-s', 'files', 'gshadow', ...Object.values(MANAGED_GROUPS)],
+      [0, 2],
+    ),
   ]);
-  const initial = parseIdentityDatabases(passwd.stdout, group.stdout);
+  const initial = parseIdentityDatabases(passwd.stdout, group.stdout, {}, gshadow.stdout);
   const effectiveGroups = {};
   for (const user of Object.values(MANAGED_USERS)) {
     if (!initial.users.has(user)) continue;
@@ -1434,7 +1482,7 @@ export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, f
         .map((groupRecord) => groupRecord.gid),
     ];
   }
-  return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups);
+  return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups, gshadow.stdout);
 }
 
 export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
@@ -1491,6 +1539,7 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
 async function assertNoLauncherInstancePolicy(fsApi) {
   let scannedEntries = 0;
   for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
+    if (directory === '/lib/systemd/system' && await isUsrMergedLib(fsApi)) continue;
     const entries = await readTrustedDirectoryEntries(
       directory,
       MAX_SYSTEMD_UNIT_PATH_ENTRIES - scannedEntries,
@@ -1498,13 +1547,34 @@ async function assertNoLauncherInstancePolicy(fsApi) {
     );
     scannedEntries += entries.length;
     for (const entry of entries) {
-      if (/^webex-codex-launcher@[^@/\s]+\.service(?:\.d)?$/.test(entry.name)) {
+      const instanceUnit = /^webex-codex-launcher@[^@/\s]+\.service$/.test(entry.name);
+      const policyDirectory =
+        /^webex-codex-launcher@(?:[^@/\s]+)?\.service(?:\.d|\.wants|\.requires)$/
+          .test(entry.name);
+      if (instanceUnit || policyDirectory) {
         throw new Error(
           `unexpected launcher instance policy in systemd unit path: ${path.join(directory, entry.name)}`,
         );
       }
     }
   }
+}
+
+async function isUsrMergedLib(fsApi) {
+  const before = await fsApi.lstat('/lib');
+  if (!before.isSymbolicLink()) return false;
+  const target = await fsApi.readlink('/lib');
+  const after = await fsApi.lstat('/lib');
+  if (
+    !sameFileIdentity(before, after)
+    || before.uid !== 0
+    || before.gid !== 0
+    || before.nlink !== 1
+    || target !== 'usr/lib'
+  ) {
+    throw new Error('usr-merge /lib link is not trusted');
+  }
+  return true;
 }
 
 function parseSystemUnitMetadata(output, unit) {
@@ -1608,6 +1678,23 @@ function assertPrimaryGroup(snapshot, user, groupName) {
   }
 }
 
+function assertManagedGroupCredentialLocked(group, shadowGroup) {
+  const groupPasswordIsLocked = /^[!*]+$/.test(group.password);
+  if (group.password !== 'x' && !groupPasswordIsLocked) {
+    throw new Error(`managed group password is not locked: ${group.name}`);
+  }
+  if (group.password === 'x' && !shadowGroup) {
+    throw new Error(`managed group shadow credential is missing: ${group.name}`);
+  }
+  if (!shadowGroup) return;
+  if (!/^[!*]+$/.test(shadowGroup.password)) {
+    throw new Error(`managed group shadow password is not locked: ${group.name}`);
+  }
+  if (shadowGroup.administrators.length !== 0 || shadowGroup.members.length !== 0) {
+    throw new Error(`managed group has shadow administrators or members: ${group.name}`);
+  }
+}
+
 function assertAccountContract(user, expected) {
   if (user.home !== expected.home || user.shell !== expected.shell) {
     throw new Error(`managed user account metadata is unexpected: ${user.name}`);
@@ -1643,6 +1730,14 @@ function parseDatabaseId(value, label) {
   const id = Number(value);
   if (!Number.isSafeInteger(id)) throw new Error(`${label} is invalid`);
   return id;
+}
+
+function parseGroupMemberList(value, groupName, label) {
+  const members = value === '' ? [] : value.split(',');
+  if (members.some((member) => member === '') || new Set(members).size !== members.length) {
+    throw new Error(`group ${label} list is malformed: ${groupName}`);
+  }
+  return Object.freeze([...members]);
 }
 
 function normalisedState(value, fallback) {

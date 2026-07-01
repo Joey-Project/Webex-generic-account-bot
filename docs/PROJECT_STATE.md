@@ -97,13 +97,15 @@
   fixed service, and root-managed versus bot-writable filesystem layout. The
   guarded provisioner now has a fixed non-secret allowlist, files-only static
   identity enumeration, a DynamicUser-only systemd userdb boundary,
-  identity-drift checks, bounded dormant-unit preflight, device-bound kernel
-  lock verification shared with config deployment, exact loaded-fragment and
-  no-drop-in checks, trusted re-exec paths, fail-closed crash recovery with full
+  identity-drift and locked-group-credential checks, bounded dormant-unit
+  preflight, device-bound kernel lock verification shared with config
+  deployment, exact loaded-fragment and no-drop-in checks, bounded template and
+  instance policy-path scanning with usr-merge handling, trusted re-exec paths,
+  fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional
-  root-owned policy installation, explicit sysusers/tmpfiles application, and
-  post-reload verification. Real host apply remains explicit before
-  Configuration Space pinning and activation.
+  root-owned policy installation without unsafe post-unlink rollback, explicit
+  sysusers/tmpfiles application, and post-reload verification. Real host apply
+  remains explicit before Configuration Space pinning and activation.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

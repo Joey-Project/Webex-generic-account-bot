@@ -162,15 +162,18 @@ superseded_by:
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
-  fixed non-secret allowlist, files-only static identity enumeration, a
-  DynamicUser-only systemd userdb boundary, identity-drift checks, dormant-unit
+  fixed non-secret allowlist, files-only static identity and gshadow
+  enumeration, a DynamicUser-only systemd userdb boundary, identity-drift and
+  locked-group-credential checks, dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
-  no-drop-in checks, fixed-path scanning for unloaded instance policy, trusted
-  re-exec paths, bounded streamed stale candidate cleanup and unit discovery,
-  recovery-before-write dormancy checks, fail-closed recovery with full
-  target-directory durability, interrupted first-run lock migration recovery,
-  and post-reload verification. Real host apply remains an
+  no-drop-in checks, fixed-path scanning for unloaded template and instance
+  policy including dependency directories and exact usr-merge compatibility,
+  trusted re-exec paths, bounded streamed stale candidate cleanup and unit
+  discovery, recovery-before-write dormancy checks, immediate recovery-time
+  manager reload, fail-closed recovery with full target-directory durability,
+  non-rollback journal-unlink failure handling, interrupted first-run lock
+  migration recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
 ## Delivery Rules
@@ -209,10 +212,14 @@ superseded_by:
   old nor desired digest. Apply the same all-target digest gate before rollback.
   Require an exact `files systemd` NSS policy, enumerate static identities from
   `files`, reject static systemd userdb records and managed IDs in the
-  DynamicUser range, and permit only the trusted DynamicUser provider. Fsync
-  every target directory and re-verify the complete old target set before
-  clearing a recovery journal, and prove every managed unit and discovered
-  instance dormant before recovery mutates policy. Serialise the full apply with
+  DynamicUser range, require locked files-backed gshadow credentials for every
+  managed privilege group, and permit only the trusted DynamicUser provider.
+  Fsync every target directory and re-verify the complete old target set before
+  clearing a recovery journal. Keep that journal while immediately reloading
+  systemd after startup recovery, and prove every managed unit and discovered
+  instance dormant before and after recovery mutates policy. Do not begin a
+  second rollback after a fully installed desired set reaches journal unlink but
+  its directory fsync fails. Serialise the full apply with
   a PID/device/inode-bound kernel lock shared with config deployment, validate
   every re-exec path ancestor, stream a bounded scan that removes only trusted
   stale candidates, and bound and reject active launcher template instances as
@@ -220,9 +227,10 @@ superseded_by:
   first-run lock state, then require tmpfiles to converge and revalidate the held
   inode before success. Require each loaded unit and instance to use the fixed
   managed fragment without any
-  drop-ins, and reject unloaded instance-specific policy from every fixed
-  systemd system-unit load path. If a later sysusers,
-  tmpfiles, manager-reload, or
+  drop-ins, and reject unloaded template or instance unit overrides, drop-ins,
+  wants, and requires from every fixed systemd system-unit load path while
+  accepting only the exact root-owned `/lib -> usr/lib` compatibility link. If
+  a later sysusers, tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an
   explicit convergent-rerun requirement; do not claim rollback of users or
   directories already created by systemd.

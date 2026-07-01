@@ -197,7 +197,7 @@ the separately hardened launcher and immutable transient runtime.
 Guarded host policy provisioning is dry-run by default:
 
 ```bash
-/usr/bin/node scripts/provision-host.mjs --dry-run
+sudo /usr/bin/node scripts/provision-host.mjs --dry-run
 sudo /usr/bin/node scripts/provision-host.mjs --apply
 ```
 
@@ -211,8 +211,10 @@ Apply also requires root-owned, non-writable ancestors and files for both the
 Node executable and provisioner script; do not run this root workflow through
 a user-managed Node installation or checkout.
 
-Dry-run validates source and target ancestor metadata, existing policy files,
-the exact non-login account metadata and NSS group set, and an exact
+Both modes require root so the fixed files-backed `gshadow` records can be
+checked without exposing them in output. Dry-run validates source and target
+ancestor metadata, existing policy files, the exact non-login account metadata,
+locked managed-group credentials, NSS group state, and an exact
 `files systemd` NSS policy for passwd, group, and optional initgroups data.
 Static identities are enumerated explicitly from the `files` database. The
 systemd user database may expose only its root-owned `DynamicUser` provider,
@@ -221,9 +223,11 @@ the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
-launcher template units. It rejects unloaded instance-specific launcher policy
-from every fixed systemd system-unit load path and requires every loaded managed
-unit to use the fixed `/etc/systemd/system` fragment with no drop-ins. The same
+launcher template units. It rejects unloaded template or instance launcher
+overrides and dependency directories from every fixed systemd system-unit load
+path, accepts only the exact root-owned `/lib -> usr/lib` compatibility link,
+and requires every loaded managed unit to use the fixed `/etc/systemd/system`
+fragment with no drop-ins. The same
 host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
@@ -242,11 +246,15 @@ Rollback and recovery classify every managed target, accept only the recorded
 old or desired digest, and fail closed on an administrator-modified third
 state. Recovery fsyncs every target directory before removing the journal,
 including targets that already match their recorded old state, and then
-re-verifies the complete old target set before clearing recovery state. Dry-run
-reports recovery required, and
-the next apply first proves every managed unit and discovered instance dormant,
-then restores the old set before
-reapplying. A later sysusers, tmpfiles, or reload failure leaves the complete
+re-verifies the complete old target set before clearing recovery state. A
+startup recovery keeps the journal while immediately reloading systemd and
+rechecking dormant unit state, so later validation failures cannot leave a
+half-committed unit cached by the manager. Dry-run reports recovery required,
+and the next apply first proves every managed unit and discovered instance
+dormant, then restores the old set before reapplying. Once a desired policy set
+is fully installed and verified, a journal unlink durability failure no longer
+starts a second rollback; it leaves that complete desired set for a convergent
+rerun. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command
 can be rerun after correction.
 

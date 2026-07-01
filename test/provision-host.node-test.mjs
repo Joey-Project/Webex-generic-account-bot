@@ -253,6 +253,7 @@ describe('guarded host provisioner policy', () => {
           'webex-generic-account-bot': [2001],
           'webex-config-deploy': [2002],
         },
+        expectedGshadowDatabase(),
       )),
       /static primary group for unexpected: webex-config-pull/,
     );
@@ -276,6 +277,7 @@ describe('guarded host provisioner policy', () => {
           'webex-generic-account-bot': [2001],
           'webex-config-deploy': [2002],
         },
+        expectedGshadowDatabase(),
       )),
       /account metadata is unexpected.*webex-generic-account-bot/,
     );
@@ -291,8 +293,45 @@ describe('guarded host provisioner policy', () => {
           'webex-generic-account-bot': [2001],
           'webex-config-deploy': [2002],
         },
+        expectedGshadowDatabase(),
       )),
       /managed user ID is outside the local range/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        groupDatabase: expectedGroupDatabase().replace(
+          'webex-codex-launch:x:',
+          'webex-codex-launch:$6$usable:',
+        ),
+      })),
+      /managed group password is not locked: webex-codex-launch/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        gshadowDatabase: expectedGshadowDatabase().replace(
+          'webex-config-deploy:!::\n',
+          '',
+        ),
+      })),
+      /managed group shadow credential is missing: webex-config-deploy/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        gshadowDatabase: expectedGshadowDatabase().replace(
+          'webex-config-pull:!::',
+          'webex-config-pull:$6$usable::',
+        ),
+      })),
+      /managed group shadow password is not locked: webex-config-pull/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        gshadowDatabase: expectedGshadowDatabase().replace(
+          'webex-codex-input:!::',
+          'webex-codex-input:!:administrator:',
+        ),
+      })),
+      /managed group has shadow administrators or members: webex-codex-input/,
     );
   });
 
@@ -311,7 +350,9 @@ describe('guarded host provisioner policy', () => {
               passwdRecord('webex-config-deploy', 1002, 2002),
               '',
             ].join('\n')
-            : expectedGroupDatabase(),
+            : args.at(-1) === 'group'
+              ? expectedGroupDatabase()
+              : expectedGshadowDatabase(),
           stderr: '',
         };
       },
@@ -321,6 +362,16 @@ describe('guarded host provisioner policy', () => {
     assert.deepEqual(commands, [
       ['/usr/bin/getent', ['-s', 'files', 'passwd']],
       ['/usr/bin/getent', ['-s', 'files', 'group']],
+      ['/usr/bin/getent', [
+        '-s',
+        'files',
+        'gshadow',
+        'webex-generic-account-bot',
+        'webex-config-deploy',
+        'webex-config-pull',
+        'webex-codex-input',
+        'webex-codex-launch',
+      ]],
     ]);
     validateIdentityPolicy(snapshot, { requireAccounts: true });
   });
@@ -567,7 +618,7 @@ describe('guarded host provisioner execution', () => {
         stderr: '',
         code: 0,
       };
-    }, systemdUnitPathFs());
+    }, systemdUnitPathFs(new Map(), { usrMerged: true }));
     assert.equal(discovered.get(instance).active, 'active');
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
@@ -597,24 +648,31 @@ describe('guarded host provisioner execution', () => {
     assert.equal(stateQueries, 0);
   });
 
-  it('rejects unloaded launcher instance policy before querying systemd', async () => {
-    let commandCalls = 0;
-    await assert.rejects(
-      readSystemUnitStates(
-        MANAGED_UNITS,
-        async () => {
-          commandCalls += 1;
-          return { stdout: '', stderr: '', code: 0 };
-        },
-        systemdUnitPathFs(new Map([
-          ['/etc/systemd/system', [
-            { name: 'webex-codex-launcher@unloaded.service.d' },
-          ]],
-        ])),
-      ),
-      /unexpected launcher instance policy.*webex-codex-launcher@unloaded\.service\.d/,
-    );
-    assert.equal(commandCalls, 0);
+  it('rejects unloaded launcher policy before querying systemd', async () => {
+    for (const policyName of [
+      'webex-codex-launcher@unloaded.service.d',
+      'webex-codex-launcher@unloaded.service.wants',
+      'webex-codex-launcher@unloaded.service.requires',
+      'webex-codex-launcher@.service.wants',
+    ]) {
+      let commandCalls = 0;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => {
+            commandCalls += 1;
+            return { stdout: '', stderr: '', code: 0 };
+          },
+          systemdUnitPathFs(new Map([
+            ['/etc/systemd/system', [
+              { name: policyName },
+            ]],
+          ])),
+        ),
+        new RegExp(`unexpected launcher instance policy.*${policyName.replaceAll('.', '\\.')}`),
+      );
+      assert.equal(commandCalls, 0);
+    }
   });
 
   it('bounds systemd unit-path scanning before querying systemd', async () => {
@@ -634,6 +692,22 @@ describe('guarded host provisioner execution', () => {
         ])),
       ),
       /too many entries in trusted directory/,
+    );
+    assert.equal(commandCalls, 0);
+  });
+
+  it('rejects a noncanonical usr-merge lib link before querying systemd', async () => {
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(new Map(), { usrMerged: true, usrMergeTarget: 'tmp/lib' }),
+      ),
+      /usr-merge \/lib link is not trusted/,
     );
     assert.equal(commandCalls, 0);
   });
@@ -714,6 +788,53 @@ describe('guarded host provisioner execution', () => {
     }
     for (const artifact of fixture.plan.artifacts.slice(2)) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
+  it('keeps the desired set when transaction unlink durability is uncertain', async (context) => {
+    const fixture = await provisionFixture(context);
+    const transactionDirectory = path.dirname(fixture.plan.transactionFile);
+    let transactionRemoved = false;
+    let injected = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'rm') {
+          return async (...args) => {
+            const result = await target.rm(...args);
+            if (args[0] === fixture.plan.transactionFile) transactionRemoved = true;
+            return result;
+          };
+        }
+        if (property !== 'open') return target[property];
+        return async (...args) => {
+          const handle = await target.open(...args);
+          if (args[0] !== transactionDirectory || !transactionRemoved || injected) return handle;
+          return new Proxy(handle, {
+            get(handleTarget, handleProperty) {
+              if (handleProperty === 'sync') {
+                return async () => {
+                  injected = true;
+                  throw new Error('injected transaction unlink fsync failure');
+                };
+              }
+              const value = handleTarget[handleProperty];
+              return typeof value === 'function' ? value.bind(handleTarget) : value;
+            },
+          });
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /policy files are installed but transaction cleanup failed.*unlink fsync failure/,
+    );
+    for (const artifact of fixture.plan.artifacts) {
+      assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
     }
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
@@ -839,15 +960,22 @@ describe('guarded host provisioner execution', () => {
       /recovery is required/,
     );
 
+    const commands = [];
     const report = await provisionHost(
       { apply: true },
-      fixture.dependencies({ applied: true }),
+      fixture.dependencies({ applied: true, commands }),
     );
     assert.equal(report.mode, 'applied');
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
     }
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
   });
 
   it('does not recover policy while a managed unit is active', async (context) => {
@@ -879,6 +1007,26 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
+  });
+
+  it('retains the recovery journal when the immediate manager reload fails', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const commands = [];
+    const dependencies = fixture.dependencies({ commands, applied: true });
+    dependencies.runCommand = async (command, args) => {
+      commands.push([command, [...args]]);
+      throw new Error('injected recovery daemon-reload failure');
+    };
+
+    await assert.rejects(
+      provisionHost({ apply: true }, dependencies),
+      /host policy recovery finalisation failed.*daemon-reload failure/,
+    );
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('refuses a target change while preparing its recovery candidate', async (context) => {
@@ -1121,7 +1269,7 @@ describe('guarded host provisioner execution', () => {
     ]);
   });
 
-  it('requires root before apply and keeps help side-effect free', async () => {
+  it('requires root for both modes and keeps help side-effect free', async () => {
     await assert.rejects(
       provisionHost(
         { apply: true },
@@ -1129,7 +1277,16 @@ describe('guarded host provisioner execution', () => {
           processApi: { geteuid: () => 1000 },
         },
       ),
-      /--apply requires root/,
+      /host provisioning requires root/,
+    );
+    await assert.rejects(
+      provisionHost(
+        { apply: false },
+        {
+          processApi: { geteuid: () => 1000 },
+        },
+      ),
+      /host provisioning requires root/,
     );
 
     const output = [];
@@ -1269,6 +1426,8 @@ function expectedIdentitySnapshot({
   botEffectiveGroups = [2001],
   workerEffectiveGroups = [2002],
   configPullMembers = [],
+  groupDatabase = expectedGroupDatabase(configPullMembers),
+  gshadowDatabase = expectedGshadowDatabase(),
 } = {}) {
   return parseIdentityDatabases(
     [
@@ -1276,11 +1435,12 @@ function expectedIdentitySnapshot({
       passwdRecord('webex-config-deploy', 1002, 2002),
       '',
     ].join('\n'),
-    expectedGroupDatabase(configPullMembers),
+    groupDatabase,
     {
       'webex-generic-account-bot': botEffectiveGroups,
       'webex-config-deploy': workerEffectiveGroups,
     },
+    gshadowDatabase,
   );
 }
 
@@ -1291,6 +1451,17 @@ function expectedGroupDatabase(configPullMembers = []) {
     groupRecord('webex-config-pull', 2003, configPullMembers),
     groupRecord('webex-codex-input', 2004),
     groupRecord('webex-codex-launch', 2005),
+    '',
+  ].join('\n');
+}
+
+function expectedGshadowDatabase() {
+  return [
+    'webex-generic-account-bot:!::',
+    'webex-config-deploy:!::',
+    'webex-config-pull:!::',
+    'webex-codex-input:!::',
+    'webex-codex-launch:!::',
     '',
   ].join('\n');
 }
@@ -1402,7 +1573,10 @@ function asyncDirectory(entries) {
   };
 }
 
-function systemdUnitPathFs(entriesByDirectory = new Map()) {
+function systemdUnitPathFs(
+  entriesByDirectory = new Map(),
+  { usrMerged = false, usrMergeTarget = 'usr/lib' } = {},
+) {
   const directoryStat = Object.freeze({
     uid: 0,
     gid: 0,
@@ -1410,8 +1584,27 @@ function systemdUnitPathFs(entriesByDirectory = new Map()) {
     isDirectory: () => true,
     isSymbolicLink: () => false,
   });
+  const usrMergeStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o120777,
+    nlink: 1,
+    dev: 1,
+    ino: 2,
+    size: 7,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isDirectory: () => false,
+    isSymbolicLink: () => true,
+  });
   return {
-    lstat: async () => directoryStat,
+    lstat: async (candidate) => (
+      usrMerged && candidate === '/lib' ? usrMergeStat : directoryStat
+    ),
+    readlink: async (candidate) => {
+      assert.equal(candidate, '/lib');
+      return usrMergeTarget;
+    },
     opendir: async (directory) => asyncDirectory(entriesByDirectory.get(directory) ?? []),
   };
 }
