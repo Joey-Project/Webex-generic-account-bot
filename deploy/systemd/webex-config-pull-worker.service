@@ -9,6 +9,7 @@ ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 Type=simple
 User=webex-config-deploy
 Group=webex-config-pull
+SupplementaryGroups=webex-config-deploy
 WorkingDirectory=/
 ExecStart=/usr/bin/node /opt/webex-generic-account-bot/code/scripts/config-pull-worker.mjs
 Restart=on-failure

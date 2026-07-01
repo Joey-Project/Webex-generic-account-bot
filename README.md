@@ -165,12 +165,22 @@ The base host service assets are:
 
 They define the stable non-login `webex-generic-account-bot` identity and keep
 root-managed rendered config, token, and environment inputs separate from the
-bot-owned state, Codex home, and workspace. The base unit has no launcher,
-sealed-input, or config-worker supplementary group. Those permissions and the
-pending-input write path remain exclusive to the activation-owned
-`10-codex-launcher.conf` drop-in. The base assets do not create token or env
-files, install binaries/code, enable units, or modify the host by themselves;
-the guarded host provisioner is a separate deployment slice.
+bot-owned state, Codex home, and workspace. The root-owned deploy-key directory
+uses mode `0750` and the worker's private `webex-config-deploy` group. The
+worker unit receives that traversal-only supplementary group; the bot never
+does, including after activation adds the separate config-pull group. The base
+unit has no launcher, sealed-input, or config-worker supplementary group. Those
+permissions and the pending-input write path remain exclusive to the
+activation-owned `10-codex-launcher.conf` drop-in. The base assets do not create
+token or env files, install binaries/code, enable units, or modify the host by
+themselves; the guarded host provisioner is a separate deployment slice.
+That provisioner must apply both the bot and config-pull worker sysusers files
+before the base tmpfiles file, whose deploy-key ownership references the worker
+identity and group.
+The rendered directory remains `root:root` mode `0755` to match the trusted
+root apply contract; rendered config is non-secret and mode `0644`, while token
+and environment secrets remain under separate `root:webex-generic-account-bot`
+mode `0750` roots.
 
 `MemoryDenyWriteExecute` remains disabled in the base service because the
 trusted Jenkins helper runs under Node/V8. Prompt-controlled Codex tools do not
@@ -234,6 +244,8 @@ The reviewed pull worker assets are:
 
 The service runs as the stable `webex-config-deploy` user with the dedicated
 `webex-config-pull` primary group; it is not lifecycle-coupled to the bot unit.
+Its same-name private supplementary group grants traversal of the root-owned
+deploy-key directory and is never granted to the bot.
 The mode `0660` socket is at `/run/webex-config-pull/config-pull.sock`; the
 common state parent `/var/lib/webex-generic-account-bot` is root-owned with mode
 `0755`. The worker state root

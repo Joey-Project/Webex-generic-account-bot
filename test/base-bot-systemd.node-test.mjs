@@ -23,19 +23,42 @@ const CONFIG_PULL_TMPFILES_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-config-pull-worker.tmpfiles.conf',
 );
+const CONFIG_PULL_SERVICE_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-config-pull-worker.service',
+);
+const CONFIG_PULL_SYSUSERS_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-config-pull-worker.sysusers.conf',
+);
 
 describe('base bot systemd contract', () => {
   it('passes the real systemd unit parser in an isolated root', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-base-unit-verify-'));
     const unitDirectory = path.join(root, 'etc', 'systemd', 'system');
     const binaryDirectory = path.join(root, 'opt', 'webex-generic-account-bot', 'bin');
+    const systemBinaryDirectory = path.join(root, 'usr', 'bin');
     try {
       await fs.mkdir(unitDirectory, { recursive: true });
       await fs.mkdir(binaryDirectory, { recursive: true });
-      await fs.copyFile(SERVICE_PATH, path.join(unitDirectory, path.basename(SERVICE_PATH)));
+      await fs.mkdir(systemBinaryDirectory, { recursive: true });
+      await Promise.all([
+        fs.copyFile(SERVICE_PATH, path.join(unitDirectory, path.basename(SERVICE_PATH))),
+        fs.copyFile(
+          CONFIG_PULL_SERVICE_PATH,
+          path.join(unitDirectory, path.basename(CONFIG_PULL_SERVICE_PATH)),
+        ),
+      ]);
       const placeholderBinary = path.join(binaryDirectory, 'webex-generic-account-bot');
-      await fs.copyFile('/usr/bin/true', placeholderBinary);
-      await fs.chmod(placeholderBinary, 0o755);
+      const placeholderNode = path.join(systemBinaryDirectory, 'node');
+      await Promise.all([
+        fs.copyFile('/usr/bin/true', placeholderBinary),
+        fs.copyFile('/usr/bin/true', placeholderNode),
+      ]);
+      await Promise.all([
+        fs.chmod(placeholderBinary, 0o755),
+        fs.chmod(placeholderNode, 0o755),
+      ]);
 
       const { stderr } = await execFileAsync('/usr/bin/systemd-analyze', [
         'verify',
@@ -43,6 +66,7 @@ describe('base bot systemd contract', () => {
         `--root=${root}`,
         '--man=no',
         path.basename(SERVICE_PATH),
+        path.basename(CONFIG_PULL_SERVICE_PATH),
       ]);
       assert.equal(stderr, '');
     } finally {
@@ -60,7 +84,7 @@ describe('base bot systemd contract', () => {
     assert.doesNotMatch(sysusers, /^m /m);
     assert.doesNotMatch(
       sysusers,
-      /webex-codex-(?:launch|input)|webex-config-pull/,
+      /webex-codex-(?:launch|input)|webex-config-(?:pull|deploy)/,
     );
   });
 
@@ -72,11 +96,17 @@ describe('base bot systemd contract', () => {
       await fs.mkdir(sysusersDirectory, { recursive: true });
       await fs.mkdir(tmpfilesDirectory, { recursive: true });
       const sysusersTarget = path.join(sysusersDirectory, 'webex-generic-account-bot.conf');
+      const workerSysusersTarget = path.join(
+        sysusersDirectory,
+        'webex-config-pull-worker.conf',
+      );
       await fs.copyFile(SYSUSERS_PATH, sysusersTarget);
+      await fs.copyFile(CONFIG_PULL_SYSUSERS_PATH, workerSysusersTarget);
       await execFileAsync('/usr/bin/systemd-sysusers', [
         '--dry-run',
         `--root=${root}`,
         sysusersTarget,
+        workerSysusersTarget,
       ]);
 
       const tmpfiles = await fs.readFile(TMPFILES_PATH, 'utf8');
@@ -102,11 +132,11 @@ describe('base bot systemd contract', () => {
         ['/etc/webex-generic-account-bot', 0o750],
         ['/var/lib/webex-headless-access', 0o750],
         ['/var/lib/webex-generic-account-bot', 0o755],
-        ['/var/lib/webex-generic-account-bot/rendered', 0o750],
+        ['/var/lib/webex-generic-account-bot/rendered', 0o755],
         ['/var/lib/webex-generic-account-bot/state', 0o700],
         ['/var/lib/webex-generic-account-bot/codex-home', 0o700],
         ['/var/lib/webex-generic-account-bot/codex-workspace', 0o700],
-        ['/var/lib/webex-generic-account-bot/deploy', 0o700],
+        ['/var/lib/webex-generic-account-bot/deploy', 0o750],
         ['/var/lib/webex-generic-account-bot/config-checkout', 0o700],
       ]);
       for (const [entry, expectedMode] of expectedModes) {
@@ -119,10 +149,104 @@ describe('base bot systemd contract', () => {
     }
   });
 
+  it('applies the exact production ownership when passwordless sudo is available', async (context) => {
+    try {
+      await execFileAsync('/usr/bin/sudo', ['-n', '/usr/bin/true']);
+    } catch {
+      context.skip('passwordless sudo is unavailable');
+      return;
+    }
+
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'webex-base-layout-root-verify-'),
+    );
+    const sysusersDirectory = path.join(root, 'etc', 'sysusers.d');
+    const tmpfilesDirectory = path.join(root, 'etc', 'tmpfiles.d');
+    try {
+      await fs.mkdir(sysusersDirectory, { recursive: true });
+      await fs.mkdir(tmpfilesDirectory, { recursive: true });
+      const sysusersTarget = path.join(
+        sysusersDirectory,
+        'webex-generic-account-bot.conf',
+      );
+      const workerSysusersTarget = path.join(
+        sysusersDirectory,
+        'webex-config-pull-worker.conf',
+      );
+      const tmpfilesTarget = path.join(
+        tmpfilesDirectory,
+        'webex-generic-account-bot.conf',
+      );
+      await Promise.all([
+        fs.copyFile(SYSUSERS_PATH, sysusersTarget),
+        fs.copyFile(CONFIG_PULL_SYSUSERS_PATH, workerSysusersTarget),
+        fs.copyFile(TMPFILES_PATH, tmpfilesTarget),
+      ]);
+
+      await execFileAsync('/usr/bin/sudo', [
+        '-n',
+        '/usr/bin/systemd-sysusers',
+        `--root=${root}`,
+        sysusersTarget,
+        workerSysusersTarget,
+      ]);
+      await execFileAsync('/usr/bin/sudo', [
+        '-n',
+        '/usr/bin/systemd-tmpfiles',
+        '--create',
+        `--root=${root}`,
+        tmpfilesTarget,
+      ]);
+
+      const [passwd, group] = await Promise.all([
+        fs.readFile(path.join(root, 'etc', 'passwd'), 'utf8'),
+        fs.readFile(path.join(root, 'etc', 'group'), 'utf8'),
+      ]);
+      const botUid = accountId(passwd, 'webex-generic-account-bot');
+      const botGid = accountId(group, 'webex-generic-account-bot');
+      accountId(passwd, 'webex-config-deploy');
+      const deployGid = accountId(group, 'webex-config-deploy');
+      accountId(group, 'webex-config-pull');
+      const expectedLayout = [
+        ['/etc/webex-generic-account-bot', 0, botGid, 0o750],
+        ['/var/lib/webex-headless-access', 0, botGid, 0o750],
+        ['/var/lib/webex-generic-account-bot', 0, 0, 0o755],
+        ['/var/lib/webex-generic-account-bot/rendered', 0, 0, 0o755],
+        ['/var/lib/webex-generic-account-bot/state', botUid, botGid, 0o700],
+        ['/var/lib/webex-generic-account-bot/codex-home', botUid, botGid, 0o700],
+        ['/var/lib/webex-generic-account-bot/codex-workspace', botUid, botGid, 0o700],
+        [
+          '/var/lib/webex-generic-account-bot/deploy',
+          0,
+          deployGid,
+          0o750,
+        ],
+        ['/var/lib/webex-generic-account-bot/config-checkout', 0, 0, 0o700],
+      ];
+      for (const [entry, expectedUid, expectedGid, expectedMode] of expectedLayout) {
+        const stat = await fs.lstat(path.join(root, entry));
+        assert.equal(stat.isDirectory(), true, entry);
+        assert.equal(stat.uid, expectedUid, `${entry} uid`);
+        assert.equal(stat.gid, expectedGid, `${entry} gid`);
+        assert.equal(stat.mode & 0o777, expectedMode, `${entry} mode`);
+      }
+    } finally {
+      await execFileAsync('/usr/bin/sudo', [
+        '-n',
+        '/usr/bin/chown',
+        '-R',
+        `${process.getuid()}:${process.getgid()}`,
+        root,
+      ]);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('separates root-managed inputs from bot-owned mutable state', async () => {
-    const [tmpfiles, workerTmpfiles] = await Promise.all([
+    const [tmpfiles, workerTmpfiles, workerSysusers] = await Promise.all([
       fs.readFile(TMPFILES_PATH, 'utf8'),
       fs.readFile(CONFIG_PULL_TMPFILES_PATH, 'utf8'),
+      fs.readFile(CONFIG_PULL_SYSUSERS_PATH, 'utf8'),
     ]);
 
     assert.equal(
@@ -131,11 +255,11 @@ describe('base bot systemd contract', () => {
         'd /etc/webex-generic-account-bot 0750 root webex-generic-account-bot -',
         'd /var/lib/webex-headless-access 0750 root webex-generic-account-bot -',
         'd /var/lib/webex-generic-account-bot 0755 root root -',
-        'd /var/lib/webex-generic-account-bot/rendered 0750 root webex-generic-account-bot -',
+        'd /var/lib/webex-generic-account-bot/rendered 0755 root root -',
         'd /var/lib/webex-generic-account-bot/state 0700 webex-generic-account-bot webex-generic-account-bot -',
         'd /var/lib/webex-generic-account-bot/codex-home 0700 webex-generic-account-bot webex-generic-account-bot -',
         'd /var/lib/webex-generic-account-bot/codex-workspace 0700 webex-generic-account-bot webex-generic-account-bot -',
-        'd /var/lib/webex-generic-account-bot/deploy 0700 root root -',
+        'd /var/lib/webex-generic-account-bot/deploy 0750 root webex-config-deploy -',
         'd /var/lib/webex-generic-account-bot/config-checkout 0700 root root -',
         '',
       ].join('\n'),
@@ -145,6 +269,17 @@ describe('base bot systemd contract', () => {
     assert.match(
       workerTmpfiles,
       /^d \/var\/lib\/webex-generic-account-bot 0755 root root -$/m,
+    );
+    assert.match(
+      workerSysusers,
+      /^u webex-config-deploy - "Webex config deployment worker" \/nonexistent \/usr\/sbin\/nologin$/m,
+    );
+    assert.match(workerSysusers, /^g webex-config-deploy -$/m);
+    assert.match(workerSysusers, /^g webex-config-pull -$/m);
+    assert.doesNotMatch(workerSysusers, /^m /m);
+    assert.match(
+      tmpfiles,
+      /^d \/var\/lib\/webex-generic-account-bot\/deploy 0750 root webex-config-deploy -$/m,
     );
   });
 
@@ -182,7 +317,10 @@ describe('base bot systemd contract', () => {
     assert.deepEqual(directiveValues(service, 'SupplementaryGroups'), ['']);
     assert.deepEqual(directiveValues(service, 'WantedBy'), ['multi-user.target']);
     assert.doesNotMatch(service, /^ExecStart=.*(?:\/bin\/(?:ba)?sh|[%$])/m);
-    assert.doesNotMatch(service, /webex-codex-(?:launch|input)|webex-config-pull/);
+    assert.doesNotMatch(
+      service,
+      /webex-codex-(?:launch|input)|webex-config-(?:pull|deploy)/,
+    );
   });
 
   it('keeps the writable surface narrow and the service fail closed', async () => {
@@ -274,4 +412,15 @@ function directiveValues(unit, directive) {
     .split('\n')
     .filter((line) => line.startsWith(prefix))
     .map((line) => line.slice(prefix.length));
+}
+
+function accountId(database, name) {
+  const fields = database
+    .split('\n')
+    .find((line) => line.startsWith(`${name}:`))
+    ?.split(':');
+  assert.ok(fields, `missing account ${name}`);
+  const id = Number(fields[2]);
+  assert.equal(Number.isSafeInteger(id), true, `${name} id`);
+  return id;
 }

@@ -2372,6 +2372,7 @@ describe('config pull worker systemd boundary', () => {
 
     assert.match(unit, /^User=webex-config-deploy$/m);
     assert.match(unit, /^Group=webex-config-pull$/m);
+    assert.match(unit, /^SupplementaryGroups=webex-config-deploy$/m);
     assert.doesNotMatch(unit, /^Group=webex-generic-account-bot$/m);
     assert.match(
       unit,
@@ -2434,12 +2435,14 @@ describe('config pull worker systemd boundary', () => {
 
     assert.match(sysusers, /^u webex-config-deploy /m);
     assert.match(sysusers, /^g webex-config-pull -$/m);
+    assert.match(sysusers, /^g webex-config-deploy -$/m);
     assert.doesNotMatch(sysusers, /^m /m);
     assert.doesNotMatch(sysusers, /^m webex-config-deploy webex-generic-account-bot$/m);
     assert.match(
       botDropIn,
       /^SupplementaryGroups=webex-codex-launch webex-config-pull$/m,
     );
+    assert.doesNotMatch(botDropIn, /webex-config-deploy/);
     assert.match(botDropIn, /^Requires=webex-codex-activation-renew\.service$/m);
     assert.doesNotMatch(botDropIn, /webex-config-pull-worker\.service/);
     const tmpfilesRecords = tmpfiles.trim().split('\n').map((line) => line.split(/\s+/));
