@@ -425,6 +425,8 @@ describe('deploy-config plan', () => {
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
     assert.equal(plan.activationRenewCommand, null);
+    assert.deepEqual(plan.permissionStateReloadCommand.args, ['daemon-reload']);
+    assert.equal(plan.permissionStateReloadCommand.condition, 'permission-state-preflight');
     assert.deepEqual(plan.activationEnsureCommand.args, [
       'reload-or-restart',
       '--',
@@ -2344,7 +2346,7 @@ describe('deploy-config CLI and execution', () => {
     );
     assert.match(
       stdout,
-      /command_1=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
+      /command_1=\/usr\/bin\/systemctl daemon-reload[\s\S]*command_2=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
     );
 
     let jsonStdout = '';
@@ -3123,7 +3125,8 @@ describe('deploy-config CLI and execution', () => {
       /stop after runner activation recovery/,
     );
 
-    assert.deepEqual(calls.slice(0, 4), [
+    assert.deepEqual(calls.slice(0, 5), [
+      ['/usr/bin/systemctl', 'daemon-reload'],
       [
         plan.liveRunnerPolicyCheckCommand.bin,
         plan.liveRunnerPolicyCheckCommand.args[0],
@@ -3303,7 +3306,7 @@ describe('deploy-config CLI and execution', () => {
       /interrupted runner activation requires rerunning with --activate-runner/,
     );
 
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, [plan.permissionStateReloadCommand]);
     await fs.access(plan.transactionFile);
     await assertLockReleased(plan.lockDir);
   });
@@ -3333,7 +3336,10 @@ describe('deploy-config CLI and execution', () => {
         /live config is not ephemeral/,
       );
 
-      assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
+      assert.deepEqual(calls, [
+        plan.permissionStateReloadCommand,
+        plan.liveRunnerPolicyCheckCommand,
+      ]);
       assert.equal(
         await fs.readFile(plan.renderedConfig, 'utf8'),
         'current-user live config\n',
@@ -3373,7 +3379,10 @@ describe('deploy-config CLI and execution', () => {
       /live config is not ephemeral/,
     );
 
-    assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
+    assert.deepEqual(calls, [
+      plan.permissionStateReloadCommand,
+      plan.liveRunnerPolicyCheckCommand,
+    ]);
     assert.equal(
       await fs.readFile(plan.renderedConfig, 'utf8'),
       'current-user live config\n',
@@ -3399,7 +3408,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -3409,6 +3421,47 @@ describe('deploy-config CLI and execution', () => {
 
     assert.equal(commandRan, false);
     await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('reloads systemd before treating an absent permission drop-in as inactive', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-stale-manager-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let staleManagerPermission = true;
+    const calls = [];
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push(command);
+        if (command === plan.permissionStateReloadCommand) {
+          assert.equal(staleManagerPermission, true);
+          staleManagerPermission = false;
+        }
+        if (command.bin === '/usr/bin/bash') {
+          assert.equal(staleManagerPermission, false);
+          await fs.writeFile(plan.candidateConfig, 'new current-user config\n', { mode: 0o644 });
+        }
+        if (command === plan.serviceCommand) {
+          assert.equal(staleManagerPermission, false);
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'d'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(calls[0], plan.permissionStateReloadCommand);
+    assert(calls.includes(plan.currentUserPolicyCheckCommand));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new current-user config\n');
     await assertLockReleased(plan.lockDir);
   });
 
@@ -3618,10 +3671,13 @@ describe('deploy-config CLI and execution', () => {
     await fs.access(plan.activationReceipt);
     await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
     await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
-    assert.deepEqual(calls, [[
-      plan.liveRunnerPolicyCheckCommand.bin,
-      plan.liveRunnerPolicyCheckCommand.args[0],
-    ]]);
+    assert.deepEqual(calls, [
+      ['/usr/bin/systemctl', 'daemon-reload'],
+      [
+        plan.liveRunnerPolicyCheckCommand.bin,
+        plan.liveRunnerPolicyCheckCommand.args[0],
+      ],
+    ]);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -3684,7 +3740,10 @@ describe('deploy-config CLI and execution', () => {
       /permission is already active; use ordinary --apply/,
     );
 
-    assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
+    assert.deepEqual(calls, [
+      plan.permissionStateReloadCommand,
+      plan.liveRunnerPolicyCheckCommand,
+    ]);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'active ephemeral config\n');
     assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
     assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"active"}\n');
@@ -3855,7 +3914,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -4299,7 +4361,7 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(metadata.status, 'installed_without_restart');
     assert.equal(metadata.service_restart_skipped, true);
     assert.equal(metadata.config_revision, 'a'.repeat(40));
-    assert.equal(calls.length, plan.commands.length + 1);
+    assert.equal(calls.length, plan.commands.length + 2);
     assert.equal(calls.at(-1).command, plan.currentUserPolicyCheckCommand);
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
@@ -4564,7 +4626,8 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          assert.equal(command, plan.permissionStateReloadCommand);
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -4572,7 +4635,7 @@ describe('deploy-config CLI and execution', () => {
       /checkout-dir mode is not trusted/,
     );
 
-    assert.equal(commandRan, false);
+    assert.equal(commandRan, true);
     await assertLockReleased(plan.lockDir);
 
     const lockParent = path.join(temp, 'unsafe-run');
@@ -4633,7 +4696,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           throw new Error('tree validation failed');
         },
@@ -4869,7 +4935,7 @@ describe('deploy-config CLI and execution', () => {
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
         }
-        if (command.bin === '/usr/bin/systemctl') {
+        if (command === plan.serviceCommand) {
           failBackupCleanup = true;
         }
         return { stdout: command.capture === 'configRevision' ? `${'f'.repeat(40)}\n` : '', stderr: '' };
@@ -5037,7 +5103,7 @@ describe('deploy-config CLI and execution', () => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command === plan.serviceCommand) {
             restartAttempts += 1;
           }
           return { stdout: command.capture === 'configRevision' ? `${'3'.repeat(40)}\n` : '', stderr: '' };
@@ -5212,7 +5278,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           await assert.rejects(() => fs.access(plan.transactionFile));
@@ -5265,7 +5334,10 @@ describe('deploy-config CLI and execution', () => {
         () => executePlan({
           plan,
           fsApi,
-          runner: async () => {
+          runner: async (command) => {
+            if (command === plan.permissionStateReloadCommand) {
+              return { stdout: '', stderr: '' };
+            }
             commandRan = true;
             assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
             await assert.rejects(() => fs.access(plan.transactionFile));
@@ -5336,7 +5408,10 @@ describe('deploy-config CLI and execution', () => {
         () => executePlan({
           plan,
           fsApi,
-          runner: async () => {
+          runner: async (command) => {
+            if (command === plan.permissionStateReloadCommand) {
+              return { stdout: '', stderr: '' };
+            }
             commandRan = true;
             return { stdout: '', stderr: '' };
           },
@@ -5382,6 +5457,9 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           calls.push(command.bin);
           await assert.rejects(() => fs.access(plan.renderedConfig));
           throw new Error('stop after prepared recovery');
@@ -5433,7 +5511,11 @@ describe('deploy-config CLI and execution', () => {
     };
 
     await assert.rejects(
-      () => executePlan({ plan, fsApi }),
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async () => ({ stdout: '', stderr: '' }),
+      }),
       /transaction cleanup failed/,
     );
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
@@ -5443,7 +5525,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           await assert.rejects(() => fs.access(plan.transactionFile));
           await assert.rejects(() => fs.access(plan.backupConfig));
@@ -5483,7 +5568,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -5525,7 +5613,10 @@ describe('deploy-config CLI and execution', () => {
     });
 
     await assert.rejects(
-      () => executePlan({ plan }),
+      () => executePlan({
+        plan,
+        runner: async () => ({ stdout: '', stderr: '' }),
+      }),
       /requires service recovery; rerun without --skip-restart/,
     );
 
@@ -5566,6 +5657,9 @@ describe('deploy-config CLI and execution', () => {
         plan,
         runner: async (command) => {
           calls.push([command.bin, command.args[0]]);
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           if (command.bin === '/usr/bin/git') {
             await assert.rejects(() => fs.access(plan.transactionFile));
@@ -5578,7 +5672,8 @@ describe('deploy-config CLI and execution', () => {
       /stop after service recovery/,
     );
 
-    assert.deepEqual(calls.slice(0, 4), [
+    assert.deepEqual(calls.slice(0, 5), [
+      ['/usr/bin/systemctl', 'daemon-reload'],
       ['/usr/bin/systemctl', 'restart'],
       ['/usr/bin/systemctl', 'is-active'],
       ['/usr/bin/curl', '--disable'],
@@ -5660,6 +5755,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.deepEqual(calls, [
+      ['/usr/bin/systemctl', 'daemon-reload'],
       ['/usr/bin/systemctl', 'restart'],
       ['/usr/bin/systemctl', 'is-active'],
       ['/usr/bin/curl', '--disable'],
@@ -5704,6 +5800,9 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           calls.push(command.bin);
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
           const recoveredMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
@@ -5780,7 +5879,10 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         fsApi,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },

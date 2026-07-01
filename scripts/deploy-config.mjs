@@ -548,6 +548,13 @@ export function buildDeployPlan(options) {
         },
       )
     : null;
+  const permissionStateReloadCommand = options.prepare
+    ? null
+    : command(
+        options.systemctlBin,
+        ['daemon-reload'],
+        { ...commandDefaults, condition: 'permission-state-preflight' },
+      );
   const activationEnsureCommand = !options.activateRunner && !options.prepare
     ? command(
         options.systemctlBin,
@@ -623,6 +630,7 @@ export function buildDeployPlan(options) {
     serviceStopCommand,
     serviceVerificationCommands,
     activationRenewCommand,
+    permissionStateReloadCommand,
     activationEnsureCommand,
     activationDaemonReloadCommand,
     activationStopCommand,
@@ -855,6 +863,12 @@ export async function executePlan({
   try {
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
+    throwIfAborted(signal);
+    await runner(
+      plan.permissionStateReloadCommand,
+      scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
+      signal,
+    );
     throwIfAborted(signal);
     runnerPermissionActive = await detectAndValidateRunnerPermission(
       plan,
@@ -3822,6 +3836,7 @@ function assertConfigRevision(value) {
 
 function allPlanCommands(plan) {
   return [
+    ...(plan.permissionStateReloadCommand ? [plan.permissionStateReloadCommand] : []),
     ...plan.commands,
     ...[
       plan.activationRenewCommand,

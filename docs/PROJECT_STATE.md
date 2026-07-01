@@ -77,7 +77,8 @@
   canaries. Ordinary apply reloads an active renewal unit without disrupting
   the bot, or starts the renewal unit when the bot and renewal unit are already
   inactive. Any out-of-band permission drop-in requires an already-ephemeral
-  live config before deploy proceeds. Rollback revokes launcher permission
+  live config before deploy proceeds, and apply reloads the systemd manager
+  before permission detection. Rollback revokes launcher permission
   before any config downgrade; receipt-only cleanup failures retain the journal
   but do not block old-service recovery. Version 2 journals reject any claim
   that launcher permission predated activation.

@@ -409,7 +409,9 @@ an already inactive unit starts again before deployment continues. Dry-run
 output labels conditional steps with their permission-state conditions. If the
 permission drop-in is installed out of band, every deploy first requires the
 live rendered config to be fully ephemeral; a missing or current-user live
-config fails closed before receipt renewal, checkout, or rollback can run.
+config fails closed before receipt renewal, checkout, or rollback can run. Each
+apply first reloads the systemd manager so permission detection cannot rely on
+stale loaded drop-in state after an out-of-band file change.
 Version 2 activation journals also require `permission_had_previous=false`;
 activation never restores a launcher permission that predates the transaction.
 
