@@ -19,6 +19,7 @@ struct Cli {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum Command {
+    Ensure,
     Renew,
 }
 
@@ -27,6 +28,9 @@ enum Command {
 async fn main() -> Result<()> {
     ensure_fixed_root_helper()?;
     match Cli::parse().command {
+        Command::Ensure => {
+            webex_generic_account_bot::activation_canary::ensure_activation_receipt().await?;
+        }
         Command::Renew => {
             webex_generic_account_bot::activation_canary::renew_activation_receipt().await?;
         }
@@ -71,7 +75,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_only_the_fixed_renew_subcommand() {
+    fn accepts_only_the_fixed_activation_subcommands() {
+        assert!(Cli::try_parse_from(["webex-codex-activation", "ensure"]).is_ok());
         assert!(Cli::try_parse_from(["webex-codex-activation", "renew"]).is_ok());
         assert!(Cli::try_parse_from(["webex-codex-activation", "mint"]).is_err());
         assert!(

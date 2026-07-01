@@ -5,20 +5,21 @@ Wants=network-online.target
 Requires=webex-codex-launcher.socket webex-config-pull-worker.service
 After=network-online.target systemd-tmpfiles-setup.service webex-codex-launcher.socket webex-config-pull-worker.service
 Before=webex-generic-account-bot.service
+PartOf=webex-generic-account-bot.service
 ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
 
 [Service]
 Type=oneshot
-RemainAfterExit=no
+RemainAfterExit=yes
 User=root
 Group=root
 SupplementaryGroups=webex-config-pull
 WorkingDirectory=/
-ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-activation renew
+ExecStart=/opt/webex-generic-account-bot/bin/webex-codex-activation ensure
+ExecReload=/opt/webex-generic-account-bot/bin/webex-codex-activation ensure
 Restart=no
 TimeoutStartSec=5400s
 TimeoutStopSec=15s
-RuntimeMaxSec=5400s
 KillMode=control-group
 OOMPolicy=kill
 UMask=0077

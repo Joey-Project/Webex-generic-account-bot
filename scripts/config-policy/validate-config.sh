@@ -8,6 +8,7 @@ source_root=""
 output=""
 output_explicit=0
 skip_bot_check=0
+stage_runner_activation=0
 node_bin="${NODE_BIN:-node}"
 python_bin="${PYTHON_BIN:-python3}"
 bot_bin="${BOT_BIN:-$bot_code_dir/target/debug/webex-generic-account-bot}"
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-bot-check)
       skip_bot_check=1
+      shift
+      ;;
+    --stage-runner-activation)
+      stage_runner_activation=1
       shift
       ;;
     *)
@@ -59,6 +64,14 @@ fi
 
 if [[ "$skip_bot_check" == 1 && "$output_explicit" == 1 ]]; then
   echo "--skip-bot-check cannot be used with an explicit --out path" >&2
+  exit 2
+fi
+if [[ "$stage_runner_activation" == 1 && "$skip_bot_check" == 1 ]]; then
+  echo "--stage-runner-activation cannot be combined with --skip-bot-check" >&2
+  exit 2
+fi
+if [[ "$stage_runner_activation" == 1 && "$output_explicit" != 1 ]]; then
+  echo "--stage-runner-activation requires an explicit --out path" >&2
   exit 2
 fi
 
@@ -111,7 +124,19 @@ install_rendered_config() {
 
 "$node_bin" "$policy_root/render-config.mjs" --env "$environment" --source-root "$source_root" --max-bytes "$max_rendered_config_bytes" --stdout > "$temp_output"
 
-"$python_bin" "$policy_root/static-config-check.py" "$temp_output"
+static_check_args=()
+if [[ "$stage_runner_activation" == 1 ]]; then
+  static_check_args+=(--require-ephemeral-linux-user)
+fi
+"$python_bin" "$policy_root/static-config-check.py" "${static_check_args[@]}" "$temp_output"
+
+if [[ "$stage_runner_activation" == 1 ]]; then
+  install_rendered_config "$temp_output" "$output"
+  trap - EXIT
+  echo "rendered_config=$output"
+  echo "bot_check_deferred=true reason=runner_activation"
+  exit 0
+fi
 
 if [[ "$skip_bot_check" == 1 ]]; then
   install_rendered_config "$temp_output" "$output"

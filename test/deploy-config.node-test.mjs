@@ -78,6 +78,12 @@ describe('deploy-config argument parsing', () => {
       '/opt/webex-generic-account-bot/bin/webex-generic-account-bot',
     );
     assert.equal(options.systemctlBin, '/usr/bin/systemctl');
+    assert.equal(options.activateRunner, false);
+    assert.equal(
+      options.botServiceDropIn,
+      '/etc/systemd/system/webex-generic-account-bot.service.d/10-codex-launcher.conf',
+    );
+    assert.equal(options.activationReceipt, '/run/webex-codex-activation/receipt.json');
     assert.equal(options.sshBin, '/usr/bin/ssh');
     assert.equal(options.sshKey, '/var/lib/webex-generic-account-bot/deploy/id_ed25519');
     assert.equal(options.sshKnownHosts, '/etc/ssh/ssh_known_hosts');
@@ -184,6 +190,23 @@ describe('deploy-config argument parsing', () => {
     assert.throws(
       () => parseArgs(['--prepare', '--request-id', 'A'.repeat(64)]),
       /64 lowercase hexadecimal/,
+    );
+  });
+
+  it('requires runner activation to be an apply transaction with restart', () => {
+    assert.equal(parseArgs(['--apply', '--activate-runner']).activateRunner, true);
+    assert.equal(parseArgs(['--dry-run', '--activate-runner']).activateRunner, true);
+    assert.throws(
+      () => parseArgs(['--activate-runner']),
+      /requires --apply or --dry-run/,
+    );
+    assert.throws(
+      () => parseArgs(['--apply', '--activate-runner', '--skip-restart']),
+      /cannot be used with --skip-restart/,
+    );
+    assert.throws(
+      () => parseArgs(['--prepare', '--activate-runner']),
+      /cannot be used with --prepare or --status/,
     );
   });
 });
@@ -401,6 +424,22 @@ describe('deploy-config plan', () => {
     assert(commands.some(([bin, args]) => bin === '/usr/bin/bash' && args.includes('--source-root')));
     assert.equal(plan.serviceCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceCommand.args, ['restart', '--', plan.service]);
+    assert.equal(plan.activationRenewCommand, null);
+    assert.deepEqual(plan.permissionStateReloadCommand.args, ['daemon-reload']);
+    assert.equal(plan.permissionStateReloadCommand.condition, 'permission-state-preflight');
+    assert.deepEqual(plan.activationEnsureCommand.args, [
+      'reload-or-restart',
+      '--',
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.equal(plan.activationEnsureCommand.condition, 'runner-permission-active');
+    assert.deepEqual(plan.liveRunnerPolicyCheckCommand.args, [
+      '/opt/webex-generic-account-bot/code/scripts/config-policy/static-config-check.py',
+      '--require-ephemeral-linux-user',
+      plan.renderedConfig,
+    ]);
+    assert.equal(plan.liveRunnerPolicyCheckCommand.condition, 'runner-permission-active');
+    assert.equal(plan.currentUserPolicyCheckCommand.condition, 'runner-permission-inactive');
     assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
     assert.deepEqual(
@@ -454,6 +493,56 @@ describe('deploy-config plan', () => {
     assert.equal(plan.serviceCommand.cwd, '/');
     assert(plan.commands.every((command) => command.timeoutMs === 600_000));
     assert(plan.commands.every((command) => command.outputLimitBytes === 1_048_576));
+  });
+
+  it('builds a fixed runner activation sequence without shell interpolation', () => {
+    const plan = buildDeployPlan(parseArgs(['--apply', '--activate-runner']));
+    const validation = plan.commands.at(-1);
+
+    assert.equal(plan.activateRunner, true);
+    assert.equal(
+      plan.botServiceDropInSource,
+      path.join(
+        plan.botCodeDir,
+        'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf',
+      ),
+    );
+    assert(validation.args.includes('--stage-runner-activation'));
+    assert.deepEqual(plan.activationRenewCommand.args, [
+      'restart',
+      '--',
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.deepEqual(plan.activationDaemonReloadCommand.args, ['daemon-reload']);
+    assert.deepEqual(plan.activationStopCommand.args, [
+      'stop',
+      '--',
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.deepEqual(plan.activationStateCommand.args, [
+      'show',
+      '--property=ActiveState',
+      '--value',
+      '--',
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.deepEqual(plan.activationConfigCheckCommand.args, [
+      '--config',
+      plan.candidateConfig,
+      '--check-config',
+    ]);
+    assert.deepEqual(plan.daemonReloadCommand.args, ['daemon-reload']);
+    assert(plan.activationRenewCommand.timeoutMs >= 5_400_000);
+    for (const command of [
+      plan.activationRenewCommand,
+      plan.activationDaemonReloadCommand,
+      plan.activationStopCommand,
+      plan.activationStateCommand,
+      plan.activationConfigCheckCommand,
+      plan.daemonReloadCommand,
+    ]) {
+      assert.equal(command.shell, undefined);
+    }
   });
 
   it('can build an install-only plan without restart', () => {
@@ -878,6 +967,65 @@ describe('trusted config policy', () => {
     assert.match(result.stdout, /rendered_config=/);
     assert.match(await fs.readFile(output, 'utf8'), /attempt_lease_secs = 3600/);
     await fs.rm(temp, { recursive: true, force: true });
+  });
+
+  it('requires every effective Codex policy to match the deployment mode', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-runner-policy-test-'));
+    const configPath = path.join(temp, 'production.toml');
+    const current = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    await fs.writeFile(configPath, current, 'utf8');
+    const currentAccepted = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(currentAccepted.status, 0, currentAccepted.stderr);
+    const currentAtHostLimit = current.replace(
+      'max_concurrent_requests = 4',
+      'max_concurrent_requests = 8',
+    );
+    await fs.writeFile(configPath, currentAtHostLimit, 'utf8');
+    const neutralCurrentAccepted = runStaticConfigPolicy(configPath);
+    assert.equal(neutralCurrentAccepted.status, 0, neutralCurrentAccepted.stderr);
+    const rejected = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /codex\.isolation\.mode must be 'ephemeral-linux-user'/);
+
+    const ephemeral = current
+      .replace('mode = "current-user"', 'mode = "ephemeral-linux-user"')
+      .replace('trusted_prompt_authors = true', 'trusted_prompt_authors = false');
+    await fs.writeFile(configPath, ephemeral, 'utf8');
+    const accepted = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
+    assert.equal(accepted.status, 0, accepted.stderr);
+    const ephemeralAboveLauncherLimit = ephemeral.replace(
+      'max_concurrent_requests = 4',
+      'max_concurrent_requests = 8',
+    );
+    await fs.writeFile(configPath, ephemeralAboveLauncherLimit, 'utf8');
+    const neutralEphemeralRejected = runStaticConfigPolicy(configPath);
+    assert.equal(neutralEphemeralRejected.status, 1);
+    assert.match(neutralEphemeralRejected.stderr, /server\.max_concurrent_requests/);
+    await fs.writeFile(configPath, ephemeral, 'utf8');
+    const ephemeralRejected = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(ephemeralRejected.status, 1);
+    assert.match(ephemeralRejected.stderr, /codex\.isolation\.mode must be 'current-user'/);
+
+    const downgradedRoom = `${ephemeral}\n[rooms.codex.isolation]\nmode = "current-user"\ntrusted_prompt_authors = true\n`;
+    await fs.writeFile(configPath, downgradedRoom, 'utf8');
+    const downgraded = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
+    assert.equal(downgraded.status, 1);
+    assert.match(downgraded.stderr, /rooms\[1\]\.codex\.isolation\.mode/);
+
+    const elevatedRoom = `${current}\n[rooms.codex.isolation]\nmode = "ephemeral-linux-user"\ntrusted_prompt_authors = false\n`;
+    await fs.writeFile(configPath, elevatedRoom, 'utf8');
+    const elevated = runStaticConfigPolicy(configPath, '--require-current-user');
+    assert.equal(elevated.status, 1);
+    assert.match(elevated.stderr, /rooms\[1\]\.codex\.isolation\.mode/);
+
+    const conflicting = runStaticConfigPolicy(
+      configPath,
+      '--require-current-user',
+      '--require-ephemeral-linux-user',
+    );
+    assert.equal(conflicting.status, 2);
   });
 
   it('rejects rooms that are not explicitly allowlisted by host policy', async () => {
@@ -2117,7 +2265,7 @@ describe('deploy-config CLI and execution', () => {
       '--metadata-file',
       path.join(temp, 'rendered', 'deploy-status.json'),
       '--lock-dir',
-      path.join(temp, 'run', 'deploy.lock'),
+      path.join(temp, 'deploy-lock', 'deploy.lock'),
       '--bot-code-dir',
       path.join(temp, 'bot-code'),
       '--bot-bin',
@@ -2198,7 +2346,7 @@ describe('deploy-config CLI and execution', () => {
     );
     assert.match(
       stdout,
-      /command_1=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
+      /command_1=\/usr\/bin\/systemctl daemon-reload[\s\S]*command_2=\/usr\/bin\/prlimit --fsize=33554432[\s\S]*-- \/usr\/bin\/git -c advice\.detachedHead=false/,
     );
 
     let jsonStdout = '';
@@ -2222,6 +2370,53 @@ describe('deploy-config CLI and execution', () => {
       serialised.plan.candidate_config,
       '/var/lib/webex-generic-account-bot/rendered/production.toml.candidate',
     );
+    const runnerPolicyCommands = serialised.plan.commands.filter(
+      (command) => command.args.includes('--require-ephemeral-linux-user'),
+    );
+    assert.equal(runnerPolicyCommands.length, 2);
+    assert(
+      runnerPolicyCommands.some(
+        (command) => command.args.includes(serialised.plan.rendered_config),
+      ),
+    );
+    assert(
+      runnerPolicyCommands.some(
+        (command) => command.args.includes(serialised.plan.candidate_config),
+      ),
+    );
+    assert(
+      runnerPolicyCommands.every(
+        (command) => command.condition === 'runner-permission-active',
+      ),
+    );
+    const receiptEnsureCommand = serialised.plan.commands.find(
+      (command) => command.args.includes('webex-codex-activation-renew.service'),
+    );
+    assert(receiptEnsureCommand);
+    assert.equal(receiptEnsureCommand.args[0], 'reload-or-restart');
+    assert.equal(receiptEnsureCommand.condition, 'runner-permission-active');
+    assert.match(stdout, /command_\d+_condition=runner-permission-active/);
+    assert.equal(executed, false);
+
+    let activationDryRun = '';
+    const activationDryRunStatus = await runCli({
+      argv: ['--dry-run', '--activate-runner', '--json'],
+      stdout: writer((chunk) => {
+        activationDryRun += chunk;
+      }),
+      stderr: writer(),
+      runner: async () => {
+        executed = true;
+      },
+    });
+    const activationPlan = JSON.parse(activationDryRun).plan;
+    const renewalCommand = activationPlan.commands.find(
+      (command) => command.args.includes('webex-codex-activation-renew.service'),
+    );
+    assert.equal(activationDryRunStatus, 0);
+    assert(renewalCommand);
+    assert.equal(renewalCommand.args[0], 'restart');
+    assert.equal(renewalCommand.condition, undefined);
     assert.equal(executed, false);
   });
 
@@ -2499,6 +2694,1360 @@ describe('deploy-config CLI and execution', () => {
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
     await assertLockReleased(plan.lockDir);
+  });
+
+  it('atomically activates runner permission, ephemeral config, and a fresh receipt', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-activation-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    const calls = [];
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push([command.bin, command.args[0], command.args.at(-1)]);
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+        }
+        if (command === plan.activationRenewCommand) {
+          assert.equal((await fs.readFile(plan.transactionFile, 'utf8')).includes(
+            'activation_renewal_started',
+          ), true);
+          await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+          await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+          await fs.chmod(plan.activationReceipt, 0o444);
+        }
+        if (command === plan.daemonReloadCommand) {
+          assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+          assert.match(
+            await fs.readFile(plan.botServiceDropIn, 'utf8'),
+            /SupplementaryGroups=webex-codex-launch/,
+          );
+          assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'a'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, true);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    assert.equal((await fs.stat(plan.activationReceipt)).mode & 0o777, 0o444);
+    assert.equal(
+      calls.filter(([, action, target]) => action === 'restart' && target === plan.service).length,
+      1,
+    );
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceiptBackup), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('invalidates a stale receipt when activation renewal fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-renewal-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"old"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let botRestarted = false;
+    let renewalStopped = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.rm(plan.activationReceipt);
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"partial"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+            throw new Error('activation canary failed');
+          }
+          if (command === plan.activationStopCommand) {
+            renewalStopped = true;
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            botRestarted = true;
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /activation canary failed/,
+    );
+
+    assert.equal(renewalStopped, true);
+    assert.equal(botRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rolls back a renewed receipt when activation config preflight fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-preflight-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let renewalStopped = false;
+    let botRestarted = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationConfigCheckCommand) {
+            throw new Error('activation config preflight failed');
+          }
+          if (command === plan.activationStopCommand) renewalStopped = true;
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) botRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /activation config preflight failed/,
+    );
+
+    assert.equal(renewalStopped, true);
+    assert.equal(botRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rolls back ephemeral config when launcher permission installation fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-install-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    const dropInTemporaryPrefix = path.join(
+      path.dirname(plan.botServiceDropIn),
+      `.${path.basename(plan.botServiceDropIn)}.`,
+    );
+    const fsApi = {
+      ...fs,
+      async open(file, ...args) {
+        if (file.startsWith(dropInTemporaryPrefix)) {
+          assert.equal(
+            await fs.readFile(plan.renderedConfig, 'utf8'),
+            'new ephemeral config\n',
+          );
+          throw new Error('launcher permission write failed');
+        }
+        return fs.open(file, ...args);
+      },
+    };
+    let renewalStopped = false;
+    let botRestarted = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStopCommand) renewalStopped = true;
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) botRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'b'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /launcher permission write failed/,
+    );
+
+    assert.equal(renewalStopped, true);
+    assert.equal(botRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_apply');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceiptBackup), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores all runner activation state before restarting the old service', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let serviceRestarts = 0;
+    let readinessChecks = 0;
+    let renewalStopped = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStopCommand) renewalStopped = true;
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarts += 1;
+            if (serviceRestarts === 1) {
+              assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+              await fs.access(plan.botServiceDropIn);
+              await fs.access(plan.activationReceipt);
+            } else {
+              assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+              await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+              await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+            }
+          }
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) throw new Error('new service is not ready');
+            return { stdout: '200', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /new service is not ready/,
+    );
+
+    assert.equal(renewalStopped, true);
+    assert.equal(serviceRestarts, 2);
+    assert.equal(readinessChecks, 2);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rolled_back');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores runner activation state when inactive verification fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-stop-failure-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let serviceRestarts = 0;
+    let readinessChecks = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            throw new Error('activation state unavailable');
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) throw new Error('new service is not ready');
+            return { stdout: '200', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /restored previous config and service but failed to stop or verify activation renewal: activation state unavailable/,
+    );
+
+    assert.equal(serviceRestarts, 2);
+    assert.equal(readinessChecks, 2);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('keeps ephemeral config when launcher permission rollback fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-permission-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let rollbackStarted = false;
+    let serviceRestarts = 0;
+    const fsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (rollbackStarted && file === plan.botServiceDropIn) {
+          throw new Error('permission removal failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            rollbackStarted = true;
+            throw new Error('new service is not ready');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore previous deployment state: permission removal failed/,
+    );
+
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    await fs.access(plan.botServiceDropIn);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('keeps ephemeral config when permission rollback cannot reload systemd', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-reload-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let permissionReloads = 0;
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            permissionReloads += 1;
+            if (permissionReloads === 2) {
+              throw new Error('permission manager reload failed');
+            }
+          }
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            throw new Error('new service is not ready');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore previous deployment state: permission manager reload failed/,
+    );
+
+    assert.equal(permissionReloads, 2);
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restarts the old service when activation receipt rollback fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let rollbackStarted = false;
+    let serviceRestarts = 0;
+    let readinessChecks = 0;
+    const fsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (rollbackStarted && file === plan.activationReceipt) {
+          throw new Error('receipt removal failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) {
+              rollbackStarted = true;
+              throw new Error('new service is not ready');
+            }
+            return { stdout: '200', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /restored previous config and service but failed to restore activation receipt: receipt removal failed/,
+    );
+
+    assert.equal(serviceRestarts, 2);
+    assert.equal(readinessChecks, 2);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('recovers an interrupted runner activation before fetching a new revision', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(
+      plan.botServiceDropIn,
+      await fs.readFile(plan.botServiceDropInSource),
+      { mode: 0o644 },
+    );
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"uncommitted"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'activation_files_installed',
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push([command.bin, command.args[0]]);
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command.bin === '/usr/bin/git') {
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+            await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+            await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+            throw new Error('stop after runner activation recovery');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /stop after runner activation recovery/,
+    );
+
+    assert.deepEqual(calls.slice(0, 6), [
+      ['/usr/bin/systemctl', 'daemon-reload'],
+      [
+        plan.liveRunnerPolicyCheckCommand.bin,
+        plan.liveRunnerPolicyCheckCommand.args[0],
+      ],
+      ['/usr/bin/systemctl', 'stop'],
+      ['/usr/bin/systemctl', 'show'],
+      ['/usr/bin/systemctl', 'daemon-reload'],
+      ['/usr/bin/git', '-c'],
+    ]);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('recovers a runner activation interrupted during the service transition', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-service-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"uncommitted"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'service_transition_started',
+    });
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarts += 1;
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+            await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+            await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+          }
+          if (command.bin === '/usr/bin/git') {
+            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+            throw new Error('stop after service-transition recovery');
+          }
+          return {
+            stdout: command.bin === '/usr/bin/curl' ? '200' : '',
+            stderr: '',
+          };
+        },
+      }),
+      /stop after service-transition recovery/,
+    );
+
+    assert.equal(serviceRestarts, 1);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restarts the old service when recovery cannot remove the activation receipt', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"uncommitted"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'service_transition_started',
+    });
+    const fsApi = {
+      ...fs,
+      async rm(file, ...args) {
+        if (file === plan.activationReceipt) {
+          throw new Error('receipt removal failed');
+        }
+        return fs.rm(file, ...args);
+      },
+    };
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarts += 1;
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+            await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+          }
+          return {
+            stdout: command.bin === '/usr/bin/curl' ? '200' : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore activation receipt during rollback: receipt removal failed/,
+    );
+
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"uncommitted"}\n');
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores interrupted activation state when recovery cannot verify renewal stop', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-stop-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"uncommitted"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'service_transition_started',
+    });
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.activationStateCommand) {
+            throw new Error('activation state unavailable');
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          return {
+            stdout: command.bin === '/usr/bin/curl' ? '200' : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to stop or verify activation renewal during rollback: activation state unavailable/,
+    );
+
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects ordinary apply over an interrupted runner activation', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-mode-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.transactionFile), { recursive: true, mode: 0o755 });
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /interrupted runner activation requires rerunning with --activate-runner/,
+    );
+
+    assert.deepEqual(calls, [plan.permissionStateReloadCommand]);
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects out-of-band runner permission over a current-user live config', async () => {
+    for (const activateRunner of [true, false]) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-inconsistent-test-'));
+      const plan = await createRunnerActivationTestPlan(temp, { activateRunner });
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'current-user live config\n', { mode: 0o644 });
+      await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+      await fs.chmod(plan.botServiceDropIn, 0o644);
+      const calls = [];
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          runner: async (command) => {
+            calls.push(command);
+            if (command === plan.liveRunnerPolicyCheckCommand) {
+              throw new Error('live config is not ephemeral');
+            }
+            return { stdout: '', stderr: '' };
+          },
+        }),
+        /live config is not ephemeral/,
+      );
+
+      assert.deepEqual(calls, [
+        plan.permissionStateReloadCommand,
+        plan.liveRunnerPolicyCheckCommand,
+      ]);
+      assert.equal(
+        await fs.readFile(plan.renderedConfig, 'utf8'),
+        'current-user live config\n',
+      );
+      assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+      await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+      await assertLockReleased(plan.lockDir);
+    }
+  });
+
+  it('rejects out-of-band runner permission before ordinary recovery', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-recovery-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'current-user live config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'older current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await writeInstallTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      serviceRestartRequired: true,
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          if (command === plan.liveRunnerPolicyCheckCommand) {
+            throw new Error('live config is not ephemeral');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /live config is not ephemeral/,
+    );
+
+    assert.deepEqual(calls, [
+      plan.permissionStateReloadCommand,
+      plan.liveRunnerPolicyCheckCommand,
+    ]);
+    assert.equal(
+      await fs.readFile(plan.renderedConfig, 'utf8'),
+      'current-user live config\n',
+    );
+    assert.equal(
+      await fs.readFile(plan.backupConfig, 'utf8'),
+      'older current-user config\n',
+    );
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects a v2 journal that claims launcher permission predated activation', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-journal-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.transactionFile), { recursive: true, mode: 0o755 });
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      permissionHadPrevious: true,
+    });
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /permission_had_previous must be false/,
+    );
+
+    assert.equal(commandRan, false);
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('reloads systemd before treating an absent permission drop-in as inactive', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-stale-manager-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let staleManagerPermission = true;
+    const calls = [];
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push(command);
+        if (command === plan.permissionStateReloadCommand) {
+          assert.equal(staleManagerPermission, true);
+          staleManagerPermission = false;
+        }
+        if (command.bin === '/usr/bin/bash') {
+          assert.equal(staleManagerPermission, false);
+          await fs.writeFile(plan.candidateConfig, 'new current-user config\n', { mode: 0o644 });
+        }
+        if (command === plan.serviceCommand) {
+          assert.equal(staleManagerPermission, false);
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'d'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(calls[0], plan.permissionStateReloadCommand);
+    assert(calls.includes(plan.currentUserPolicyCheckCommand));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new current-user config\n');
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it(
+    'rejects a launcher drop-in that appears while activation is being prepared',
+    async () => {
+      const temp = await fs.mkdtemp(
+        path.join(os.tmpdir(), 'deploy-runner-permission-race-test-'),
+      );
+      const plan = await createRunnerActivationTestPlan(temp);
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          runner: async (command) => {
+            if (command.bin === '/usr/bin/bash') {
+              await fs.writeFile(plan.candidateConfig, 'candidate ephemeral config\n', {
+                mode: 0o644,
+              });
+              await fs.mkdir(path.dirname(plan.botServiceDropIn), {
+                recursive: true,
+                mode: 0o755,
+              });
+              await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+              await fs.chmod(plan.botServiceDropIn, 0o644);
+            }
+            return {
+              stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
+              stderr: '',
+            };
+          },
+        }),
+        /bot service drop-in appeared during runner activation/,
+      );
+
+      assert.equal(
+        await fs.readFile(plan.renderedConfig, 'utf8'),
+        'old current-user config\n',
+      );
+      assert.match(
+        await fs.readFile(plan.botServiceDropIn, 'utf8'),
+        /webex-codex-launch/,
+      );
+      await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+      await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
+      await assertLockReleased(plan.lockDir);
+    },
+  );
+
+  it('restores a prior receipt after interruption in the renewed phase', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'uncommitted ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await fs.writeFile(plan.activationReceiptBackup, '{"receipt":"prior"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceiptBackup, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'activation_renewed',
+      receiptHadPrevious: true,
+    });
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command.bin === '/usr/bin/git') {
+            assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+            assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"prior"}\n');
+            await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+            throw new Error('stop after renewed receipt recovery');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /stop after renewed receipt recovery/,
+    );
+
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('drops a prior receipt after interruption while renewal is in progress', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-renewal-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"partial"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await fs.writeFile(plan.activationReceiptBackup, '{"receipt":"prior"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceiptBackup, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'activation_renewal_started',
+      receiptHadPrevious: true,
+    });
+    let renewalStopped = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.activationStopCommand) renewalStopped = true;
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command.bin === '/usr/bin/git') {
+            await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+            throw new Error('stop after renewal-started recovery');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /stop after renewal-started recovery/,
+    );
+
+    assert.equal(renewalStopped, true);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('recovers a prepared activation without stopping renewal', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-prepared-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"prior"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await fs.writeFile(plan.activationReceiptBackup, '{"receipt":"prior"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceiptBackup, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      phase: 'prepared',
+      receiptHadPrevious: true,
+    });
+    let renewalStopRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.activationStopCommand || command === plan.activationStateCommand) {
+            renewalStopRan = true;
+          }
+          if (command.bin === '/usr/bin/git') {
+            assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"prior"}\n');
+            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+            throw new Error('stop after prepared recovery');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /stop after prepared recovery/,
+    );
+
+    assert.equal(renewalStopRan, false);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('finalises committed runner activation without renewing or rolling back', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-commit-recovery-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'committed ephemeral config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"committed"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'f'.repeat(40),
+      phase: 'committed_pending_metadata',
+    });
+    const calls = [];
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push([command.bin, command.args[0]]);
+        return { stdout: '', stderr: '' };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, true);
+    assert.equal(metadata.config_revision, 'f'.repeat(40));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed ephemeral config\n');
+    await fs.access(plan.botServiceDropIn);
+    await fs.access(plan.activationReceipt);
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
+    assert.deepEqual(calls, [
+      ['/usr/bin/systemctl', 'daemon-reload'],
+      [
+        plan.liveRunnerPolicyCheckCommand.bin,
+        plan.liveRunnerPolicyCheckCommand.args[0],
+      ],
+    ]);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('continues explicit activation after finalising an ordinary committed apply', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-v1-commit-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'committed ordinary config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'old ordinary config\n', { mode: 0o644 });
+    await writeInstallTransactionFixture(plan, {
+      configRevision: 'f'.repeat(40),
+      serviceRestartRequired: true,
+      phase: 'committed_pending_metadata',
+    });
+    let activationContinued = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/git') {
+            activationContinued = true;
+            const metadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+            assert.equal(metadata.status, 'deployed');
+            assert.equal(metadata.runner_activation, false);
+            await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+            throw new Error('explicit activation continued');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /explicit activation continued/,
+    );
+
+    assert.equal(activationContinued, true);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects repeated runner activation without touching active state', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-repeat-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'active ephemeral config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"active"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /permission is already active; use ordinary --apply/,
+    );
+
+    assert.deepEqual(calls, [
+      plan.permissionStateReloadCommand,
+      plan.liveRunnerPolicyCheckCommand,
+    ]);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'active ephemeral config\n');
+    assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"active"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('renews a missing receipt before rejecting current-user downgrade', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-downgrade-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    let serviceRestarted = false;
+    let policyChecked = false;
+    let livePolicyChecked = false;
+    let receiptEnsured = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.liveRunnerPolicyCheckCommand) {
+            livePolicyChecked = true;
+          }
+          if (command === plan.activationEnsureCommand) {
+            assert.equal(livePolicyChecked, true);
+            assert.equal(command.args[0], 'reload-or-restart');
+            receiptEnsured = true;
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command.bin === '/usr/bin/bash') {
+            assert.equal(receiptEnsured, true);
+            await fs.writeFile(plan.candidateConfig, 'downgraded current-user config\n', { mode: 0o644 });
+          }
+          if (command === plan.runnerPolicyCheckCommand) {
+            policyChecked = true;
+            throw new Error('runner downgrade rejected');
+          }
+          if (command === plan.serviceCommand) serviceRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'e'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /runner downgrade rejected/,
+    );
+
+    assert.equal(policyChecked, true);
+    assert.equal(livePolicyChecked, true);
+    assert.equal(receiptEnsured, true);
+    assert.equal(serviceRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
+    assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('starts an inactive renewal unit before applying an active-runner update', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-update-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    const calls = [];
+    let renewalUnitActive = false;
+    let livePolicyChecked = false;
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        calls.push(command);
+        if (command === plan.liveRunnerPolicyCheckCommand) {
+          livePolicyChecked = true;
+        }
+        if (command === plan.activationEnsureCommand) {
+          assert.equal(livePolicyChecked, true);
+          assert.equal(renewalUnitActive, false);
+          assert.equal(command.args[0], 'reload-or-restart');
+          renewalUnitActive = true;
+          await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
+          await fs.chmod(plan.activationReceipt, 0o444);
+        }
+        if (command.bin === '/usr/bin/bash') {
+          assert(calls.includes(plan.activationEnsureCommand));
+          assert.equal(renewalUnitActive, true);
+          await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'e'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, false);
+    assert.equal(livePolicyChecked, true);
+    assert(calls.includes(plan.runnerPolicyCheckCommand));
+    assert(calls.includes(plan.serviceCommand));
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"renewed"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects an ephemeral update while runner permission is absent', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-inactive-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"pre-existing"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let policyChecked = false;
+    let serviceRestarted = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'unactivated ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.currentUserPolicyCheckCommand) {
+            policyChecked = true;
+            throw new Error('inactive runner policy rejected');
+          }
+          if (command === plan.serviceCommand) serviceRestarted = true;
+          return {
+            stdout: command.capture === 'configRevision' ? `${'e'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /inactive runner policy rejected/,
+    );
+
+    assert.equal(policyChecked, true);
+    assert.equal(serviceRestarted, false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects a symlinked activation receipt ancestor during ordinary apply', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-link-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    const receiptParent = path.dirname(plan.activationReceipt);
+    const receiptTarget = path.join(temp, 'real-activation-state');
+    await fs.mkdir(path.dirname(receiptParent), { recursive: true, mode: 0o755 });
+    await fs.mkdir(receiptTarget, { recursive: true, mode: 0o755 });
+    await fs.symlink(receiptTarget, receiptParent);
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /activation receipt must not contain symlink ancestors/,
+    );
+
+    assert.equal(commandRan, false);
+    await assert.rejects(() => fs.access(plan.lockDir), /ENOENT/);
   });
 
   it('rejects prepare when the live output directory is worker-owned mode 0555', async () => {
@@ -2933,7 +4482,8 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(metadata.status, 'installed_without_restart');
     assert.equal(metadata.service_restart_skipped, true);
     assert.equal(metadata.config_revision, 'a'.repeat(40));
-    assert.equal(calls.length, plan.commands.length);
+    assert.equal(calls.length, plan.commands.length + 2);
+    assert.equal(calls.at(-1).command, plan.currentUserPolicyCheckCommand);
     assert(calls.every((call) => call.env.SSH_AUTH_SOCK === undefined));
     assert(calls.every((call) => call.env.WEBEX_ACCESS_TOKEN === undefined));
     assert(calls.every((call) => call.env.PATH === '/usr/bin:/bin'));
@@ -3197,7 +4747,8 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          assert.equal(command, plan.permissionStateReloadCommand);
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -3205,7 +4756,7 @@ describe('deploy-config CLI and execution', () => {
       /checkout-dir mode is not trusted/,
     );
 
-    assert.equal(commandRan, false);
+    assert.equal(commandRan, true);
     await assertLockReleased(plan.lockDir);
 
     const lockParent = path.join(temp, 'unsafe-run');
@@ -3266,7 +4817,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           throw new Error('tree validation failed');
         },
@@ -3502,7 +5056,7 @@ describe('deploy-config CLI and execution', () => {
         if (command.bin === '/usr/bin/bash') {
           await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
         }
-        if (command.bin === '/usr/bin/systemctl') {
+        if (command === plan.serviceCommand) {
           failBackupCleanup = true;
         }
         return { stdout: command.capture === 'configRevision' ? `${'f'.repeat(40)}\n` : '', stderr: '' };
@@ -3670,7 +5224,7 @@ describe('deploy-config CLI and execution', () => {
           if (command.bin === '/usr/bin/bash') {
             await fs.writeFile(plan.candidateConfig, 'new config\n', 'utf8');
           }
-          if (command.bin === '/usr/bin/systemctl') {
+          if (command === plan.serviceCommand) {
             restartAttempts += 1;
           }
           return { stdout: command.capture === 'configRevision' ? `${'3'.repeat(40)}\n` : '', stderr: '' };
@@ -3845,7 +5399,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           await assert.rejects(() => fs.access(plan.transactionFile));
@@ -3898,7 +5455,10 @@ describe('deploy-config CLI and execution', () => {
         () => executePlan({
           plan,
           fsApi,
-          runner: async () => {
+          runner: async (command) => {
+            if (command === plan.permissionStateReloadCommand) {
+              return { stdout: '', stderr: '' };
+            }
             commandRan = true;
             assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
             await assert.rejects(() => fs.access(plan.transactionFile));
@@ -3969,7 +5529,10 @@ describe('deploy-config CLI and execution', () => {
         () => executePlan({
           plan,
           fsApi,
-          runner: async () => {
+          runner: async (command) => {
+            if (command === plan.permissionStateReloadCommand) {
+              return { stdout: '', stderr: '' };
+            }
             commandRan = true;
             return { stdout: '', stderr: '' };
           },
@@ -4015,6 +5578,9 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           calls.push(command.bin);
           await assert.rejects(() => fs.access(plan.renderedConfig));
           throw new Error('stop after prepared recovery');
@@ -4066,7 +5632,11 @@ describe('deploy-config CLI and execution', () => {
     };
 
     await assert.rejects(
-      () => executePlan({ plan, fsApi }),
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async () => ({ stdout: '', stderr: '' }),
+      }),
       /transaction cleanup failed/,
     );
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
@@ -4076,7 +5646,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           await assert.rejects(() => fs.access(plan.transactionFile));
           await assert.rejects(() => fs.access(plan.backupConfig));
@@ -4116,7 +5689,10 @@ describe('deploy-config CLI and execution', () => {
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -4158,7 +5734,10 @@ describe('deploy-config CLI and execution', () => {
     });
 
     await assert.rejects(
-      () => executePlan({ plan }),
+      () => executePlan({
+        plan,
+        runner: async () => ({ stdout: '', stderr: '' }),
+      }),
       /requires service recovery; rerun without --skip-restart/,
     );
 
@@ -4199,6 +5778,9 @@ describe('deploy-config CLI and execution', () => {
         plan,
         runner: async (command) => {
           calls.push([command.bin, command.args[0]]);
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old config\n');
           if (command.bin === '/usr/bin/git') {
             await assert.rejects(() => fs.access(plan.transactionFile));
@@ -4211,7 +5793,8 @@ describe('deploy-config CLI and execution', () => {
       /stop after service recovery/,
     );
 
-    assert.deepEqual(calls.slice(0, 4), [
+    assert.deepEqual(calls.slice(0, 5), [
+      ['/usr/bin/systemctl', 'daemon-reload'],
       ['/usr/bin/systemctl', 'restart'],
       ['/usr/bin/systemctl', 'is-active'],
       ['/usr/bin/curl', '--disable'],
@@ -4293,6 +5876,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.deepEqual(calls, [
+      ['/usr/bin/systemctl', 'daemon-reload'],
       ['/usr/bin/systemctl', 'restart'],
       ['/usr/bin/systemctl', 'is-active'],
       ['/usr/bin/curl', '--disable'],
@@ -4337,6 +5921,9 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           calls.push(command.bin);
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'committed config\n');
           const recoveredMetadata = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
@@ -4413,7 +6000,10 @@ describe('deploy-config CLI and execution', () => {
       () => executePlan({
         plan,
         fsApi,
-        runner: async () => {
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            return { stdout: '', stderr: '' };
+          }
           commandRan = true;
           return { stdout: '', stderr: '' };
         },
@@ -4891,7 +6481,7 @@ describe('deploy-config CLI and execution', () => {
         assert.equal(error.exitStatus, 70);
         assert.match(
           error.message,
-          /restart command tree was not contained; failed to restore previous config: rollback rename failed/,
+          /restart command tree was not contained; failed to restore previous deployment state: rollback rename failed/,
         );
         return true;
       },
@@ -5375,7 +6965,7 @@ describe('deploy-config CLI and execution', () => {
           return { stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '', stderr: '' };
         },
       }),
-      /restart failed; failed to restore previous config: rollback rename failed/,
+      /restart failed; failed to restore previous deployment state: rollback rename failed/,
     );
 
     await assert.rejects(() => fs.stat(plan.candidateConfig), /ENOENT/);
@@ -5828,6 +7418,47 @@ async function writeInstallTransactionFixture(
   );
 }
 
+async function writeRunnerActivationTransactionFixture(
+  plan,
+  {
+    configRevision,
+    phase = 'activation_files_installed',
+    permissionHadPrevious = false,
+    receiptHadPrevious = false,
+    committedAt = phase === 'committed_pending_metadata'
+      ? '2026-06-30T00:01:00.000Z'
+      : null,
+  },
+) {
+  await fs.writeFile(
+    plan.transactionFile,
+    `${JSON.stringify({
+      version: 2,
+      phase,
+      had_previous: true,
+      config_revision: configRevision,
+      service_restart_required: true,
+      service: plan.service,
+      config_repo: plan.configRepo,
+      config_ref: plan.configRef,
+      bot_code_dir: plan.botCodeDir,
+      rendered_config: plan.renderedConfig,
+      metadata_file: plan.metadataFile,
+      started_at: '2026-06-30T00:00:00.000Z',
+      committed_at: committedAt,
+      runner_activation: {
+        activation_receipt: plan.activationReceipt,
+        activation_receipt_backup: plan.activationReceiptBackup,
+        bot_service_drop_in: plan.botServiceDropIn,
+        bot_service_drop_in_backup: plan.botServiceDropInBackup,
+        permission_had_previous: permissionHadPrevious,
+        receipt_had_previous: receiptHadPrevious,
+      },
+    }, null, 2)}\n`,
+    { mode: 0o644 },
+  );
+}
+
 function overrideInstallTransactionStat(fsApi, transactionFile, overrides) {
   return {
     ...fsApi,
@@ -6002,8 +7633,45 @@ function parseArgsAllow(args) {
   return parseArgs(withBotBin, { allowHostOverrides: true });
 }
 
-function runStaticConfigPolicy(configPath) {
-  return spawnSync('python3', ['scripts/config-policy/static-config-check.py', configPath], {
+async function createRunnerActivationTestPlan(temp, { activateRunner = true } = {}) {
+  const botCodeDir = path.join(temp, 'bot-code');
+  const source = path.join(
+    botCodeDir,
+    'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf',
+  );
+  const reviewedDropIn = await fs.readFile(
+    path.join(
+      process.cwd(),
+      'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf',
+    ),
+    'utf8',
+  );
+  await fs.mkdir(path.dirname(source), { recursive: true, mode: 0o755 });
+  await fs.writeFile(source, reviewedDropIn, { mode: 0o644 });
+  return buildDeployPlan(
+    parseArgsAllow([
+      '--apply',
+      ...(activateRunner ? ['--activate-runner'] : []),
+      '--checkout-dir',
+      path.join(temp, 'checkout'),
+      '--rendered-config',
+      path.join(temp, 'rendered', 'production.toml'),
+      '--metadata-file',
+      path.join(temp, 'rendered', 'deploy-status.json'),
+      '--lock-dir',
+      path.join(temp, 'deploy-lock', 'deploy.lock'),
+      '--bot-code-dir',
+      botCodeDir,
+      '--bot-service-drop-in',
+      path.join(temp, 'etc', 'systemd', 'system', 'webex-generic-account-bot.service.d', '10-codex-launcher.conf'),
+      '--activation-receipt',
+      path.join(temp, 'run', 'webex-codex-activation', 'receipt.json'),
+    ]),
+  );
+}
+
+function runStaticConfigPolicy(configPath, ...args) {
+  return spawnSync('python3', ['scripts/config-policy/static-config-check.py', ...args, configPath], {
     cwd: process.cwd(),
     encoding: 'utf8',
   });

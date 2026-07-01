@@ -93,6 +93,38 @@ superseded_by:
   a real-reboot challenge, and root-only atomic receipt renewal. It remains
   inactive and grants no bot launcher permission; PR 4c2b still owns the
   deployment transaction and production switch.
+- PR 4c2b implements explicit transactional runner activation with a strict
+  ephemeral-only staging policy, version 2 config/drop-in/receipt recovery,
+  bounded receipt renewal, bot host preflight, minimum launcher/pending access,
+  restart/readiness rollback, boot-time renewal ordering, and downgrade
+  prevention after permission activation. The explicit command refuses a
+  repeated activation once the permission drop-in is installed; boot renewal
+  and later ordinary ephemeral-only config applies own subsequent lifecycle.
+  Renewal stop verification cannot suppress three-state or old-service
+  recovery, and an unresolved stop leaves the recovery journal in place.
+  Permission rollback precedes any config downgrade; a failed drop-in removal
+  leaves the ephemeral config and journal intact. The renewal unit is part of
+  the bot restart lifecycle and uses a fixed ensure command so a valid receipt
+  is a fast no-op while a missing or stale receipt runs the full canaries.
+  Ordinary active-runner apply reloads an active renewal unit to ensure the
+  receipt without propagating a bot stop or restart. If the bot and renewal
+  unit are already inactive, it starts the renewal unit instead. A permission
+  drop-in installed outside the transaction fails closed unless the live
+  rendered config is already fully ephemeral. Every apply reloads the systemd
+  manager before permission detection so stale loaded drop-in state cannot
+  select the wrong isolation policy. Version 2 journals require that launcher
+  permission did not predate activation. Rollback reloads the manager after
+  permission removal and before config downgrade; reload failure preserves the
+  ephemeral config and recovery journal.
+  Receipt-only rollback failures retain the journal and fail the action after
+  restoring the prior config and service.
+  Ordinary apply enforces current-user policy while permission is absent and
+  ephemeral-only policy while it is present, leaving explicit activation as
+  the only mode transition.
+  Committed legacy apply recovery continues into an explicitly requested
+  activation instead of returning ordinary deployment metadata as success.
+  The production host still requires
+  a matching reviewed config and a successful real-reboot canary run.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -362,6 +394,9 @@ superseded_by:
   Codex config away from current-user execution, mint or renew the receipt,
   restart and health-check the service, and roll all three states back
   together. Bot launcher permission must never land in an earlier slice.
+  This slice is implemented; host activation remains a separate deployment
+  operation because the first reboot-cleanup challenge intentionally fails
+  until a real reboot occurs.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.

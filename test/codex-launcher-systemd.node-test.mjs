@@ -204,7 +204,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.doesNotMatch(tmpfiles, /receipt\.json/);
   });
 
-  it('keeps activation renewal root-only, bounded, and inactive by default', async () => {
+  it('keeps activation renewal root-only, bounded, and boot-gated by the bot', async () => {
     const service = await fs.readFile(ACTIVATION_RENEW_SERVICE_PATH, 'utf8');
 
     assert.deepEqual(directiveValues(service, 'Wants'), ['network-online.target']);
@@ -217,21 +217,27 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'Before'), [
       'webex-generic-account-bot.service',
     ]);
+    assert.deepEqual(directiveValues(service, 'PartOf'), [
+      'webex-generic-account-bot.service',
+    ]);
     assert.deepEqual(directiveValues(service, 'ConditionPathExists'), [
       '/sys/fs/cgroup/cgroup.controllers',
     ]);
     assert.deepEqual(directiveValues(service, 'Type'), ['oneshot']);
-    assert.deepEqual(directiveValues(service, 'RemainAfterExit'), ['no']);
+    assert.deepEqual(directiveValues(service, 'RemainAfterExit'), ['yes']);
     assert.deepEqual(directiveValues(service, 'User'), ['root']);
     assert.deepEqual(directiveValues(service, 'Group'), ['root']);
     assert.deepEqual(directiveValues(service, 'WorkingDirectory'), ['/']);
     assert.deepEqual(directiveValues(service, 'ExecStart'), [
-      '/opt/webex-generic-account-bot/bin/webex-codex-activation renew',
+      '/opt/webex-generic-account-bot/bin/webex-codex-activation ensure',
+    ]);
+    assert.deepEqual(directiveValues(service, 'ExecReload'), [
+      '/opt/webex-generic-account-bot/bin/webex-codex-activation ensure',
     ]);
     assert.deepEqual(directiveValues(service, 'Restart'), ['no']);
     assert.deepEqual(directiveValues(service, 'TimeoutStartSec'), ['5400s']);
     assert.deepEqual(directiveValues(service, 'TimeoutStopSec'), ['15s']);
-    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), ['5400s']);
+    assert.deepEqual(directiveValues(service, 'RuntimeMaxSec'), []);
     assert.deepEqual(directiveValues(service, 'KillMode'), ['control-group']);
     assert.deepEqual(directiveValues(service, 'OOMPolicy'), ['kill']);
     assert.deepEqual(directiveValues(service, 'UMask'), ['0077']);
@@ -244,7 +250,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'WantedBy'), []);
     assert.doesNotMatch(service, /^EnvironmentFile=/m);
     assert.doesNotMatch(service, /^ExecStart=.*[%$]/m);
-    for (const directive of ['Requires', 'Wants', 'After', 'PartOf', 'WantedBy']) {
+    for (const directive of ['Requires', 'Wants', 'After', 'WantedBy']) {
       assert.equal(
         directiveValues(service, directive).some((value) =>
           value.split(/\s+/).includes('webex-generic-account-bot.service')
@@ -409,9 +415,9 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });
 
-  it('keeps bot launcher access disabled until isolated activation', async () => {
-    await assert.rejects(fs.stat(BOT_DROP_IN_PATH), { code: 'ENOENT' });
-    const [launcherFiles, botDropIns] = await Promise.all([
+  it('grants the bot only launcher access and pending input writes', async () => {
+    const [dropIn, launcherFiles, botDropIns] = await Promise.all([
+      fs.readFile(BOT_DROP_IN_PATH, 'utf8'),
       Promise.all(
         [
           SOCKET_PATH,
@@ -428,7 +434,38 @@ describe('Codex launcher systemd boundary', () => {
       readTextFilesRecursively(BOT_DROP_IN_ROOT),
     ]);
 
+    assert.equal(
+      dropIn,
+      [
+        '[Unit]',
+        'Requires=webex-codex-activation-renew.service',
+        'After=webex-codex-activation-renew.service',
+        '',
+        '[Service]',
+        'SupplementaryGroups=webex-codex-launch',
+        'ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending',
+        '',
+      ].join('\n'),
+    );
+    assert.deepEqual(directiveValues(dropIn, 'SupplementaryGroups'), [
+      'webex-codex-launch',
+    ]);
+    assert.deepEqual(directiveValues(dropIn, 'Requires'), [
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.deepEqual(directiveValues(dropIn, 'After'), [
+      'webex-codex-activation-renew.service',
+    ]);
+    assert.deepEqual(directiveValues(dropIn, 'ReadWritePaths'), [
+      '/var/lib/webex-generic-account-bot/codex-input-staging/pending',
+    ]);
+    assert.doesNotMatch(dropIn, /\bwebex-(?:config-pull|codex-input)\b/);
+    assert.doesNotMatch(dropIn, /config[_-]?commands/i);
+
     for (const { file, contents } of botDropIns) {
+      if (file === BOT_DROP_IN_PATH) {
+        continue;
+      }
       assert.doesNotMatch(
         contents,
         /webex-codex-(?:launch|input)|codex-input-staging|webex-codex-activation|webex-codex-launcher|\/run\/credentials/,
