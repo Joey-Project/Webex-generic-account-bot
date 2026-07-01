@@ -221,13 +221,16 @@ the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
-launcher template units. It also requires every loaded managed unit to use the
-fixed `/etc/systemd/system` fragment with no drop-ins. The same host-wide
-`flock` used by config deployment serialises the complete apply, and the
-re-executed process verifies the kernel lock PID, device, and inode instead of
-trusting its environment. Apply streams a bounded number of
-directory entries and removes only bounded, exact-name, trusted stale
-candidates left by an interrupted prior run. It installs the complete
+launcher template units. It rejects unloaded instance-specific launcher policy
+from every fixed systemd system-unit load path and requires every loaded managed
+unit to use the fixed `/etc/systemd/system` fragment with no drop-ins. The same
+host-wide `flock` used by config deployment serialises the complete apply, and
+the re-executed process verifies the kernel lock PID, device, and inode instead
+of trusting its environment. An interrupted first-run lock metadata migration
+is accepted only in its root-owned half-migrated state. Apply must then prove
+that tmpfiles converged the same held inode to deployed metadata. Apply streams
+a bounded number of directory entries and removes only bounded, exact-name,
+trusted stale candidates left by an interrupted prior run. It installs the complete
 policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
@@ -241,7 +244,8 @@ state. Recovery fsyncs every target directory before removing the journal,
 including targets that already match their recorded old state, and then
 re-verifies the complete old target set before clearing recovery state. Dry-run
 reports recovery required, and
-the next apply restores the old set before
+the next apply first proves every managed unit and discovered instance dormant,
+then restores the old set before
 reapplying. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command
 can be rerun after correction.

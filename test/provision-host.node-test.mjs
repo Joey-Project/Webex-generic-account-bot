@@ -145,7 +145,7 @@ describe('guarded host provisioner policy', () => {
     );
   });
 
-  it('accepts only bootstrap or deployed shared lock metadata', () => {
+  it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {
     const directoryStat = (gid, mode) => ({
       uid: 0,
       gid,
@@ -164,11 +164,24 @@ describe('guarded host provisioner policy', () => {
 
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
-      { gid: 0, mode: 0o600 },
+      { state: 'bootstrap', gid: 0, mode: 0o600 },
     );
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(2003, 0o660), 2003),
-      { gid: 2003, mode: 0o660 },
+      { state: 'deployed', gid: 2003, mode: 0o660 },
+    );
+    assert.deepEqual(
+      validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(0, 0o600), 2003),
+      { state: 'deployed', gid: 2003, mode: 0o660 },
+    );
+    assert.throws(
+      () => validateProvisionLockMetadata(
+        directoryStat(2003, 0o750),
+        lockStat(0, 0o600),
+        2003,
+        { allowInterruptedMigration: false },
+      ),
+      /provision lock file is not trusted/,
     );
     assert.throws(
       () => validateProvisionLockMetadata(
@@ -408,9 +421,16 @@ describe('guarded host provisioner execution', () => {
   it('installs the fixed set transactionally and converges without enabling units', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
+    let lockConvergenceChecks = 0;
     const report = await provisionHost(
       { apply: true },
-      fixture.dependencies({ commands, applied: true }),
+      fixture.dependencies({
+        commands,
+        applied: true,
+        verifyProvisionLockConverged: async () => {
+          lockConvergenceChecks += 1;
+        },
+      }),
     );
 
     assert.equal(report.mode, 'applied');
@@ -422,6 +442,7 @@ describe('guarded host provisioner execution', () => {
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
       ['/usr/bin/systemctl', ['daemon-reload']],
     ]);
+    assert.equal(lockConvergenceChecks, 1);
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(
         await fs.readFile(artifact.target, 'utf8'),
@@ -546,7 +567,7 @@ describe('guarded host provisioner execution', () => {
         stderr: '',
         code: 0,
       };
-    });
+    }, systemdUnitPathFs());
     assert.equal(discovered.get(instance).active, 'active');
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
@@ -570,10 +591,51 @@ describe('guarded host provisioner execution', () => {
         }
         stateQueries += 1;
         return { stdout: '', stderr: '', code: 0 };
-      }),
+      }, systemdUnitPathFs()),
       /too many launcher instances/,
     );
     assert.equal(stateQueries, 0);
+  });
+
+  it('rejects unloaded launcher instance policy before querying systemd', async () => {
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(new Map([
+          ['/etc/systemd/system', [
+            { name: 'webex-codex-launcher@unloaded.service.d' },
+          ]],
+        ])),
+      ),
+      /unexpected launcher instance policy.*webex-codex-launcher@unloaded\.service\.d/,
+    );
+    assert.equal(commandCalls, 0);
+  });
+
+  it('bounds systemd unit-path scanning before querying systemd', async () => {
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(new Map([
+          ['/etc/systemd/system', Array.from(
+            { length: 4097 },
+            (_, index) => ({ name: `unrelated-${index}.service` }),
+          )],
+        ])),
+      ),
+      /too many entries in trusted directory/,
+    );
+    assert.equal(commandCalls, 0);
   });
 
   it('rejects loaded fragments and drop-ins outside the fixed policy', async (context) => {
@@ -785,6 +847,37 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
+    }
+  });
+
+  it('does not recover policy while a managed unit is active', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const activeStates = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    activeStates.set(MANAGED_UNITS[0], {
+      load: 'loaded',
+      active: 'active',
+      enabled: 'disabled',
+      fragment: fixture.plan.units.find(
+        (candidate) => path.basename(candidate) === MANAGED_UNITS[0],
+      ),
+      dropIns: '',
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ unitStateSequence: [activeStates] }),
+      ),
+      /managed unit is not inactive/,
+    );
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
   });
 
@@ -1006,6 +1099,28 @@ describe('guarded host provisioner execution', () => {
     }
   });
 
+  it('does not reload systemd until the held lock metadata has converged', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          commands,
+          applied: true,
+          verifyProvisionLockConverged: async () => {
+            throw new Error('held lock metadata is still transitional');
+          },
+        }),
+      ),
+      /policy files are installed but convergence failed.*held lock metadata is still transitional/,
+    );
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+    ]);
+  });
+
   it('requires root before apply and keeps help side-effect free', async () => {
     await assert.rejects(
       provisionHost(
@@ -1052,6 +1167,7 @@ async function provisionFixture(context) {
       applied = false,
       identitySequence = null,
       unitStateSequence = null,
+      verifyProvisionLockConverged = async () => {},
     } = {}) {
       const identities = identitySequence ?? (applied
         ? [emptyIdentitySnapshot(), expectedIdentitySnapshot()]
@@ -1082,6 +1198,7 @@ async function provisionFixture(context) {
         readUnitStates: async () => stateSequence[
           Math.min(stateIndex++, stateSequence.length - 1)
         ],
+        verifyProvisionLockConverged,
         runCommand: async (command, args) => {
           commands.push([command, [...args]]);
           return { command, args: [...args], code: 0, stdout: '', stderr: '' };
@@ -1282,6 +1399,20 @@ function asyncDirectory(entries) {
       yield* entries;
     },
     close: async () => {},
+  };
+}
+
+function systemdUnitPathFs(entriesByDirectory = new Map()) {
+  const directoryStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o40755,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  });
+  return {
+    lstat: async () => directoryStat,
+    opendir: async (directory) => asyncDirectory(entriesByDirectory.get(directory) ?? []),
   };
 }
 

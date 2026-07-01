@@ -166,9 +166,11 @@ superseded_by:
   DynamicUser-only systemd userdb boundary, identity-drift checks, dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
-  no-drop-in checks, trusted re-exec paths, bounded streamed stale candidate
-  cleanup and unit discovery, fail-closed recovery with full target-directory
-  durability, and post-reload verification. Real host apply remains an
+  no-drop-in checks, fixed-path scanning for unloaded instance policy, trusted
+  re-exec paths, bounded streamed stale candidate cleanup and unit discovery,
+  recovery-before-write dormancy checks, fail-closed recovery with full
+  target-directory durability, interrupted first-run lock migration recovery,
+  and post-reload verification. Real host apply remains an
   explicit operational gate.
 
 ## Delivery Rules
@@ -209,12 +211,17 @@ superseded_by:
   `files`, reject static systemd userdb records and managed IDs in the
   DynamicUser range, and permit only the trusted DynamicUser provider. Fsync
   every target directory and re-verify the complete old target set before
-  clearing a recovery journal. Serialise the full apply with a
-  PID/device/inode-bound kernel lock shared with config deployment, validate
+  clearing a recovery journal, and prove every managed unit and discovered
+  instance dormant before recovery mutates policy. Serialise the full apply with
+  a PID/device/inode-bound kernel lock shared with config deployment, validate
   every re-exec path ancestor, stream a bounded scan that removes only trusted
   stale candidates, and bound and reject active launcher template instances as
-  well as active template units. Require each loaded unit and instance to use
-  the fixed managed fragment without any drop-ins. If a later sysusers,
+  well as active template units. Allow only the exact root-owned half-migrated
+  first-run lock state, then require tmpfiles to converge and revalidate the held
+  inode before success. Require each loaded unit and instance to use the fixed
+  managed fragment without any
+  drop-ins, and reject unloaded instance-specific policy from every fixed
+  systemd system-unit load path. If a later sysusers,
   tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an
   explicit convergent-rerun requirement; do not claim rollback of users or

@@ -25,6 +25,7 @@ const MAX_STALE_CANDIDATES = 256;
 const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
 const MAX_SYSTEMD_USERDB_ENTRIES = 16;
+const MAX_SYSTEMD_UNIT_PATH_ENTRIES = 4096;
 const MAX_MANAGED_ID = 59_999;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
@@ -38,6 +39,21 @@ const CANDIDATE_UUID_PATTERN =
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
 const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
+const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
+  '/etc/systemd/system.control',
+  '/run/systemd/system.control',
+  '/run/systemd/transient',
+  '/run/systemd/generator.early',
+  '/etc/systemd/system',
+  '/etc/systemd/system.attached',
+  '/run/systemd/system',
+  '/run/systemd/system.attached',
+  '/run/systemd/generator',
+  '/usr/local/lib/systemd/system',
+  '/usr/lib/systemd/system',
+  '/lib/systemd/system',
+  '/run/systemd/generator.late',
+]);
 const STATIC_USERDB_DIRECTORIES = Object.freeze([
   '/etc/userdb',
   '/run/userdb',
@@ -379,6 +395,8 @@ export async function provisionHost(options, dependencies = {}) {
     throw new Error('host policy recovery is required; run --apply');
   }
   if (transaction) {
+    const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+    assertUnitsDormant(recoveryUnitStates, plan, { requireLoaded: false });
     await recoverPolicyTransaction(transaction, plan, deps);
   }
 
@@ -402,6 +420,7 @@ export async function provisionHost(options, dependencies = {}) {
       '--create',
       ...plan.tmpfiles,
     ]));
+    await deps.verifyProvisionLockConverged();
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
     const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS);
@@ -511,7 +530,7 @@ async function executeLockedApply(argv) {
   });
 }
 
-async function assertProvisionLockHeld() {
+async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
   const configPullGid = await readConfigPullGroupGid(runFixedCommand);
   const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
   const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
@@ -522,7 +541,7 @@ async function assertProvisionLockHeld() {
   let stat;
   try {
     stat = await lock.stat();
-    assertTrustedProvisionLock(stat, lockPolicy);
+    assertTrustedProvisionLock(stat, lockPolicy, { allowInterruptedMigration });
   } finally {
     await lock.close();
   }
@@ -835,30 +854,43 @@ function assertTrustedProvisionLockParent(stat, configPullGid) {
   }
   const mode = stat.mode & 0o7777;
   if (stat.gid === 0 && mode === DIRECTORY_MODE) {
-    return Object.freeze({ gid: 0, mode: 0o600 });
+    return Object.freeze({ state: 'bootstrap', gid: 0, mode: 0o600 });
   }
   if (configPullGid !== null && stat.gid === configPullGid && mode === 0o750) {
-    return Object.freeze({ gid: configPullGid, mode: 0o660 });
+    return Object.freeze({ state: 'deployed', gid: configPullGid, mode: 0o660 });
   }
   throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
 }
 
-function assertTrustedProvisionLock(stat, policy) {
+function assertTrustedProvisionLock(
+  stat,
+  policy,
+  { allowInterruptedMigration = true } = {},
+) {
+  const mode = stat.mode & 0o7777;
+  const matchesPolicy = stat.gid === policy.gid && mode === policy.mode;
+  const isInterruptedMigration = policy.state === 'deployed'
+    && stat.gid === 0
+    && mode === 0o600;
   if (
     !stat.isFile()
     || stat.isSymbolicLink()
     || stat.nlink !== 1
     || stat.uid !== 0
-    || stat.gid !== policy.gid
-    || (stat.mode & 0o7777) !== policy.mode
+    || (!matchesPolicy && !(allowInterruptedMigration && isInterruptedMigration))
   ) {
     throw new Error(`provision lock file is not trusted: ${PROVISION_LOCK_PATH}`);
   }
 }
 
-export function validateProvisionLockMetadata(parentStat, lockStat, configPullGid) {
+export function validateProvisionLockMetadata(
+  parentStat,
+  lockStat,
+  configPullGid,
+  options = {},
+) {
   const policy = assertTrustedProvisionLockParent(parentStat, configPullGid);
-  assertTrustedProvisionLock(lockStat, policy);
+  assertTrustedProvisionLock(lockStat, policy, options);
   return policy;
 }
 
@@ -1405,7 +1437,8 @@ export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, f
   return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups);
 }
 
-export async function readSystemUnitStates(units, runCommand = runFixedCommand) {
+export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
+  await assertNoLauncherInstancePolicy(fsApi);
   const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
@@ -1453,6 +1486,25 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand) 
     }));
   }
   return states;
+}
+
+async function assertNoLauncherInstancePolicy(fsApi) {
+  let scannedEntries = 0;
+  for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
+    const entries = await readTrustedDirectoryEntries(
+      directory,
+      MAX_SYSTEMD_UNIT_PATH_ENTRIES - scannedEntries,
+      fsApi,
+    );
+    scannedEntries += entries.length;
+    for (const entry of entries) {
+      if (/^webex-codex-launcher@[^@/\s]+\.service(?:\.d)?$/.test(entry.name)) {
+        throw new Error(
+          `unexpected launcher instance policy in systemd unit path: ${path.join(directory, entry.name)}`,
+        );
+      }
+    }
+  }
 }
 
 function parseSystemUnitMetadata(output, unit) {
@@ -1530,7 +1582,9 @@ function provisionDependencies(dependencies) {
     readIdentitySnapshot: dependencies.readIdentitySnapshot
       ?? (() => readSystemIdentitySnapshot(runCommand, dependencies.fsApi ?? fs)),
     readUnitStates: dependencies.readUnitStates
-      ?? ((units) => readSystemUnitStates(units, runCommand)),
+      ?? ((units) => readSystemUnitStates(units, runCommand, dependencies.fsApi ?? fs)),
+    verifyProvisionLockConverged: dependencies.verifyProvisionLockConverged
+      ?? (() => assertProvisionLockHeld({ allowInterruptedMigration: false })),
   };
 }
 
