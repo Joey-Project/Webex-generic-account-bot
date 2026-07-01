@@ -442,6 +442,14 @@ describe('deploy-config plan', () => {
     assert.equal(plan.currentUserPolicyCheckCommand.condition, 'runner-permission-inactive');
     assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
+    assert.deepEqual(plan.serviceInactiveStateCommand.args, [
+      'show',
+      '--property=ActiveState',
+      '--value',
+      '--',
+      plan.service,
+    ]);
+    assert.equal(plan.serviceInactiveStateCommand.validation, 'service-inactive');
     assert.deepEqual(
       plan.serviceVerificationCommands.map((command) => [command.bin, command.args]),
       [
@@ -3778,6 +3786,190 @@ describe('deploy-config CLI and execution', () => {
     assert.equal(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
     await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects an out-of-band sibling drop-in before current-user apply', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-sibling-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'current-user live config\n', { mode: 0o644 });
+    await fs.writeFile(
+      path.join(path.dirname(plan.botServiceDropIn), '20-out-of-band.conf'),
+      '[Service]\nSupplementaryGroups=webex-config-pull\n',
+      { mode: 0o644 },
+    );
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /unexpected bot service drop-in blocks runner permission detection: "20-out-of-band\.conf"/,
+    );
+
+    assert.deepEqual(calls, []);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'current-user live config\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('ignores a stale atomic-write temporary that systemd cannot load', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-stale-temp-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    const staleTemporary = path.join(
+      path.dirname(plan.botServiceDropIn),
+      `.${path.basename(plan.botServiceDropIn)}.1234.stale.tmp`,
+    );
+    await fs.writeFile(staleTemporary, '[Service]\nSupplementaryGroups=webex-config-pull\n', {
+      mode: 0o644,
+    });
+    let currentPolicyChecked = false;
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new current-user config\n', { mode: 0o644 });
+        }
+        if (command === plan.currentUserPolicyCheckCommand) {
+          currentPolicyChecked = true;
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'d'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(currentPolicyChecked, true);
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new current-user config\n');
+    await fs.access(staleTemporary);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects a sibling drop-in added after the activation transaction is durable', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-sibling-race-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    const sibling = path.join(path.dirname(plan.botServiceDropIn), '20-out-of-band.conf');
+    let siblingInjected = false;
+    const fsApi = {
+      ...fs,
+      async rename(source, destination) {
+        await fs.rename(source, destination);
+        if (destination === plan.transactionFile && !siblingInjected) {
+          siblingInjected = true;
+          await fs.writeFile(
+            sibling,
+            '[Service]\nSupplementaryGroups=webex-config-pull\n',
+            { mode: 0o644 },
+          );
+        }
+      },
+    };
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        fsApi,
+        runner: async (command) => {
+          calls.push(command);
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /unexpected bot service drop-in blocks runner permission detection: "20-out-of-band\.conf"/,
+    );
+
+    assert.equal(siblingInjected, true);
+    assert.equal(calls.includes(plan.activationDaemonReloadCommand), false);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old current-user config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('stops a newly privileged bot when sibling drift blocks rollback', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-sibling-containment-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    const sibling = path.join(path.dirname(plan.botServiceDropIn), '20-out-of-band.conf');
+    let serviceRestarted = false;
+    let serviceStopped = false;
+    let inactiveVerified = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarted = true;
+          }
+          if (command.bin === '/usr/bin/curl') {
+            await fs.writeFile(
+              sibling,
+              '[Service]\nSupplementaryGroups=webex-config-pull\n',
+              { mode: 0o644 },
+            );
+            throw new Error('new service is not ready');
+          }
+          if (command === plan.serviceStopCommand) {
+            serviceStopped = true;
+          }
+          if (command === plan.serviceInactiveStateCommand) {
+            inactiveVerified = true;
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore previous deployment state: unexpected bot service drop-in.*bot service stopped after rollback failure/,
+    );
+
+    assert.equal(serviceRestarted, true);
+    assert.equal(serviceStopped, true);
+    assert.equal(inactiveVerified, true);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await fs.access(plan.transactionFile);
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
     await assertLockReleased(plan.lockDir);
   });
 

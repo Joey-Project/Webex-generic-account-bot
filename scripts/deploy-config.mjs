@@ -510,6 +510,13 @@ export function buildDeployPlan(options) {
   const serviceStopCommand = options.skipRestart
     ? null
     : command(options.systemctlBin, ['stop', '--', options.service], commandDefaults);
+  const serviceInactiveStateCommand = options.skipRestart
+    ? null
+    : command(
+        options.systemctlBin,
+        ['show', '--property=ActiveState', '--value', '--', options.service],
+        { ...commandDefaults, validation: 'service-inactive' },
+      );
   const serviceVerificationCommands = options.skipRestart
     ? []
     : [
@@ -632,6 +639,7 @@ export function buildDeployPlan(options) {
     commands,
     serviceCommand,
     serviceStopCommand,
+    serviceInactiveStateCommand,
     serviceVerificationCommands,
     activationRenewCommand,
     permissionStateReloadCommand,
@@ -868,6 +876,7 @@ export async function executePlan({
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
+    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
     await runner(
       plan.permissionStateReloadCommand,
       scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
@@ -937,12 +946,14 @@ export async function executePlan({
       throwIfAborted(signal);
     }
     if (plan.activateRunner) {
+      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
       installState = await prepareRunnerActivation(
         plan,
         captures.configRevision,
         fsApi,
         { migrateLegacyPermission: runnerPermission.legacy },
       );
+      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
       await runner(
         plan.activationDaemonReloadCommand,
         scrubEnv(parentEnv, plan.activationDaemonReloadCommand.env),
@@ -997,7 +1008,7 @@ export async function executePlan({
         fsApi,
       );
       try {
-        await runServiceTransition(plan, runner, parentEnv, signal);
+        await runServiceTransition(plan, runner, parentEnv, fsApi, signal);
       } catch (error) {
         const rollbackState = installState;
         installState = null;
@@ -1032,10 +1043,24 @@ export async function executePlan({
             : restoreError;
         }
         if (rollbackError) {
+          let containedRollbackError = rollbackError;
+          let containmentStatus = '';
+          if (rollbackState.runnerActivation) {
+            try {
+              await stopServiceForContainment(plan, runner, parentEnv);
+              containmentStatus = '; bot service stopped after rollback failure';
+            } catch (containmentError) {
+              containedRollbackError = errorPreservingDeploymentStatus(
+                rollbackError,
+                `${rollbackError.message}; failed to stop the bot after rollback failure: ${containmentError.message}`,
+                containmentError,
+              );
+            }
+          }
           const failure = errorPreservingDeploymentStatus(
             error,
-            `${error.message}; failed to restore previous deployment state: ${rollbackError.message}`,
-            rollbackError,
+            `${error.message}; failed to restore previous deployment state: ${containedRollbackError.message}${containmentStatus}`,
+            containedRollbackError,
           );
           await recordFailure(
             'failed_restart_rollback_failed',
@@ -1046,7 +1071,7 @@ export async function executePlan({
           throw failure;
         }
         try {
-          await runServiceRollback(plan, rollbackState, runner, parentEnv);
+          await runServiceRollback(plan, rollbackState, runner, parentEnv, fsApi);
         } catch (restoreError) {
           const rollbackAction = rollbackState.hadPrevious
             ? 'service restart'
@@ -1257,9 +1282,10 @@ export async function executePlan({
   }
 }
 
-async function runServiceTransition(plan, runner, parentEnv, signal = null) {
+async function runServiceTransition(plan, runner, parentEnv, fsApi, signal = null) {
   throwIfAborted(signal);
   if (plan.daemonReloadCommand) {
+    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
     await runner(
       plan.daemonReloadCommand,
       scrubEnv(parentEnv, plan.daemonReloadCommand.env),
@@ -1281,6 +1307,20 @@ async function runServiceTransition(plan, runner, parentEnv, signal = null) {
     );
     throwIfAborted(signal);
   }
+}
+
+async function stopServiceForContainment(plan, runner, parentEnv) {
+  if (!plan.serviceStopCommand || !plan.serviceInactiveStateCommand) {
+    throw new Error('cannot contain the bot service without fixed stop and state commands');
+  }
+  await runner(
+    plan.serviceStopCommand,
+    scrubEnv(parentEnv, plan.serviceStopCommand.env),
+  );
+  await runner(
+    plan.serviceInactiveStateCommand,
+    scrubEnv(parentEnv, plan.serviceInactiveStateCommand.env),
+  );
 }
 
 async function stopActivationRenewal(plan, runner, parentEnv) {
@@ -2078,6 +2118,13 @@ function validateCommandResult(commandSpec, result) {
     const state = result.stdout.trim();
     if (state !== 'inactive') {
       throw new Error(`activation renewal unit remained ${state || 'unknown'}`);
+    }
+    return;
+  }
+  if (commandSpec.validation === 'service-inactive') {
+    const state = result.stdout.trim();
+    if (state !== 'inactive') {
+      throw new Error(`bot service remained ${state || 'unknown'}`);
     }
     return;
   }
@@ -2903,6 +2950,7 @@ async function assertTrustedBotServiceDropInSource(file, fsApi) {
 }
 
 async function detectRunnerPermission(plan, fsApi) {
+  await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
   let snapshot;
   try {
     snapshot = await readStableTrustedFile(
@@ -2925,6 +2973,25 @@ async function detectRunnerPermission(plan, fsApi) {
     return RUNNER_PERMISSION_LEGACY;
   }
   throw new Error('installed bot service drop-in does not match a fixed activation policy');
+}
+
+async function assertNoUnexpectedBotServiceDropIns(managedDropIn, fsApi) {
+  const directory = path.dirname(managedDropIn);
+  let entries;
+  try {
+    entries = await fsApi.readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const managedName = path.basename(managedDropIn);
+  for (const entry of entries) {
+    if (entry.name !== managedName && entry.name.endsWith('.conf')) {
+      throw new Error(
+        `unexpected bot service drop-in blocks runner permission detection: ${JSON.stringify(entry.name)}`,
+      );
+    }
+  }
 }
 
 async function detectAndValidateRunnerPermission(
@@ -3038,6 +3105,20 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
     restoreError = error;
   }
   if (restoreError) {
+    if (
+      installState.runnerActivation
+      && installState.phase === 'service_transition_started'
+    ) {
+      try {
+        await stopServiceForContainment(plan, runner, parentEnv);
+      } catch (containmentError) {
+        restoreError = errorPreservingDeploymentStatus(
+          restoreError,
+          `${restoreError.message}; failed to stop the bot after rollback failure: ${containmentError.message}`,
+          containmentError,
+        );
+      }
+    }
     if (renewalStopError) {
       throw errorPreservingDeploymentStatus(
         restoreError,
@@ -3049,7 +3130,7 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
   }
   if (installState.phase === 'service_transition_started') {
     try {
-      await runServiceRollback(plan, installState, runner, parentEnv);
+      await runServiceRollback(plan, installState, runner, parentEnv, fsApi);
     } catch (error) {
       const rollbackFailures = [
         renewalStopError
@@ -3102,7 +3183,7 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
   await cleanupInstallBackups(plan, installState, fsApi).catch(() => {});
 }
 
-async function runServiceRollback(plan, installState, runner, parentEnv) {
+async function runServiceRollback(plan, installState, runner, parentEnv, fsApi) {
   if (!installState.serviceRestartRequired) {
     return;
   }
@@ -3110,22 +3191,30 @@ async function runServiceRollback(plan, installState, runner, parentEnv) {
     if (!plan.serviceCommand) {
       throw new Error('cannot restore service state without a configured restart command');
     }
-    await runServiceTransition(plan, runner, parentEnv);
+    try {
+      await runServiceTransition(plan, runner, parentEnv, fsApi);
+    } catch (error) {
+      try {
+        await stopServiceForContainment(plan, runner, parentEnv);
+      } catch (containmentError) {
+        throw errorPreservingDeploymentStatus(
+          error,
+          `${error.message}; failed to stop the bot after rollback transition failure: ${containmentError.message}`,
+          containmentError,
+        );
+      }
+      throw error;
+    }
     return;
   }
-  if (!plan.serviceStopCommand) {
-    throw new Error('cannot restore an absent initial config without a configured stop command');
-  }
+  await stopServiceForContainment(plan, runner, parentEnv);
   if (plan.daemonReloadCommand) {
+    await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
     await runner(
       plan.daemonReloadCommand,
       scrubEnv(parentEnv, plan.daemonReloadCommand.env),
     );
   }
-  await runner(
-    plan.serviceStopCommand,
-    scrubEnv(parentEnv, plan.serviceStopCommand.env),
-  );
 }
 
 async function restoreDeploymentState(
@@ -3147,6 +3236,7 @@ async function restoreDeploymentState(
       if (!runner) {
         throw new Error('runner permission rollback requires systemd manager synchronisation');
       }
+      await assertNoUnexpectedBotServiceDropIns(plan.botServiceDropIn, fsApi);
       await runner(
         plan.permissionStateReloadCommand,
         scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
@@ -3918,6 +4008,7 @@ function allPlanCommands(plan) {
       plan.serviceCommand,
       ...plan.serviceVerificationCommands,
       plan.serviceStopCommand,
+      plan.serviceInactiveStateCommand,
     ].filter(Boolean),
   ];
 }

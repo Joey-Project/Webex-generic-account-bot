@@ -376,7 +376,11 @@ incomplete metadata.
 refuses to run when the current reviewed permission drop-in is already active,
 but transactionally migrates the exact launcher-only drop-in installed by the
 previous activation slice. Ordinary apply fails with an explicit migration
-instruction while that legacy drop-in remains. It first renders a candidate that is statically required to use
+instruction while that legacy drop-in remains. The bot unit's drop-in directory
+is dedicated to this managed file; any sibling `*.conf` entry blocks permission
+detection and is checked again before every permission-relevant `daemon-reload`,
+so an out-of-band group grant cannot be mistaken for an inactive runner. Stale
+atomic-write temporary files are ignored because systemd does not load them. It first renders a candidate that is statically required to use
 `ephemeral-linux-user` for every effective Codex policy. Before canaries run,
 the entrypoint writes a version 2 recovery journal and snapshots the live
 config, bot permission drop-in, and any prior boot receipt. It then restarts
@@ -389,7 +393,9 @@ the commit point stops and verifies the renewal unit, revokes the launcher
 drop-in before restoring a prior config, restores the receipt, reloads systemd,
 and verifies the old service. If permission revocation fails, rollback keeps
 the ephemeral config and recovery journal instead of exposing launcher access
-to a `current-user` config. A canary failure leaves no stale receipt. A renewal
+to a `current-user` config; after a service transition it also stops the bot and
+verifies `ActiveState=inactive` so no newly privileged process remains live. A
+canary failure leaves no stale receipt. A renewal
 stop or inactive-verification failure does not skip three-state restoration or
 old-service recovery; the apply still fails and retains its journal for a later
 recovery retry. Once permission and config are restored, a receipt-only cleanup
