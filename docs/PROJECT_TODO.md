@@ -27,7 +27,8 @@
 - [completed] Include config-worker socket access in transactional runner
   activation and permit the `pull` schema only under fully ephemeral isolation.
 - [completed] Add the base bot systemd identity, service, and filesystem layout.
-- [pending] Add a guarded host provisioner before production activation.
+- [completed] Add a guarded host provisioner before production activation;
+  real host apply remains an explicit operational step.
 - [pending] Pin the reviewed Configuration Space and enable `/config pull` in
   the production config repository, then run deployment and Webex E2E.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics

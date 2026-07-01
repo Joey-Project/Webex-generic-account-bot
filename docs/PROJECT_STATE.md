@@ -94,9 +94,11 @@
 - Host deployment discovery found that the repository had privileged launcher,
   activation, and worker units but no base bot unit or reproducible host
   provisioner. The base contract now defines the unprivileged bot identity,
-  fixed service, and root-managed versus bot-writable filesystem layout. A
-  guarded installer remains the next slice before Configuration Space pinning
-  and real host activation.
+  fixed service, and root-managed versus bot-writable filesystem layout. The
+  guarded provisioner now has a fixed non-secret allowlist, identity-drift and
+  dormant-unit preflight, transactional root-owned policy installation, explicit
+  sysusers/tmpfiles application, and post-reload verification. Real host apply
+  remains explicit before Configuration Space pinning and activation.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

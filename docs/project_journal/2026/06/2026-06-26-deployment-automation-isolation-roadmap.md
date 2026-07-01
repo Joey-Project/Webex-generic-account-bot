@@ -161,7 +161,10 @@ superseded_by:
   stable unprivileged bot identity, fixed service, and root-managed versus
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
-  activation drop-in. PR 4d2 owns the guarded dry-run/apply provisioner.
+  activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
+  fixed non-secret allowlist, identity-drift and dormant-unit preflight, transactional
+  policy-file installation, and post-reload verification. Real host apply
+  remains an explicit operational gate.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -192,6 +195,13 @@ superseded_by:
   launcher, input, config-pull, or config-deploy group because systemd extends
   user-database groups even after an empty `SupplementaryGroups=` assignment.
   Also reject worker membership in the bot group or any bot-secret group.
+- Install the complete root-owned policy file set transactionally with atomic
+  per-file replacement. If a later
+  commit is interrupted, recover the old set from a fixed root-only journal
+  before reapplying. If a later sysusers, tmpfiles, manager-reload, or
+  post-verification step fails, retain that complete set and fail with an
+  explicit convergent-rerun requirement; do not claim rollback of users or
+  directories already created by systemd.
 - Never copy secrets, install the activation-owned bot drop-in, enable the bot,
   or run the real reboot challenge as an implicit side effect.
 
