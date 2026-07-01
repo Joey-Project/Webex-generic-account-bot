@@ -102,12 +102,14 @@
   shared with config deployment, exact loaded-fragment, no-drop-in,
   no-stale-manager, and no-external-activator checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
-  dash-prefix drop-in with usr-merge handling, merged boot sysusers/tmpfiles
-  policy auditing,
+  dash-prefix drop-in with usr-merge handling, direct disk scanning of external
+  units, drop-ins, aliases, and dependency symlinks, semantic merged boot
+  sysusers/tmpfiles policy auditing,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional
-  root-owned policy installation without unsafe post-unlink rollback, explicit
+  root-owned policy installation whose journal remains through manager
+  convergence without unsafe post-unlink rollback, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.
 

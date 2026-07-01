@@ -169,14 +169,18 @@ superseded_by:
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
   no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
-  enabled-unit next-boot dependency graph inspection, fixed-path scanning for
-  unloaded policy and dependency directories across all managed units plus
+  direct next-boot disk inspection of external units, drop-ins, aliases, and
+  dependency symlinks, fixed-path scanning for unloaded policy and dependency
+  directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
-  usr-merge compatibility, merged boot sysusers/tmpfiles policy auditing,
+  usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
+  auditing with C-escape, specifier/glob-prefix, path-derived-ID, and recursive
+  parent handling,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, explicit complete-target stale-cache convergence recovery,
-  fail-closed recovery with full target-directory durability,
+  fail-closed recovery with full target-directory durability and a journal
+  retained through final manager convergence,
   non-rollback journal-unlink failure handling, interrupted first-run lock
   migration recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.
@@ -232,7 +236,7 @@ superseded_by:
   first-run lock state, then require tmpfiles to converge and revalidate the held
   inode before success. Require each loaded unit and instance to use the fixed
   managed fragment without any
-  drop-ins, and reject unloaded unit overrides, drop-ins, wants, and requires
+  drop-ins, and reject unloaded unit overrides, drop-ins, wants, requires, and upholds
   for every managed unit and launcher instance from every fixed systemd
   system-unit load path while
   accepting only the exact root-owned `/lib -> usr/lib` compatibility link. If

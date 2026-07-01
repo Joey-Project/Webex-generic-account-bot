@@ -299,6 +299,31 @@ describe('guarded host provisioner policy', () => {
       /managed user ID is outside the local range/,
     );
     assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        [
+          passwdRecord('webex-generic-account-bot', 0, 2001),
+          passwdRecord('webex-config-deploy', 1002, 2002),
+          '',
+        ].join('\n'),
+        expectedGroupDatabase(),
+        {
+          'webex-generic-account-bot': [2001],
+          'webex-config-deploy': [2002],
+        },
+        expectedGshadowDatabase(),
+      ), { requireAccounts: true }),
+      /managed user ID is outside the local range/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        groupDatabase: expectedGroupDatabase().replace(
+          'webex-codex-launch:x:2005:',
+          'webex-codex-launch:x:0:',
+        ),
+      })),
+      /managed group ID is outside the local range/,
+    );
+    assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
         groupDatabase: expectedGroupDatabase().replace(
           'webex-codex-launch:x:',
@@ -414,7 +439,14 @@ describe('guarded host provisioner execution', () => {
   it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
     for (const [kind, policy] of [
       ['sysusers', 'm webex-generic-account-bot sudo'],
+      ['sysusers', 'm \\x77ebex-generic-account-bot sudo'],
+      ['sysusers', 'u external /var/lib/webex-generic-account-bot/state -'],
       ['tmpfiles', 'd /run/webex-codex-canary 0777 root root -'],
+      ['tmpfiles', 'd /run/\\x77ebex-config-deploy 0777 root root -'],
+      ['tmpfiles', 'R /run/* - - - -'],
+      ['tmpfiles', 'Z /var/lib 0777 root root -'],
+      ['tmpfiles', 'R /run/%H - - - -'],
+      ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
     ]) {
       const fixture = await provisionFixture(context);
       await assert.rejects(
@@ -710,6 +742,8 @@ describe('guarded host provisioner execution', () => {
           'UpheldBy=',
           'BoundBy=',
           'TriggeredBy=',
+          'OnFailureOf=',
+          'OnSuccessOf=',
           '',
         ].join('\n'),
         stderr: '',
@@ -719,7 +753,7 @@ describe('guarded host provisioner execution', () => {
     assert.equal(discovered.get(instance).active, 'active');
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
-    assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 2);
+    assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 1);
 
     let stateQueries = 0;
     await assert.rejects(
@@ -745,33 +779,61 @@ describe('guarded host provisioner execution', () => {
     assert.equal(stateQueries, 0);
   });
 
-  it('rejects enabled external dependency graphs that activate managed units', async () => {
-    let metadataQueries = 0;
-    await assert.rejects(
-      readSystemUnitStates(MANAGED_UNITS, async (_command, args) => {
-        if (args[0] === 'list-units') return { stdout: '', stderr: '', code: 0 };
-        if (args[0] === 'list-unit-files') {
-          return {
-            stdout: args.some((arg) => arg.startsWith('--state='))
-              ? 'external-boot.service enabled -\n'
-              : '',
-            stderr: '',
-            code: 0,
-          };
-        }
-        if (args[0] === 'list-dependencies') {
-          return {
-            stdout: 'external-boot.service\nwebex-codex-activation-renew.service\n',
-            stderr: '',
-            code: 0,
-          };
-        }
-        metadataQueries += 1;
-        return { stdout: '', stderr: '', code: 0 };
-      }, systemdUnitPathFs()),
-      /enabled systemd dependency graph activates a managed unit/,
+  it('rejects next-boot managed-unit references directly from disk policy', async () => {
+    const externalUnit = '/etc/systemd/system/external-boot.service';
+    const encodedReference = Buffer.from(
+      '[Unit]\nOnFailure=webex-codex-activation\\x2drenew.service\n',
     );
-    assert.equal(metadataQueries, 0);
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-boot.service',
+              isFile: () => true,
+              isDirectory: () => false,
+              isSymbolicLink: () => false,
+            }]],
+          ]),
+          { filesByPath: new Map([[externalUnit, encodedReference]]) },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+    assert.equal(commandCalls, 0);
+
+    const wantsDirectory = '/etc/systemd/system/multi-user.target.wants';
+    const managedLink = path.join(wantsDirectory, 'webex-generic-account-bot.service');
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'multi-user.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [wantsDirectory, [{
+              name: 'webex-generic-account-bot.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          { symlinksByPath: new Map([[managedLink, '../webex-generic-account-bot.service']]) },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
   });
 
   it('rejects unloaded managed-unit policy before querying systemd', async () => {
@@ -781,9 +843,11 @@ describe('guarded host provisioner execution', () => {
       'webex-codex-launcher@unloaded.service.wants',
       'webex-codex-launcher@unloaded.service.requires',
       'webex-codex-launcher@.service.wants',
+      'webex-codex-launcher@.service.upholds',
       'webex-generic-account-bot.service.d',
       'webex-generic-account-bot.service.wants',
       'webex-config-pull-worker.service.requires',
+      'webex-config-pull-worker.service.upholds',
       'service.d',
       'socket.d',
       'webex-.service.d',
@@ -807,6 +871,22 @@ describe('guarded host provisioner execution', () => {
       );
       assert.equal(commandCalls, 0);
     }
+
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(new Map([
+          ['/usr/lib/systemd/system', [{ name: 'webex-generic-account-bot.service' }]],
+        ])),
+      ),
+      /unexpected managed unit policy.*\/usr\/lib\/systemd\/system\/webex-generic-account-bot\.service/,
+    );
+    assert.equal(commandCalls, 0);
   });
 
   it('bounds systemd unit-path scanning before querying systemd', async () => {
@@ -975,7 +1055,7 @@ describe('guarded host provisioner execution', () => {
         { apply: true },
         fixture.dependencies({ fsApi, applied: true }),
       ),
-      /policy files are installed but transaction cleanup failed.*unlink fsync failure/,
+      /host policy files are installed but convergence failed.*unlink fsync failure/,
     );
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
@@ -1389,6 +1469,7 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
     }
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('does not reload systemd until the held lock metadata has converged', async (context) => {
@@ -1411,6 +1492,7 @@ describe('guarded host provisioner execution', () => {
       ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
     ]);
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('requires root for both modes and keeps help side-effect free', async () => {
@@ -1769,7 +1851,12 @@ function asyncDirectory(entries) {
 
 function systemdUnitPathFs(
   entriesByDirectory = new Map(),
-  { usrMerged = false, usrMergeTarget = 'usr/lib' } = {},
+  {
+    usrMerged = false,
+    usrMergeTarget = 'usr/lib',
+    filesByPath = new Map(),
+    symlinksByPath = new Map(),
+  } = {},
 ) {
   const directoryStat = Object.freeze({
     uid: 0,
@@ -1791,15 +1878,56 @@ function systemdUnitPathFs(
     isDirectory: () => false,
     isSymbolicLink: () => true,
   });
+  const fileStat = (contents) => Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o100644,
+    nlink: 1,
+    dev: 1,
+    ino: 3,
+    size: contents.length,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => true,
+    isDirectory: () => false,
+    isSymbolicLink: () => false,
+  });
+  const symlinkStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o120777,
+    nlink: 1,
+    dev: 1,
+    ino: 4,
+    size: 1,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => false,
+    isDirectory: () => false,
+    isSymbolicLink: () => true,
+  });
   return {
-    lstat: async (candidate) => (
-      usrMerged && candidate === '/lib' ? usrMergeStat : directoryStat
-    ),
+    lstat: async (candidate) => {
+      if (usrMerged && candidate === '/lib') return usrMergeStat;
+      if (filesByPath.has(candidate)) return fileStat(filesByPath.get(candidate));
+      if (symlinksByPath.has(candidate)) return symlinkStat;
+      return directoryStat;
+    },
     readlink: async (candidate) => {
+      if (symlinksByPath.has(candidate)) return symlinksByPath.get(candidate);
       assert.equal(candidate, '/lib');
       return usrMergeTarget;
     },
     opendir: async (directory) => asyncDirectory(entriesByDirectory.get(directory) ?? []),
+    open: async (candidate) => {
+      const contents = filesByPath.get(candidate);
+      if (!contents) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return {
+        stat: async () => fileStat(contents),
+        readFile: async () => Buffer.from(contents),
+        close: async () => {},
+      };
+    },
   };
 }
 

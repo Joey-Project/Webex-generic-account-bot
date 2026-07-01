@@ -26,7 +26,9 @@ const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
 const MAX_SYSTEMD_USERDB_ENTRIES = 16;
 const MAX_SYSTEMD_UNIT_PATH_ENTRIES = 4096;
-const MAX_ENABLED_SYSTEM_UNITS = 1024;
+const MAX_SYSTEMD_POLICY_TREE_ENTRIES = 32_768;
+const MAX_SYSTEMD_POLICY_FILES = 8192;
+const MAX_SYSTEMD_POLICY_BYTES = 64 * 1024 * 1024;
 const MAX_MANAGED_ID = 59_999;
 const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
 const TRANSACTION_VERSION = 1;
@@ -99,6 +101,7 @@ const MANAGED_UNIT_POLICY_DIRECTORY_NAMES = Object.freeze(
     ...systemdDropInDirectoryNames(unit),
     `${unit}.wants`,
     `${unit}.requires`,
+    `${unit}.upholds`,
   ]))],
 );
 const REVERSE_ACTIVATION_PROPERTIES = Object.freeze([
@@ -107,6 +110,8 @@ const REVERSE_ACTIVATION_PROPERTIES = Object.freeze([
   'UpheldBy',
   'BoundBy',
   'TriggeredBy',
+  'OnFailureOf',
+  'OnSuccessOf',
 ]);
 
 export const ARTIFACTS = Object.freeze([
@@ -365,7 +370,12 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
   }
 
   for (const user of [bot, worker].filter(Boolean)) {
-    if (user.uid > MAX_MANAGED_ID || user.gid > MAX_MANAGED_ID) {
+    if (
+      user.uid === 0
+      || user.gid === 0
+      || user.uid > MAX_MANAGED_ID
+      || user.gid > MAX_MANAGED_ID
+    ) {
       throw new Error(`managed user ID is outside the local range: ${user.name}`);
     }
     const aliases = [...snapshot.users.values()]
@@ -385,7 +395,7 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
       }
       continue;
     }
-    if (group.gid > MAX_MANAGED_ID) {
+    if (group.gid === 0 || group.gid > MAX_MANAGED_ID) {
       throw new Error(`managed group ID is outside the local range: ${groupName}`);
     }
     const aliases = [...snapshot.groups.values()]
@@ -517,6 +527,7 @@ export async function provisionHost(options, dependencies = {}) {
     await verifyInstalledArtifacts(inspected, deps);
     const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS);
     assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
+    if (installed.length > 0) await removeProvisionTransaction(plan, deps);
   } catch (error) {
     throw new Error(
       `host policy files are installed but convergence failed; rerun --apply after correction: ${error.message}`,
@@ -806,14 +817,6 @@ async function installPolicySetAtomically(inspected, plan, deps) {
     await Promise.allSettled(staged
       .filter(({ temporary }) => temporary)
       .map(({ temporary }) => deps.fsApi.rm(temporary, { force: true })));
-  }
-  try {
-    await removeProvisionTransaction(plan, deps);
-  } catch (error) {
-    throw new Error(
-      `policy files are installed but transaction cleanup failed; rerun --apply after correction: ${error.message}`,
-      { cause: error },
-    );
   }
   return changed.map(({ target }) => target);
 }
@@ -1634,6 +1637,10 @@ export function auditBootPolicyCatalogs(
     const record = identitySnapshot.groups.get(group);
     if (record) managedIds.add(String(record.gid));
   }
+  const protectedPaths = new Set(inspected.artifacts
+    .filter((artifact) => artifact.kind === 'tmpfiles')
+    .flatMap((artifact) => policyCatalogLines(artifact.source.contents))
+    .map((line) => parseSystemdFields(line)[1]));
 
   for (const kind of ['sysusers', 'tmpfiles']) {
     if (typeof catalogs?.[kind] !== 'string') {
@@ -1652,7 +1659,13 @@ export function auditBootPolicyCatalogs(
     }
     for (const line of observed) {
       if (allowed.has(line)) continue;
-      if (bootPolicyLineTouchesManagedSurface(kind, line, managedNames, managedIds)) {
+      if (bootPolicyLineTouchesManagedSurface(
+        kind,
+        line,
+        managedNames,
+        managedIds,
+        protectedPaths,
+      )) {
         throw new Error(`unmanaged ${kind} policy touches the Webex boundary: ${line}`);
       }
     }
@@ -1660,34 +1673,202 @@ export function auditBootPolicyCatalogs(
 }
 
 function policyCatalogLines(contents) {
-  return String(contents)
-    .split('\n')
+  const logicalLines = [];
+  let pending = '';
+  for (const physicalLine of String(contents).split('\n')) {
+    const line = `${pending}${physicalLine}`;
+    if (hasTrailingContinuation(line)) {
+      pending = `${line.slice(0, -1)} `;
+    } else {
+      logicalLines.push(line);
+      pending = '';
+    }
+  }
+  if (pending !== '') throw new Error('boot policy ends with an unterminated continuation');
+  return logicalLines
     .map((line) => line.trim())
     .filter((line) => line !== '' && !line.startsWith('#'));
 }
 
-function bootPolicyLineTouchesManagedSurface(kind, line, managedNames, managedIds) {
-  for (const name of managedNames) {
-    if (new RegExp(`(^|[^A-Za-z0-9_.-])${escapeRegExp(name)}([^A-Za-z0-9_.-]|$)`).test(line)) {
-      return true;
-    }
+function hasTrailingContinuation(line) {
+  let backslashes = 0;
+  for (let offset = line.length - 1; offset >= 0 && line[offset] === '\\'; offset -= 1) {
+    backslashes += 1;
   }
-  const fields = line.split(/\s+/);
+  return backslashes % 2 === 1;
+}
+
+function bootPolicyLineTouchesManagedSurface(
+  kind,
+  line,
+  managedNames,
+  managedIds,
+  protectedPaths,
+) {
+  const fields = parseSystemdFields(line);
   if (kind === 'sysusers') {
-    return ['u', 'u!', 'g', 'g!'].includes(fields[0]) && managedIds.has(fields[2]);
+    return sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths);
   }
   if (kind === 'tmpfiles') {
-    const policyPath = fields[1] ?? '';
-    return /(^|\/)webex(?:-|\/|$)/.test(policyPath)
-      || managedIds.has(fields[3])
-      || managedIds.has(fields[4]);
+    return tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths);
   }
   throw new Error(`unsupported boot policy kind: ${kind}`);
 }
 
+function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths) {
+  if (fields.length < 3) throw new Error('sysusers policy line is malformed');
+  const [type, name, id] = fields;
+  if (managedNames.has(name) || [...managedNames].some((managed) => id === managed)) return true;
+  if (name.includes('%') || id.includes('%')) return true;
+  if (type === 'm') return managedNames.has(name) || managedNames.has(id);
+  if (['u', 'u!', 'g', 'g!'].includes(type)) {
+    if (id.startsWith('/')) return true;
+    for (const component of id.split(':')) {
+      if (managedIds.has(component) || managedNames.has(component)) return true;
+    }
+    for (const field of fields.slice(3)) {
+      if (pathFieldTouchesProtected(field, type, protectedPaths)) return true;
+    }
+    return false;
+  }
+  if (type === 'r') {
+    const match = id.match(/^(\d+)(?:-(\d+))?$/);
+    if (!match) return id !== '-';
+    const lower = Number(match[1]);
+    const upper = Number(match[2] ?? match[1]);
+    return [...managedIds].some((managedId) => {
+      const value = Number(managedId);
+      return value >= lower && value <= upper;
+    });
+  }
+  throw new Error(`unsupported sysusers policy type: ${type}`);
+}
+
+function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths) {
+  if (fields.length < 2) throw new Error('tmpfiles policy line is malformed');
+  const [type, policyPath] = fields;
+  const user = fields[3] ?? '-';
+  const group = fields[4] ?? '-';
+  if (
+    managedNames.has(user)
+    || managedNames.has(group)
+    || managedIds.has(user)
+    || managedIds.has(group)
+  ) {
+    return true;
+  }
+  return pathFieldTouchesProtected(policyPath, type, protectedPaths);
+}
+
+function pathFieldTouchesProtected(policyPath, type, protectedPaths) {
+  if (/(^|\/)webex(?:-|\/|$)/.test(policyPath)) return true;
+  if (!policyPath.startsWith('/')) return policyPath.includes('%');
+  const wildcardOffset = policyPath.search(/[%*?[]/);
+  const literal = wildcardOffset < 0 ? path.posix.normalize(policyPath) : null;
+  const staticPrefix = wildcardOffset < 0
+    ? literal
+    : policyPath.slice(0, wildcardOffset);
+  const recursiveType = new Set(['A', 'D', 'H', 'R', 'T', 'Z']).has(type[0]);
+  for (const protectedPath of protectedPaths) {
+    if (literal !== null) {
+      if (literal === protectedPath || literal.startsWith(`${protectedPath}/`)) return true;
+      if (recursiveType && protectedPath.startsWith(`${literal}/`)) return true;
+      continue;
+    }
+    if (
+      protectedPath.startsWith(staticPrefix)
+      || staticPrefix === protectedPath
+      || staticPrefix.startsWith(`${protectedPath}/`)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseSystemdFields(line) {
+  const fields = [];
+  let field = '';
+  let quote = null;
+  let started = false;
+  for (let offset = 0; offset < line.length; offset += 1) {
+    const character = line[offset];
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      } else if (character === '\\') {
+        const decoded = decodeSystemdEscape(line, offset);
+        field += decoded.value;
+        offset = decoded.end;
+      } else {
+        field += character;
+      }
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) {
+        fields.push(field);
+        field = '';
+        started = false;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (character === '\\') {
+      const decoded = decodeSystemdEscape(line, offset);
+      field += decoded.value;
+      offset = decoded.end;
+    } else {
+      field += character;
+    }
+    started = true;
+  }
+  if (quote !== null) throw new Error('systemd policy field has an unterminated quote');
+  if (started) fields.push(field);
+  return fields;
+}
+
+function decodeSystemdEscape(value, offset) {
+  const marker = value[offset + 1];
+  const simple = new Map([
+    ['a', '\x07'], ['b', '\b'], ['e', '\x1b'], ['f', '\f'], ['n', '\n'], ['r', '\r'],
+    ['s', ' '], ['t', '\t'], ['v', '\v'], ['\\', '\\'], ['"', '"'], ["'", "'"],
+  ]);
+  if (simple.has(marker)) return { value: simple.get(marker), end: offset + 1 };
+  const formats = marker === 'x'
+    ? { digits: 2, radix: 16 }
+    : marker === 'u'
+      ? { digits: 4, radix: 16 }
+      : marker === 'U'
+        ? { digits: 8, radix: 16 }
+        : /[0-7]/.test(marker ?? '')
+          ? { digits: Math.min(3, (value.slice(offset + 1).match(/^[0-7]+/)?.[0].length ?? 0)), radix: 8 }
+          : null;
+  if (!formats || formats.digits === 0) throw new Error('systemd policy contains an invalid escape');
+  const start = marker === 'x' || marker === 'u' || marker === 'U' ? offset + 2 : offset + 1;
+  const encoded = value.slice(start, start + formats.digits);
+  const pattern = formats.radix === 16 ? /^[0-9A-Fa-f]+$/ : /^[0-7]+$/;
+  if (encoded.length !== formats.digits || !pattern.test(encoded)) {
+    throw new Error('systemd policy contains an invalid escape');
+  }
+  const codePoint = Number.parseInt(encoded, formats.radix);
+  if (codePoint === 0 || codePoint > 0x10ffff) {
+    throw new Error('systemd policy contains an invalid code point');
+  }
+  return {
+    value: String.fromCodePoint(codePoint),
+    end: start + formats.digits - 1,
+  };
+}
+
 export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
   await assertNoUnexpectedManagedUnitPolicy(fsApi);
-  const [loadedInstances, installedInstances, enabledUnitsResult] = await Promise.all([
+  const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
       '--all',
@@ -1705,26 +1886,7 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
       '--no-pager',
       'webex-codex-launcher@*.service',
     ]),
-    runCommand('/usr/bin/systemctl', [
-      'list-unit-files',
-      '--state=enabled,enabled-runtime',
-      '--full',
-      '--no-legend',
-      '--no-pager',
-    ]),
   ]);
-  const enabledUnits = parseEnabledUnitFiles(enabledUnitsResult.stdout);
-  if (enabledUnits.length > 0) {
-    const dependencies = await runCommand('/usr/bin/systemctl', [
-      'list-dependencies',
-      '--all',
-      '--plain',
-      '--no-legend',
-      '--no-pager',
-      ...enabledUnits,
-    ]);
-    assertEnabledUnitsDoNotActivateManaged(dependencies.stdout);
-  }
   const discovered = new Set([
     ...parseLauncherInstanceUnits(loadedInstances.stdout),
     ...parseLauncherInstanceUnits(installedInstances.stdout),
@@ -1757,61 +1919,122 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
   return states;
 }
 
-function parseEnabledUnitFiles(output) {
-  const units = new Set();
-  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
-    const [unit, state] = line.split(/\s+/);
-    if (
-      !unit
-      || unit.length > 256
-      || unit.includes('/')
-      || !unit.includes('.')
-      || !['enabled', 'enabled-runtime'].includes(state)
-    ) {
-      throw new Error(`enabled systemd unit listing is malformed: ${line}`);
-    }
-    units.add(unit);
-    if (units.size > MAX_ENABLED_SYSTEM_UNITS) {
-      throw new Error('too many enabled systemd units');
-    }
-  }
-  return [...units].sort();
-}
-
-function assertEnabledUnitsDoNotActivateManaged(output) {
-  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
-    const match = line.match(/([A-Za-z0-9:_.@-]+)$/);
-    if (!match) throw new Error(`systemd dependency listing is malformed: ${line}`);
-    const unit = match[1];
-    if (MANAGED_UNITS.includes(unit) || LAUNCHER_INSTANCE_PATTERN.test(unit)) {
-      throw new Error(`enabled systemd dependency graph activates a managed unit: ${unit}`);
-    }
-  }
-}
-
 async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
-  let scannedEntries = 0;
+  const budget = { entries: 0, files: 0, bytes: 0 };
   for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
     if (directory === '/lib/systemd/system' && await isUsrMergedLib(fsApi)) continue;
     const entries = await readTrustedDirectoryEntries(
       directory,
-      MAX_SYSTEMD_UNIT_PATH_ENTRIES - scannedEntries,
+      Math.min(
+        MAX_SYSTEMD_UNIT_PATH_ENTRIES,
+        MAX_SYSTEMD_POLICY_TREE_ENTRIES - budget.entries,
+      ),
       fsApi,
     );
-    scannedEntries += entries.length;
+    budget.entries += entries.length;
     for (const entry of entries) {
       const instanceUnit = /^webex-codex-launcher@[^@/\s]+\.service$/.test(entry.name);
       const policyDirectory =
-        /^webex-codex-launcher@(?:[^@/\s]+)?\.service(?:\.d|\.wants|\.requires)$/
+        /^webex-codex-launcher@(?:[^@/\s]+)?\.service(?:\.d|\.wants|\.requires|\.upholds)$/
           .test(entry.name);
       const managedUnitPolicyDirectory = MANAGED_UNIT_POLICY_DIRECTORY_NAMES.includes(entry.name);
-      if (instanceUnit || policyDirectory || managedUnitPolicyDirectory) {
+      const managedFragmentOutsideTarget = MANAGED_UNITS.includes(entry.name)
+        && directory !== '/etc/systemd/system';
+      if (
+        instanceUnit
+        || policyDirectory
+        || managedUnitPolicyDirectory
+        || managedFragmentOutsideTarget
+      ) {
         throw new Error(
           `unexpected managed unit policy in systemd unit path: ${path.join(directory, entry.name)}`,
         );
       }
+      if (directory === '/etc/systemd/system' && MANAGED_UNITS.includes(entry.name)) {
+        continue;
+      }
+      await auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested: false });
     }
   }
+}
+
+async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested }) {
+  const candidate = path.join(directory, entry.name);
+  if (nested) assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate);
+  const unitFile = /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/.test(
+    entry.name,
+  );
+  if (!nested && !unitFile && !entry.isDirectory?.()) return;
+  if (entry.isSymbolicLink?.()) {
+    const before = await fsApi.lstat(candidate);
+    const target = await fsApi.readlink(candidate);
+    const after = await fsApi.lstat(candidate);
+    if (!sameFileIdentity(before, after)) {
+      throw new Error(`systemd policy symlink changed while reading: ${candidate}`);
+    }
+    assertSystemdPolicyDoesNotReferenceManaged(`${entry.name} ${target}`, candidate);
+    return;
+  }
+  if (entry.isFile?.()) {
+    budget.files += 1;
+    if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
+      throw new Error('too many systemd policy files');
+    }
+    const policy = await readTrustedFile(candidate, 0, 0, null, fsApi);
+    budget.bytes += policy.contents.length;
+    if (budget.bytes > MAX_SYSTEMD_POLICY_BYTES) {
+      throw new Error('systemd policy files exceed the aggregate byte limit');
+    }
+    for (const line of policyCatalogLines(policy.contents)) {
+      assertSystemdPolicyDoesNotReferenceManaged(line, candidate);
+    }
+    return;
+  }
+  if (!entry.isDirectory?.()) return;
+  if (!/\.(?:d|wants|requires|upholds)$/.test(entry.name)) return;
+  const nestedEntries = await readTrustedDirectoryEntries(
+    candidate,
+    MAX_SYSTEMD_POLICY_TREE_ENTRIES - budget.entries,
+    fsApi,
+  );
+  budget.entries += nestedEntries.length;
+  for (const child of nestedEntries) {
+    if (child.isDirectory?.()) {
+      throw new Error(`nested systemd policy directory is not supported: ${path.join(candidate, child.name)}`);
+    }
+    await auditSystemdPolicyEntry(candidate, child, budget, fsApi, { nested: true });
+  }
+}
+
+function assertSystemdPolicyDoesNotReferenceManaged(value, source) {
+  const decoded = decodeSystemdEscapesForAudit(String(value));
+  if (
+    MANAGED_UNITS.some((unit) => decoded.includes(unit))
+    || LAUNCHER_INSTANCE_PATTERN.test(path.basename(decoded))
+  ) {
+    throw new Error(`external systemd policy references a managed unit: ${source}`);
+  }
+}
+
+function decodeSystemdEscapesForAudit(value) {
+  let decoded = '';
+  for (let offset = 0; offset < value.length; offset += 1) {
+    if (value[offset] !== '\\') {
+      decoded += value[offset];
+      continue;
+    }
+    try {
+      const escape = decodeSystemdEscape(value, offset);
+      decoded += escape.value;
+      offset = escape.end;
+    } catch {
+      if (offset + 1 < value.length) {
+        decoded += value[offset + 1];
+        offset += 1;
+      }
+    }
+  }
+  return decoded;
 }
 
 function systemdDropInDirectoryNames(unit) {

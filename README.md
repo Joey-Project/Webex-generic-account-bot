@@ -232,11 +232,14 @@ load path. It accepts only the exact root-owned `/lib -> usr/lib` compatibility
 link and requires every loaded managed unit to use the fixed
 `/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
 no external reverse activator. Enabled external unit dependency graphs are
-also checked so a dormant static root service cannot become a next-boot trigger.
-The merged systemd sysusers and tmpfiles catalogues are audited before mutation
-and again after account allocation; only the reviewed Webex lines may mention
-managed identities, IDs, or paths, which keeps the identity and filesystem
-boundary durable across reboot.
+not inferred from a potentially stale manager cache: every trusted system unit
+load path is scanned directly for external unit, drop-in, alias, and dependency
+symlink references to managed units, including C-escaped references. The merged
+systemd sysusers and tmpfiles catalogues are audited before mutation and again
+after account allocation using systemd field, quoting, continuation, C-escape,
+specifier/glob-prefix, path-derived-ID, and recursive-parent semantics. Only the
+reviewed Webex lines may affect managed identities, IDs, or paths, which keeps
+the identity and filesystem boundary durable across reboot.
 The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
@@ -251,6 +254,9 @@ unit became active or enabled. It never starts or enables a unit. A policy-file
 transaction failure restores the old file set. Each file replacement is atomic,
 and a root-only transaction journal
 under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
+The journal remains durable through sysusers/tmpfiles convergence, manager
+reload, and final unit verification; it is removed only after all of those
+steps succeed.
 Rollback and recovery classify every managed target, accept only the recorded
 old or desired digest, and fail closed on an administrator-modified third
 state. Recovery fsyncs every target directory before removing the journal,
