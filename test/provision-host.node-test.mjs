@@ -20,6 +20,7 @@ import {
   parseIdentityDatabases,
   provisionHost,
   readSystemIdentitySnapshot,
+  readSystemBootPolicyCatalogs,
   readSystemUnitStates,
   runCli,
   validateIdentityPolicy,
@@ -342,73 +343,37 @@ describe('guarded host provisioner policy', () => {
       )),
       /managed group has an orphan shadow credential: webex-codex-launch/,
     );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        gshadowDatabase: `${expectedGshadowDatabase()}docker:!:administrator:webex-generic-account-bot\n`,
+      })),
+      /managed user has shadow-group privileges: webex-generic-account-bot \(docker\)/,
+    );
   });
 
-  it('enumerates static identities from files and permits only DynamicUser', async () => {
-    const commands = [];
+  it('reads complete stable files identities and permits only DynamicUser', async () => {
     const snapshot = await readSystemIdentitySnapshot(
-      async (command, args) => {
-        commands.push([command, [...args]]);
-        return {
-          command,
-          args: [...args],
-          code: 0,
-          stdout: args.at(-1) === 'passwd'
-            ? [
-              passwdRecord('webex-generic-account-bot', 1001, 2001),
-              passwdRecord('webex-config-deploy', 1002, 2002),
-              '',
-            ].join('\n')
-            : args.at(-1) === 'group'
-              ? expectedGroupDatabase()
-              : expectedGshadowDatabase(),
-          stderr: '',
-        };
-      },
       systemIdentityFs({ dynamicUserProvider: true }),
     );
 
-    assert.deepEqual(commands, [
-      ['/usr/bin/getent', ['-s', 'files', 'passwd']],
-      ['/usr/bin/getent', ['-s', 'files', 'group']],
-      ['/usr/bin/getent', [
-        '-s',
-        'files',
-        'gshadow',
-        'webex-generic-account-bot',
-        'webex-config-deploy',
-        'webex-config-pull',
-        'webex-codex-input',
-        'webex-codex-launch',
-      ]],
-    ]);
     validateIdentityPolicy(snapshot, { requireAccounts: true });
   });
 
-  it('rejects unsupported or static systemd userdb records before getent', async () => {
-    let commandCalled = false;
-    const runCommand = async () => {
-      commandCalled = true;
-      throw new Error('getent must not run');
-    };
-
+  it('rejects unsupported or static systemd userdb records', async () => {
     await assert.rejects(
       readSystemIdentitySnapshot(
-        runCommand,
         systemIdentityFs({ providerName: 'io.example.Untrusted' }),
       ),
       /unsupported systemd userdb provider/,
     );
     await assert.rejects(
       readSystemIdentitySnapshot(
-        runCommand,
         systemIdentityFs({ staticUserdbEntry: '9000.user' }),
       ),
       /static systemd userdb records are not supported/,
     );
     await assert.rejects(
       readSystemIdentitySnapshot(
-        runCommand,
         systemIdentityFs({
           staticUserdbDirectory: '/usr/local/lib/userdb',
           staticUserdbEntry: '9001.user',
@@ -416,7 +381,17 @@ describe('guarded host provisioner policy', () => {
       ),
       /static systemd userdb records are not supported/,
     );
-    assert.equal(commandCalled, false);
+  });
+
+  it('rejects writable or unstable files identity databases', async () => {
+    await assert.rejects(
+      readSystemIdentitySnapshot(systemIdentityFs({ groupMode: 0o666 })),
+      /policy file metadata is not trusted: \/etc\/group/,
+    );
+    await assert.rejects(
+      readSystemIdentitySnapshot(systemIdentityFs({ mutateGroupIdentity: true })),
+      /policy file changed while reading: \/etc\/group/,
+    );
   });
 });
 
@@ -434,6 +409,66 @@ describe('guarded host provisioner execution', () => {
     assert.equal(report.changed_artifact_count, 15);
     assert.deepEqual(commands, []);
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
+    for (const [kind, policy] of [
+      ['sysusers', 'm webex-generic-account-bot sudo'],
+      ['tmpfiles', 'd /run/webex-codex-canary 0777 root root -'],
+    ]) {
+      const fixture = await provisionFixture(context);
+      await assert.rejects(
+        provisionHost(
+          { apply: false },
+          fixture.dependencies({
+            bootPolicySequence: [{
+              ...fixture.bootPolicyCatalogs,
+              [kind]: `${fixture.bootPolicyCatalogs[kind]}\n${policy}\n`,
+            }],
+          }),
+        ),
+        new RegExp(`unmanaged ${kind} policy touches the Webex boundary`),
+      );
+    }
+  });
+
+  it('rechecks numeric tmpfiles ownership after allocating managed IDs', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          bootPolicySequence: [
+            fixture.bootPolicyCatalogs,
+            {
+              ...fixture.bootPolicyCatalogs,
+              tmpfiles: `${fixture.bootPolicyCatalogs.tmpfiles}\nf /tmp/untrusted 0600 1001 root -\n`,
+            },
+          ],
+        }),
+      ),
+      /unmanaged tmpfiles policy touches the Webex boundary/,
+    );
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+    ]);
+  });
+
+  it('reads the merged boot policy through fixed read-only commands', async () => {
+    const commands = [];
+    const catalogs = await readSystemBootPolicyCatalogs(async (command, args) => {
+      commands.push([command, [...args]]);
+      return { stdout: `${path.basename(command)} policy\n`, stderr: '', code: 0 };
+    });
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']],
+      ['/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']],
+    ]);
+    assert.match(catalogs.sysusers, /systemd-sysusers policy/);
+    assert.match(catalogs.tmpfiles, /systemd-tmpfiles policy/);
   });
 
   it('preserves stale candidates in dry-run and removes them before apply', async (context) => {
@@ -549,6 +584,40 @@ describe('guarded host provisioner execution', () => {
     assert.equal(second.changed_artifact_count, 0);
     assert.deepEqual(second.installed_artifacts, []);
     assert.equal(secondCommands.length, 3);
+
+    const staleManagerStates = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+      needDaemonReload: true,
+    }, fixture.plan);
+    await assert.rejects(
+      provisionHost(
+        { apply: false },
+        fixture.dependencies({
+          identitySequence: [expectedIdentitySnapshot()],
+          unitStateSequence: [staleManagerStates],
+        }),
+      ),
+      /managed unit requires daemon-reload/,
+    );
+    const recoveredCommands = [];
+    const recovered = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        commands: recoveredCommands,
+        applied: true,
+        identitySequence: [expectedIdentitySnapshot(), expectedIdentitySnapshot()],
+        unitStateSequence: [staleManagerStates, loadedStates, loadedStates],
+      }),
+    );
+    assert.equal(recovered.changed_artifact_count, 0);
+    assert.deepEqual(recoveredCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
   });
 
   it('rejects untrusted sources before creating target directories', async (context) => {
@@ -607,6 +676,9 @@ describe('guarded host provisioner execution', () => {
         return { stdout: `${instance} loaded active running test\n`, stderr: '', code: 0 };
       }
       if (args[0] === 'list-unit-files') {
+        if (args.some((arg) => arg.startsWith('--state='))) {
+          return { stdout: '', stderr: '', code: 0 };
+        }
         return {
           stdout: 'webex-codex-launcher@.service static -\nwebex-codex-launcher@boot.service enabled -\n',
           stderr: '',
@@ -632,6 +704,12 @@ describe('guarded host provisioner execution', () => {
           'LoadState=loaded',
           `FragmentPath=/etc/systemd/system/${fragmentUnit}`,
           'DropInPaths=',
+          'NeedDaemonReload=no',
+          'RequiredBy=',
+          'WantedBy=',
+          'UpheldBy=',
+          'BoundBy=',
+          'TriggeredBy=',
           '',
         ].join('\n'),
         stderr: '',
@@ -641,7 +719,7 @@ describe('guarded host provisioner execution', () => {
     assert.equal(discovered.get(instance).active, 'active');
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
-    assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 1);
+    assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 2);
 
     let stateQueries = 0;
     await assert.rejects(
@@ -667,6 +745,35 @@ describe('guarded host provisioner execution', () => {
     assert.equal(stateQueries, 0);
   });
 
+  it('rejects enabled external dependency graphs that activate managed units', async () => {
+    let metadataQueries = 0;
+    await assert.rejects(
+      readSystemUnitStates(MANAGED_UNITS, async (_command, args) => {
+        if (args[0] === 'list-units') return { stdout: '', stderr: '', code: 0 };
+        if (args[0] === 'list-unit-files') {
+          return {
+            stdout: args.some((arg) => arg.startsWith('--state='))
+              ? 'external-boot.service enabled -\n'
+              : '',
+            stderr: '',
+            code: 0,
+          };
+        }
+        if (args[0] === 'list-dependencies') {
+          return {
+            stdout: 'external-boot.service\nwebex-codex-activation-renew.service\n',
+            stderr: '',
+            code: 0,
+          };
+        }
+        metadataQueries += 1;
+        return { stdout: '', stderr: '', code: 0 };
+      }, systemdUnitPathFs()),
+      /enabled systemd dependency graph activates a managed unit/,
+    );
+    assert.equal(metadataQueries, 0);
+  });
+
   it('rejects unloaded managed-unit policy before querying systemd', async () => {
     for (const policyName of [
       'webex-codex-launcher@unloaded.service',
@@ -677,6 +784,10 @@ describe('guarded host provisioner execution', () => {
       'webex-generic-account-bot.service.d',
       'webex-generic-account-bot.service.wants',
       'webex-config-pull-worker.service.requires',
+      'service.d',
+      'socket.d',
+      'webex-.service.d',
+      'webex-codex-.service.d',
     ]) {
       let commandCalls = 0;
       await assert.rejects(
@@ -735,7 +846,7 @@ describe('guarded host provisioner execution', () => {
     assert.equal(commandCalls, 0);
   });
 
-  it('rejects loaded fragments and drop-ins outside the fixed policy', async (context) => {
+  it('rejects loaded policy, stale manager state, and reverse activators', async (context) => {
     const cases = [
       [
         'fragment',
@@ -746,6 +857,16 @@ describe('guarded host provisioner execution', () => {
         'drop-in',
         (state) => ({ ...state, dropIns: '/etc/systemd/system/service.d/90-untrusted.conf' }),
         /managed unit loaded unexpected drop-ins/,
+      ],
+      [
+        'daemon-reload',
+        (state) => ({ ...state, needDaemonReload: true }),
+        /managed unit requires daemon-reload/,
+      ],
+      [
+        'reverse-activator',
+        (state) => ({ ...state, reverseActivators: ['external-boot.service'] }),
+        /managed unit has an external reverse activator/,
       ],
     ];
     for (const [label, mutate, expected] of cases) {
@@ -1336,17 +1457,27 @@ async function provisionFixture(context) {
     await fs.chmod(path.join(sourceRoot, artifact.sourceName), 0o644);
   }
   const plan = buildProvisionPlan({ sourceRoot, targetRoot });
+  const bootPolicyCatalogs = {
+    sysusers: (await Promise.all(plan.artifacts
+      .filter(({ kind }) => kind === 'sysusers')
+      .map(({ source }) => fs.readFile(source, 'utf8')))).join('\n'),
+    tmpfiles: (await Promise.all(plan.artifacts
+      .filter(({ kind }) => kind === 'tmpfiles')
+      .map(({ source }) => fs.readFile(source, 'utf8')))).join('\n'),
+  };
   return {
     root,
     sourceRoot,
     targetRoot,
     plan,
+    bootPolicyCatalogs,
     dependencies({
       commands = [],
       fsApi = fs,
       applied = false,
       identitySequence = null,
       unitStateSequence = null,
+      bootPolicySequence = null,
       verifyProvisionLockConverged = async () => {},
     } = {}) {
       const identities = identitySequence ?? (applied
@@ -1360,7 +1491,9 @@ async function provisionFixture(context) {
         : [unitStates({ load: 'not-found', active: 'inactive', enabled: 'not-found' })]);
       let identityIndex = 0;
       let stateIndex = 0;
+      let bootPolicyIndex = 0;
       let uuid = 0;
+      const bootPolicies = bootPolicySequence ?? [bootPolicyCatalogs];
       return {
         plan,
         fsApi,
@@ -1374,6 +1507,9 @@ async function provisionFixture(context) {
         randomUUID: () => `00000000-0000-4000-8000-${String(uuid += 1).padStart(12, '0')}`,
         readIdentitySnapshot: async () => identities[
           Math.min(identityIndex++, identities.length - 1)
+        ],
+        readBootPolicyCatalogs: async () => bootPolicies[
+          Math.min(bootPolicyIndex++, bootPolicies.length - 1)
         ],
         readUnitStates: async () => stateSequence[
           Math.min(stateIndex++, stateSequence.length - 1)
@@ -1469,6 +1605,7 @@ function expectedIdentitySnapshot({
 
 function expectedGroupDatabase(configPullMembers = []) {
   return [
+    groupRecord('shadow', 42),
     groupRecord('webex-generic-account-bot', 2001),
     groupRecord('webex-config-deploy', 2002),
     groupRecord('webex-config-pull', 2003, configPullMembers),
@@ -1480,6 +1617,7 @@ function expectedGroupDatabase(configPullMembers = []) {
 
 function expectedGshadowDatabase() {
   return [
+    'shadow:!::',
     'webex-generic-account-bot:!::',
     'webex-config-deploy:!::',
     'webex-config-pull:!::',
@@ -1507,8 +1645,35 @@ function systemIdentityFs({
   providerName = null,
   staticUserdbDirectory = '/etc/userdb',
   staticUserdbEntry = null,
+  groupMode = 0o644,
+  mutateGroupIdentity = false,
 } = {}) {
-  const nsswitch = Buffer.from('passwd: files systemd\ngroup: files systemd\n');
+  const identityFiles = new Map([
+    ['/etc/nsswitch.conf', {
+      contents: Buffer.from('passwd: files systemd\ngroup: files systemd\n'),
+      gid: 0,
+      mode: 0o644,
+    }],
+    ['/etc/passwd', {
+      contents: Buffer.from([
+        passwdRecord('webex-generic-account-bot', 1001, 2001),
+        passwdRecord('webex-config-deploy', 1002, 2002),
+        '',
+      ].join('\n')),
+      gid: 0,
+      mode: 0o644,
+    }],
+    ['/etc/group', {
+      contents: Buffer.from(expectedGroupDatabase()),
+      gid: 0,
+      mode: groupMode,
+    }],
+    ['/etc/gshadow', {
+      contents: Buffer.from(expectedGshadowDatabase()),
+      gid: 42,
+      mode: 0o640,
+    }],
+  ]);
   const provider = providerName
     ?? (dynamicUserProvider ? 'io.systemd.DynamicUser' : null);
   const directoryEntries = new Map();
@@ -1541,27 +1706,31 @@ function systemIdentityFs({
     isSocket: () => true,
     isSymbolicLink: () => false,
   });
-  const nsswitchStat = Object.freeze({
-    uid: 0,
-    gid: 0,
-    mode: 0o100644,
-    nlink: 1,
-    size: nsswitch.length,
-    dev: 1,
-    ino: 1,
-    mtimeMs: 1,
-    ctimeMs: 1,
-    isFile: () => true,
-    isSymbolicLink: () => false,
-  });
   const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
 
   return {
     async open(file) {
-      if (file !== '/etc/nsswitch.conf') throw missing();
+      const record = identityFiles.get(file);
+      if (!record) throw missing();
+      let statCalls = 0;
       return {
-        stat: async () => nsswitchStat,
-        readFile: async () => Buffer.from(nsswitch),
+        stat: async () => {
+          statCalls += 1;
+          return Object.freeze({
+            uid: 0,
+            gid: record.gid,
+            mode: 0o100000 | record.mode,
+            nlink: 1,
+            size: record.contents.length,
+            dev: 1,
+            ino: mutateGroupIdentity && file === '/etc/group' && statCalls > 1 ? 99 : 1,
+            mtimeMs: 1,
+            ctimeMs: 1,
+            isFile: () => true,
+            isSymbolicLink: () => false,
+          });
+        },
+        readFile: async () => Buffer.from(record.contents),
         close: async () => {},
       };
     },
@@ -1645,5 +1814,7 @@ function unitStates(state, plan = null) {
         : ''
     ),
     dropIns: state.dropIns ?? '',
+    needDaemonReload: state.needDaemonReload ?? false,
+    reverseActivators: state.reverseActivators ?? [],
   }]));
 }

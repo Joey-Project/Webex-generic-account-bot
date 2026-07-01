@@ -162,17 +162,21 @@ superseded_by:
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
-  fixed non-secret allowlist, files-only static identity and gshadow
-  enumeration, a DynamicUser-only systemd userdb boundary, identity-drift and
-  locked-group-credential checks, dormant-unit
+  fixed non-secret allowlist, stable no-follow reads of complete files identity
+  and gshadow databases, a DynamicUser-only systemd userdb boundary,
+  identity-drift, locked-group-credential, and cross-group shadow-grant checks,
+  dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
-  no-drop-in checks, fixed-path scanning for unloaded policy and dependency
-  directories across all managed units plus template and instance launcher
-  overrides, with exact usr-merge compatibility,
+  no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
+  enabled-unit next-boot dependency graph inspection, fixed-path scanning for
+  unloaded policy and dependency directories across all managed units plus
+  template, instance, type-level, and dash-prefix overrides, with exact
+  usr-merge compatibility, merged boot sysusers/tmpfiles policy auditing,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
-  manager reload, fail-closed recovery with full target-directory durability,
+  manager reload, explicit complete-target stale-cache convergence recovery,
+  fail-closed recovery with full target-directory durability,
   non-rollback journal-unlink failure handling, interrupted first-run lock
   migration recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.

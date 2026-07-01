@@ -211,10 +211,12 @@ Apply also requires root-owned, non-writable ancestors and files for both the
 Node executable and provisioner script; do not run this root workflow through
 a user-managed Node installation or checkout.
 
-Both modes require root so the fixed files-backed `gshadow` records can be
-checked without exposing them in output. Dry-run validates source and target
-ancestor metadata, existing policy files, the exact non-login account metadata,
-locked managed-group credentials, NSS group state, and an exact
+Both modes require root so the complete files-backed `gshadow` database can be
+checked without exposing it in output. Dry-run reads `/etc/passwd`,
+`/etc/group`, and `/etc/gshadow` through stable no-follow handles with fixed
+root-owned metadata, then validates source and target ancestor metadata,
+existing policy files, the exact non-login account metadata, locked
+managed-group credentials, all shadow-group grants, NSS group state, and an exact
 `files systemd` NSS policy for passwd, group, and optional initgroups data.
 Static identities are enumerated explicitly from the `files` database. The
 systemd user database may expose only its root-owned `DynamicUser` provider,
@@ -224,10 +226,17 @@ It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
 launcher template units. It rejects unloaded policy and dependency directories
-for every fixed managed unit, plus template or instance launcher overrides,
-from every fixed systemd system-unit load path. It accepts only the exact
-root-owned `/lib -> usr/lib` compatibility link and requires every loaded
-managed unit to use the fixed `/etc/systemd/system` fragment with no drop-ins.
+for every fixed managed unit, template or instance launcher overrides, and
+systemd type-level or dash-prefix drop-ins from every fixed systemd system-unit
+load path. It accepts only the exact root-owned `/lib -> usr/lib` compatibility
+link and requires every loaded managed unit to use the fixed
+`/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
+no external reverse activator. Enabled external unit dependency graphs are
+also checked so a dormant static root service cannot become a next-boot trigger.
+The merged systemd sysusers and tmpfiles catalogues are audited before mutation
+and again after account allocation; only the reviewed Webex lines may mention
+managed identities, IDs, or paths, which keeps the identity and filesystem
+boundary durable across reboot.
 The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
@@ -256,7 +265,10 @@ is fully installed and verified, a journal unlink durability failure no longer
 starts a second rollback; it leaves that complete desired set for a convergent
 rerun. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command
-can be rerun after correction.
+can be rerun after correction. If that leaves the complete desired file set on
+disk with `NeedDaemonReload=yes`, only an explicit apply may reload the manager,
+revalidate the complete dormant policy, and resume convergence; dry-run still
+fails closed on the stale cache.
 
 The deployment entrypoint lives in this bot repository, not in the config
 repository checkout. It treats the config checkout as data, builds fixed argv

@@ -95,12 +95,15 @@
   activation, and worker units but no base bot unit or reproducible host
   provisioner. The base contract now defines the unprivileged bot identity,
   fixed service, and root-managed versus bot-writable filesystem layout. The
-  guarded provisioner now has a fixed non-secret allowlist, files-only static
-  identity enumeration, a DynamicUser-only systemd userdb boundary,
-  identity-drift and locked-group-credential checks, bounded dormant-unit
-  preflight, device-bound kernel lock verification shared with config
-  deployment, exact loaded-fragment and no-drop-in checks, bounded policy-path
-  scanning for every managed unit and launcher instance with usr-merge handling,
+  guarded provisioner now has a fixed non-secret allowlist, stable no-follow
+  reads of the complete files identity databases, a DynamicUser-only systemd
+  userdb boundary, identity-drift, locked-group-credential, and shadow-grant
+  checks, bounded dormant-unit preflight, device-bound kernel lock verification
+  shared with config deployment, exact loaded-fragment, no-drop-in,
+  no-stale-manager, and no-external-activator checks, bounded policy-path
+  scanning for every managed unit, launcher instance, type drop-in, and
+  dash-prefix drop-in with usr-merge handling, merged boot sysusers/tmpfiles
+  policy auditing,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional

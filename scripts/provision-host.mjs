@@ -26,7 +26,9 @@ const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
 const MAX_SYSTEMD_USERDB_ENTRIES = 16;
 const MAX_SYSTEMD_UNIT_PATH_ENTRIES = 4096;
+const MAX_ENABLED_SYSTEM_UNITS = 1024;
 const MAX_MANAGED_ID = 59_999;
+const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
@@ -93,12 +95,19 @@ export const MANAGED_UNITS = Object.freeze([
   'webex-codex-activation-renew.service',
 ]);
 const MANAGED_UNIT_POLICY_DIRECTORY_NAMES = Object.freeze(
-  MANAGED_UNITS.flatMap((unit) => [
-    `${unit}.d`,
+  [...new Set(MANAGED_UNITS.flatMap((unit) => [
+    ...systemdDropInDirectoryNames(unit),
     `${unit}.wants`,
     `${unit}.requires`,
-  ]),
+  ]))],
 );
+const REVERSE_ACTIVATION_PROPERTIES = Object.freeze([
+  'RequiredBy',
+  'WantedBy',
+  'UpheldBy',
+  'BoundBy',
+  'TriggeredBy',
+]);
 
 export const ARTIFACTS = Object.freeze([
   policyArtifact(
@@ -400,6 +409,19 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
     }
   }
 
+  for (const shadowGroup of snapshot.shadowGroups.values()) {
+    for (const user of Object.values(MANAGED_USERS)) {
+      if (
+        shadowGroup.administrators.includes(user)
+        || shadowGroup.members.includes(user)
+      ) {
+        throw new Error(
+          `managed user has shadow-group privileges: ${user} (${shadowGroup.name})`,
+        );
+      }
+    }
+  }
+
   if (bot) {
     assertAccountContract(bot, MANAGED_ACCOUNTS.bot);
     assertPrimaryGroup(snapshot, bot, MANAGED_GROUPS.bot);
@@ -431,7 +453,10 @@ export async function provisionHost(options, dependencies = {}) {
   const commands = [];
   if (transaction) {
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS);
-    assertUnitsDormant(recoveryUnitStates, plan, { requireLoaded: false });
+    assertUnitsDormant(recoveryUnitStates, plan, {
+      requireLoaded: false,
+      allowDaemonReloadRequired: true,
+    });
     await recoverPolicyTransaction(transaction, plan, deps, { removeTransaction: false });
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
@@ -449,18 +474,40 @@ export async function provisionHost(options, dependencies = {}) {
   const identityBefore = await deps.readIdentitySnapshot();
   validateIdentityPolicy(identityBefore);
   const unitStatesBefore = await deps.readUnitStates(MANAGED_UNITS);
-  assertUnitsDormant(unitStatesBefore, plan, { requireLoaded: false });
   const inspected = await inspectArtifacts(plan, deps);
+  auditBootPolicyCatalogs(
+    await deps.readBootPolicyCatalogs(),
+    inspected,
+    identityBefore,
+  );
+  const canRecoverManagerCache = options.apply
+    && inspected.artifacts.every(({ changed }) => !changed);
+  assertUnitsDormant(unitStatesBefore, plan, {
+    requireLoaded: false,
+    allowDaemonReloadRequired: canRecoverManagerCache,
+  });
+  if (unitStatesNeedDaemonReload(unitStatesBefore)) {
+    commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
+    const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+    assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
+  }
 
   if (!options.apply) {
-    return provisionReport('dry-run', plan, inspected, []);
+    return provisionReport('dry-run', plan, inspected, commands);
   }
 
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
   try {
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
-    validateIdentityPolicy(await deps.readIdentitySnapshot(), { requireAccounts: true });
+    const identityAfter = await deps.readIdentitySnapshot();
+    validateIdentityPolicy(identityAfter, { requireAccounts: true });
+    auditBootPolicyCatalogs(
+      await deps.readBootPolicyCatalogs(),
+      inspected,
+      identityAfter,
+      { requireManagedPolicy: true },
+    );
     commands.push(await deps.runCommand('/usr/bin/systemd-tmpfiles', [
       '--create',
       ...plan.tmpfiles,
@@ -548,7 +595,7 @@ export function hasProvisionLock(locksText, pid, stat) {
 }
 
 async function executeLockedApply(argv) {
-  await ensureProvisionLockFile(fs, runFixedCommand);
+  await ensureProvisionLockFile(fs);
   const scriptPath = fileURLToPath(import.meta.url);
   await assertTrustedReexecFile(process.execPath, { executable: true }, fs);
   await assertTrustedReexecFile(scriptPath, { mode: FILE_MODE }, fs);
@@ -576,7 +623,7 @@ async function executeLockedApply(argv) {
 }
 
 async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
-  const configPullGid = await readConfigPullGroupGid(runFixedCommand);
+  const configPullGid = await readConfigPullGroupGid(fs);
   const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
   const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
   const lock = await fs.open(
@@ -829,7 +876,7 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
   }
 }
 
-async function ensureProvisionLockFile(fsApi, runCommand) {
+async function ensureProvisionLockFile(fsApi) {
   await assertTrustedDirectoryChain(
     '/',
     path.dirname(PROVISION_LOCK_PARENT),
@@ -837,7 +884,7 @@ async function ensureProvisionLockFile(fsApi, runCommand) {
     0,
     fsApi,
   );
-  const configPullGid = await readConfigPullGroupGid(runCommand);
+  const configPullGid = await readConfigPullGroupGid(fsApi);
   let parentStat;
   try {
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
@@ -882,18 +929,17 @@ async function ensureProvisionLockFile(fsApi, runCommand) {
   }
 }
 
-async function readConfigPullGroupGid(runCommand) {
-  const result = await runCommand(
-    '/usr/bin/getent',
-    ['-s', 'files', 'group', MANAGED_GROUPS.configPull],
-    [0, 2],
+async function readConfigPullGroupGid(fsApi) {
+  const group = await readTrustedFile(
+    '/etc/group',
+    0,
+    0,
+    FILE_MODE,
+    fsApi,
+    MAX_IDENTITY_FILE_BYTES,
   );
-  if (result.code === 2 || result.stdout.trim() === '') return null;
-  const snapshot = parseIdentityDatabases('', result.stdout);
-  if (snapshot.groups.size !== 1 || !snapshot.groups.has(MANAGED_GROUPS.configPull)) {
-    throw new Error('config-pull group lookup returned unexpected records');
-  }
-  return snapshot.groups.get(MANAGED_GROUPS.configPull).gid;
+  const snapshot = parseIdentityDatabases('', group.contents.toString('utf8'));
+  return snapshot.groups.get(MANAGED_GROUPS.configPull)?.gid ?? null;
 }
 
 function assertTrustedProvisionLockParent(stat, configPullGid) {
@@ -1030,6 +1076,37 @@ async function readTrustedFile(
       sha256: createHash('sha256').update(contents).digest('hex'),
       stat: before,
     });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readTrustedSensitiveIdentityFile(file, allowedGids, allowedModes, fsApi) {
+  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    const mode = before.mode & 0o7777;
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.nlink !== 1
+      || before.uid !== 0
+      || !allowedGids.has(before.gid)
+      || !allowedModes.has(mode)
+      || before.size <= 0
+      || before.size > MAX_IDENTITY_FILE_BYTES
+    ) {
+      throw new Error(`identity file metadata is not trusted: ${file}`);
+    }
+    const contents = await handle.readFile();
+    if (contents.length !== before.size) {
+      throw new Error(`identity file size is invalid: ${file}`);
+    }
+    const after = await handle.stat();
+    if (!sameFileIdentity(before, after)) {
+      throw new Error(`identity file changed while reading: ${file}`);
+    }
+    return Object.freeze({ contents, stat: before });
   } finally {
     await handle.close();
   }
@@ -1353,12 +1430,17 @@ async function removeProvisionTransaction(plan, deps) {
   await syncDirectory(path.dirname(plan.transactionFile), deps.fsApi);
 }
 
-function assertUnitsDormant(states, plan, { requireLoaded }) {
+function assertUnitsDormant(
+  states,
+  plan,
+  { requireLoaded, allowDaemonReloadRequired = false },
+) {
   for (const unit of MANAGED_UNITS) {
     const state = states.get(unit);
     if (!state) throw new Error(`unit state is missing: ${unit}`);
     assertUnitDormant(unit, state, {
       requireLoaded,
+      allowDaemonReloadRequired,
       expectedFragment: expectedUnitFragment(plan, unit),
     });
   }
@@ -1366,12 +1448,17 @@ function assertUnitsDormant(states, plan, { requireLoaded }) {
     if (!LAUNCHER_INSTANCE_PATTERN.test(unit)) continue;
     assertUnitDormant(unit, state, {
       requireLoaded,
+      allowDaemonReloadRequired,
       expectedFragment: expectedUnitFragment(plan, 'webex-codex-launcher@.service'),
     });
   }
 }
 
-function assertUnitDormant(unit, state, { requireLoaded, expectedFragment }) {
+function assertUnitDormant(
+  unit,
+  state,
+  { requireLoaded, allowDaemonReloadRequired, expectedFragment },
+) {
   if (!['inactive', 'unknown'].includes(state.active)) {
     throw new Error(`managed unit is not inactive: ${unit} (${state.active})`);
   }
@@ -1393,6 +1480,18 @@ function assertUnitDormant(unit, state, { requireLoaded, expectedFragment }) {
   if (state.dropIns !== '') {
     throw new Error(`managed unit loaded unexpected drop-ins: ${unit} (${state.dropIns})`);
   }
+  if (state.needDaemonReload && !allowDaemonReloadRequired) {
+    throw new Error(`managed unit requires daemon-reload: ${unit}`);
+  }
+  for (const activator of state.reverseActivators) {
+    if (!MANAGED_UNITS.includes(activator) && !LAUNCHER_INSTANCE_PATTERN.test(activator)) {
+      throw new Error(`managed unit has an external reverse activator: ${unit} (${activator})`);
+    }
+  }
+}
+
+function unitStatesNeedDaemonReload(states) {
+  return [...states.values()].some(({ needDaemonReload }) => needDaemonReload);
 }
 
 function expectedUnitFragment(plan, unit) {
@@ -1465,43 +1564,130 @@ async function readTrustedDirectoryEntries(directory, maxEntries, fsApi) {
   return entries;
 }
 
-export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, fsApi = fs) {
-  const nsswitch = await readTrustedFile(
-    '/etc/nsswitch.conf',
-    0,
-    0,
-    FILE_MODE,
-    fsApi,
-  );
+export async function readSystemIdentitySnapshot(fsApi = fs) {
+  const [nsswitch, passwd, group] = await Promise.all([
+    readTrustedFile('/etc/nsswitch.conf', 0, 0, FILE_MODE, fsApi),
+    readTrustedFile('/etc/passwd', 0, 0, FILE_MODE, fsApi, MAX_IDENTITY_FILE_BYTES),
+    readTrustedFile('/etc/group', 0, 0, FILE_MODE, fsApi, MAX_IDENTITY_FILE_BYTES),
+  ]);
   validateNsswitchPolicy(nsswitch.contents.toString('utf8'));
   await validateSystemdUserdbBoundary(fsApi);
-  const [passwd, group, gshadow] = await Promise.all([
-    runCommand('/usr/bin/getent', ['-s', 'files', 'passwd']),
-    runCommand('/usr/bin/getent', ['-s', 'files', 'group']),
-    runCommand(
-      '/usr/bin/getent',
-      ['-s', 'files', 'gshadow', ...Object.values(MANAGED_GROUPS)],
-      [0, 2],
-    ),
-  ]);
-  const initial = parseIdentityDatabases(passwd.stdout, group.stdout, {}, gshadow.stdout);
+  const initial = parseIdentityDatabases(
+    passwd.contents.toString('utf8'),
+    group.contents.toString('utf8'),
+  );
+  const shadowGid = initial.groups.get('shadow')?.gid ?? 0;
+  const gshadow = await readTrustedSensitiveIdentityFile(
+    '/etc/gshadow',
+    new Set([0, shadowGid]),
+    new Set([0o600, 0o640]),
+    fsApi,
+  );
+  const passwdText = passwd.contents.toString('utf8');
+  const groupText = group.contents.toString('utf8');
+  const gshadowText = gshadow.contents.toString('utf8');
+  const complete = parseIdentityDatabases(passwdText, groupText, {}, gshadowText);
   const effectiveGroups = {};
   for (const user of Object.values(MANAGED_USERS)) {
-    if (!initial.users.has(user)) continue;
-    const record = initial.users.get(user);
+    if (!complete.users.has(user)) continue;
+    const record = complete.users.get(user);
     effectiveGroups[user] = [
       record.gid,
-      ...[...initial.groups.values()]
+      ...[...complete.groups.values()]
         .filter((groupRecord) => groupRecord.members.includes(user))
         .map((groupRecord) => groupRecord.gid),
     ];
   }
-  return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups, gshadow.stdout);
+  return parseIdentityDatabases(passwdText, groupText, effectiveGroups, gshadowText);
+}
+
+export async function readSystemBootPolicyCatalogs(runCommand = runFixedCommand) {
+  const [sysusers, tmpfiles] = await Promise.all([
+    runCommand('/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']),
+    runCommand('/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']),
+  ]);
+  return Object.freeze({
+    sysusers: sysusers.stdout,
+    tmpfiles: tmpfiles.stdout,
+  });
+}
+
+export function auditBootPolicyCatalogs(
+  catalogs,
+  inspected,
+  identitySnapshot,
+  { requireManagedPolicy = false } = {},
+) {
+  const managedNames = new Set([
+    ...Object.values(MANAGED_USERS),
+    ...Object.values(MANAGED_GROUPS),
+  ]);
+  const managedIds = new Set();
+  for (const user of Object.values(MANAGED_USERS)) {
+    const record = identitySnapshot.users.get(user);
+    if (record) {
+      managedIds.add(String(record.uid));
+      managedIds.add(String(record.gid));
+    }
+  }
+  for (const group of Object.values(MANAGED_GROUPS)) {
+    const record = identitySnapshot.groups.get(group);
+    if (record) managedIds.add(String(record.gid));
+  }
+
+  for (const kind of ['sysusers', 'tmpfiles']) {
+    if (typeof catalogs?.[kind] !== 'string') {
+      throw new Error(`boot policy catalog is missing: ${kind}`);
+    }
+    const allowed = new Set(inspected.artifacts
+      .filter((artifact) => artifact.kind === kind)
+      .flatMap((artifact) => policyCatalogLines(artifact.source.contents)));
+    const observed = new Set(policyCatalogLines(catalogs[kind]));
+    if (requireManagedPolicy) {
+      for (const line of allowed) {
+        if (!observed.has(line)) {
+          throw new Error(`managed ${kind} policy is not active: ${line}`);
+        }
+      }
+    }
+    for (const line of observed) {
+      if (allowed.has(line)) continue;
+      if (bootPolicyLineTouchesManagedSurface(kind, line, managedNames, managedIds)) {
+        throw new Error(`unmanaged ${kind} policy touches the Webex boundary: ${line}`);
+      }
+    }
+  }
+}
+
+function policyCatalogLines(contents) {
+  return String(contents)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'));
+}
+
+function bootPolicyLineTouchesManagedSurface(kind, line, managedNames, managedIds) {
+  for (const name of managedNames) {
+    if (new RegExp(`(^|[^A-Za-z0-9_.-])${escapeRegExp(name)}([^A-Za-z0-9_.-]|$)`).test(line)) {
+      return true;
+    }
+  }
+  const fields = line.split(/\s+/);
+  if (kind === 'sysusers') {
+    return ['u', 'u!', 'g', 'g!'].includes(fields[0]) && managedIds.has(fields[2]);
+  }
+  if (kind === 'tmpfiles') {
+    const policyPath = fields[1] ?? '';
+    return /(^|\/)webex(?:-|\/|$)/.test(policyPath)
+      || managedIds.has(fields[3])
+      || managedIds.has(fields[4]);
+  }
+  throw new Error(`unsupported boot policy kind: ${kind}`);
 }
 
 export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
   await assertNoUnexpectedManagedUnitPolicy(fsApi);
-  const [loadedInstances, installedInstances] = await Promise.all([
+  const [loadedInstances, installedInstances, enabledUnitsResult] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
       '--all',
@@ -1519,7 +1705,26 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
       '--no-pager',
       'webex-codex-launcher@*.service',
     ]),
+    runCommand('/usr/bin/systemctl', [
+      'list-unit-files',
+      '--state=enabled,enabled-runtime',
+      '--full',
+      '--no-legend',
+      '--no-pager',
+    ]),
   ]);
+  const enabledUnits = parseEnabledUnitFiles(enabledUnitsResult.stdout);
+  if (enabledUnits.length > 0) {
+    const dependencies = await runCommand('/usr/bin/systemctl', [
+      'list-dependencies',
+      '--all',
+      '--plain',
+      '--no-legend',
+      '--no-pager',
+      ...enabledUnits,
+    ]);
+    assertEnabledUnitsDoNotActivateManaged(dependencies.stdout);
+  }
   const discovered = new Set([
     ...parseLauncherInstanceUnits(loadedInstances.stdout),
     ...parseLauncherInstanceUnits(installedInstances.stdout),
@@ -1537,6 +1742,8 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
         '--property=LoadState',
         '--property=FragmentPath',
         '--property=DropInPaths',
+        '--property=NeedDaemonReload',
+        ...REVERSE_ACTIVATION_PROPERTIES.map((property) => `--property=${property}`),
         unit,
       ], [0, 1, 3, 4]),
     ]);
@@ -1548,6 +1755,38 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
     }));
   }
   return states;
+}
+
+function parseEnabledUnitFiles(output) {
+  const units = new Set();
+  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const [unit, state] = line.split(/\s+/);
+    if (
+      !unit
+      || unit.length > 256
+      || unit.includes('/')
+      || !unit.includes('.')
+      || !['enabled', 'enabled-runtime'].includes(state)
+    ) {
+      throw new Error(`enabled systemd unit listing is malformed: ${line}`);
+    }
+    units.add(unit);
+    if (units.size > MAX_ENABLED_SYSTEM_UNITS) {
+      throw new Error('too many enabled systemd units');
+    }
+  }
+  return [...units].sort();
+}
+
+function assertEnabledUnitsDoNotActivateManaged(output) {
+  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const match = line.match(/([A-Za-z0-9:_.@-]+)$/);
+    if (!match) throw new Error(`systemd dependency listing is malformed: ${line}`);
+    const unit = match[1];
+    if (MANAGED_UNITS.includes(unit) || LAUNCHER_INSTANCE_PATTERN.test(unit)) {
+      throw new Error(`enabled systemd dependency graph activates a managed unit: ${unit}`);
+    }
+  }
 }
 
 async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
@@ -1575,6 +1814,19 @@ async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
   }
 }
 
+function systemdDropInDirectoryNames(unit) {
+  const suffixOffset = unit.lastIndexOf('.');
+  if (suffixOffset <= 0) throw new Error(`managed unit name is invalid: ${unit}`);
+  const suffix = unit.slice(suffixOffset);
+  const unitStem = unit.slice(0, suffixOffset);
+  const prefixStem = unitStem.includes('@') ? unitStem.slice(0, unitStem.indexOf('@')) : unitStem;
+  const names = new Set([`${unit}.d`, `${suffix.slice(1)}.d`]);
+  for (let offset = prefixStem.indexOf('-'); offset >= 0; offset = prefixStem.indexOf('-', offset + 1)) {
+    names.add(`${prefixStem.slice(0, offset + 1)}${suffix}.d`);
+  }
+  return [...names];
+}
+
 async function isUsrMergedLib(fsApi) {
   const before = await fsApi.lstat('/lib');
   if (!before.isSymbolicLink()) return false;
@@ -1594,7 +1846,13 @@ async function isUsrMergedLib(fsApi) {
 
 function parseSystemUnitMetadata(output, unit) {
   const values = new Map();
-  const expected = new Set(['LoadState', 'FragmentPath', 'DropInPaths']);
+  const expected = new Set([
+    'LoadState',
+    'FragmentPath',
+    'DropInPaths',
+    'NeedDaemonReload',
+    ...REVERSE_ACTIVATION_PROPERTIES,
+  ]);
   for (const line of String(output).split('\n').filter((value) => value !== '')) {
     const separator = line.indexOf('=');
     const key = separator < 0 ? '' : line.slice(0, separator);
@@ -1606,10 +1864,25 @@ function parseSystemUnitMetadata(output, unit) {
   if (values.size !== expected.size) {
     throw new Error(`managed unit metadata is incomplete: ${unit}`);
   }
+  const needDaemonReload = values.get('NeedDaemonReload');
+  if (!['yes', 'no'].includes(needDaemonReload)) {
+    throw new Error(`managed unit daemon-reload state is malformed: ${unit}`);
+  }
+  const reverseActivators = new Set();
+  for (const property of REVERSE_ACTIVATION_PROPERTIES) {
+    for (const activator of values.get(property).split(/\s+/).filter(Boolean)) {
+      if (!/^[A-Za-z0-9:_.@-]+$/.test(activator)) {
+        throw new Error(`managed unit reverse activation state is malformed: ${unit}`);
+      }
+      reverseActivators.add(activator);
+    }
+  }
   return Object.freeze({
     load: normalisedState(values.get('LoadState'), 'not-found'),
     fragment: values.get('FragmentPath'),
     dropIns: values.get('DropInPaths'),
+    needDaemonReload: needDaemonReload === 'yes',
+    reverseActivators: Object.freeze([...reverseActivators].sort()),
   });
 }
 
@@ -1665,7 +1938,9 @@ function provisionDependencies(dependencies) {
     targetGid: dependencies.targetGid ?? 0,
     runCommand,
     readIdentitySnapshot: dependencies.readIdentitySnapshot
-      ?? (() => readSystemIdentitySnapshot(runCommand, dependencies.fsApi ?? fs)),
+      ?? (() => readSystemIdentitySnapshot(dependencies.fsApi ?? fs)),
+    readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
+      ?? (() => readSystemBootPolicyCatalogs(runCommand)),
     readUnitStates: dependencies.readUnitStates
       ?? ((units) => readSystemUnitStates(units, runCommand, dependencies.fsApi ?? fs)),
     verifyProvisionLockConverged: dependencies.verifyProvisionLockConverged
@@ -1758,6 +2033,10 @@ function parseGroupMemberList(value, groupName, label) {
 function normalisedState(value, fallback) {
   const state = String(value).trim();
   return state === '' ? fallback : state;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
