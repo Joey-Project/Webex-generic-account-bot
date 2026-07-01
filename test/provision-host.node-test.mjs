@@ -167,7 +167,7 @@ describe('guarded host provisioner policy', () => {
       validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
       { state: 'bootstrap', gid: 0, mode: 0o600 },
     );
-    for (const interruptedMode of [0o700, 0o710, 0o750]) {
+    for (const interruptedMode of [0o000, 0o055, 0o500, 0o700, 0o710, 0o750]) {
       assert.deepEqual(
         validateProvisionLockMetadata(
           directoryStat(0, interruptedMode),
@@ -387,23 +387,51 @@ describe('guarded host provisioner policy', () => {
   });
 
   it('reads complete stable files identities and permits only DynamicUser', async () => {
+    const lookups = [];
     const snapshot = await readSystemIdentitySnapshot(
       systemIdentityFs({ dynamicUserProvider: true }),
+      emptySystemdIdentityLookup(lookups),
     );
 
     validateIdentityPolicy(snapshot, { requireAccounts: true });
+    assert.equal(lookups.length, 7);
+    assert.deepEqual(lookups[0], [
+      '/usr/bin/getent',
+      ['-s', 'systemd', 'passwd', 'webex-generic-account-bot'],
+      [0, 2],
+    ]);
+  });
+
+  it('rejects managed identities claimed by DynamicUser', async () => {
+    await assert.rejects(
+      readSystemIdentitySnapshot(
+        systemIdentityFs({ dynamicUserProvider: true }),
+        async (_command, args) => (
+          args.at(-1) === 'webex-config-deploy'
+            ? {
+              code: 0,
+              stdout: 'webex-config-deploy:x:61184:61184:Dynamic User:/:/usr/sbin/nologin\n',
+              stderr: '',
+            }
+            : { code: 2, stdout: '', stderr: '' }
+        ),
+      ),
+      /managed identity is claimed by systemd userdb: webex-config-deploy/,
+    );
   });
 
   it('rejects unsupported or static systemd userdb records', async () => {
     await assert.rejects(
       readSystemIdentitySnapshot(
         systemIdentityFs({ providerName: 'io.example.Untrusted' }),
+        emptySystemdIdentityLookup(),
       ),
       /unsupported systemd userdb provider/,
     );
     await assert.rejects(
       readSystemIdentitySnapshot(
         systemIdentityFs({ staticUserdbEntry: '9000.user' }),
+        emptySystemdIdentityLookup(),
       ),
       /static systemd userdb records are not supported/,
     );
@@ -413,6 +441,7 @@ describe('guarded host provisioner policy', () => {
           staticUserdbDirectory: '/usr/local/lib/userdb',
           staticUserdbEntry: '9001.user',
         }),
+        emptySystemdIdentityLookup(),
       ),
       /static systemd userdb records are not supported/,
     );
@@ -420,11 +449,17 @@ describe('guarded host provisioner policy', () => {
 
   it('rejects writable or unstable files identity databases', async () => {
     await assert.rejects(
-      readSystemIdentitySnapshot(systemIdentityFs({ groupMode: 0o666 })),
+      readSystemIdentitySnapshot(
+        systemIdentityFs({ groupMode: 0o666 }),
+        emptySystemdIdentityLookup(),
+      ),
       /policy file metadata is not trusted: \/etc\/group/,
     );
     await assert.rejects(
-      readSystemIdentitySnapshot(systemIdentityFs({ mutateGroupIdentity: true })),
+      readSystemIdentitySnapshot(
+        systemIdentityFs({ mutateGroupIdentity: true }),
+        emptySystemdIdentityLookup(),
+      ),
       /policy file changed while reading: \/etc\/group/,
     );
   });
@@ -465,6 +500,9 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'C+ /var/lib - - - - /usr/share/factory/var/lib'],
       ['tmpfiles', 'L+ /var/lib - - - - /tmp'],
       ['tmpfiles', 'd /var/lib 0755 root root 0'],
+      ['tmpfiles', 'R / - - - -'],
+      ['tmpfiles', 'd / 0777 root root -'],
+      ['tmpfiles', ['R \\', '# ignored continuation comment', '/etc/systemd/system/* - - - -'].join('\n')],
     ]) {
       const fixture = await provisionFixture(context);
       await assert.rejects(
@@ -492,6 +530,7 @@ describe('guarded host provisioner execution', () => {
           tmpfiles: [
             fixture.bootPolicyCatalogs.tmpfiles,
             'q /var 0755 - - -',
+            'd / 0755 root root -',
             'd /var/lib 0755 root root -',
             'z /etc/systemd 0755 :root :root -',
             '',
@@ -868,6 +907,56 @@ describe('guarded host provisioner execution', () => {
             filesByPath: new Map([[
               launcherUnit,
               Buffer.from('[Unit]\nWants=webex-codex-launcher@%i.service\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const specifierUnit = '/etc/systemd/system/webex-generic@.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'webex-generic@.service',
+              isFile: () => true,
+              isDirectory: () => false,
+              isSymbolicLink: () => false,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              specifierUnit,
+              Buffer.from('[Unit]\nWants=%p-account-bot.service\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const identityUnit = '/etc/systemd/system/external-dynamic.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-dynamic.service',
+              isFile: () => true,
+              isDirectory: () => false,
+              isSymbolicLink: () => false,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              identityUnit,
+              Buffer.from('[Service]\nDynamicUser=yes\nUser=webex-config-deploy\n'),
             ]]),
           },
         ),
@@ -1868,6 +1957,13 @@ function passwdRecord(name, uid, gid, {
 
 function groupRecord(name, gid, members = []) {
   return `${name}:x:${gid}:${members.join(',')}`;
+}
+
+function emptySystemdIdentityLookup(calls = []) {
+  return async (command, args, allowedExitCodes) => {
+    calls.push([command, [...args], [...allowedExitCodes]]);
+    return { code: 2, stdout: '', stderr: '' };
+  };
 }
 
 function systemIdentityFs({

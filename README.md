@@ -220,8 +220,9 @@ managed-group credentials, all shadow-group grants, NSS group state, and an exac
 `files systemd` NSS policy for passwd, group, and optional initgroups data.
 Static identities are enumerated explicitly from the `files` database. The
 systemd user database may expose only its root-owned `DynamicUser` provider,
-static userdb records are rejected, and managed UIDs/GIDs must remain below
-the dynamic allocation range.
+static userdb records are rejected, fixed `getent -s systemd` lookups must show
+every managed user and group name unclaimed, and managed UIDs/GIDs must remain
+below the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
@@ -237,7 +238,9 @@ load path is scanned directly for external unit, drop-in, alias, and dependency
 symlink references to managed units, including C-escaped references, launcher
 instances, and the contents of trusted linked unit files. A dangling external
 alias is accepted only when its link text is clean and its target parent remains
-root-owned and non-writable. The merged systemd
+root-owned and non-writable. Unit-name specifiers are expanded against each
+external fragment, alias, and drop-in owner before matching, and external policy
+may not assign a managed user or group identity. The merged systemd
 sysusers and tmpfiles catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, path-derived-ID, owner modifiers, ancestor metadata, and
@@ -249,7 +252,8 @@ The same host-wide `flock` used by config deployment serialises the complete app
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a
-safe mode narrowed by the caller's umask before the first metadata update.
+safe mode narrowed to any value by the caller's umask before the first metadata
+update. A rerun first converges that directory to the exact bootstrap mode.
 Apply must then prove
 that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,

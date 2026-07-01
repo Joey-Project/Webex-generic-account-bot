@@ -42,6 +42,8 @@ const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
+const SYSTEMD_UNIT_NAME_PATTERN =
+  /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
 const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
 const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
@@ -89,6 +91,12 @@ const MANAGED_GROUPS = Object.freeze({
   codexInput: 'webex-codex-input',
   codexLaunch: 'webex-codex-launch',
 });
+const MANAGED_IDENTITY_PATTERNS = Object.freeze(
+  [...new Set([...Object.values(MANAGED_USERS), ...Object.values(MANAGED_GROUPS)])]
+    .map((name) => new RegExp(
+      `(^|[^A-Za-z0-9_.-])${escapeRegExp(name)}([^A-Za-z0-9_.-]|$)`,
+    )),
+);
 
 export const MANAGED_UNITS = Object.freeze([
   'webex-generic-account-bot.service',
@@ -900,7 +908,16 @@ async function ensureProvisionLockFile(fsApi) {
     await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
   }
-  const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  let lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  if (
+    lockPolicy.state === 'bootstrap'
+    && (parentStat.mode & 0o7777) !== DIRECTORY_MODE
+  ) {
+    await fsApi.chmod(PROVISION_LOCK_PARENT, DIRECTORY_MODE);
+    await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
+    parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
+    lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  }
   let handle;
   try {
     handle = await fsApi.open(
@@ -955,9 +972,7 @@ function assertTrustedProvisionLockParent(stat, configPullGid) {
     throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
   }
   const mode = stat.mode & 0o7777;
-  const recoverableBootstrapMode = (mode & 0o7000) === 0
-    && (mode & 0o700) === 0o700
-    && (mode & 0o022) === 0;
+  const recoverableBootstrapMode = (mode & 0o7000) === 0 && (mode & 0o022) === 0;
   if (stat.gid === 0 && recoverableBootstrapMode) {
     return Object.freeze({ state: 'bootstrap', gid: 0, mode: 0o600 });
   }
@@ -1507,7 +1522,7 @@ function expectedUnitFragment(plan, unit) {
   return target;
 }
 
-async function validateSystemdUserdbBoundary(fsApi) {
+async function validateSystemdUserdbBoundary(fsApi, runCommand) {
   const providers = await readTrustedDirectoryEntries(
     SYSTEMD_USERDB_DIRECTORY,
     MAX_SYSTEMD_USERDB_ENTRIES,
@@ -1541,6 +1556,21 @@ async function validateSystemdUserdbBoundary(fsApi) {
       throw new Error(`static systemd userdb records are not supported: ${directory}`);
     }
   }
+  for (const [database, names] of [
+    ['passwd', Object.values(MANAGED_USERS)],
+    ['group', Object.values(MANAGED_GROUPS)],
+  ]) {
+    for (const name of names) {
+      const result = await runCommand(
+        '/usr/bin/getent',
+        ['-s', 'systemd', database, name],
+        [0, 2],
+      );
+      if (result.code !== 2 || result.stdout !== '' || result.stderr !== '') {
+        throw new Error(`managed identity is claimed by systemd userdb: ${name}`);
+      }
+    }
+  }
 }
 
 async function readTrustedDirectoryEntries(directory, maxEntries, fsApi) {
@@ -1571,14 +1601,14 @@ async function readTrustedDirectoryEntries(directory, maxEntries, fsApi) {
   return entries;
 }
 
-export async function readSystemIdentitySnapshot(fsApi = fs) {
+export async function readSystemIdentitySnapshot(fsApi = fs, runCommand = runFixedCommand) {
   const [nsswitch, passwd, group] = await Promise.all([
     readTrustedFile('/etc/nsswitch.conf', 0, 0, FILE_MODE, fsApi),
     readTrustedFile('/etc/passwd', 0, 0, FILE_MODE, fsApi, MAX_IDENTITY_FILE_BYTES),
     readTrustedFile('/etc/group', 0, 0, FILE_MODE, fsApi, MAX_IDENTITY_FILE_BYTES),
   ]);
   validateNsswitchPolicy(nsswitch.contents.toString('utf8'));
-  await validateSystemdUserdbBoundary(fsApi);
+  await validateSystemdUserdbBoundary(fsApi, runCommand);
   const initial = parseIdentityDatabases(
     passwd.contents.toString('utf8'),
     group.contents.toString('utf8'),
@@ -1685,6 +1715,13 @@ function policyCatalogLines(contents) {
   const logicalLines = [];
   let pending = '';
   for (const physicalLine of String(contents).split('\n')) {
+    const trimmed = physicalLine.trimStart();
+    if (
+      pending !== ''
+      && (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith(';'))
+    ) {
+      continue;
+    }
     const line = `${pending}${physicalLine}`;
     if (hasTrailingContinuation(line)) {
       pending = `${line.slice(0, -1)} `;
@@ -1696,7 +1733,7 @@ function policyCatalogLines(contents) {
   if (pending !== '') throw new Error('boot policy ends with an unterminated continuation');
   return logicalLines
     .map((line) => line.trim())
-    .filter((line) => line !== '' && !line.startsWith('#'));
+    .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith(';'));
 }
 
 function hasTrailingContinuation(line) {
@@ -1788,8 +1825,11 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
   for (const protectedPath of protectedPaths) {
     if (literal !== null) {
       if (literal === protectedPath || literal.startsWith(`${protectedPath}/`)) return true;
+      const protectsAncestor = literal === '/'
+        ? protectedPath.startsWith('/')
+        : protectedPath.startsWith(`${literal}/`);
       if (
-        protectedPath.startsWith(`${literal}/`)
+        protectsAncestor
         && !ancestorPolicyIsSafe
       ) {
         return true;
@@ -1993,18 +2033,17 @@ async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
 
 async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested }) {
   const candidate = path.join(directory, entry.name);
-  if (nested) assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate);
-  const unitFile = /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/.test(
-    entry.name,
-  );
+  const unitNames = systemdPolicyUnitNames(directory, entry.name);
+  if (nested) assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate, unitNames);
+  const unitFile = SYSTEMD_UNIT_NAME_PATTERN.test(entry.name);
   const policyDirectory = /\.(?:d|wants|requires|upholds)$/.test(entry.name);
   if (!nested && !unitFile && !policyDirectory && !entry.isDirectory?.()) return;
   if (entry.isSymbolicLink?.()) {
-    await auditSystemdPolicySymlink(candidate, budget, fsApi, new Set());
+    await auditSystemdPolicySymlink(candidate, budget, fsApi, new Set(), unitNames);
     return;
   }
   if (entry.isFile?.()) {
-    await auditSystemdPolicyFile(candidate, budget, fsApi);
+    await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames);
     return;
   }
   if (!entry.isDirectory?.()) return;
@@ -2023,7 +2062,7 @@ async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested
   }
 }
 
-async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited) {
+async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited, unitNames) {
   if (visited.has(candidate) || visited.size >= 32) {
     throw new Error(`systemd policy symlink chain is invalid: ${candidate}`);
   }
@@ -2034,7 +2073,11 @@ async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited) {
   if (!before.isSymbolicLink() || !sameFileIdentity(before, after)) {
     throw new Error(`systemd policy symlink changed while reading: ${candidate}`);
   }
-  assertSystemdPolicyDoesNotReferenceManaged(`${path.basename(candidate)} ${target}`, candidate);
+  assertSystemdPolicyDoesNotReferenceManaged(
+    `${path.basename(candidate)} ${target}`,
+    candidate,
+    unitNames,
+  );
   let resolved = path.resolve(path.dirname(candidate), target);
   if (resolved === '/dev/null') return;
   if (resolved === '/lib/systemd/system' || resolved.startsWith('/lib/systemd/system/')) {
@@ -2049,16 +2092,27 @@ async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited) {
     throw error;
   }
   if (targetStat.isSymbolicLink()) {
-    await auditSystemdPolicySymlink(resolved, budget, fsApi, visited);
+    await auditSystemdPolicySymlink(
+      resolved,
+      budget,
+      fsApi,
+      visited,
+      mergeSystemdUnitNames(unitNames, path.basename(resolved)),
+    );
     return;
   }
   if (!targetStat.isFile()) {
     throw new Error(`systemd policy symlink target is not a regular file: ${candidate}`);
   }
-  await auditSystemdPolicyFile(resolved, budget, fsApi);
+  await auditSystemdPolicyFile(
+    resolved,
+    budget,
+    fsApi,
+    mergeSystemdUnitNames(unitNames, path.basename(resolved)),
+  );
 }
 
-async function auditSystemdPolicyFile(candidate, budget, fsApi) {
+async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames) {
   budget.files += 1;
   if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
     throw new Error('too many systemd policy files');
@@ -2069,18 +2123,64 @@ async function auditSystemdPolicyFile(candidate, budget, fsApi) {
     throw new Error('systemd policy files exceed the aggregate byte limit');
   }
   for (const line of policyCatalogLines(policy.contents)) {
-    assertSystemdPolicyDoesNotReferenceManaged(line, candidate);
+    assertSystemdPolicyDoesNotReferenceManaged(line, candidate, unitNames);
   }
 }
 
-function assertSystemdPolicyDoesNotReferenceManaged(value, source) {
+function assertSystemdPolicyDoesNotReferenceManaged(value, source, unitNames = new Set()) {
   const decoded = decodeSystemdEscapesForAudit(String(value));
-  if (
-    MANAGED_UNITS.some((unit) => decoded.includes(unit))
-    || LAUNCHER_REFERENCE_PATTERN.test(decoded)
-  ) {
-    throw new Error(`external systemd policy references a managed unit: ${source}`);
+  const expanded = new Set([
+    decoded,
+    ...[...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName)),
+  ]);
+  for (const candidate of expanded) {
+    if (
+      MANAGED_UNITS.some((unit) => candidate.includes(unit))
+      || LAUNCHER_REFERENCE_PATTERN.test(candidate)
+      || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
+    ) {
+      throw new Error(`external systemd policy references a managed unit: ${source}`);
+    }
   }
+}
+
+function systemdPolicyUnitNames(directory, entryName) {
+  const unitNames = new Set();
+  if (SYSTEMD_UNIT_NAME_PATTERN.test(entryName)) unitNames.add(entryName);
+  const parent = path.basename(directory);
+  if (parent.endsWith('.d')) {
+    const owner = parent.slice(0, -2);
+    if (SYSTEMD_UNIT_NAME_PATTERN.test(owner)) unitNames.add(owner);
+  }
+  return unitNames;
+}
+
+function mergeSystemdUnitNames(unitNames, candidate) {
+  const merged = new Set(unitNames);
+  if (SYSTEMD_UNIT_NAME_PATTERN.test(candidate)) merged.add(candidate);
+  return merged;
+}
+
+function expandSystemdUnitNameSpecifiers(value, unitName) {
+  const suffixOffset = unitName.lastIndexOf('.');
+  if (suffixOffset <= 0) return value;
+  const stem = unitName.slice(0, suffixOffset);
+  const atOffset = stem.indexOf('@');
+  const prefix = atOffset < 0 ? stem : stem.slice(0, atOffset);
+  const instance = atOffset < 0 ? '' : stem.slice(atOffset + 1);
+  const finalComponent = prefix.slice(prefix.lastIndexOf('-') + 1);
+  const replacements = new Map([
+    ['%%', '%'],
+    ['%n', unitName],
+    ['%N', stem],
+    ['%p', prefix],
+    ['%P', decodeSystemdEscapesForAudit(prefix)],
+    ['%i', instance],
+    ['%I', decodeSystemdEscapesForAudit(instance)],
+    ['%j', finalComponent],
+    ['%J', decodeSystemdEscapesForAudit(finalComponent)],
+  ]);
+  return value.replace(/%%|%[nNpPiIjJ]/g, (specifier) => replacements.get(specifier));
 }
 
 function decodeSystemdEscapesForAudit(value) {
@@ -2228,7 +2328,7 @@ function provisionDependencies(dependencies) {
     targetGid: dependencies.targetGid ?? 0,
     runCommand,
     readIdentitySnapshot: dependencies.readIdentitySnapshot
-      ?? (() => readSystemIdentitySnapshot(dependencies.fsApi ?? fs)),
+      ?? (() => readSystemIdentitySnapshot(dependencies.fsApi ?? fs, runCommand)),
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
       ?? (() => readSystemBootPolicyCatalogs(runCommand)),
     readUnitStates: dependencies.readUnitStates

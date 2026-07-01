@@ -164,26 +164,28 @@ superseded_by:
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
   fixed non-secret allowlist, stable no-follow reads of complete files identity
   and gshadow databases, a DynamicUser-only systemd userdb boundary,
-  identity-drift, locked-group-credential, and cross-group shadow-grant checks,
+  fixed managed-name vacancy lookups, identity-drift, locked-group-credential,
+  and cross-group shadow-grant checks,
   dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
   no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
-  and launcher-instance references, fixed-path scanning for unloaded policy and dependency
+  unit-name specifier expansion, managed identity assignments, and launcher-instance
+  references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
   auditing with C-escape, specifier/glob-prefix, path-derived-ID, owner
-  modifiers, protected installed-policy targets, safe ancestor metadata, and
+  modifiers, protected root and installed-policy targets, safe ancestor metadata, and
   recursive parent handling,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, explicit complete-target stale-cache convergence recovery,
   fail-closed recovery with full target-directory durability and a journal
   retained through final manager convergence,
-  non-rollback journal-unlink failure handling, umask-safe interrupted first-run lock
+  non-rollback journal-unlink failure handling, all-mode umask-safe interrupted first-run lock
   migration recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
