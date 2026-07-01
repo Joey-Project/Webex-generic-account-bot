@@ -185,6 +185,19 @@ describe('base bot systemd contract', () => {
 
       await execFileAsync('/usr/bin/sudo', [
         '-n',
+        '/usr/bin/chown',
+        '0:0',
+        root,
+      ]);
+      await execFileAsync('/usr/bin/sudo', [
+        '-n',
+        '/usr/bin/chmod',
+        '0755',
+        root,
+      ]);
+
+      await execFileAsync('/usr/bin/sudo', [
+        '-n',
         '/usr/bin/systemd-sysusers',
         `--root=${root}`,
         sysusersTarget,
