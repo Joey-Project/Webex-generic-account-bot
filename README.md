@@ -215,7 +215,10 @@ the exact non-login account metadata and NSS group set, and dormant unit state
 without creating files or directories. Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
 launcher template units. A fixed root-only `flock` serialises the complete
-apply. It installs the complete policy file set transactionally,
+apply, and the re-executed process verifies the kernel lock record instead of
+trusting its environment. Apply removes only bounded, exact-name, trusted
+stale candidates left by an interrupted prior run. It installs the complete
+policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
 unit became active or enabled. It never starts or enables a unit. A policy-file

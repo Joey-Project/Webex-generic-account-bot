@@ -20,12 +20,17 @@ const DIRECTORY_MODE = 0o755;
 const MAX_POLICY_FILE_BYTES = 256 * 1024;
 const MAX_TRANSACTION_BYTES = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
+const MAX_PROC_LOCKS_BYTES = 1024 * 1024;
+const MAX_STALE_CANDIDATES = 256;
+const MAX_LAUNCHER_INSTANCES = 128;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
 const PROVISION_LOCK_PATH = '/run/webex-host-provision.lock';
 const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
+const CANDIDATE_UUID_PATTERN =
+  '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const MANAGED_ACCOUNTS = Object.freeze({
   bot: Object.freeze({
@@ -325,6 +330,8 @@ export async function provisionHost(options, dependencies = {}) {
     throw new Error('--apply requires root');
   }
 
+  if (options.apply) await cleanupStaleCandidates(plan, deps);
+
   const transaction = await readProvisionTransaction(plan, deps);
   if (transaction && !options.apply) {
     throw new Error('host policy recovery is required; run --apply');
@@ -372,6 +379,7 @@ export async function runCli({
   dependencies = {},
   lockHeld = process.env[PROVISION_LOCK_ENV] === '1',
   runLockedApply = executeLockedApply,
+  verifyLockedApply = assertProvisionLockHeld,
 } = {}) {
   const options = parseArgs(argv);
   if (options.help) {
@@ -381,6 +389,7 @@ export async function runCli({
   if (options.apply && !lockHeld) {
     return runLockedApply(argv);
   }
+  if (options.apply) await verifyLockedApply();
   const report = await provisionHost(options, dependencies);
   if (options.json) {
     stdout.write(`${JSON.stringify(report)}\n`);
@@ -417,6 +426,17 @@ export function buildLockedApplyCommand({
   });
 }
 
+export function hasProvisionLock(locksText, pid, inode) {
+  const expectedPid = String(pid);
+  const expectedInode = String(inode);
+  return String(locksText).split('\n').some((line) => {
+    const match = line.match(
+      /^\d+:\s+FLOCK\s+\S+\s+WRITE\s+(\d+)\s+\S+:\S+:(\d+)\s+\d+\s+EOF$/,
+    );
+    return match?.[1] === expectedPid && match?.[2] === expectedInode;
+  });
+}
+
 async function executeLockedApply(argv) {
   await ensureProvisionLockFile(fs);
   await assertTrustedRuntimeExecutable(process.execPath, fs);
@@ -441,6 +461,24 @@ async function executeLockedApply(argv) {
       resolve(code ?? 1);
     });
   });
+}
+
+async function assertProvisionLockHeld() {
+  const lock = await fs.open(
+    PROVISION_LOCK_PATH,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  let stat;
+  try {
+    stat = await lock.stat();
+    assertTrustedFileMetadata(PROVISION_LOCK_PATH, stat, 0, 0, 0o600);
+  } finally {
+    await lock.close();
+  }
+  const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fs);
+  if (!hasProvisionLock(procLocks, process.pid, stat.ino)) {
+    throw new Error('current process does not hold the host provision lock');
+  }
 }
 
 async function inspectArtifacts(plan, deps) {
@@ -497,6 +535,58 @@ async function ensureTargetDirectories(plan, deps) {
   }
 }
 
+async function cleanupStaleCandidates(plan, deps) {
+  const targets = [...plan.artifacts.map(({ target }) => target), plan.transactionFile];
+  const targetsByDirectory = new Map();
+  for (const target of targets) {
+    const directory = path.dirname(target);
+    const prefixes = targetsByDirectory.get(directory) ?? [];
+    prefixes.push(`.${path.basename(target)}.provision-`);
+    targetsByDirectory.set(directory, prefixes);
+  }
+
+  let candidateCount = 0;
+  for (const [directory, prefixes] of targetsByDirectory) {
+    await assertTrustedExistingAncestors(
+      plan.targetRoot,
+      directory,
+      deps.targetUid,
+      deps.targetGid,
+      deps.fsApi,
+    );
+    let entries;
+    try {
+      entries = await deps.fsApi.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    let changed = false;
+    for (const entry of entries) {
+      const prefix = prefixes.find((value) => entry.name.startsWith(value));
+      if (!prefix) continue;
+      candidateCount += 1;
+      if (candidateCount > MAX_STALE_CANDIDATES) {
+        throw new Error('too many stale policy candidates');
+      }
+      const suffix = entry.name.slice(prefix.length);
+      if (!new RegExp(`^${CANDIDATE_UUID_PATTERN}\\.tmp$`).test(suffix)) {
+        throw new Error(`stale policy candidate name is malformed: ${entry.name}`);
+      }
+      const candidate = path.join(directory, entry.name);
+      const stat = await deps.fsApi.lstat(candidate);
+      const mode = stat.mode & 0o7777;
+      assertTrustedFileMetadata(candidate, stat, deps.targetUid, deps.targetGid, null);
+      if (!entry.isFile() || ![0o600, FILE_MODE].includes(mode)) {
+        throw new Error(`stale policy candidate metadata is not trusted: ${candidate}`);
+      }
+      await deps.fsApi.rm(candidate);
+      changed = true;
+    }
+    if (changed) await syncDirectory(directory, deps.fsApi);
+  }
+}
+
 async function installPolicySetAtomically(inspected, plan, deps) {
   const changed = inspected.artifacts.filter(({ changed }) => changed);
   if (changed.length === 0) return [];
@@ -523,8 +613,37 @@ async function installPolicySetAtomically(inspected, plan, deps) {
     await removeProvisionTransaction(plan, deps);
   } catch (error) {
     const rollbackErrors = [];
-    for (const artifact of committed.reverse()) {
+    const rollback = [];
+    for (const artifact of [...committed].reverse()) {
       try {
+        const current = await readTrustedFile(
+          artifact.target,
+          deps.targetUid,
+          deps.targetGid,
+          FILE_MODE,
+          deps.fsApi,
+        );
+        if (current.sha256 !== artifact.source.sha256) {
+          throw new Error('target no longer matches the installed digest');
+        }
+        rollback.push({ artifact, current });
+      } catch (rollbackError) {
+        rollbackErrors.push(`${artifact.target}: ${rollbackError.message}`);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new Error(
+        `${error.message}; policy rollback failed: ${rollbackErrors.join('; ')}`,
+        { cause: error },
+      );
+    }
+    for (const entry of rollback) {
+      const { artifact } = entry;
+      try {
+        await assertTargetUnchanged(
+          { target: artifact.target, existing: entry.current },
+          deps.fsApi,
+        );
         if (artifact.existing) {
           const temporary = await writeCandidate(
             artifact.target,
@@ -720,6 +839,18 @@ async function readTrustedFile(
       sha256: createHash('sha256').update(contents).digest('hex'),
       stat: before,
     });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBoundedProcFile(file, maxBytes, fsApi) {
+  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxBytes) throw new Error(`proc file is too large: ${file}`);
+    return buffer.subarray(0, bytesRead).toString('utf8');
   } finally {
     await handle.close();
   }
@@ -1065,6 +1196,9 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand) 
     ...parseLauncherInstanceUnits(loadedInstances.stdout),
     ...parseLauncherInstanceUnits(installedInstances.stdout),
   ]);
+  if (discovered.size > MAX_LAUNCHER_INSTANCES) {
+    throw new Error('too many launcher instances');
+  }
   const states = new Map();
   for (const unit of [...units, ...[...discovered].sort()]) {
     const [active, enabled, load] = await Promise.all([

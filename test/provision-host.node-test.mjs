@@ -10,6 +10,7 @@ import {
   MANAGED_UNITS,
   buildLockedApplyCommand,
   buildProvisionPlan,
+  hasProvisionLock,
   parseArgs,
   parseIdentityDatabases,
   provisionHost,
@@ -96,6 +97,24 @@ describe('guarded host provisioner policy', () => {
       },
     }), 75);
     assert.deepEqual(calls, [['--apply']]);
+    assert.equal(
+      hasProvisionLock('7: FLOCK ADVISORY WRITE 123 00:2a:456 0 EOF\n', 123, 456),
+      true,
+    );
+    assert.equal(
+      hasProvisionLock('7: FLOCK ADVISORY WRITE 124 00:2a:456 0 EOF\n', 123, 456),
+      false,
+    );
+    await assert.rejects(
+      runCli({
+        argv: ['--apply'],
+        lockHeld: true,
+        verifyLockedApply: async () => {
+          throw new Error('lock ownership is not proven');
+        },
+      }),
+      /lock ownership is not proven/,
+    );
   });
 
   it('rejects static membership and primary-GID drift', () => {
@@ -182,6 +201,28 @@ describe('guarded host provisioner execution', () => {
     assert.equal(report.changed_artifact_count, 15);
     assert.deepEqual(commands, []);
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('preserves stale candidates in dry-run and removes them before apply', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const candidate = path.join(
+      path.dirname(artifact.target),
+      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000099.tmp`,
+    );
+    await fs.mkdir(path.dirname(candidate), { recursive: true, mode: 0o755 });
+    await fs.writeFile(candidate, 'interrupted candidate\n', { mode: 0o600 });
+    await fs.chmod(candidate, 0o600);
+
+    await provisionHost({ apply: false }, fixture.dependencies());
+    assert.equal(await fs.readFile(candidate, 'utf8'), 'interrupted candidate\n');
+
+    await provisionHost(
+      { apply: true },
+      fixture.dependencies({ applied: true }),
+    );
+    await assert.rejects(fs.stat(candidate), { code: 'ENOENT' });
+    assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
   });
 
   it('installs the fixed set transactionally and converges without enabling units', async (context) => {
@@ -318,6 +359,29 @@ describe('guarded host provisioner execution', () => {
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
     assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 1);
+
+    let stateQueries = 0;
+    await assert.rejects(
+      readSystemUnitStates(MANAGED_UNITS, async (_command, args) => {
+        if (args[0] === 'list-units') {
+          return {
+            stdout: Array.from(
+              { length: 129 },
+              (_, index) => `webex-codex-launcher@instance-${index}.service loaded inactive dead test`,
+            ).join('\n'),
+            stderr: '',
+            code: 0,
+          };
+        }
+        if (args[0] === 'list-unit-files') {
+          return { stdout: '', stderr: '', code: 0 };
+        }
+        stateQueries += 1;
+        return { stdout: '', stderr: '', code: 0 };
+      }),
+      /too many launcher instances/,
+    );
+    assert.equal(stateQueries, 0);
   });
 
   it('rolls back the complete policy set when an atomic rename fails', async (context) => {
@@ -356,6 +420,40 @@ describe('guarded host provisioner execution', () => {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
+  it('preserves the journal instead of rolling back over an unknown state', async (context) => {
+    const fixture = await provisionFixture(context);
+    const firstTarget = fixture.plan.artifacts[0].target;
+    let candidateRenames = 0;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'rename') return target[property];
+        return async (source, destination) => {
+          if (path.basename(source).includes('.provision-')) {
+            candidateRenames += 1;
+            if (candidateRenames === 3) {
+              await target.writeFile(firstTarget, 'concurrent administrator state\n', {
+                mode: 0o644,
+              });
+              await target.chmod(firstTarget, 0o644);
+              throw new Error('injected later rename failure');
+            }
+          }
+          return target.rename(source, destination);
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /policy rollback failed.*target no longer matches the installed digest/,
+    );
+    assert.equal(await fs.readFile(firstTarget, 'utf8'), 'concurrent administrator state\n');
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('rolls back a target whose post-rename directory fsync fails', async (context) => {
