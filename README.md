@@ -171,12 +171,19 @@ worker unit receives that traversal-only supplementary group; the bot never
 does, including after activation adds the separate config-pull group. The base
 unit has no launcher, sealed-input, or config-worker supplementary group. Those
 permissions and the pending-input write path remain exclusive to the
-activation-owned `10-codex-launcher.conf` drop-in. The base assets do not create
-token or env files, install binaries/code, enable units, or modify the host by
-themselves; the guarded host provisioner is a separate deployment slice.
+activation-owned `10-codex-launcher.conf` drop-in. The activated bot's mount
+namespace also hides `/run/webex-config-deploy`, so its config-pull group cannot
+open or lock the worker's shared deployment lock files. The base assets do not
+create token or env files, install binaries/code, enable units, or modify the
+host by themselves; the guarded host provisioner is a separate deployment
+slice.
 That provisioner must apply both the bot and config-pull worker sysusers files
 before the base tmpfiles file, whose deploy-key ownership references the worker
 identity and group.
+Because systemd extends the user's group-database memberships even after an
+empty `SupplementaryGroups=`, the guarded provisioner must reject any existing
+static bot membership in launcher, input, config-pull, or config-deploy groups
+before installation. Fresh sysusers declarations do not add those memberships.
 The rendered directory remains `root:root` mode `0755` to match the trusted
 root apply contract; rendered config is non-secret and mode `0644`, while token
 and environment secrets remain under separate `root:webex-generic-account-bot`

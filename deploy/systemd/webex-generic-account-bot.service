@@ -32,6 +32,7 @@ ReadOnlyPaths=/run/systemd
 ReadOnlyPaths=/var/lib/webex-generic-account-bot/rendered
 ReadOnlyPaths=/var/lib/webex-headless-access
 ReadOnlyPaths=/etc/webex-generic-account-bot
+InaccessiblePaths=-/run/webex-config-deploy
 ReadWritePaths=/var/lib/webex-generic-account-bot/state
 ReadWritePaths=/var/lib/webex-generic-account-bot/codex-home
 ReadWritePaths=/var/lib/webex-generic-account-bot/codex-workspace

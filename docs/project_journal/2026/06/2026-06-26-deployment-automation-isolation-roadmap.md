@@ -188,6 +188,10 @@ superseded_by:
 - Add a default-dry-run, explicit-apply provisioner with a fixed artifact
   allowlist, atomic root-owned installation, sysusers/tmpfiles application,
   manager reload, and post-install verification.
+- Before installation, reject pre-existing static bot membership in every
+  launcher, input, config-pull, or config-deploy group because systemd extends
+  user-database groups even after an empty `SupplementaryGroups=` assignment.
+  Also reject worker membership in the bot group or any bot-secret group.
 - Never copy secrets, install the activation-owned bot drop-in, enable the bot,
   or run the real reboot challenge as an implicit side effect.
 

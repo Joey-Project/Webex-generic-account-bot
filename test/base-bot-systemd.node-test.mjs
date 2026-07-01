@@ -31,19 +31,33 @@ const CONFIG_PULL_SYSUSERS_PATH = path.join(
   SYSTEMD_ROOT,
   'webex-config-pull-worker.sysusers.conf',
 );
+const BOT_DROP_IN_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-generic-account-bot.service.d',
+  '10-codex-launcher.conf',
+);
 
 describe('base bot systemd contract', () => {
-  it('passes the real systemd unit parser in an isolated root', async () => {
+  it('passes the real systemd unit parser with the activation drop-in', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-base-unit-verify-'));
     const unitDirectory = path.join(root, 'etc', 'systemd', 'system');
+    const dropInDirectory = path.join(
+      unitDirectory,
+      `${path.basename(SERVICE_PATH)}.d`,
+    );
     const binaryDirectory = path.join(root, 'opt', 'webex-generic-account-bot', 'bin');
     const systemBinaryDirectory = path.join(root, 'usr', 'bin');
     try {
       await fs.mkdir(unitDirectory, { recursive: true });
+      await fs.mkdir(dropInDirectory, { recursive: true });
       await fs.mkdir(binaryDirectory, { recursive: true });
       await fs.mkdir(systemBinaryDirectory, { recursive: true });
       await Promise.all([
         fs.copyFile(SERVICE_PATH, path.join(unitDirectory, path.basename(SERVICE_PATH))),
+        fs.copyFile(
+          BOT_DROP_IN_PATH,
+          path.join(dropInDirectory, path.basename(BOT_DROP_IN_PATH)),
+        ),
         fs.copyFile(
           CONFIG_PULL_SERVICE_PATH,
           path.join(unitDirectory, path.basename(CONFIG_PULL_SERVICE_PATH)),
@@ -332,7 +346,7 @@ describe('base bot systemd contract', () => {
     assert.doesNotMatch(service, /^ExecStart=.*(?:\/bin\/(?:ba)?sh|[%$])/m);
     assert.doesNotMatch(
       service,
-      /webex-codex-(?:launch|input)|webex-config-(?:pull|deploy)/,
+      /^(?:SupplementaryGroups|ReadWritePaths)=.*(?:webex-codex-(?:launch|input)|webex-config-(?:pull|deploy))/m,
     );
   });
 
@@ -350,6 +364,9 @@ describe('base bot systemd contract', () => {
       '/var/lib/webex-generic-account-bot/state',
       '/var/lib/webex-generic-account-bot/codex-home',
       '/var/lib/webex-generic-account-bot/codex-workspace',
+    ]);
+    assert.deepEqual(directiveValues(service, 'InaccessiblePaths'), [
+      '-/run/webex-config-deploy',
     ]);
     for (const directive of [
       'RuntimeDirectory',
