@@ -162,8 +162,9 @@ superseded_by:
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
-  fixed non-secret allowlist, identity-drift and dormant-unit preflight, transactional
-  policy-file installation, kernel-verified full-apply locking, bounded stale
+  fixed non-secret allowlist, local-only NSS and identity-drift checks,
+  dormant-unit preflight, transactional policy-file installation, device-bound
+  kernel lock verification, trusted re-exec paths, bounded streamed stale
   candidate cleanup and unit discovery, fail-closed recovery, and post-reload
   verification. Real host apply remains an explicit operational gate.
 
@@ -200,10 +201,12 @@ superseded_by:
   per-file replacement. If a later
   commit is interrupted, recover the old set from a fixed root-only journal
   before reapplying, but reject any target that matches neither the recorded
-  old nor desired digest. Apply the same digest gate before rollback. Serialise
-  the full apply with a kernel-verified lock, remove only bounded trusted stale
-  candidates, and bound and reject active launcher template instances as well
-  as active template units. If a later sysusers, tmpfiles, manager-reload, or
+  old nor desired digest. Apply the same all-target digest gate before rollback.
+  Require a locally enumerable `files systemd` NSS policy, serialise the full
+  apply with a PID/device/inode-bound kernel lock, validate every re-exec path
+  ancestor, stream a bounded scan that removes only trusted stale candidates,
+  and bound and reject active launcher template instances as well as active
+  template units. If a later sysusers, tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an
   explicit convergent-rerun requirement; do not claim rollback of users or
   directories already created by systemd.

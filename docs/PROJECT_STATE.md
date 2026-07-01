@@ -95,11 +95,12 @@
   activation, and worker units but no base bot unit or reproducible host
   provisioner. The base contract now defines the unprivileged bot identity,
   fixed service, and root-managed versus bot-writable filesystem layout. The
-  guarded provisioner now has a fixed non-secret allowlist, identity-drift and
-  bounded dormant-unit preflight, kernel-verified full-apply locking,
-  fail-closed crash recovery and stale-candidate cleanup, transactional
-  root-owned policy installation, explicit sysusers/tmpfiles application, and
-  post-reload verification. Real host apply remains explicit before
+  guarded provisioner now has a fixed non-secret allowlist, local-only NSS and
+  identity-drift checks, bounded dormant-unit preflight, device-bound kernel
+  lock verification, trusted re-exec paths, fail-closed crash recovery and
+  streamed stale-candidate cleanup, transactional root-owned policy
+  installation, explicit sysusers/tmpfiles application, and post-reload
+  verification. Real host apply remains explicit before
   Configuration Space pinning and activation.
 
 ## Recovery Pointers

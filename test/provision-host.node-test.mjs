@@ -17,6 +17,7 @@ import {
   readSystemUnitStates,
   runCli,
   validateIdentityPolicy,
+  validateNsswitchPolicy,
 } from '../scripts/provision-host.mjs';
 
 const REPO_SYSTEMD_ROOT = fileURLToPath(
@@ -98,11 +99,27 @@ describe('guarded host provisioner policy', () => {
     }), 75);
     assert.deepEqual(calls, [['--apply']]);
     assert.equal(
-      hasProvisionLock('7: FLOCK ADVISORY WRITE 123 00:2a:456 0 EOF\n', 123, 456),
+      hasProvisionLock(
+        '7: FLOCK ADVISORY WRITE 123 00:2a:456 0 EOF\n',
+        123,
+        { dev: 0x2a, ino: 456 },
+      ),
       true,
     );
     assert.equal(
-      hasProvisionLock('7: FLOCK ADVISORY WRITE 124 00:2a:456 0 EOF\n', 123, 456),
+      hasProvisionLock(
+        '7: FLOCK ADVISORY WRITE 124 00:2a:456 0 EOF\n',
+        123,
+        { dev: 0x2a, ino: 456 },
+      ),
+      false,
+    );
+    assert.equal(
+      hasProvisionLock(
+        '7: FLOCK ADVISORY WRITE 123 00:2b:456 0 EOF\n',
+        123,
+        { dev: 0x2a, ino: 456 },
+      ),
       false,
     );
     await assert.rejects(
@@ -118,6 +135,17 @@ describe('guarded host provisioner policy', () => {
   });
 
   it('rejects static membership and primary-GID drift', () => {
+    validateNsswitchPolicy('passwd: files systemd\ngroup: files systemd\n');
+    assert.throws(
+      () => validateNsswitchPolicy('passwd: files sss\ngroup: files systemd\n'),
+      /unsupported NSS policy for passwd/,
+    );
+    assert.throws(
+      () => validateNsswitchPolicy(
+        'passwd: files systemd\ngroup: files systemd\ninitgroups: files sss\n',
+      ),
+      /unsupported NSS policy for initgroups/,
+    );
     const clean = expectedIdentitySnapshot();
     validateIdentityPolicy(clean, { requireAccounts: true });
 
@@ -223,6 +251,36 @@ describe('guarded host provisioner execution', () => {
     );
     await assert.rejects(fs.stat(candidate), { code: 'ENOENT' });
     assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
+  });
+
+  it('bounds total directory entries before stale-candidate inspection', async (context) => {
+    const fixture = await provisionFixture(context);
+    const firstDirectory = path.dirname(fixture.plan.artifacts[0].target);
+    await fs.mkdir(firstDirectory, { recursive: true, mode: 0o755 });
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'opendir') return target[property];
+        return async (directory) => {
+          if (directory !== firstDirectory) return target.opendir(directory);
+          return {
+            async *[Symbol.asyncIterator]() {
+              for (let index = 0; index < 4097; index += 1) {
+                yield { name: `unrelated-${index}`, isFile: () => true };
+              }
+            },
+            close: async () => {},
+          };
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /too many policy directory entries/,
+    );
   });
 
   it('installs the fixed set transactionally and converges without enabling units', async (context) => {
@@ -424,7 +482,7 @@ describe('guarded host provisioner execution', () => {
 
   it('preserves the journal instead of rolling back over an unknown state', async (context) => {
     const fixture = await provisionFixture(context);
-    const firstTarget = fixture.plan.artifacts[0].target;
+    const unknownTarget = fixture.plan.artifacts[1].target;
     let candidateRenames = 0;
     const fsApi = new Proxy(fs, {
       get(target, property) {
@@ -433,10 +491,10 @@ describe('guarded host provisioner execution', () => {
           if (path.basename(source).includes('.provision-')) {
             candidateRenames += 1;
             if (candidateRenames === 3) {
-              await target.writeFile(firstTarget, 'concurrent administrator state\n', {
+              await target.writeFile(unknownTarget, 'concurrent administrator state\n', {
                 mode: 0o644,
               });
-              await target.chmod(firstTarget, 0o644);
+              await target.chmod(unknownTarget, 0o644);
               throw new Error('injected later rename failure');
             }
           }
@@ -450,9 +508,9 @@ describe('guarded host provisioner execution', () => {
         { apply: true },
         fixture.dependencies({ fsApi, applied: true }),
       ),
-      /policy rollback failed.*target no longer matches the installed digest/,
+      /policy rollback failed.*policy target has unknown state during recovery/,
     );
-    assert.equal(await fs.readFile(firstTarget, 'utf8'), 'concurrent administrator state\n');
+    assert.equal(await fs.readFile(unknownTarget, 'utf8'), 'concurrent administrator state\n');
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 

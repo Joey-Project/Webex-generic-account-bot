@@ -22,6 +22,7 @@ const MAX_TRANSACTION_BYTES = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROC_LOCKS_BYTES = 1024 * 1024;
 const MAX_STALE_CANDIDATES = 256;
+const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
@@ -255,6 +256,30 @@ export function parseIdentityDatabases(passwdText, groupText, effectiveGroups = 
   return Object.freeze({ users, groups, effectiveGroups: effective });
 }
 
+export function validateNsswitchPolicy(contents) {
+  const databases = new Map();
+  for (const rawLine of String(contents).split('\n')) {
+    const line = rawLine.split('#', 1)[0].trim();
+    if (line === '') continue;
+    const separator = line.indexOf(':');
+    if (separator <= 0) throw new Error('nsswitch policy is malformed');
+    const database = line.slice(0, separator).trim();
+    if (databases.has(database)) throw new Error(`nsswitch database is duplicated: ${database}`);
+    databases.set(database, line.slice(separator + 1).trim().split(/\s+/).filter(Boolean));
+  }
+  for (const database of ['passwd', 'group']) {
+    if (JSON.stringify(databases.get(database)) !== JSON.stringify(['files', 'systemd'])) {
+      throw new Error(`unsupported NSS policy for ${database}`);
+    }
+  }
+  if (
+    databases.has('initgroups')
+    && JSON.stringify(databases.get('initgroups')) !== JSON.stringify(['files', 'systemd'])
+  ) {
+    throw new Error('unsupported NSS policy for initgroups');
+  }
+}
+
 export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {}) {
   const bot = snapshot.users.get(MANAGED_USERS.bot);
   const worker = snapshot.users.get(MANAGED_USERS.worker);
@@ -426,21 +451,27 @@ export function buildLockedApplyCommand({
   });
 }
 
-export function hasProvisionLock(locksText, pid, inode) {
+export function hasProvisionLock(locksText, pid, stat) {
   const expectedPid = String(pid);
-  const expectedInode = String(inode);
+  const expectedInode = String(stat.ino);
+  const expectedDevice = linuxDeviceNumbers(stat.dev);
   return String(locksText).split('\n').some((line) => {
     const match = line.match(
-      /^\d+:\s+FLOCK\s+\S+\s+WRITE\s+(\d+)\s+\S+:\S+:(\d+)\s+\d+\s+EOF$/,
+      /^\d+:\s+FLOCK\s+\S+\s+WRITE\s+(\d+)\s+([0-9a-f]+):([0-9a-f]+):(\d+)\s+\d+\s+EOF$/i,
     );
-    return match?.[1] === expectedPid && match?.[2] === expectedInode;
+    return match?.[1] === expectedPid
+      && BigInt(`0x${match[2]}`) === expectedDevice.major
+      && BigInt(`0x${match[3]}`) === expectedDevice.minor
+      && match[4] === expectedInode;
   });
 }
 
 async function executeLockedApply(argv) {
   await ensureProvisionLockFile(fs);
-  await assertTrustedRuntimeExecutable(process.execPath, fs);
-  const command = buildLockedApplyCommand({ argv });
+  const scriptPath = fileURLToPath(import.meta.url);
+  await assertTrustedReexecFile(process.execPath, { executable: true }, fs);
+  await assertTrustedReexecFile(scriptPath, { mode: FILE_MODE }, fs);
+  const command = buildLockedApplyCommand({ argv, scriptPath });
   return new Promise((resolve, reject) => {
     const child = spawn(command.command, command.args, {
       cwd: '/',
@@ -476,9 +507,17 @@ async function assertProvisionLockHeld() {
     await lock.close();
   }
   const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fs);
-  if (!hasProvisionLock(procLocks, process.pid, stat.ino)) {
+  if (!hasProvisionLock(procLocks, process.pid, stat)) {
     throw new Error('current process does not hold the host provision lock');
   }
+}
+
+function linuxDeviceNumbers(device) {
+  const value = BigInt(device);
+  return Object.freeze({
+    major: ((value >> 8n) & 0xfffn) | ((value >> 32n) & 0xfffff000n),
+    minor: (value & 0xffn) | ((value >> 12n) & 0xffffff00n),
+  });
 }
 
 async function inspectArtifacts(plan, deps) {
@@ -546,6 +585,7 @@ async function cleanupStaleCandidates(plan, deps) {
   }
 
   let candidateCount = 0;
+  let scannedEntryCount = 0;
   for (const [directory, prefixes] of targetsByDirectory) {
     await assertTrustedExistingAncestors(
       plan.targetRoot,
@@ -554,34 +594,46 @@ async function cleanupStaleCandidates(plan, deps) {
       deps.targetGid,
       deps.fsApi,
     );
-    let entries;
+    let directoryHandle;
     try {
-      entries = await deps.fsApi.readdir(directory, { withFileTypes: true });
+      directoryHandle = await deps.fsApi.opendir(directory);
     } catch (error) {
       if (error?.code === 'ENOENT') continue;
       throw error;
     }
     let changed = false;
-    for (const entry of entries) {
-      const prefix = prefixes.find((value) => entry.name.startsWith(value));
-      if (!prefix) continue;
-      candidateCount += 1;
-      if (candidateCount > MAX_STALE_CANDIDATES) {
-        throw new Error('too many stale policy candidates');
+    try {
+      for await (const entry of directoryHandle) {
+        scannedEntryCount += 1;
+        if (scannedEntryCount > MAX_SCANNED_DIRECTORY_ENTRIES) {
+          throw new Error('too many policy directory entries');
+        }
+        const prefix = prefixes.find((value) => entry.name.startsWith(value));
+        if (!prefix) continue;
+        candidateCount += 1;
+        if (candidateCount > MAX_STALE_CANDIDATES) {
+          throw new Error('too many stale policy candidates');
+        }
+        const suffix = entry.name.slice(prefix.length);
+        if (!new RegExp(`^${CANDIDATE_UUID_PATTERN}\\.tmp$`).test(suffix)) {
+          throw new Error(`stale policy candidate name is malformed: ${entry.name}`);
+        }
+        const candidate = path.join(directory, entry.name);
+        const stat = await deps.fsApi.lstat(candidate);
+        const mode = stat.mode & 0o7777;
+        assertTrustedFileMetadata(candidate, stat, deps.targetUid, deps.targetGid, null);
+        if (!entry.isFile() || ![0o600, FILE_MODE].includes(mode)) {
+          throw new Error(`stale policy candidate metadata is not trusted: ${candidate}`);
+        }
+        await deps.fsApi.rm(candidate);
+        changed = true;
       }
-      const suffix = entry.name.slice(prefix.length);
-      if (!new RegExp(`^${CANDIDATE_UUID_PATTERN}\\.tmp$`).test(suffix)) {
-        throw new Error(`stale policy candidate name is malformed: ${entry.name}`);
+    } finally {
+      try {
+        await directoryHandle.close();
+      } catch (error) {
+        if (error?.code !== 'ERR_DIR_CLOSED') throw error;
       }
-      const candidate = path.join(directory, entry.name);
-      const stat = await deps.fsApi.lstat(candidate);
-      const mode = stat.mode & 0o7777;
-      assertTrustedFileMetadata(candidate, stat, deps.targetUid, deps.targetGid, null);
-      if (!entry.isFile() || ![0o600, FILE_MODE].includes(mode)) {
-        throw new Error(`stale policy candidate metadata is not trusted: ${candidate}`);
-      }
-      await deps.fsApi.rm(candidate);
-      changed = true;
     }
     if (changed) await syncDirectory(directory, deps.fsApi);
   }
@@ -591,7 +643,7 @@ async function installPolicySetAtomically(inspected, plan, deps) {
   const changed = inspected.artifacts.filter(({ changed }) => changed);
   if (changed.length === 0) return [];
   const staged = [];
-  const committed = [];
+  const rollbackTransaction = transactionFromInspected(inspected);
   await writeProvisionTransaction(inspected, plan, deps);
   try {
     for (const artifact of changed) {
@@ -606,71 +658,19 @@ async function installPolicySetAtomically(inspected, plan, deps) {
       await assertTargetUnchanged(entry.artifact, deps.fsApi);
       await deps.fsApi.rename(entry.temporary, entry.artifact.target);
       entry.temporary = null;
-      committed.push(entry.artifact);
       await syncDirectory(path.dirname(entry.artifact.target), deps.fsApi);
     }
     await verifyInstalledArtifacts(inspected, deps);
     await removeProvisionTransaction(plan, deps);
   } catch (error) {
-    const rollbackErrors = [];
-    const rollback = [];
-    for (const artifact of [...committed].reverse()) {
-      try {
-        const current = await readTrustedFile(
-          artifact.target,
-          deps.targetUid,
-          deps.targetGid,
-          FILE_MODE,
-          deps.fsApi,
-        );
-        if (current.sha256 !== artifact.source.sha256) {
-          throw new Error('target no longer matches the installed digest');
-        }
-        rollback.push({ artifact, current });
-      } catch (rollbackError) {
-        rollbackErrors.push(`${artifact.target}: ${rollbackError.message}`);
-      }
-    }
-    if (rollbackErrors.length > 0) {
+    try {
+      await recoverPolicyTransaction(rollbackTransaction, plan, deps);
+    } catch (rollbackError) {
       throw new Error(
-        `${error.message}; policy rollback failed: ${rollbackErrors.join('; ')}`,
+        `${error.message}; policy rollback failed: ${rollbackError.message}`,
         { cause: error },
       );
     }
-    for (const entry of rollback) {
-      const { artifact } = entry;
-      try {
-        await assertTargetUnchanged(
-          { target: artifact.target, existing: entry.current },
-          deps.fsApi,
-        );
-        if (artifact.existing) {
-          const temporary = await writeCandidate(
-            artifact.target,
-            artifact.existing.contents,
-            deps,
-          );
-          try {
-            await deps.fsApi.rename(temporary, artifact.target);
-          } catch (error) {
-            await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
-            throw error;
-          }
-        } else {
-          await deps.fsApi.rm(artifact.target, { force: true });
-        }
-        await syncDirectory(path.dirname(artifact.target), deps.fsApi);
-      } catch (rollbackError) {
-        rollbackErrors.push(`${artifact.target}: ${rollbackError.message}`);
-      }
-    }
-    if (rollbackErrors.length > 0) {
-      throw new Error(
-        `${error.message}; policy rollback failed: ${rollbackErrors.join('; ')}`,
-        { cause: error },
-      );
-    }
-    await removeProvisionTransaction(plan, deps);
     throw error;
   } finally {
     await Promise.allSettled(staged
@@ -678,6 +678,19 @@ async function installPolicySetAtomically(inspected, plan, deps) {
       .map(({ temporary }) => deps.fsApi.rm(temporary, { force: true })));
   }
   return changed.map(({ target }) => target);
+}
+
+function transactionFromInspected(inspected) {
+  return Object.freeze({
+    version: TRANSACTION_VERSION,
+    artifacts: Object.freeze(inspected.artifacts.map((artifact) => Object.freeze({
+      target: artifact.target,
+      desiredSha256: artifact.source.sha256,
+      existing: artifact.existing
+        ? Object.freeze({ contents: artifact.existing.contents })
+        : null,
+    }))),
+  });
 }
 
 async function verifyInstalledArtifacts(inspected, deps) {
@@ -765,21 +778,31 @@ async function ensureProvisionLockFile(fsApi) {
   }
 }
 
-async function assertTrustedRuntimeExecutable(executable, fsApi) {
-  if (!path.isAbsolute(executable)) {
-    throw new Error('Node runtime path is not absolute');
-  }
-  const stat = await fsApi.lstat(executable);
-  if (
-    !stat.isFile()
-    || stat.isSymbolicLink()
-    || stat.nlink !== 1
-    || stat.uid !== 0
-    || stat.gid !== 0
-    || ((stat.mode & 0o7777) & 0o022) !== 0
-    || (stat.mode & 0o111) === 0
-  ) {
-    throw new Error(`Node runtime metadata is not trusted: ${executable}`);
+async function assertTrustedReexecFile(file, policy, fsApi) {
+  if (!path.isAbsolute(file)) throw new Error(`re-exec path is not absolute: ${file}`);
+  await assertTrustedDirectoryChain('/', path.dirname(file), 0, 0, fsApi);
+  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (policy.mode !== undefined) {
+      assertTrustedFileMetadata(file, stat, 0, 0, policy.mode);
+      return;
+    }
+    const mode = stat.mode & 0o7777;
+    if (
+      !stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.nlink !== 1
+      || stat.uid !== 0
+      || stat.gid !== 0
+      || (mode & 0o7022) !== 0
+      || (mode & 0o100) === 0
+      || !policy.executable
+    ) {
+      throw new Error(`re-exec file metadata is not trusted: ${file}`);
+    }
+  } finally {
+    await handle.close();
   }
 }
 
@@ -1156,7 +1179,15 @@ function assertUnitDormant(unit, state, { requireLoaded }) {
   }
 }
 
-async function readSystemIdentitySnapshot(runCommand = runFixedCommand) {
+async function readSystemIdentitySnapshot(runCommand = runFixedCommand, fsApi = fs) {
+  const nsswitch = await readTrustedFile(
+    '/etc/nsswitch.conf',
+    0,
+    0,
+    FILE_MODE,
+    fsApi,
+  );
+  validateNsswitchPolicy(nsswitch.contents.toString('utf8'));
   const [passwd, group] = await Promise.all([
     runCommand('/usr/bin/getent', ['passwd']),
     runCommand('/usr/bin/getent', ['group']),
@@ -1271,7 +1302,7 @@ function provisionDependencies(dependencies) {
     targetGid: dependencies.targetGid ?? 0,
     runCommand,
     readIdentitySnapshot: dependencies.readIdentitySnapshot
-      ?? (() => readSystemIdentitySnapshot(runCommand)),
+      ?? (() => readSystemIdentitySnapshot(runCommand, dependencies.fsApi ?? fs)),
     readUnitStates: dependencies.readUnitStates
       ?? ((units) => readSystemUnitStates(units, runCommand)),
   };
