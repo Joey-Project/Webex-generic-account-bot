@@ -245,10 +245,12 @@ are classified from `lstat` rather than optional `d_type` metadata, and external
 policy may not assign a managed user or group by name or implicit DynamicUser
 unit name, unresolved instance specifiers are forbidden in identity directives
 except for the exact vendor `user@.service` user-manager assignment when both
-the physical file and logical unit owner match, and
-external units may not use numeric identities from the static system-ID
+the physical file and logical unit owner match. Unresolved instance specifiers
+in unit-reference directives are symbolically checked against every managed
+unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
 range before allocation. Direct boot-policy credential injection is rejected;
-credential import selectors are evaluated across glob and rename forms, and
+credential import selectors are evaluated across exact, trailing-glob, and
+rename forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
 exact physical-file/logical-owner pair after the current system credential set
 and all plaintext and encrypted credential stores prove that `sysusers.extra`
@@ -260,7 +262,8 @@ owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
 metadata, and recursive-parent semantics. External
 sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
 must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
-the local identity databases and NSS policy, every fixed systemd system-unit
+the local identity databases and NSS policy, every static and runtime systemd
+userdb path, every fixed systemd system-unit
 load path, every installed policy target, the transaction journal, and the
 shared lock are protected from external tmpfiles policy; ancestor maintenance must preserve
 traversal for the managed accounts. Only the reviewed Webex lines may affect

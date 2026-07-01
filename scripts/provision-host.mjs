@@ -43,6 +43,7 @@ const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
+const SYMBOLIC_LAUNCHER_INSTANCE = 'webex-codex-launcher@instance.service';
 const SYSTEMD_UNIT_NAME_PATTERN =
   /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
@@ -107,6 +108,32 @@ const SYSTEMD_IDENTITY_DIRECTIVES = new Set([
   'SocketUser',
   'SupplementaryGroups',
   'User',
+]);
+const SYSTEMD_UNIT_REFERENCE_DIRECTIVES = new Set([
+  'After',
+  'Alias',
+  'Also',
+  'Before',
+  'BindsTo',
+  'Conflicts',
+  'JoinsNamespaceOf',
+  'OnFailure',
+  'OnSuccess',
+  'PartOf',
+  'PropagatesReloadTo',
+  'PropagatesStopTo',
+  'ReloadPropagatedFrom',
+  'RequiredBy',
+  'Requires',
+  'Requisite',
+  'Service',
+  'Sockets',
+  'StopPropagatedFrom',
+  'Unit',
+  'Upholds',
+  'UpheldBy',
+  'Wants',
+  'WantedBy',
 ]);
 const BOOT_POLICY_DIRECTORIES = Object.freeze({
   sysusers: Object.freeze([
@@ -1968,6 +1995,8 @@ export function auditBootPolicyCatalogs(
       .map((line) => parseSystemdFields(line)[1]),
     ...inspected.artifacts.map((artifact) => artifact.targetPath),
     ...IDENTITY_POLICY_PATHS,
+    ...STATIC_USERDB_DIRECTORIES,
+    SYSTEMD_USERDB_DIRECTORY,
     ...SYSTEMD_SYSTEM_UNIT_LOAD_PATHS,
     ...BOOT_POLICY_CREDENTIAL_PATHS,
     TRANSACTION_PATH,
@@ -2560,6 +2589,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
+      || unresolvedInstanceCouldReferenceManagedUnit(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
       || systemdIdentityDirectiveUsesManagedId(
@@ -2603,62 +2633,25 @@ function systemdPolicyInjectsBootPolicyCredential(
 }
 
 function importCredentialSelectorTargetsBootPolicy(selector) {
-  if (selector.length > 255 || selector.includes('%')) return true;
+  if (
+    selector.length > 255
+    || selector.includes('%')
+    || /[?[\]]/.test(selector)
+  ) return true;
   const components = selector.split(':');
   if (components.length > 2) return true;
-  return components.some((pattern) => BOOT_POLICY_CREDENTIAL_NAMES.some(
-    (name) => systemdCredentialGlobMatches(pattern, name),
-  ));
-}
-
-function systemdCredentialGlobMatches(pattern, value) {
-  const memo = new Map();
-  const matches = (patternOffset, valueOffset) => {
-    const key = `${patternOffset}:${valueOffset}`;
-    if (memo.has(key)) return memo.get(key);
-    let result;
-    if (patternOffset === pattern.length) {
-      result = valueOffset === value.length;
-    } else if (pattern[patternOffset] === '*') {
-      result = matches(patternOffset + 1, valueOffset)
-        || (valueOffset < value.length && matches(patternOffset, valueOffset + 1));
-    } else if (pattern[patternOffset] === '?') {
-      result = valueOffset < value.length && matches(patternOffset + 1, valueOffset + 1);
-    } else if (pattern[patternOffset] === '[') {
-      const closing = pattern.indexOf(']', patternOffset + 1);
-      if (closing < 0) {
-        result = true;
-      } else {
-        const expression = pattern.slice(patternOffset + 1, closing);
-        result = valueOffset < value.length
-          && credentialCharacterClassMatches(expression, value[valueOffset])
-          && matches(closing + 1, valueOffset + 1);
-      }
-    } else {
-      result = valueOffset < value.length
-        && pattern[patternOffset] === value[valueOffset]
-        && matches(patternOffset + 1, valueOffset + 1);
-    }
-    memo.set(key, result);
-    return result;
-  };
-  return matches(0, 0);
-}
-
-function credentialCharacterClassMatches(expression, value) {
-  if (expression === '') return true;
-  const negated = expression[0] === '!' || expression[0] === '^';
-  const body = negated ? expression.slice(1) : expression;
-  let matched = false;
-  for (let offset = 0; offset < body.length; offset += 1) {
-    if (offset + 2 < body.length && body[offset + 1] === '-') {
-      matched ||= value >= body[offset] && value <= body[offset + 2];
-      offset += 2;
-    } else {
-      matched ||= value === body[offset];
-    }
-  }
-  return negated ? !matched : matched;
+  return components.some((pattern) => {
+    const wildcardOffset = pattern.indexOf('*');
+    if (wildcardOffset >= 0 && (
+      wildcardOffset !== pattern.length - 1
+      || pattern.lastIndexOf('*') !== wildcardOffset
+    )) return true;
+    return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
+      wildcardOffset < 0
+        ? pattern === name
+        : name.startsWith(pattern.slice(0, -1))
+    ));
+  });
 }
 
 function isExpectedVendorBootPolicyCredentialImport(
@@ -2684,6 +2677,21 @@ function isExpectedVendorBootPolicyCredentialImport(
 
 function systemdUnitNamesEqual(unitNames, unit) {
   return unitNames.size === 1 && unitNames.has(unit);
+}
+
+function unresolvedInstanceCouldReferenceManagedUnit(value) {
+  if (!/%[iI]/.test(value)) return false;
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!SYSTEMD_UNIT_REFERENCE_DIRECTIVES.has(directive)) return false;
+  const managedUnits = [...MANAGED_UNITS, SYMBOLIC_LAUNCHER_INSTANCE];
+  return parseSystemdFields(value.slice(separator + 1)).some((field) => {
+    if (!/%[iI]/.test(field)) return false;
+    const pattern = escapeRegExp(field).replace(/%[iI]/g, '[^\\s/]+');
+    const instanceReference = new RegExp(`^${pattern}$`);
+    return managedUnits.some((unit) => instanceReference.test(unit));
+  });
 }
 
 function unitNameClaimsManagedIdentity(unitName) {
@@ -2776,6 +2784,7 @@ function expandSystemdUnitNameSpecifiers(value, unitName) {
   const atOffset = stem.indexOf('@');
   const prefix = atOffset < 0 ? stem : stem.slice(0, atOffset);
   const instance = atOffset < 0 ? '' : stem.slice(atOffset + 1);
+  const unresolvedInstance = atOffset >= 0 && instance === '';
   const finalComponent = prefix.slice(prefix.lastIndexOf('-') + 1);
   const replacements = new Map([
     ['%%', '%'],
@@ -2783,8 +2792,8 @@ function expandSystemdUnitNameSpecifiers(value, unitName) {
     ['%N', stem],
     ['%p', prefix],
     ['%P', decodeSystemdEscapesForAudit(prefix)],
-    ['%i', instance],
-    ['%I', decodeSystemdEscapesForAudit(instance)],
+    ['%i', unresolvedInstance ? '%i' : instance],
+    ['%I', unresolvedInstance ? '%I' : decodeSystemdEscapesForAudit(instance)],
     ['%j', finalComponent],
     ['%J', decodeSystemdEscapesForAudit(finalComponent)],
   ]);

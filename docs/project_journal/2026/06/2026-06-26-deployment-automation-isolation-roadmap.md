@@ -175,9 +175,11 @@ superseded_by:
   `d_type`-independent file classification, unit-name specifier expansion,
   named/implicit-DynamicUser assignments, unresolved identity instance
   specifiers outside the physical-file/logical-owner-bound vendor user-manager
-  assignment, pre-allocation
+  assignment plus symbolic managed-unit reachability checks for unresolved
+  unit-reference instances, pre-allocation
   rejection of static-range numeric identities,
-  boot-policy credential injection with glob/rename-aware selectors and
+  boot-policy credential injection with exact/trailing-glob/rename-aware
+  selectors, fail-closed complex wildcard handling, and
   physical-file/logical-owner vendor binding plus current system and
   credential-store inputs, and launcher-instance
   references, fixed-path scanning for unloaded policy and dependency
@@ -188,7 +190,8 @@ superseded_by:
   paths, source-associated managed-policy upgrades, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
   identities, ACL principals, and symlink targets, protected root, identity
-  databases and NSS policy, fixed systemd system-unit load paths, and installed
+  databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
+  system-unit load paths, and installed
   policy targets, traversal-preserving ancestor metadata, recursive parent
   handling, and root-owned stable source
   metadata for every effective catalogue file,

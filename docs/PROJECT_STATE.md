@@ -109,12 +109,15 @@
   specifier expansion, named/implicit-DynamicUser identities, unresolved
   instance-specifier rejection in identity directives with only the exact
   physical-file/logical-owner vendor user-manager identity assignment permitted,
-  pre-allocation rejection
+  symbolic managed-unit reachability checks for unresolved instance specifiers
+  in unit-reference directives, pre-allocation rejection
   of static-range numeric identities, and boot-policy credential injection
-  rejection with glob/rename-aware selectors, physical-file/logical-owner vendor
+  rejection with exact/trailing-glob/rename-aware selectors and fail-closed
+  complex wildcard handling, physical-file/logical-owner vendor
   binding, and system-credential and credential-store absence checks,
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
-  auditing that protects root, runtime, identity databases and NSS policy,
+  auditing that protects root, runtime, identity databases, NSS policy, and
+  static/runtime systemd userdb paths,
   systemd system-unit load paths, and installed policy paths from owner-modifier,
   numeric-identity, ACL-principal, symlink-target, traversal-restricting ancestor
   metadata, cleanup, replacement, and recursive rules, allocation ranges,

@@ -683,6 +683,8 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f /tmp/untrusted 0600 1001 root -'],
       ['tmpfiles', 'f /tmp/untrusted 0600 root :02001 -'],
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
+      ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
+      ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
       ['tmpfiles', 'A+! /opt/private-tree - - - - user:webex-generic-account-bot:r-X'],
       ['tmpfiles', 'A+! /opt/private-tree - - - - group:02001:r-X'],
       [
@@ -1382,6 +1384,7 @@ describe('guarded host provisioner execution', () => {
       'ImportCredential=payload:sysusers.extra',
       'ImportCredential=sysusers.?xtra',
       'ImportCredential=sysusers.[e]xtra',
+      'ImportCredential=sysusers.[[:alpha:]]xtra',
     ]) {
       await assert.rejects(
         readSystemUnitStates(
@@ -1422,6 +1425,7 @@ describe('guarded host provisioner execution', () => {
             ['/usr/lib/systemd/system', [
               { name: 'systemd-sysusers.service' },
               { name: 'systemd-tmpfiles-setup.service' },
+              { name: 'systemd-pcrfs@.service' },
               { name: 'user@.service' },
             ]],
           ]),
@@ -1436,8 +1440,19 @@ describe('guarded host provisioner execution', () => {
                 Buffer.from('[Service]\nImportCredential=tmpfiles.*\n'),
               ],
               [
+                '/usr/lib/systemd/system/systemd-pcrfs@.service',
+                Buffer.from('[Unit]\nBindsTo=%i.mount\n'),
+              ],
+              [
                 '/usr/lib/systemd/system/user@.service',
-                Buffer.from('[Service]\nUser=%i\n'),
+                Buffer.from([
+                  '[Unit]',
+                  'After=user-runtime-dir@%i.service',
+                  '[Service]',
+                  'User=%i',
+                  'Slice=user-%i.slice',
+                  '',
+                ].join('\n')),
               ],
             ]),
           },
@@ -1446,6 +1461,28 @@ describe('guarded host provisioner execution', () => {
       /systemctl reached after vendor credential import audit/,
     );
     assert.equal(vendorImportCommandCalls, 2);
+
+    const unresolvedDependencyTemplate =
+      '/etc/systemd/system/external-dependency@.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([[
+            '/etc/systemd/system',
+            [{ name: 'external-dependency@.service' }],
+          ]]),
+          {
+            filesByPath: new Map([[
+              unresolvedDependencyTemplate,
+              Buffer.from('[Unit]\nWants=%i.service\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
 
     for (const [name, target, contents, expected] of [
       [
