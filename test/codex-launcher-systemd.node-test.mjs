@@ -13,6 +13,10 @@ const BOT_DROP_IN_ROOT = path.join(
 );
 const BOT_DROP_IN_PATH = path.join(BOT_DROP_IN_ROOT, '10-codex-launcher.conf');
 const SYSUSERS_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.sysusers.conf');
+const CONFIG_PULL_SYSUSERS_PATH = path.join(
+  SYSTEMD_ROOT,
+  'webex-config-pull-worker.sysusers.conf',
+);
 const TMPFILES_PATH = path.join(SYSTEMD_ROOT, 'webex-codex-launcher.tmpfiles.conf');
 const ACTIVATION_TMPFILES_PATH = path.join(
   SYSTEMD_ROOT,
@@ -415,7 +419,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(service, 'MemorySwapMax'), ['0']);
   });
 
-  it('grants the bot only launcher access and pending input writes', async () => {
+  it('grants the bot only reviewed launcher and config-pull access', async () => {
     const [dropIn, launcherFiles, botDropIns] = await Promise.all([
       fs.readFile(BOT_DROP_IN_PATH, 'utf8'),
       Promise.all(
@@ -425,6 +429,7 @@ describe('Codex launcher systemd boundary', () => {
           SYSUSERS_PATH,
           TMPFILES_PATH,
           RUNTIME_SYSUSERS_PATH,
+          CONFIG_PULL_SYSUSERS_PATH,
           RUNTIME_TMPFILES_PATH,
           INPUT_STAGING_TMPFILES_PATH,
           ACTIVATION_TMPFILES_PATH,
@@ -442,13 +447,13 @@ describe('Codex launcher systemd boundary', () => {
         'After=webex-codex-activation-renew.service',
         '',
         '[Service]',
-        'SupplementaryGroups=webex-codex-launch',
+        'SupplementaryGroups=webex-codex-launch webex-config-pull',
         'ReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending',
         '',
       ].join('\n'),
     );
     assert.deepEqual(directiveValues(dropIn, 'SupplementaryGroups'), [
-      'webex-codex-launch',
+      'webex-codex-launch webex-config-pull',
     ]);
     assert.deepEqual(directiveValues(dropIn, 'Requires'), [
       'webex-codex-activation-renew.service',
@@ -459,7 +464,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.deepEqual(directiveValues(dropIn, 'ReadWritePaths'), [
       '/var/lib/webex-generic-account-bot/codex-input-staging/pending',
     ]);
-    assert.doesNotMatch(dropIn, /\bwebex-(?:config-pull|codex-input)\b/);
+    assert.doesNotMatch(dropIn, /\bwebex-codex-input\b/);
     assert.doesNotMatch(dropIn, /config[_-]?commands/i);
 
     for (const { file, contents } of botDropIns) {
@@ -468,7 +473,7 @@ describe('Codex launcher systemd boundary', () => {
       }
       assert.doesNotMatch(
         contents,
-        /webex-codex-(?:launch|input)|codex-input-staging|webex-codex-activation|webex-codex-launcher|\/run\/credentials/,
+        /webex-codex-(?:launch|input)|webex-config-pull|codex-input-staging|webex-codex-activation|webex-codex-launcher|\/run\/credentials/,
         file,
       );
     }
@@ -478,6 +483,8 @@ describe('Codex launcher systemd boundary', () => {
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-launch$/m);
       assert.doesNotMatch(contents, /^m\s+webex-codex-launch\s+webex-generic-account-bot$/m);
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-input$/m);
+      assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-config-pull$/m);
+      assert.doesNotMatch(contents, /^m\s+webex-config-pull\s+webex-generic-account-bot$/m);
     }
   });
 
@@ -601,6 +608,14 @@ describe('Codex launcher systemd boundary', () => {
       isolatedExecution,
       /InaccessiblePaths=[^"\n]*-\/run\/webex-codex-activation(?:\s|$)/,
     );
+    assert.match(
+      isolatedExecution,
+      /InaccessiblePaths=[^"\n]*-\/run\/webex-config-pull(?:\s|"|$)/,
+    );
+    assert.doesNotMatch(
+      isolatedExecution,
+      /SupplementaryGroups=[^"\n]*webex-config-pull/,
+    );
     assert.match(isolatedExecution, /CapabilityBoundingSet=/);
     assert.match(
       isolatedExecution,
@@ -618,6 +633,7 @@ describe('Codex launcher systemd boundary', () => {
     assert.match(runtimeSource, /SYS_close_range/);
     assert.match(runtimeSource, /shell_environment_policy\.inherit=\\"none\\"/);
     assert.match(runtimeSource, /permissions\.webex-isolated\.network\.enabled=false/);
+    assert.match(runtimeSource, /\\"\/run\/webex-config-pull\\"=\\"deny\\"/);
     assert.match(runtimeSource, /features\.hooks=false/);
     assert.doesNotMatch(runtimeSource, /systemd-run|sudo|pkexec|PolicyKit|polkit/i);
 

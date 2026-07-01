@@ -25,6 +25,7 @@ ALLOWED_TOP_LEVEL = {
     "server",
     "webex",
     "codex",
+    "config_commands",
     "rooms",
 }
 MIKU_SELF_PERSON_ID = "Y2lzY29zcGFyazovL3VzL1BFT1BMRS9iYTcyOTQzZi1jNjdlLTRlNjUtOGYyYi01MGQwNmJlNGM0MzQ"
@@ -153,6 +154,16 @@ ALLOWED_ISOLATION_KEYS = {
     "mode",
     "trusted_prompt_authors",
 }
+ALLOWED_CONFIG_COMMAND_KEYS = {
+    "room_id",
+    "allowed_person_ids",
+    "allowed_person_emails",
+    "allowed_commands",
+}
+CONFIG_COMMANDS_ROOM_ID: str | None = None
+CONFIG_COMMANDS_ALLOWED_PERSON_IDS: list[str] = []
+CONFIG_COMMANDS_ALLOWED_PERSON_EMAILS = ["hoteng@cisco.com"]
+CONFIG_COMMANDS_ALLOWED_COMMANDS = ["status", "pull"]
 ALLOWED_ROOM_KEYS = {
     "name",
     "room_id",
@@ -250,6 +261,7 @@ class Validator:
             require_current_user=self.require_current_user,
         )
         self.validate_top_level_paths()
+        self.validate_config_commands(self.document.get("config_commands"))
         self.validate_rooms(self.document.get("rooms"))
         return self.errors
 
@@ -462,6 +474,77 @@ class Validator:
             "state_file",
             "/var/lib/webex-generic-account-bot/state/",
         )
+
+    def validate_config_commands(self, raw_config_commands: Any) -> None:
+        if raw_config_commands is None:
+            return
+        config_commands = as_table(raw_config_commands, "config_commands", self.errors)
+        self.expect_keys(
+            config_commands,
+            "config_commands",
+            ALLOWED_CONFIG_COMMAND_KEYS,
+        )
+        if CONFIG_COMMANDS_ROOM_ID is None:
+            self.error(
+                "config_commands are disabled until host policy pins the reviewed admin Space"
+            )
+        else:
+            self.require_equal(
+                config_commands,
+                "config_commands",
+                "room_id",
+                CONFIG_COMMANDS_ROOM_ID,
+            )
+        self.require_equal(
+            config_commands,
+            "config_commands",
+            "allowed_person_ids",
+            CONFIG_COMMANDS_ALLOWED_PERSON_IDS,
+        )
+        self.require_equal(
+            config_commands,
+            "config_commands",
+            "allowed_person_emails",
+            CONFIG_COMMANDS_ALLOWED_PERSON_EMAILS,
+        )
+        self.require_equal(
+            config_commands,
+            "config_commands",
+            "allowed_commands",
+            CONFIG_COMMANDS_ALLOWED_COMMANDS,
+        )
+        codex = self.document.get("codex")
+        isolation = codex.get("isolation") if isinstance(codex, dict) else None
+        if not isinstance(isolation, dict) or isolation.get("mode") != "ephemeral-linux-user":
+            self.error(
+                "config_commands require codex.isolation.mode = 'ephemeral-linux-user'"
+            )
+        elif isolation.get("trusted_prompt_authors") is not False:
+            self.error(
+                "config_commands require codex.isolation.trusted_prompt_authors = false"
+            )
+
+        rooms = self.document.get("rooms")
+        if not isinstance(rooms, list):
+            return
+        for index, room in enumerate(rooms):
+            if not isinstance(room, dict):
+                continue
+            room_codex = room.get("codex")
+            if not isinstance(room_codex, dict) or "isolation" not in room_codex:
+                continue
+            room_isolation = room_codex.get("isolation")
+            if not isinstance(room_isolation, dict):
+                continue
+            path = f"rooms[{index}].codex.isolation"
+            if room_isolation.get("mode") != "ephemeral-linux-user":
+                self.error(
+                    f"config_commands require {path}.mode = 'ephemeral-linux-user'"
+                )
+            if room_isolation.get("trusted_prompt_authors") is not False:
+                self.error(
+                    f"config_commands require {path}.trusted_prompt_authors = false"
+                )
 
     def validate_rooms(self, rooms: Any) -> None:
         if not isinstance(rooms, list) or not rooms:

@@ -3,7 +3,7 @@ id: 20260627-configuration-space-commands
 title: Configuration Space Commands
 status: active
 created: 2026-06-27
-updated: 2026-06-28
+updated: 2026-07-01
 branch: codex/config-pull-worker
 pr:
 supersedes: []
@@ -78,11 +78,43 @@ superseded_by:
 - Keep `/config pull` configuration-invalid and do not grant the bot the socket
   group because current-user Codex children inherit its supplementary groups.
 
-## PR 2b2b
-- After the runner abstraction and `ephemeral-linux-user` launcher merge, prove
-  prompt-controlled children cannot access `/run/webex-config-pull`.
-- Then grant only the bot process the socket group, enable `/config pull`, and
-  add the reviewed admin Space/sender config in one bounded enablement sequence.
+## PR 2b2b1
+- Include `webex-config-pull` in the same fixed service drop-in that
+  transactional runner activation installs with the launcher group, ephemeral
+  config, and boot-scoped receipt. Rollback therefore revokes both privileged
+  socket groups before any config downgrade. Reject every other loadable
+  systemd drop-in across control, runtime, generator, local, vendor, prefix,
+  and service-wide policy layers, and require the managed fixed policy to stay
+  unchanged across every permission-relevant manager reload. If an interrupted
+  service transition, including one completed pending metadata, cannot pass
+  that startup preflight, stop the bot and verify it inactive while retaining
+  the recovery journal. Recovery from an
+  `activation_files_installing` or `activation_files_installed` journal applies
+  the same containment to startup preflight failures and stops the bot before
+  revoking the potentially installed group policy, so a reboot cannot preserve
+  inherited access. A successful rollback then restarts and verifies an
+  existing old service before continuing. Recovery-mode rejection uses the
+  same containment, and a
+  failed new-service transition, including an ordinary active-runner update,
+  stops the bot before any permission or config rollback. Committed recovery
+  renews any active runner receipt and verifies bot readiness before clearing
+  the journal.
+- Permit `pull` in the Rust command schema only when every effective Codex
+  runner is `ephemeral-linux-user`; keep `reload` and `sync` invalid.
+- Keep transient Codex workers outside the bot's supplementary groups and deny
+  `/run/webex-config-pull` through both systemd mount isolation and the inner
+  Codex permission profile. Retain the real worker-socket denial canary.
+- Add the production host-policy schema and exact sender/action pins, while
+  leaving the admin Space pin explicitly disabled until its reviewed room ID is
+  available. This slice does not make `/config pull` production-deployable.
+
+## PR 2b2b2
+- Pin the dedicated Configuration Space and administrator in host policy, then
+  update the config repository to all-ephemeral execution with only `status`
+  and `pull` enabled.
+- Activate the runner and worker socket permission in one reviewed deployment,
+  then verify durable enqueue, duplicate-event convergence, status, and
+  isolated-child denial through Webex E2E.
 
 ## PR 2b3
 - Add recoverable activation and persist the exact staged target revision before

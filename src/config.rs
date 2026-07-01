@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::{
-    config_commands::ConfigCommandsConfig,
+    config_commands::{ConfigCommand, ConfigCommandsConfig},
     launcher_protocol::{
         EPHEMERAL_RUNNER_WALL_OVERHEAD_SECONDS, LAUNCHER_MAX_CONNECTIONS, OUTPUT_CHAR_LIMIT_MAX,
         TIMEOUT_SECONDS_MAX,
@@ -95,6 +95,13 @@ impl BotConfig {
                 .validate()
                 .context("invalid config_commands")?;
             self.validate_config_commands_room(config_commands)?;
+            if config_commands.command_allowed(ConfigCommand::Pull)
+                && !self.all_codex_configs_use_ephemeral_linux_user()
+            {
+                return Err(anyhow!(
+                    "config_commands pull requires ephemeral-linux-user for every Codex runner"
+                ));
+            }
         }
         for (name, codex) in self.codex_configs() {
             codex
@@ -155,6 +162,12 @@ impl BotConfig {
         self.codex_configs()
             .into_iter()
             .any(|(_, codex)| codex.isolation.mode == IsolationMode::EphemeralLinuxUser)
+    }
+
+    fn all_codex_configs_use_ephemeral_linux_user(&self) -> bool {
+        self.codex_configs()
+            .into_iter()
+            .all(|(_, codex)| codex.isolation.mode == IsolationMode::EphemeralLinuxUser)
     }
 
     fn validate_room_ids(&self) -> Result<()> {
@@ -1011,8 +1024,8 @@ allow_all_senders = true
     }
 
     #[test]
-    fn rejects_pull_config_until_runner_isolation_is_enabled() {
-        let config: BotConfig = toml::from_str(
+    fn pull_config_requires_ephemeral_runner_isolation() {
+        let current_user: BotConfig = toml::from_str(
             r#"
 [config_commands]
 room_id = "admin-room"
@@ -1027,8 +1040,71 @@ allow_all_senders = true
         )
         .unwrap();
 
-        let error = format!("{:#}", config.validate().unwrap_err());
-        assert!(error.contains("only status is supported"));
+        let error = format!("{:#}", current_user.validate().unwrap_err());
+        assert!(error.contains("pull requires ephemeral-linux-user"));
+
+        let ephemeral: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 3600
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[config_commands]
+room_id = "admin-room"
+allowed_person_ids = []
+allowed_person_emails = ["operator@example.com"]
+allowed_commands = ["status", "pull"]
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+"#,
+        )
+        .unwrap();
+
+        ephemeral.validate().unwrap();
+
+        let mixed: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 3600
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[config_commands]
+room_id = "admin-room"
+allowed_person_ids = []
+allowed_person_emails = ["operator@example.com"]
+allowed_commands = ["status", "pull"]
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.codex.isolation]
+mode = "current-user"
+trusted_prompt_authors = true
+"#,
+        )
+        .unwrap();
+
+        let error = format!("{:#}", mixed.validate().unwrap_err());
+        assert!(error.contains("pull requires ephemeral-linux-user"));
     }
 
     #[test]

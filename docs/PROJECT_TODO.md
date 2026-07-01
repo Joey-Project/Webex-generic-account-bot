@@ -24,7 +24,10 @@
   lifecycle canaries plus root-only receipt renewal without granting bot
   launcher access or enabling production configuration.
 - [completed] Implement PR 4c2b's transactional permission/config activation.
-- [pending] Separately grant config-worker socket access and enable `/config pull`.
+- [completed] Include config-worker socket access in transactional runner
+  activation and permit the `pull` schema only under fully ephemeral isolation.
+- [pending] Pin the reviewed Configuration Space and enable `/config pull` in
+  the production config repository, then run deployment and Webex E2E.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
   service work inside the Webex request handler.

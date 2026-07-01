@@ -2416,8 +2416,8 @@ describe('config pull worker systemd boundary', () => {
     assert.equal(plan.stagedMetadataFile, DEFAULTS.stagedMetadataFile);
   });
 
-  it('provisions only the worker identity and host-owned writable deployment roots', async () => {
-    const [sysusers, tmpfiles] = await Promise.all([
+  it('provisions the worker identity, transactional bot permission, and host-owned roots', async () => {
+    const [sysusers, tmpfiles, botDropIn] = await Promise.all([
       fs.readFile(
         new URL('../deploy/systemd/webex-config-pull-worker.sysusers.conf', import.meta.url),
         'utf8',
@@ -2426,21 +2426,22 @@ describe('config pull worker systemd boundary', () => {
         new URL('../deploy/systemd/webex-config-pull-worker.tmpfiles.conf', import.meta.url),
         'utf8',
       ),
+      fs.readFile(
+        new URL('../deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf', import.meta.url),
+        'utf8',
+      ),
     ]);
 
     assert.match(sysusers, /^u webex-config-deploy /m);
     assert.match(sysusers, /^g webex-config-pull -$/m);
     assert.doesNotMatch(sysusers, /^m /m);
     assert.doesNotMatch(sysusers, /^m webex-config-deploy webex-generic-account-bot$/m);
-    await assert.rejects(
-      fs.stat(
-        new URL(
-          '../deploy/systemd/webex-generic-account-bot.service.d/10-config-pull.conf',
-          import.meta.url,
-        ),
-      ),
-      { code: 'ENOENT' },
+    assert.match(
+      botDropIn,
+      /^SupplementaryGroups=webex-codex-launch webex-config-pull$/m,
     );
+    assert.match(botDropIn, /^Requires=webex-codex-activation-renew\.service$/m);
+    assert.doesNotMatch(botDropIn, /webex-config-pull-worker\.service/);
     const tmpfilesRecords = tmpfiles.trim().split('\n').map((line) => line.split(/\s+/));
     assert.deepEqual(tmpfilesRecords, [
       ['d', '/run/webex-config-deploy', '0750', 'root', 'webex-config-pull', '-'],

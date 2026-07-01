@@ -29,8 +29,9 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   body, thread, Codex, or reply-routing decisions. Sidecar message fields are
   hints only.
 - Supports an optional dedicated Configuration Space with explicit sender and
-  command allowlists. The current slice implements read-only `/config status`
-  and the dormant durable pull-worker foundation.
+  command allowlists. The schema permits read-only `/config status` and permits
+  durable `/config pull` only when every effective Codex runner is isolated as
+  `ephemeral-linux-user`; `reload` and `sync` remain invalid.
 
 The first implementation is synchronous per sidecar request: the HTTP request
 returns after Codex finishes and the Webex reply is accepted. For this slice,
@@ -61,11 +62,12 @@ The admin Space cannot overlap an input or output room, has no
 `allow_all_senders` mode, and accepts only exact `/config ...` commands after
 authoritative Webex hydration. `/config status` reads fixed host deployment
 metadata with no-follow and size checks, returns only allowlisted fields, and
-uses the normal idempotent Webex reply marker. The dormant `/config pull` path
-can durably submit a fixed action to a separate worker over a host-owned Unix
-socket before acknowledgement, but configuration validation rejects it until
-Codex runs use the isolated runner. The worker runs immutable staged preparation
-only; it cannot reload the bot. `reload` and `sync` also remain undeployable.
+uses the normal idempotent Webex reply marker. `/config pull` durably submits a
+fixed action to a separate worker over a host-owned Unix socket before
+acknowledgement, and configuration validation accepts it only when every
+effective Codex runner uses `ephemeral-linux-user`. The worker runs immutable
+staged preparation only; it cannot reload the bot. `reload` and `sync` remain
+undeployable.
 When a trusted, valid deployment recovery journal exists, status reports only
 its allowlisted phase, config revision, and service. Production root apply
 writes that credential-free journal as root-owned (UID 0) with mode `0644` so
@@ -79,10 +81,10 @@ fail closed. This deployment journal is separate
 from the worker's private queue and staging state. A strict, bounded mode
 `0644` public worker status file projects only the latest pull action state and
 prepared revision, without exposing private queue records or failure output.
-The current production host policy also rejects the entire table until a
-companion config PR pins the exact admin Space and sender allowlist. The example
-above is therefore for local validation and the upcoming reviewed deployment,
-not yet for `scripts/deploy-config.mjs --apply`.
+The current production host policy rejects the entire table until a companion
+config PR pins the exact admin Space and sender allowlist. The example above is
+therefore for local validation and a future reviewed deployment, not yet for
+`scripts/deploy-config.mjs --apply`.
 
 For staging production Space behaviour, a room policy can set
 `output_room_id`, `forward_source_message = true`, and
@@ -229,12 +231,18 @@ Before connecting, the bot resolves the fixed system account and group names and
 requires both the socket and its mode `0750` parent to be owned by
 `webex-config-deploy:webex-config-pull`. The worker is never added to the bot's
 own group, so it cannot read bot tokens, Codex state, or Jenkins credentials.
-The bot is deliberately not added to `webex-config-pull` in this slice: a Codex
-child currently inherits the bot's supplementary groups, so granting socket
-access before isolated runner execution would let ordinary-room code bypass the
-configuration Space allowlist. The service keeps `UMask=0077`; worker code
-explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
-public status file after creation.
+The bot receives `webex-config-pull` only through the reviewed transactional
+`10-codex-launcher.conf` service drop-in. Runner activation installs that group
+together with the launcher permission, ephemeral config, and boot-scoped
+receipt, and rolls it back before any config downgrade. `/config pull`
+configuration is valid only when every effective Codex runner uses
+`ephemeral-linux-user`. The transient runner receives only `webex-codex-input`,
+hides `/run/webex-config-pull` with `InaccessiblePaths`, and denies the same path
+in the inner Codex permission profile. The activation canary also attempts the
+real worker socket and requires access to be denied. The permission does not
+couple the worker lifecycle to the bot. The service keeps `UMask=0077`; worker
+code explicitly applies and verifies mode `0660` on the socket and mode `0644`
+on the public status file after creation.
 
 The socket parent and lock parent are deliberately separate. The shared socket
 parent is mode `0750` at `/run/webex-config-pull`. The root-owned
@@ -303,14 +311,15 @@ changing state and only then discovering the first worker's active socket. A
 stop signal aborts the bounded stale-socket probe, waits for partial startup to
 unwind, and removes any socket already created before the process exits.
 
-The bot-side client and fixed command routing are present for integration tests,
-but configuration validation still rejects `pull`, `reload`, and `sync` and no
-config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
-only the receipt-gated Codex launcher client path. Runner activation grants the
-bot only launcher-group and pending-input access while removing the
-current-user path. A later enablement PR may allow `pull`
-only after `ephemeral-linux-user` runner isolation is deployable and verified;
-`reload` and `sync` require the later activation work as well.
+The bot-side client durably enqueues `/config pull` before acknowledging the
+Webex request. Configuration validation permits only `status` and `pull`, and
+requires fully ephemeral runner isolation whenever `pull` is allowed. The
+host policy pins `hoteng@cisco.com` and `status`/`pull`, but its Configuration
+Space ID remains explicitly unset, so this slice is not production-deployable.
+User message text cannot select an action, path, repository, revision, or
+command argument. `/config reload` and `/config sync` remain undeployable until
+staged activation, rollback, health verification, and in-flight attempt
+semantics land.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.
@@ -345,10 +354,13 @@ required because mode `0644` grants no group write. Deployment recovery trusts
 the same-owner UID for both current mode `0644` and legacy mode `0600` journals,
 while `/config status` parses only the root-owned (UID 0), mode `0644` journal
 at the fixed path and reports private legacy files only as generic
-`recovery_required`. The journal
-advances through
-`prepared`, `service_transition_started`, and `committed_pending_metadata`, and
-remains until success metadata is durable. After an unclean exit, the next apply
+`recovery_required`. A version 1 journal advances through `prepared`,
+`service_transition_started`, and `committed_pending_metadata`. A version 2
+runner-activation journal additionally advances through
+`activation_renewal_started`, `activation_renewed`,
+`activation_files_installing`, and `activation_files_installed` before its
+service transition. The journal remains until success metadata is durable.
+After an unclean exit, the next apply
 either restores the preserved backup without consuming it or finalises metadata
 for an already committed service. Required rollback restarts and verifies an old
 service; a failed first deployment is restored by stopping the service after its
@@ -366,8 +378,14 @@ including `--status --json`, validates the status schema and rejects malformed o
 incomplete metadata.
 
 `--apply --activate-runner` is the explicit final runner activation path. It
-is a one-time transition and refuses to run when the reviewed permission
-drop-in is already active. It first renders a candidate that is statically required to use
+refuses to run when the current reviewed permission drop-in is already active,
+but transactionally migrates the exact launcher-only drop-in installed by the
+previous activation slice. Ordinary apply fails with an explicit migration
+instruction while that legacy drop-in remains. The bot unit's drop-in directory
+is dedicated to this managed file; any sibling `*.conf` entry blocks permission
+detection and is checked again before every permission-relevant `daemon-reload`,
+so an out-of-band group grant cannot be mistaken for an inactive runner. Stale
+atomic-write temporary files are ignored because systemd does not load them. It first renders a candidate that is statically required to use
 `ephemeral-linux-user` for every effective Codex policy. Before canaries run,
 the entrypoint writes a version 2 recovery journal and snapshots the live
 config, bot permission drop-in, and any prior boot receipt. It then restarts
@@ -380,14 +398,18 @@ the commit point stops and verifies the renewal unit, revokes the launcher
 drop-in before restoring a prior config, restores the receipt, reloads systemd,
 and verifies the old service. If permission revocation fails, rollback keeps
 the ephemeral config and recovery journal instead of exposing launcher access
-to a `current-user` config. A canary failure leaves no stale receipt. A renewal
+to a `current-user` config; after a service transition it also stops the bot and
+verifies `ActiveState=inactive` so no newly privileged process remains live. A
+canary failure leaves no stale receipt. A renewal
 stop or inactive-verification failure does not skip three-state restoration or
 old-service recovery; the apply still fails and retains its journal for a later
 recovery retry. Once permission and config are restored, a receipt-only cleanup
 failure also leaves the journal and reports failure but does not prevent the
 old service from restarting. Version 1 deployment journals remain recoverable, and an
 explicit activation continues after finalising a committed ordinary deployment
-instead of treating it as an activated runner.
+instead of treating it as an activated runner. Committed recovery renews any
+active runner receipt, restarts and verifies the bot, and clears the journal
+only after service readiness succeeds.
 
 The activation unit remains active after a successful oneshot. The bot drop-in
 requires it and orders bot startup after it, while `PartOf=` restarts the unit
@@ -412,8 +434,9 @@ live rendered config to be fully ephemeral; a missing or current-user live
 config fails closed before receipt renewal, checkout, or rollback can run. Each
 apply first reloads the systemd manager so permission detection cannot rely on
 stale loaded drop-in state after an out-of-band file change.
-Version 2 activation journals also require `permission_had_previous=false`;
-activation never restores a launcher permission that predates the transaction.
+Version 2 activation journals may record the exact previous launcher-only
+permission during the reviewed migration. Rollback restores it only when the
+saved drop-in still matches that fixed legacy policy byte for byte.
 Rollback reloads the systemd manager immediately after removing launcher
 permission and before restoring any previous config; reload failure leaves the
 ephemeral config and recovery journal in place.
@@ -973,12 +996,14 @@ and every ephemeral Codex policy still requires the fixed model, no profile,
 ephemeral state, repository-check bypass, bounded timeout/output, and
 `trusted_prompt_authors = false`.
 
-The installed bot drop-in grants only `webex-codex-launch` and write access to
-the non-enumerable pending-input directory. It does not grant
-`webex-codex-input` or `webex-config-pull`. The drop-in also requires the
-boot-scoped renewal unit, which remains active after success so isolated
-transient units can bind their lifetime to it. `/config pull`, `/config reload`,
-and `/config sync` remain disabled and are owned by later PRs.
+At the PR 4c2b stage, the installed bot drop-in granted only
+`webex-codex-launch` and write access to the non-enumerable pending-input
+directory; it did not grant `webex-codex-input` or `webex-config-pull`. This
+later command-enablement change adds `webex-config-pull` to the same fixed,
+transactional drop-in while still withholding `webex-codex-input`. The drop-in
+also requires the boot-scoped renewal unit, which remains active after success
+so isolated transient units can bind their lifetime to it. `reload` and `sync`
+remain disabled.
 
 ## Development
 

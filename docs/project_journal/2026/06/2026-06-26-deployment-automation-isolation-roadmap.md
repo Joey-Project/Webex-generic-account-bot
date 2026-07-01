@@ -3,7 +3,7 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-06-30
+updated: 2026-07-01
 branch: codex/roadmap-deploy-isolation
 pr:
 supersedes: []
@@ -25,8 +25,9 @@ superseded_by:
   (isolated execution), PR 4c1a (boot-scoped activation receipt foundation),
   PR 4c1b (root fresh-inode input sealer), PR 4c1c (gated runner wiring), PR
   4c2a1 (canary contract/probe), 4c2a2 (production-image and lifecycle
-  canaries plus receipt helper), 4c2b (transactional final activation), PR 2b2b (`/config
-  pull` enablement), and PR 2b3 (recoverable
+  canaries plus receipt helper), 4c2b (transactional final activation), PR
+  2b2b1 (config-pull permission and schema boundary), PR 2b2b2 (reviewed Space
+  and config enablement), and PR 2b3 (recoverable
   activation plus `/config reload` and `/config sync`). Mutating commands
   remain undeployable until their security dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
@@ -112,10 +113,30 @@ superseded_by:
   drop-in installed outside the transaction fails closed unless the live
   rendered config is already fully ephemeral. Every apply reloads the systemd
   manager before permission detection so stale loaded drop-in state cannot
-  select the wrong isolation policy. Version 2 journals require that launcher
-  permission did not predate activation. Rollback reloads the manager after
-  permission removal and before config downgrade; reload failure preserves the
-  ephemeral config and recovery journal.
+  select the wrong isolation policy. Permission-relevant reloads reject any
+  other loadable unit, prefix, or service-wide drop-in across systemd's control,
+  runtime, generator, local, and vendor paths, and verify the fixed managed
+  drop-in state both before and after reload. Version 2 journals may record the
+  exact reviewed launcher-only policy that predates migration, and rollback
+  restores only that byte-matched legacy policy. Rollback reloads the manager
+  after permission removal and before config downgrade; reload failure preserves
+  the ephemeral config and recovery journal. When a crash journal records that a
+  service transition started or completed pending metadata, any startup
+  permission preflight failure stops the bot and verifies it inactive before
+  leaving the journal for recovery.
+  Recovery mode rejection, including ordinary apply over a version 2 journal
+  or skip-restart over a service transition, applies the same containment.
+  Recovery records `activation_files_installing` before writing the new config
+  and drop-in. Both that phase and `activation_files_installed` contain startup
+  preflight failures and stop the bot before rollback, covering a reboot that
+  loaded the new group policy before the service-transition phase was recorded.
+  After restoring an existing old config, recovery restarts and verifies the
+  old service before continuing.
+  A failed new-service transition, from activation or an ordinary active-runner
+  update, stops and verifies the bot before restoring permission or config, so
+  a crash cannot leave inherited groups in a process after the on-disk policy
+  has rolled back. Recovery from `committed_pending_metadata` renews any active
+  runner receipt and re-verifies service readiness before clearing the journal.
   Receipt-only rollback failures retain the journal and fail the action after
   restoring the prior config and service.
   Ordinary apply enforces current-user policy while permission is absent and
@@ -125,6 +146,15 @@ superseded_by:
   activation instead of returning ordinary deployment metadata as success.
   The production host still requires
   a matching reviewed config and a successful real-reboot canary run.
+- PR 2b2b1 adds the config-worker socket group to the same fixed drop-in owned
+  by the runner activation transaction, so it cannot be independently granted
+  while current-user Codex execution is active. The Rust schema allows `pull`
+  only for a fully ephemeral effective runner configuration, while `reload`
+  and `sync` remain invalid. Transient Codex receives only the input group and
+  continues to hide and deny `/run/webex-config-pull`; the activation canary
+  probes the real worker socket. Host policy recognises the command schema but
+  keeps the admin Space pin disabled. PR 2b2b2 owns the exact room pin,
+  companion config change, deployment, and Webex E2E.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -208,13 +238,19 @@ superseded_by:
 - Keep bot socket-group access and deployable `/config pull` disabled because
   current-user Codex children inherit the bot's supplementary groups.
 
-#### PR 2b2b: Pull Enablement After Runner Isolation
+#### PR 2b2b1: Pull Permission and Schema Boundary
 - Merge PRs 3, 4a, 4b, and 4c first and prove prompt-controlled Codex
   subprocesses cannot access the worker socket, bot/deployment secrets, or host
   `/run` paths.
-- Then grant the bot socket access and enable `/config pull` only after socket
-  authorization, queue durability, duplicate-event, crash-recovery, fixed-argv,
-  ownership, symlink, and isolated-child denial tests pass.
+- Add the config-worker group to the transactional runner permission drop-in,
+  allow the `pull` schema only under fully ephemeral isolation, and keep the
+  production admin-room pin disabled.
+
+#### PR 2b2b2: Reviewed Pull Enablement
+- Pin the exact admin Space and sender, update the reviewed config repository,
+  and enable `/config pull` only after socket authorization, queue durability,
+  duplicate-event, crash-recovery, fixed-argv, ownership, symlink, and
+  isolated-child denial tests pass.
 
 #### PR 2b3: Recoverable Activation
 - Add activation of an already staged immutable revision without network fetch,
