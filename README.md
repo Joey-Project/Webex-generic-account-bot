@@ -244,12 +244,15 @@ external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
 policy may not assign a managed user or group by name or implicit DynamicUser
 unit name, unresolved instance specifiers are forbidden in identity directives
-except for the exact vendor `user@.service` user-manager assignment, and
+except for the exact vendor `user@.service` user-manager assignment when both
+the physical file and logical unit owner match, and
 external units may not use numeric identities from the static system-ID
 range before allocation. Direct boot-policy credential injection is rejected;
-the standard vendor `ImportCredential=` consumers remain allowed only after the
-current system credential set and all plaintext and encrypted credential stores
-prove that `sysusers.extra` and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
+credential import selectors are evaluated across glob and rename forms, and
+the standard vendor `ImportCredential=` consumers remain allowed only for an
+exact physical-file/logical-owner pair after the current system credential set
+and all plaintext and encrypted credential stores prove that `sysusers.extra`
+and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, lexical path normalisation, copy-source, path-derived-ID,
@@ -266,8 +269,10 @@ boundary durable across reboot. Catalogue source markers bind each active line
 to its policy file, allowing a trusted installed managed version to be replaced
 by the reviewed desired version without accepting the same line from an
 unmanaged source.
-The same host-wide `flock` used by config deployment serialises the complete apply, and
-the re-executed process verifies the kernel lock PID, device, and inode instead
+The same host-wide `flock` used by config deployment serialises the complete apply.
+The trusted Node and provisioner entrypoints are verified before first-run lock
+metadata can be created or converged, and the re-executed process then verifies
+the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a
 safe mode narrowed to any value by the caller's umask before the first metadata
@@ -290,6 +295,10 @@ unit became active or enabled. It never starts or enables a unit. A policy-file
 transaction failure restores the old file set. Each file replacement is atomic,
 and a root-only transaction journal
 under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
+Recovery first proves identity, unit, source, merged boot-policy, system
+credential, and credential-store trust against the current partial state. After
+restoring the old set and reloading the manager, the journal remains until the
+same common preflight accepts the recovered state.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.

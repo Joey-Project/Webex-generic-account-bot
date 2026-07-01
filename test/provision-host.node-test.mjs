@@ -17,6 +17,7 @@ import {
   buildLockedApplyCommand,
   buildProvisionPlan,
   ensureProvisionLockFile,
+  executeLockedApply,
   hasProvisionLock,
   parseArgs,
   parseIdentityDatabases,
@@ -146,6 +147,27 @@ describe('guarded host provisioner policy', () => {
       }),
       /lock ownership is not proven/,
     );
+
+    const entrypoints = [];
+    let ensureLockCalls = 0;
+    await assert.rejects(
+      executeLockedApply(['--apply'], {
+        nodePath: '/trusted/node',
+        scriptPath: '/untrusted/provision-host.mjs',
+        verifyReexecFile: async (file) => {
+          entrypoints.push(file);
+          if (file === '/untrusted/provision-host.mjs') {
+            throw new Error('provisioner script is not trusted');
+          }
+        },
+        ensureLock: async () => {
+          ensureLockCalls += 1;
+        },
+      }),
+      /provisioner script is not trusted/,
+    );
+    assert.deepEqual(entrypoints, ['/trusted/node', '/untrusted/provision-host.mjs']);
+    assert.equal(ensureLockCalls, 0);
   });
 
   it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {
@@ -1355,30 +1377,37 @@ describe('guarded host provisioner execution', () => {
     const sysusersDropInDirectory =
       '/etc/systemd/system/systemd-sysusers.service.d';
     const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
-    await assert.rejects(
-      readSystemUnitStates(
-        MANAGED_UNITS,
-        async () => ({ stdout: '', stderr: '', code: 0 }),
-        systemdUnitPathFs(
-          new Map([
-            ['/etc/systemd/system', [{
-              name: 'systemd-sysusers.service.d',
-              isFile: () => false,
-              isDirectory: () => true,
-              isSymbolicLink: () => false,
-            }]],
-            [sysusersDropInDirectory, [{ name: '50-extra-policy.conf' }]],
-          ]),
-          {
-            filesByPath: new Map([[
-              sysusersDropIn,
-              Buffer.from('[Service]\nLoadCredential=sysusers.extra:/root/policy\n'),
-            ]]),
-          },
+    for (const policy of [
+      'LoadCredential=sysusers.extra:/root/policy',
+      'ImportCredential=payload:sysusers.extra',
+      'ImportCredential=sysusers.?xtra',
+      'ImportCredential=sysusers.[e]xtra',
+    ]) {
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([
+              ['/etc/systemd/system', [{
+                name: 'systemd-sysusers.service.d',
+                isFile: () => false,
+                isDirectory: () => true,
+                isSymbolicLink: () => false,
+              }]],
+              [sysusersDropInDirectory, [{ name: '50-extra-policy.conf' }]],
+            ]),
+            {
+              filesByPath: new Map([[
+                sysusersDropIn,
+                Buffer.from(`[Service]\n${policy}\n`),
+              ]]),
+            },
+          ),
         ),
-      ),
-      /external systemd policy injects a boot policy credential/,
-    );
+        /external systemd policy injects a boot policy credential/,
+      );
+    }
 
     let vendorImportCommandCalls = 0;
     await assert.rejects(
@@ -1417,6 +1446,64 @@ describe('guarded host provisioner execution', () => {
       /systemctl reached after vendor credential import audit/,
     );
     assert.equal(vendorImportCommandCalls, 2);
+
+    for (const [name, target, contents, expected] of [
+      [
+        'external@.service',
+        '/usr/lib/systemd/system/user@.service',
+        '[Service]\nUser=%i\n',
+        /external systemd policy references a managed unit/,
+      ],
+      [
+        'external-sysusers.service',
+        '/usr/lib/systemd/system/systemd-sysusers.service',
+        '[Service]\nImportCredential=sysusers.*\n',
+        /external systemd policy injects a boot policy credential/,
+      ],
+    ]) {
+      const alias = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{
+              name,
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]]]),
+            {
+              filesByPath: new Map([[target, Buffer.from(contents)]]),
+              symlinksByPath: new Map([[alias, target]]),
+            },
+          ),
+        ),
+        expected,
+      );
+    }
+
+    const fakeVendorUnit =
+      '/usr/lib/systemd/system/systemd-tmpfiles-unreviewed.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([[
+            '/usr/lib/systemd/system',
+            [{ name: 'systemd-tmpfiles-unreviewed.service' }],
+          ]]),
+          {
+            filesByPath: new Map([[
+              fakeVendorUnit,
+              Buffer.from('[Service]\nImportCredential=tmpfiles.*\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy injects a boot policy credential/,
+    );
 
     const implicitDynamicUserUnit = '/etc/systemd/system/webex-config-deploy.service';
     await assert.rejects(
@@ -1943,6 +2030,27 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
+  });
+
+  it('does not recover policy before source trust preflight succeeds', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const desired = Buffer.from('interrupted desired policy\n');
+    const existing = Buffer.from('recorded old policy\n');
+    await writeRecoveryTransaction(fixture, artifact, desired, existing);
+    await fs.chmod(artifact.source, 0o664);
+    const commands = [];
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ applied: true, commands }),
+      ),
+      /policy file metadata is not trusted/,
+    );
+    assert.equal(await fs.readFile(artifact.target, 'utf8'), desired.toString('utf8'));
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+    assert.deepEqual(commands, []);
   });
 
   it('retains the recovery journal when the immediate manager reload fails', async (context) => {

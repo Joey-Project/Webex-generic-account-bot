@@ -155,6 +155,12 @@ const CREDENTIAL_DIRECTIVES = new Set([
   'SetCredential',
   'SetCredentialEncrypted',
 ]);
+const VENDOR_TMPFILES_CREDENTIAL_UNITS = new Set([
+  'systemd-tmpfiles-clean.service',
+  'systemd-tmpfiles-setup-dev-early.service',
+  'systemd-tmpfiles-setup-dev.service',
+  'systemd-tmpfiles-setup.service',
+]);
 
 export const MANAGED_UNITS = Object.freeze([
   'webex-generic-account-bot.service',
@@ -562,10 +568,17 @@ export async function provisionHost(options, dependencies = {}) {
   }
   const commands = [];
   let identityBefore = null;
+  let recoveryPending = false;
   if (transaction) {
     identityBefore = await deps.readIdentitySnapshot();
     validateIdentityPolicy(identityBefore);
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
+    const recoveryInspected = await inspectArtifacts(plan, deps);
+    auditBootPolicyCatalogs(
+      await deps.readBootPolicyCatalogs(),
+      recoveryInspected,
+      identityBefore,
+    );
     assertUnitsDormant(recoveryUnitStates, plan, {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
@@ -575,13 +588,13 @@ export async function provisionHost(options, dependencies = {}) {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
       const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
       assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
-      await removeProvisionTransaction(plan, deps);
     } catch (error) {
       throw new Error(
         `host policy recovery finalisation failed; rerun --apply after correction: ${error.message}`,
         { cause: error },
       );
     }
+    recoveryPending = true;
   }
 
   if (identityBefore === null) {
@@ -605,6 +618,16 @@ export async function provisionHost(options, dependencies = {}) {
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
+  }
+  if (recoveryPending) {
+    try {
+      await removeProvisionTransaction(plan, deps);
+    } catch (error) {
+      throw new Error(
+        `host policy recovery finalisation failed; rerun --apply after correction: ${error.message}`,
+        { cause: error },
+      );
+    }
   }
 
   if (!options.apply) {
@@ -711,14 +734,20 @@ export function hasProvisionLock(locksText, pid, stat) {
   });
 }
 
-async function executeLockedApply(argv) {
-  await ensureProvisionLockFile(fs);
-  const scriptPath = fileURLToPath(import.meta.url);
-  await assertTrustedReexecFile(process.execPath, { executable: true }, fs);
-  await assertTrustedReexecFile(scriptPath, { mode: FILE_MODE }, fs);
-  const command = buildLockedApplyCommand({ argv, scriptPath });
+export async function executeLockedApply(argv, {
+  fsApi = fs,
+  nodePath = process.execPath,
+  scriptPath = fileURLToPath(import.meta.url),
+  verifyReexecFile = assertTrustedReexecFile,
+  ensureLock = ensureProvisionLockFile,
+  spawnProcess = spawn,
+} = {}) {
+  await verifyReexecFile(nodePath, { executable: true }, fsApi);
+  await verifyReexecFile(scriptPath, { mode: FILE_MODE }, fsApi);
+  await ensureLock(fsApi);
+  const command = buildLockedApplyCommand({ argv, nodePath, scriptPath });
   return new Promise((resolve, reject) => {
-    const child = spawn(command.command, command.args, {
+    const child = spawnProcess(command.command, command.args, {
       cwd: '/',
       env: {
         PATH: '/usr/bin:/bin',
@@ -2383,11 +2412,12 @@ async function auditSystemdPolicyEntry(
       new Set(),
       unitNames,
       managedIds,
+      candidate,
     );
     return;
   }
   if (stat.isFile()) {
-    await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds);
+    await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds, candidate);
     return;
   }
   if (!stat.isDirectory()) return;
@@ -2421,6 +2451,7 @@ async function auditSystemdPolicySymlink(
   visited,
   unitNames,
   managedIds,
+  logicalSource,
 ) {
   if (visited.has(candidate) || visited.size >= 32) {
     throw new Error(`systemd policy symlink chain is invalid: ${candidate}`);
@@ -2437,6 +2468,7 @@ async function auditSystemdPolicySymlink(
     candidate,
     unitNames,
     managedIds,
+    logicalSource,
   );
   let resolved = path.resolve(path.dirname(candidate), target);
   if (resolved === '/dev/null') return;
@@ -2459,6 +2491,7 @@ async function auditSystemdPolicySymlink(
       visited,
       mergeSystemdUnitNames(unitNames, path.basename(resolved)),
       managedIds,
+      logicalSource,
     );
     return;
   }
@@ -2471,10 +2504,18 @@ async function auditSystemdPolicySymlink(
     fsApi,
     mergeSystemdUnitNames(unitNames, path.basename(resolved)),
     managedIds,
+    logicalSource,
   );
 }
 
-async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds) {
+async function auditSystemdPolicyFile(
+  candidate,
+  budget,
+  fsApi,
+  unitNames,
+  managedIds,
+  logicalSource,
+) {
   budget.files += 1;
   if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
     throw new Error('too many systemd policy files');
@@ -2485,7 +2526,13 @@ async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, manag
     throw new Error('systemd policy files exceed the aggregate byte limit');
   }
   for (const line of policyCatalogLines(policy.contents)) {
-    assertSystemdPolicyDoesNotReferenceManaged(line, candidate, unitNames, managedIds);
+    assertSystemdPolicyDoesNotReferenceManaged(
+      line,
+      candidate,
+      unitNames,
+      managedIds,
+      logicalSource,
+    );
   }
 }
 
@@ -2494,9 +2541,15 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   source,
   unitNames = new Set(),
   managedIds = new Set(),
+  logicalSource = source,
 ) {
   const decoded = decodeSystemdEscapesForAudit(String(value));
-  if (systemdPolicyInjectsBootPolicyCredential(decoded, source)) {
+  if (systemdPolicyInjectsBootPolicyCredential(
+    decoded,
+    source,
+    unitNames,
+    logicalSource,
+  )) {
     throw new Error(`external systemd policy injects a boot policy credential: ${source}`);
   }
   const expanded = new Set([
@@ -2509,45 +2562,128 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
-      || systemdIdentityDirectiveUsesManagedId(candidate, managedIds, source)
+      || systemdIdentityDirectiveUsesManagedId(
+        candidate,
+        managedIds,
+        source,
+        unitNames,
+        logicalSource,
+      )
     ) {
       throw new Error(`external systemd policy references a managed unit: ${source}`);
     }
   }
 }
 
-function systemdPolicyInjectsBootPolicyCredential(value, source) {
+function systemdPolicyInjectsBootPolicyCredential(
+  value,
+  source,
+  unitNames,
+  logicalSource,
+) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
   if (!CREDENTIAL_DIRECTIVES.has(directive)) return false;
-  if (isExpectedVendorBootPolicyCredentialImport(source, value.trim())) return false;
+  if (isExpectedVendorBootPolicyCredentialImport(
+    source,
+    value.trim(),
+    unitNames,
+    logicalSource,
+  )) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
   if (directive === 'ImportCredential') {
-    return fields.some((selector) => BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
-      selector === name
-      || (selector.endsWith('*') && name.startsWith(selector.slice(0, -1)))
-    )));
+    return fields.some(importCredentialSelectorTargetsBootPolicy);
   }
   return fields.some((field) => {
     const separatorOffset = field.indexOf(':');
     const credential = separatorOffset < 0 ? field : field.slice(0, separatorOffset);
-    return BOOT_POLICY_CREDENTIAL_NAMES.includes(credential);
+    return credential.includes('%') || BOOT_POLICY_CREDENTIAL_NAMES.includes(credential);
   });
 }
 
-function isExpectedVendorBootPolicyCredentialImport(source, line) {
+function importCredentialSelectorTargetsBootPolicy(selector) {
+  if (selector.length > 255 || selector.includes('%')) return true;
+  const components = selector.split(':');
+  if (components.length > 2) return true;
+  return components.some((pattern) => BOOT_POLICY_CREDENTIAL_NAMES.some(
+    (name) => systemdCredentialGlobMatches(pattern, name),
+  ));
+}
+
+function systemdCredentialGlobMatches(pattern, value) {
+  const memo = new Map();
+  const matches = (patternOffset, valueOffset) => {
+    const key = `${patternOffset}:${valueOffset}`;
+    if (memo.has(key)) return memo.get(key);
+    let result;
+    if (patternOffset === pattern.length) {
+      result = valueOffset === value.length;
+    } else if (pattern[patternOffset] === '*') {
+      result = matches(patternOffset + 1, valueOffset)
+        || (valueOffset < value.length && matches(patternOffset, valueOffset + 1));
+    } else if (pattern[patternOffset] === '?') {
+      result = valueOffset < value.length && matches(patternOffset + 1, valueOffset + 1);
+    } else if (pattern[patternOffset] === '[') {
+      const closing = pattern.indexOf(']', patternOffset + 1);
+      if (closing < 0) {
+        result = true;
+      } else {
+        const expression = pattern.slice(patternOffset + 1, closing);
+        result = valueOffset < value.length
+          && credentialCharacterClassMatches(expression, value[valueOffset])
+          && matches(closing + 1, valueOffset + 1);
+      }
+    } else {
+      result = valueOffset < value.length
+        && pattern[patternOffset] === value[valueOffset]
+        && matches(patternOffset + 1, valueOffset + 1);
+    }
+    memo.set(key, result);
+    return result;
+  };
+  return matches(0, 0);
+}
+
+function credentialCharacterClassMatches(expression, value) {
+  if (expression === '') return true;
+  const negated = expression[0] === '!' || expression[0] === '^';
+  const body = negated ? expression.slice(1) : expression;
+  let matched = false;
+  for (let offset = 0; offset < body.length; offset += 1) {
+    if (offset + 2 < body.length && body[offset + 1] === '-') {
+      matched ||= value >= body[offset] && value <= body[offset + 2];
+      offset += 2;
+    } else {
+      matched ||= value === body[offset];
+    }
+  }
+  return negated ? !matched : matched;
+}
+
+function isExpectedVendorBootPolicyCredentialImport(
+  source,
+  line,
+  unitNames,
+  logicalSource,
+) {
+  if (source !== logicalSource) return false;
   const directory = path.dirname(source);
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
   return (
     unit === 'systemd-sysusers.service'
+    && systemdUnitNamesEqual(unitNames, unit)
     && line === 'ImportCredential=sysusers.*'
   ) || (
-    unit.startsWith('systemd-tmpfiles-')
-    && unit.endsWith('.service')
+    VENDOR_TMPFILES_CREDENTIAL_UNITS.has(unit)
+    && systemdUnitNamesEqual(unitNames, unit)
     && line === 'ImportCredential=tmpfiles.*'
   );
+}
+
+function systemdUnitNamesEqual(unitNames, unit) {
+  return unitNames.size === 1 && unitNames.has(unit);
 }
 
 function unitNameClaimsManagedIdentity(unitName) {
@@ -2558,7 +2694,13 @@ function unitNameClaimsManagedIdentity(unitName) {
   return MANAGED_IDENTITY_NAMES.includes(decodeSystemdEscapesForAudit(implicitIdentity));
 }
 
-function systemdIdentityDirectiveUsesManagedId(value, managedIds, source) {
+function systemdIdentityDirectiveUsesManagedId(
+  value,
+  managedIds,
+  source,
+  unitNames,
+  logicalSource,
+) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
@@ -2566,7 +2708,12 @@ function systemdIdentityDirectiveUsesManagedId(value, managedIds, source) {
   const identities = parseSystemdFields(value.slice(separator + 1));
   if (
     identities.some((identity) => /%[iI]/.test(identity))
-    && !isExpectedVendorUserManagerIdentity(source, value.trim())
+    && !isExpectedVendorUserManagerIdentity(
+      source,
+      value.trim(),
+      unitNames,
+      logicalSource,
+    )
   ) {
     return true;
   }
@@ -2578,10 +2725,12 @@ function systemdIdentityDirectiveUsesManagedId(value, managedIds, source) {
   });
 }
 
-function isExpectedVendorUserManagerIdentity(source, line) {
+function isExpectedVendorUserManagerIdentity(source, line, unitNames, logicalSource) {
   return (
-    ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(path.dirname(source))
+    source === logicalSource
+    && ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(path.dirname(source))
     && path.basename(source) === 'user@.service'
+    && systemdUnitNamesEqual(unitNames, 'user@.service')
     && line === 'User=%i'
   );
 }

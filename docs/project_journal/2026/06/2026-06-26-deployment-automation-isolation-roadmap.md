@@ -174,10 +174,12 @@ superseded_by:
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion,
   named/implicit-DynamicUser assignments, unresolved identity instance
-  specifiers outside the exact vendor user-manager assignment, pre-allocation
+  specifiers outside the physical-file/logical-owner-bound vendor user-manager
+  assignment, pre-allocation
   rejection of static-range numeric identities,
-  boot-policy credential injection plus current system and credential-store
-  inputs, and launcher-instance
+  boot-policy credential injection with glob/rename-aware selectors and
+  physical-file/logical-owner vendor binding plus current system and
+  credential-store inputs, and launcher-instance
   references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
@@ -190,10 +192,13 @@ superseded_by:
   policy targets, traversal-preserving ancestor metadata, recursive parent
   handling, and root-owned stable source
   metadata for every effective catalogue file,
-  trusted re-exec paths, bounded post-preflight stale candidate collection with
+  trusted re-exec paths checked before first-run lock convergence, bounded
+  post-preflight stale candidate collection with
   all-before-any validation and unit
-  discovery, recovery-before-write dormancy checks, immediate recovery-time
-  manager reload, explicit complete-target stale-cache convergence recovery,
+  discovery, complete recovery-before-write identity, unit, source,
+  boot-policy, and credential checks, immediate recovery-time manager reload,
+  delayed journal removal until the recovered state passes common preflight,
+  explicit complete-target stale-cache convergence recovery,
   fail-closed recovery with full target-directory durability and a journal
   retained through final manager convergence,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate

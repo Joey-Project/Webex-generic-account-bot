@@ -108,9 +108,11 @@
   dangling-alias parents, `d_type`-independent entry classification, unit-name
   specifier expansion, named/implicit-DynamicUser identities, unresolved
   instance-specifier rejection in identity directives with only the exact
-  vendor user-manager identity assignment permitted, pre-allocation rejection
+  physical-file/logical-owner vendor user-manager identity assignment permitted,
+  pre-allocation rejection
   of static-range numeric identities, and boot-policy credential injection
-  rejection with system-credential and credential-store absence checks,
+  rejection with glob/rename-aware selectors, physical-file/logical-owner vendor
+  binding, and system-credential and credential-store absence checks,
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
   auditing that protects root, runtime, identity databases and NSS policy,
   systemd system-unit load paths, and installed policy paths from owner-modifier,
@@ -118,8 +120,9 @@
   metadata, cleanup, replacement, and recursive rules, allocation ranges,
   normalised glob paths, source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
-  trusted re-exec paths,
-  fail-closed crash recovery with immediate manager reload and full
+  trusted re-exec paths validated before first-run lock convergence,
+  fail-closed crash recovery bracketed by complete preflight checks, with
+  immediate manager reload, delayed journal removal, and full
   target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional
   root-owned policy installation whose journal remains through manager
   convergence without unsafe post-unlink rollback, explicit
