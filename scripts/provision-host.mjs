@@ -41,6 +41,7 @@ const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
+const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
 const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
 const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
@@ -954,7 +955,10 @@ function assertTrustedProvisionLockParent(stat, configPullGid) {
     throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
   }
   const mode = stat.mode & 0o7777;
-  if (stat.gid === 0 && mode === DIRECTORY_MODE) {
+  const recoverableBootstrapMode = (mode & 0o7000) === 0
+    && (mode & 0o700) === 0o700
+    && (mode & 0o022) === 0;
+  if (stat.gid === 0 && recoverableBootstrapMode) {
     return Object.freeze({ state: 'bootstrap', gid: 0, mode: 0o600 });
   }
   if (configPullGid !== null && stat.gid === configPullGid && mode === 0o750) {
@@ -1637,10 +1641,15 @@ export function auditBootPolicyCatalogs(
     const record = identitySnapshot.groups.get(group);
     if (record) managedIds.add(String(record.gid));
   }
-  const protectedPaths = new Set(inspected.artifacts
-    .filter((artifact) => artifact.kind === 'tmpfiles')
-    .flatMap((artifact) => policyCatalogLines(artifact.source.contents))
-    .map((line) => parseSystemdFields(line)[1]));
+  const protectedPaths = new Set([
+    ...inspected.artifacts
+      .filter((artifact) => artifact.kind === 'tmpfiles')
+      .flatMap((artifact) => policyCatalogLines(artifact.source.contents))
+      .map((line) => parseSystemdFields(line)[1]),
+    ...inspected.artifacts.map((artifact) => artifact.targetPath),
+    TRANSACTION_PATH,
+    PROVISION_LOCK_PATH,
+  ]);
 
   for (const kind of ['sysusers', 'tmpfiles']) {
     if (typeof catalogs?.[kind] !== 'string') {
@@ -1727,7 +1736,7 @@ function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, pro
       if (managedIds.has(component) || managedNames.has(component)) return true;
     }
     for (const field of fields.slice(3)) {
-      if (pathFieldTouchesProtected(field, type, protectedPaths)) return true;
+      if (pathFieldTouchesProtected(field, true, protectedPaths)) return true;
     }
     return false;
   }
@@ -1747,8 +1756,8 @@ function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, pro
 function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths) {
   if (fields.length < 2) throw new Error('tmpfiles policy line is malformed');
   const [type, policyPath] = fields;
-  const user = fields[3] ?? '-';
-  const group = fields[4] ?? '-';
+  const user = normaliseTmpfilesOwner(fields[3] ?? '-');
+  const group = normaliseTmpfilesOwner(fields[4] ?? '-');
   if (
     managedNames.has(user)
     || managedNames.has(group)
@@ -1757,10 +1766,18 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   ) {
     return true;
   }
-  return pathFieldTouchesProtected(policyPath, type, protectedPaths);
+  return pathFieldTouchesProtected(
+    policyPath,
+    tmpfilesAncestorPolicyIsSafe(fields),
+    protectedPaths,
+  );
 }
 
-function pathFieldTouchesProtected(policyPath, type, protectedPaths) {
+function normaliseTmpfilesOwner(owner) {
+  return owner.startsWith(':') ? owner.slice(1) : owner;
+}
+
+function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPaths) {
   if (/(^|\/)webex(?:-|\/|$)/.test(policyPath)) return true;
   if (!policyPath.startsWith('/')) return policyPath.includes('%');
   const wildcardOffset = policyPath.search(/[%*?[]/);
@@ -1768,11 +1785,15 @@ function pathFieldTouchesProtected(policyPath, type, protectedPaths) {
   const staticPrefix = wildcardOffset < 0
     ? literal
     : policyPath.slice(0, wildcardOffset);
-  const recursiveType = new Set(['A', 'D', 'H', 'R', 'T', 'Z']).has(type[0]);
   for (const protectedPath of protectedPaths) {
     if (literal !== null) {
       if (literal === protectedPath || literal.startsWith(`${protectedPath}/`)) return true;
-      if (recursiveType && protectedPath.startsWith(`${literal}/`)) return true;
+      if (
+        protectedPath.startsWith(`${literal}/`)
+        && !ancestorPolicyIsSafe
+      ) {
+        return true;
+      }
       continue;
     }
     if (
@@ -1784,6 +1805,18 @@ function pathFieldTouchesProtected(policyPath, type, protectedPaths) {
     }
   }
   return false;
+}
+
+function tmpfilesAncestorPolicyIsSafe(fields) {
+  const [type, , mode = '-', rawUser = '-', rawGroup = '-', age = '-'] = fields;
+  if (!new Set(['d', 'e', 'v', 'q', 'Q', 'z']).has(type?.[0])) return false;
+  if (age !== '-') return false;
+  const user = normaliseTmpfilesOwner(rawUser);
+  const group = normaliseTmpfilesOwner(rawGroup);
+  if (!['-', 'root', '0'].includes(user) || !['-', 'root', '0'].includes(group)) return false;
+  if (mode === '-') return true;
+  if (!/^[0-7]{3,4}$/.test(mode)) return false;
+  return (Number.parseInt(mode, 8) & 0o022) === 0;
 }
 
 function parseSystemdFields(line) {
@@ -1964,30 +1997,14 @@ async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested
   const unitFile = /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/.test(
     entry.name,
   );
-  if (!nested && !unitFile && !entry.isDirectory?.()) return;
+  const policyDirectory = /\.(?:d|wants|requires|upholds)$/.test(entry.name);
+  if (!nested && !unitFile && !policyDirectory && !entry.isDirectory?.()) return;
   if (entry.isSymbolicLink?.()) {
-    const before = await fsApi.lstat(candidate);
-    const target = await fsApi.readlink(candidate);
-    const after = await fsApi.lstat(candidate);
-    if (!sameFileIdentity(before, after)) {
-      throw new Error(`systemd policy symlink changed while reading: ${candidate}`);
-    }
-    assertSystemdPolicyDoesNotReferenceManaged(`${entry.name} ${target}`, candidate);
+    await auditSystemdPolicySymlink(candidate, budget, fsApi, new Set());
     return;
   }
   if (entry.isFile?.()) {
-    budget.files += 1;
-    if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
-      throw new Error('too many systemd policy files');
-    }
-    const policy = await readTrustedFile(candidate, 0, 0, null, fsApi);
-    budget.bytes += policy.contents.length;
-    if (budget.bytes > MAX_SYSTEMD_POLICY_BYTES) {
-      throw new Error('systemd policy files exceed the aggregate byte limit');
-    }
-    for (const line of policyCatalogLines(policy.contents)) {
-      assertSystemdPolicyDoesNotReferenceManaged(line, candidate);
-    }
+    await auditSystemdPolicyFile(candidate, budget, fsApi);
     return;
   }
   if (!entry.isDirectory?.()) return;
@@ -2006,11 +2023,61 @@ async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested
   }
 }
 
+async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited) {
+  if (visited.has(candidate) || visited.size >= 32) {
+    throw new Error(`systemd policy symlink chain is invalid: ${candidate}`);
+  }
+  visited.add(candidate);
+  const before = await fsApi.lstat(candidate);
+  const target = await fsApi.readlink(candidate);
+  const after = await fsApi.lstat(candidate);
+  if (!before.isSymbolicLink() || !sameFileIdentity(before, after)) {
+    throw new Error(`systemd policy symlink changed while reading: ${candidate}`);
+  }
+  assertSystemdPolicyDoesNotReferenceManaged(`${path.basename(candidate)} ${target}`, candidate);
+  let resolved = path.resolve(path.dirname(candidate), target);
+  if (resolved === '/dev/null') return;
+  if (resolved === '/lib/systemd/system' || resolved.startsWith('/lib/systemd/system/')) {
+    if (await isUsrMergedLib(fsApi)) resolved = `/usr${resolved}`;
+  }
+  await assertTrustedDirectoryChain('/', path.dirname(resolved), 0, 0, fsApi);
+  let targetStat;
+  try {
+    targetStat = await fsApi.lstat(resolved);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (targetStat.isSymbolicLink()) {
+    await auditSystemdPolicySymlink(resolved, budget, fsApi, visited);
+    return;
+  }
+  if (!targetStat.isFile()) {
+    throw new Error(`systemd policy symlink target is not a regular file: ${candidate}`);
+  }
+  await auditSystemdPolicyFile(resolved, budget, fsApi);
+}
+
+async function auditSystemdPolicyFile(candidate, budget, fsApi) {
+  budget.files += 1;
+  if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
+    throw new Error('too many systemd policy files');
+  }
+  const policy = await readTrustedFile(candidate, 0, 0, null, fsApi);
+  budget.bytes += policy.contents.length;
+  if (budget.bytes > MAX_SYSTEMD_POLICY_BYTES) {
+    throw new Error('systemd policy files exceed the aggregate byte limit');
+  }
+  for (const line of policyCatalogLines(policy.contents)) {
+    assertSystemdPolicyDoesNotReferenceManaged(line, candidate);
+  }
+}
+
 function assertSystemdPolicyDoesNotReferenceManaged(value, source) {
   const decoded = decodeSystemdEscapesForAudit(String(value));
   if (
     MANAGED_UNITS.some((unit) => decoded.includes(unit))
-    || LAUNCHER_INSTANCE_PATTERN.test(path.basename(decoded))
+    || LAUNCHER_REFERENCE_PATTERN.test(decoded)
   ) {
     throw new Error(`external systemd policy references a managed unit: ${source}`);
   }

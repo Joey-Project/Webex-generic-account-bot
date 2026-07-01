@@ -234,16 +234,23 @@ link and requires every loaded managed unit to use the fixed
 no external reverse activator. Enabled external unit dependency graphs are
 not inferred from a potentially stale manager cache: every trusted system unit
 load path is scanned directly for external unit, drop-in, alias, and dependency
-symlink references to managed units, including C-escaped references. The merged
-systemd sysusers and tmpfiles catalogues are audited before mutation and again
-after account allocation using systemd field, quoting, continuation, C-escape,
-specifier/glob-prefix, path-derived-ID, and recursive-parent semantics. Only the
-reviewed Webex lines may affect managed identities, IDs, or paths, which keeps
-the identity and filesystem boundary durable across reboot.
+symlink references to managed units, including C-escaped references, launcher
+instances, and the contents of trusted linked unit files. A dangling external
+alias is accepted only when its link text is clean and its target parent remains
+root-owned and non-writable. The merged systemd
+sysusers and tmpfiles catalogues are audited before mutation and again after
+account allocation using systemd field, quoting, continuation, C-escape,
+specifier/glob-prefix, path-derived-ID, owner modifiers, ancestor metadata, and
+recursive-parent semantics. Runtime paths, every installed policy target, the
+transaction journal, and the shared lock are protected from external tmpfiles
+policy. Only the reviewed Webex lines may affect managed identities, IDs, or
+paths, which keeps the identity and filesystem boundary durable across reboot.
 The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
-is accepted only in its root-owned half-migrated state. Apply must then prove
+is accepted only in a root-owned, non-writable half-migrated state, including a
+safe mode narrowed by the caller's umask before the first metadata update.
+Apply must then prove
 that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,
 trusted stale candidates left by an interrupted prior run. It installs the complete

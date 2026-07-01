@@ -167,6 +167,16 @@ describe('guarded host provisioner policy', () => {
       validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
       { state: 'bootstrap', gid: 0, mode: 0o600 },
     );
+    for (const interruptedMode of [0o700, 0o710, 0o750]) {
+      assert.deepEqual(
+        validateProvisionLockMetadata(
+          directoryStat(0, interruptedMode),
+          lockStat(0, 0o600),
+          null,
+        ),
+        { state: 'bootstrap', gid: 0, mode: 0o600 },
+      );
+    }
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(2003, 0o660), 2003),
       { state: 'deployed', gid: 2003, mode: 0o660 },
@@ -447,6 +457,14 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
+      ['tmpfiles', 'f /tmp/untrusted 0600 :webex-config-deploy root -'],
+      ['tmpfiles', 'R /etc/systemd/system/* - - - -'],
+      ['tmpfiles', 'R /etc/sysusers.d/* - - - -'],
+      ['tmpfiles', 'R /etc/tmpfiles.d/* - - - -'],
+      ['tmpfiles', 'z /var/lib 0777 root root -'],
+      ['tmpfiles', 'C+ /var/lib - - - - /usr/share/factory/var/lib'],
+      ['tmpfiles', 'L+ /var/lib - - - - /tmp'],
+      ['tmpfiles', 'd /var/lib 0755 root root 0'],
     ]) {
       const fixture = await provisionFixture(context);
       await assert.rejects(
@@ -464,6 +482,26 @@ describe('guarded host provisioner execution', () => {
     }
   });
 
+  it('accepts non-writable root maintenance for protected-path ancestors', async (context) => {
+    const fixture = await provisionFixture(context);
+    const report = await provisionHost(
+      { apply: false },
+      fixture.dependencies({
+        bootPolicySequence: [{
+          ...fixture.bootPolicyCatalogs,
+          tmpfiles: [
+            fixture.bootPolicyCatalogs.tmpfiles,
+            'q /var 0755 - - -',
+            'd /var/lib 0755 root root -',
+            'z /etc/systemd 0755 :root :root -',
+            '',
+          ].join('\n'),
+        }],
+      }),
+    );
+    assert.equal(report.mode, 'dry-run');
+  });
+
   it('rechecks numeric tmpfiles ownership after allocating managed IDs', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
@@ -477,7 +515,11 @@ describe('guarded host provisioner execution', () => {
             fixture.bootPolicyCatalogs,
             {
               ...fixture.bootPolicyCatalogs,
-              tmpfiles: `${fixture.bootPolicyCatalogs.tmpfiles}\nf /tmp/untrusted 0600 1001 root -\n`,
+              tmpfiles: [
+                fixture.bootPolicyCatalogs.tmpfiles,
+                'f /tmp/untrusted 0600 :1002 root -',
+                '',
+              ].join('\n'),
             },
           ],
         }),
@@ -807,6 +849,112 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy references a managed unit/,
     );
     assert.equal(commandCalls, 0);
+
+    const launcherUnit = '/etc/systemd/system/external-launcher.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-launcher.service',
+              isFile: () => true,
+              isDirectory: () => false,
+              isSymbolicLink: () => false,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              launcherUnit,
+              Buffer.from('[Unit]\nWants=webex-codex-launcher@%i.service\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const linkedUnit = '/etc/systemd/system/external-linked.service';
+    const linkedTarget = '/opt/systemd/external-linked.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-linked.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              linkedTarget,
+              Buffer.from('[Unit]\nWants=webex-generic-account-bot.service\n'),
+            ]]),
+            symlinksByPath: new Map([[linkedUnit, linkedTarget]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const linkedDropIn = '/etc/systemd/system/external.service.d';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external.service.d',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            symlinksByPath: new Map([[
+              linkedDropIn,
+              '/opt/systemd/external.service.d',
+            ]]),
+          },
+        ),
+      ),
+      /systemd policy symlink target is not a regular file/,
+    );
+
+    const danglingUnit = '/etc/systemd/system/external-dangling.service';
+    const danglingTarget = '/usr/lib/systemd/system/missing-external.service';
+    let danglingCommandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          danglingCommandCalls += 1;
+          throw new Error('systemctl reached after dangling alias audit');
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-dangling.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            missingPaths: new Set([danglingTarget]),
+            symlinksByPath: new Map([[danglingUnit, danglingTarget]]),
+          },
+        ),
+      ),
+      /systemctl reached after dangling alias audit/,
+    );
+    assert.equal(danglingCommandCalls, 2);
 
     const wantsDirectory = '/etc/systemd/system/multi-user.target.wants';
     const managedLink = path.join(wantsDirectory, 'webex-generic-account-bot.service');
@@ -1855,6 +2003,7 @@ function systemdUnitPathFs(
     usrMerged = false,
     usrMergeTarget = 'usr/lib',
     filesByPath = new Map(),
+    missingPaths = new Set(),
     symlinksByPath = new Map(),
   } = {},
 ) {
@@ -1862,6 +2011,7 @@ function systemdUnitPathFs(
     uid: 0,
     gid: 0,
     mode: 0o40755,
+    isFile: () => false,
     isDirectory: () => true,
     isSymbolicLink: () => false,
   });
@@ -1909,6 +2059,9 @@ function systemdUnitPathFs(
   return {
     lstat: async (candidate) => {
       if (usrMerged && candidate === '/lib') return usrMergeStat;
+      if (missingPaths.has(candidate)) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      }
       if (filesByPath.has(candidate)) return fileStat(filesByPath.get(candidate));
       if (symlinksByPath.has(candidate)) return symlinkStat;
       return directoryStat;

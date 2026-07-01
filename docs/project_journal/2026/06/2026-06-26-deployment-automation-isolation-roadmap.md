@@ -169,19 +169,21 @@ superseded_by:
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
   no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
-  direct next-boot disk inspection of external units, drop-ins, aliases, and
-  dependency symlinks, fixed-path scanning for unloaded policy and dependency
+  direct next-boot disk inspection of external units, drop-ins, aliases,
+  dependency symlinks, linked policy contents, trusted dangling-alias parents,
+  and launcher-instance references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
-  auditing with C-escape, specifier/glob-prefix, path-derived-ID, and recursive
-  parent handling,
+  auditing with C-escape, specifier/glob-prefix, path-derived-ID, owner
+  modifiers, protected installed-policy targets, safe ancestor metadata, and
+  recursive parent handling,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, explicit complete-target stale-cache convergence recovery,
   fail-closed recovery with full target-directory durability and a journal
   retained through final manager convergence,
-  non-rollback journal-unlink failure handling, interrupted first-run lock
+  non-rollback journal-unlink failure handling, umask-safe interrupted first-run lock
   migration recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
@@ -232,8 +234,9 @@ superseded_by:
   a PID/device/inode-bound kernel lock shared with config deployment, validate
   every re-exec path ancestor, stream a bounded scan that removes only trusted
   stale candidates, and bound and reject active launcher template instances as
-  well as active template units. Allow only the exact root-owned half-migrated
-  first-run lock state, then require tmpfiles to converge and revalidate the held
+  well as active template units. Allow only a root-owned, non-writable
+  half-migrated first-run lock state, including safe umask-narrowed modes, then
+  require tmpfiles to converge and revalidate the held
   inode before success. Require each loaded unit and instance to use the fixed
   managed fragment without any
   drop-ins, and reject unloaded unit overrides, drop-ins, wants, requires, and upholds

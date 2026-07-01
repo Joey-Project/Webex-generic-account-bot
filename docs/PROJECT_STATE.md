@@ -103,8 +103,10 @@
   no-stale-manager, and no-external-activator checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
-  units, drop-ins, aliases, and dependency symlinks, semantic merged boot
-  sysusers/tmpfiles policy auditing,
+  units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
+  dangling-alias parents, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
+  auditing that protects runtime and installed policy paths from owner-modifier,
+  ancestor-metadata, cleanup, replacement, and recursive rules,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional
