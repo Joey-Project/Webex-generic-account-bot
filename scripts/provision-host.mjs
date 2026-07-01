@@ -610,7 +610,7 @@ export async function provisionHost(options, dependencies = {}) {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
     });
-    await recoverPolicyTransaction(transaction, plan, deps, { removeTransaction: false });
+    await recoverPolicyTransaction(transaction, plan, deps);
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
       const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
@@ -1576,7 +1576,6 @@ async function recoverPolicyTransaction(
   transaction,
   plan,
   deps,
-  { removeTransaction = true } = {},
 ) {
   const directories = new Set(
     transaction.artifacts.map(({ target }) => path.dirname(target)),
@@ -1660,7 +1659,6 @@ async function recoverPolicyTransaction(
       throw new Error(`policy target changed after recovery: ${artifact.target}`);
     }
   }
-  if (removeTransaction) await removeProvisionTransaction(plan, deps);
 }
 
 async function removeProvisionTransaction(plan, deps) {
@@ -2140,6 +2138,13 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   ) {
     return true;
   }
+  const argument = fields[6];
+  if (type === 'L' && policyPath === '/var/run' && argument !== undefined) {
+    const resolvedTarget = argument.startsWith('/')
+      ? argument
+      : path.posix.resolve(path.posix.dirname(policyPath), argument);
+    if (resolvedTarget === '/run') return false;
+  }
   if (pathFieldTouchesProtected(
     policyPath,
     tmpfilesAncestorPolicyIsSafe(fields),
@@ -2147,7 +2152,6 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   )) {
     return true;
   }
-  const argument = fields[6];
   if (argument === undefined || argument === '-') return false;
   if (type.startsWith('C')) {
     return !argument.startsWith('/')
@@ -2157,9 +2161,6 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
     const resolvedTarget = argument.startsWith('/')
       ? argument
       : path.posix.resolve(path.posix.dirname(policyPath), argument);
-    if (type === 'L' && policyPath === '/var/run' && resolvedTarget === '/run') {
-      return false;
-    }
     return pathFieldTouchesProtected(resolvedTarget, false, protectedPaths);
   }
   if (/^[aA]/.test(type)) {
@@ -2189,7 +2190,7 @@ function identityTokenTouchesManagedSurface(identity, managedNames, managedIds) 
 
 function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPaths) {
   if (!policyPath.startsWith('/')) return policyPath.includes('%');
-  const normalisedPolicyPath = path.posix.normalize(policyPath);
+  const normalisedPolicyPath = normaliseBootPolicyPath(policyPath);
   if (/(^|\/)webex(?:-|\/|$)/.test(normalisedPolicyPath)) return true;
   const wildcardOffset = normalisedPolicyPath.search(/[%*?[]/);
   const literal = wildcardOffset < 0 ? normalisedPolicyPath : null;
@@ -2219,6 +2220,13 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
     }
   }
   return false;
+}
+
+function normaliseBootPolicyPath(policyPath) {
+  const normalised = path.posix.normalize(policyPath);
+  if (normalised === '/var/run') return '/run';
+  if (normalised.startsWith('/var/run/')) return `/run/${normalised.slice('/var/run/'.length)}`;
+  return normalised;
 }
 
 function tmpfilesAncestorPolicyIsSafe(fields) {
@@ -2581,15 +2589,14 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   )) {
     throw new Error(`external systemd policy injects a boot policy credential: ${source}`);
   }
-  const expanded = new Set([
-    decoded,
-    ...[...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName)),
-  ]);
+  const expanded = new Set(unitNames.size === 0
+    ? [decoded]
+    : [...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName)));
   for (const candidate of expanded) {
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
-      || unresolvedInstanceCouldReferenceManagedUnit(candidate)
+      || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
       || systemdIdentityDirectiveUsesManagedId(
@@ -2679,19 +2686,36 @@ function systemdUnitNamesEqual(unitNames, unit) {
   return unitNames.size === 1 && unitNames.has(unit);
 }
 
-function unresolvedInstanceCouldReferenceManagedUnit(value) {
-  if (!/%[iI]/.test(value)) return false;
+function unresolvedSpecifierCouldReferenceManagedUnit(value) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
   if (!SYSTEMD_UNIT_REFERENCE_DIRECTIVES.has(directive)) return false;
   const managedUnits = [...MANAGED_UNITS, SYMBOLIC_LAUNCHER_INSTANCE];
-  return parseSystemdFields(value.slice(separator + 1)).some((field) => {
-    if (!/%[iI]/.test(field)) return false;
-    const pattern = escapeRegExp(field).replace(/%[iI]/g, '[^\\s/]+');
-    const instanceReference = new RegExp(`^${pattern}$`);
-    return managedUnits.some((unit) => instanceReference.test(unit));
-  });
+  return parseSystemdFields(value.slice(separator + 1))
+    .some((field) => systemdSpecifierFieldCouldMatch(field, managedUnits));
+}
+
+function systemdSpecifierFieldCouldMatch(field, candidates) {
+  let pattern = '';
+  let hasUnresolvedSpecifier = false;
+  for (let offset = 0; offset < field.length; offset += 1) {
+    if (field[offset] !== '%') {
+      pattern += escapeRegExp(field[offset]);
+      continue;
+    }
+    if (field[offset + 1] === '%') {
+      pattern += escapeRegExp('%');
+      offset += 1;
+      continue;
+    }
+    hasUnresolvedSpecifier = true;
+    pattern += '[^\\s/]+';
+    if (offset + 1 < field.length) offset += 1;
+  }
+  if (!hasUnresolvedSpecifier) return false;
+  const reference = new RegExp(`^${pattern}$`);
+  return candidates.some((candidate) => reference.test(candidate));
 }
 
 function unitNameClaimsManagedIdentity(unitName) {
@@ -2715,7 +2739,7 @@ function systemdIdentityDirectiveUsesManagedId(
   if (!SYSTEMD_IDENTITY_DIRECTIVES.has(directive)) return false;
   const identities = parseSystemdFields(value.slice(separator + 1));
   if (
-    identities.some((identity) => /%[iI]/.test(identity))
+    identities.some(hasUnresolvedSystemdSpecifier)
     && !isExpectedVendorUserManagerIdentity(
       source,
       value.trim(),
@@ -2731,6 +2755,18 @@ function systemdIdentityDirectiveUsesManagedId(
     const id = Number(identity);
     return Number.isSafeInteger(id) && id > 0 && id <= MAX_MANAGED_ID;
   });
+}
+
+function hasUnresolvedSystemdSpecifier(value) {
+  for (let offset = 0; offset < value.length; offset += 1) {
+    if (value[offset] !== '%') continue;
+    if (value[offset + 1] === '%') {
+      offset += 1;
+      continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 function isExpectedVendorUserManagerIdentity(source, line, unitNames, logicalSource) {
@@ -2787,7 +2823,7 @@ function expandSystemdUnitNameSpecifiers(value, unitName) {
   const unresolvedInstance = atOffset >= 0 && instance === '';
   const finalComponent = prefix.slice(prefix.lastIndexOf('-') + 1);
   const replacements = new Map([
-    ['%%', '%'],
+    ['%%', '%%'],
     ['%n', unitName],
     ['%N', stem],
     ['%p', prefix],

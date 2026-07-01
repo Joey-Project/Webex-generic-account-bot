@@ -243,9 +243,9 @@ root-owned and non-writable. Unit-name specifiers are expanded against each
 external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
 policy may not assign a managed user or group by name or implicit DynamicUser
-unit name, unresolved instance specifiers are forbidden in identity directives
+unit name, unresolved dynamic specifiers are forbidden in identity directives
 except for the exact vendor `user@.service` user-manager assignment when both
-the physical file and logical unit owner match. Unresolved instance specifiers
+the physical file and logical unit owner match. Unresolved dynamic specifiers
 in unit-reference directives are symbolically checked against every managed
 unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
 range before allocation. Direct boot-policy credential injection is rejected;
@@ -257,7 +257,8 @@ and all plaintext and encrypted credential stores prove that `sysusers.extra`
 and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
-specifier/glob-prefix, lexical path normalisation, copy-source, path-derived-ID,
+specifier/glob-prefix, lexical path normalisation including the legacy
+`/var/run` alias, copy-source, path-derived-ID,
 owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
 metadata, and recursive-parent semantics. External
 sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
@@ -295,7 +296,8 @@ policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
 unit became active or enabled. It never starts or enables a unit. A policy-file
-transaction failure restores the old file set. Each file replacement is atomic,
+transaction failure restores the old file set and retains the journal until a
+later apply reloads the manager and accepts the common preflight. Each file replacement is atomic,
 and a root-only transaction journal
 under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
 Recovery first proves identity, unit, source, merged boot-policy, system

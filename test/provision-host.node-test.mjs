@@ -685,6 +685,9 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
       ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
+      ['tmpfiles', 'f+ /var/run/systemd/system/external.service 0644 root root - payload'],
+      ['tmpfiles', 'R /var/run/systemd/system/* - - - -'],
+      ['tmpfiles', 'L+ /var/run/userdb/untrusted - - - - /tmp/provider'],
       ['tmpfiles', 'A+! /opt/private-tree - - - - user:webex-generic-account-bot:r-X'],
       ['tmpfiles', 'A+! /opt/private-tree - - - - group:02001:r-X'],
       [
@@ -1376,6 +1379,24 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy references a managed unit/,
     );
 
+    for (const [name, policy] of [
+      ['external-host-identity.service', '[Service]\nUser=%H\n'],
+      ['external-host-unit.service', '[Unit]\nWants=%H.service\n'],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy references a managed unit/,
+      );
+    }
+
     const sysusersDropInDirectory =
       '/etc/systemd/system/systemd-sysusers.service.d';
     const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
@@ -1849,7 +1870,7 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts.slice(2)) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
-    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('keeps the desired set when transaction unlink durability is uncertain', async (context) => {
@@ -1897,6 +1918,75 @@ describe('guarded host provisioner execution', () => {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
     }
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
+  it('reloads stale manager state after an installation rollback before reapplying', async (context) => {
+    const fixture = await provisionFixture(context);
+    let candidateRenames = 0;
+    const interruptedFs = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'rename') return target[property];
+        return async (source, destination) => {
+          if (path.basename(source).includes('.provision-')) {
+            candidateRenames += 1;
+            if (candidateRenames === 13) throw new Error('injected unit rename failure');
+          }
+          return target.rename(source, destination);
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi: interruptedFs, applied: true }),
+      ),
+      /injected unit rename failure/,
+    );
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    const staleManagerStates = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+      needDaemonReload: true,
+    });
+    const unloadedStates = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const loadedStates = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    const commands = [];
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        applied: true,
+        commands,
+        unitStateSequence: [
+          staleManagerStates,
+          unloadedStates,
+          unloadedStates,
+          loadedStates,
+        ],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
   });
 
   it('preserves the journal instead of rolling back over an unknown state', async (context) => {
@@ -1980,7 +2070,7 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
-    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('recovers a crash-interrupted policy transaction before reapplying', async (context) => {
