@@ -485,6 +485,8 @@ describe('Codex launcher systemd boundary', () => {
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-codex-input$/m);
       assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-config-pull$/m);
       assert.doesNotMatch(contents, /^m\s+webex-config-pull\s+webex-generic-account-bot$/m);
+      assert.doesNotMatch(contents, /^m\s+webex-generic-account-bot\s+webex-config-deploy$/m);
+      assert.doesNotMatch(contents, /^m\s+webex-config-deploy\s+webex-generic-account-bot$/m);
     }
   });
 

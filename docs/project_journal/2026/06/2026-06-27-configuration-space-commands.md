@@ -109,6 +109,9 @@ superseded_by:
   available. This slice does not make `/config pull` production-deployable.
 
 ## PR 2b2b2
+- Depend on the bot repository's base-service contract and guarded host
+  provisioner so the reviewed config can be activated reproducibly rather than
+  against the current tmux-only staging layout.
 - Pin the dedicated Configuration Space and administrator in host policy, then
   update the config repository to all-ephemeral execution with only `status`
   and `pull` enabled.

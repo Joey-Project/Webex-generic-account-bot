@@ -26,8 +26,9 @@ superseded_by:
   PR 4c1b (root fresh-inode input sealer), PR 4c1c (gated runner wiring), PR
   4c2a1 (canary contract/probe), 4c2a2 (production-image and lifecycle
   canaries plus receipt helper), 4c2b (transactional final activation), PR
-  2b2b1 (config-pull permission and schema boundary), PR 2b2b2 (reviewed Space
-  and config enablement), and PR 2b3 (recoverable
+  2b2b1 (config-pull permission and schema boundary), PR 4d1 (base bot host
+  contract), PR 4d2 (guarded host provisioner), PR 2b2b2 (reviewed Space and
+  config enablement), and PR 2b3 (recoverable
   activation plus `/config reload` and `/config sync`). Mutating commands
   remain undeployable until their security dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
@@ -155,6 +156,12 @@ superseded_by:
   probes the real worker socket. Host policy recognises the command schema but
   keeps the admin Space pin disabled. PR 2b2b2 owns the exact room pin,
   companion config change, deployment, and Webex E2E.
+- Host discovery after PR 2b2b1 found no installed bot, activation, or worker
+  units and no repository-owned base bot service. PR 4d1 therefore adds the
+  stable unprivileged bot identity, fixed service, and root-managed versus
+  bot-writable filesystem contract. It grants no launcher, input, or
+  config-worker group and does not install secrets, assets, units, or the
+  activation drop-in. PR 4d2 owns the guarded dry-run/apply provisioner.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -165,6 +172,28 @@ superseded_by:
 - Do not use admin bypass or forced checks unless Joey explicitly authorises that exact exception.
 
 ## Planned PRs
+
+### PR 4d1: Base Bot Host Contract
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Define a stable non-login bot identity, fixed base service, and explicit
+  tmpfiles ownership boundary for root-managed config/token inputs and
+  bot-writable state, Codex home, and workspace.
+- Keep privileged supplementary groups and pending-input access absent from the
+  base service; the reviewed activation drop-in remains their only source.
+- Ship policy assets and tests only. Do not install files, create secrets,
+  enable units, stop the tmux staging deployment, or mutate the host.
+
+### PR 4d2: Guarded Host Provisioner
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Add a default-dry-run, explicit-apply provisioner with a fixed artifact
+  allowlist, atomic root-owned installation, sysusers/tmpfiles application,
+  manager reload, and post-install verification.
+- Before installation, reject pre-existing static bot membership in every
+  launcher, input, config-pull, or config-deploy group because systemd extends
+  user-database groups even after an empty `SupplementaryGroups=` assignment.
+  Also reject worker membership in the bot group or any bot-secret group.
+- Never copy secrets, install the activation-owned bot drop-in, enable the bot,
+  or run the real reboot challenge as an implicit side effect.
 
 ### PR 1a: Low-Privilege Config Render and Validation
 - Repository: `WebexServices-staging/webex-generic-account-bot-config`.
