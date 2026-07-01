@@ -78,10 +78,11 @@
   the bot, or starts the renewal unit when the bot and renewal unit are already
   inactive. Any out-of-band permission drop-in requires an already-ephemeral
   live config before deploy proceeds, and apply reloads the systemd manager
-  before permission detection. Rollback revokes launcher permission
-  before any config downgrade; receipt-only cleanup failures retain the journal
-  but do not block old-service recovery. Version 2 journals reject any claim
-  that launcher permission predated activation.
+  before permission detection. Rollback revokes launcher permission and reloads
+  the manager before any config downgrade; a reload failure preserves the
+  ephemeral config and journal. Receipt-only cleanup failures retain the journal
+  but do not block old-service recovery. Version 2 journals reject any claim that
+  launcher permission predated activation.
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
   The bot receives only launch-group and

@@ -3019,6 +3019,60 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('keeps ephemeral config when permission rollback cannot reload systemd', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-reload-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+    let permissionReloads = 0;
+    let serviceRestarts = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command === plan.permissionStateReloadCommand) {
+            permissionReloads += 1;
+            if (permissionReloads === 2) {
+              throw new Error('permission manager reload failed');
+            }
+          }
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) serviceRestarts += 1;
+          if (command.bin === '/usr/bin/curl') {
+            throw new Error('new service is not ready');
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /failed to restore previous deployment state: permission manager reload failed/,
+    );
+
+    assert.equal(permissionReloads, 2);
+    assert.equal(serviceRestarts, 1);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    await assert.rejects(() => fs.access(plan.botServiceDropIn), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.activationReceipt), /ENOENT/);
+    const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+    assert.equal(transaction.phase, 'service_transition_started');
+    const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
+    assert.equal(failure.status, 'failed_restart_rollback_failed');
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('restarts the old service when activation receipt rollback fails', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-rollback-test-'));
     const plan = await createRunnerActivationTestPlan(temp);
@@ -3125,7 +3179,7 @@ describe('deploy-config CLI and execution', () => {
       /stop after runner activation recovery/,
     );
 
-    assert.deepEqual(calls.slice(0, 5), [
+    assert.deepEqual(calls.slice(0, 6), [
       ['/usr/bin/systemctl', 'daemon-reload'],
       [
         plan.liveRunnerPolicyCheckCommand.bin,
@@ -3133,6 +3187,7 @@ describe('deploy-config CLI and execution', () => {
       ],
       ['/usr/bin/systemctl', 'stop'],
       ['/usr/bin/systemctl', 'show'],
+      ['/usr/bin/systemctl', 'daemon-reload'],
       ['/usr/bin/git', '-c'],
     ]);
     await assertLockReleased(plan.lockDir);

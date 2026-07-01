@@ -414,6 +414,9 @@ apply first reloads the systemd manager so permission detection cannot rely on
 stale loaded drop-in state after an out-of-band file change.
 Version 2 activation journals also require `permission_had_previous=false`;
 activation never restores a launcher permission that predates the transaction.
+Rollback reloads the systemd manager immediately after removing launcher
+permission and before restoring any previous config; reload failure leaves the
+ephemeral config and recovery journal in place.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,

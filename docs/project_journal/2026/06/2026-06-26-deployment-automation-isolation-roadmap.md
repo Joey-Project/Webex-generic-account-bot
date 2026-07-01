@@ -113,7 +113,9 @@ superseded_by:
   rendered config is already fully ephemeral. Every apply reloads the systemd
   manager before permission detection so stale loaded drop-in state cannot
   select the wrong isolation policy. Version 2 journals require that launcher
-  permission did not predate activation.
+  permission did not predate activation. Rollback reloads the manager after
+  permission removal and before config downgrade; reload failure preserves the
+  ephemeral config and recovery journal.
   Receipt-only rollback failures retain the journal and fail the action after
   restoring the prior config and service.
   Ordinary apply enforces current-user policy while permission is absent and

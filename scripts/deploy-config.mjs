@@ -1003,7 +1003,13 @@ export async function executePlan({
           }
         }
         try {
-          const rollbackResult = await restoreDeploymentState(plan, rollbackState, fsApi);
+          const rollbackResult = await restoreDeploymentState(
+            plan,
+            rollbackState,
+            fsApi,
+            runner,
+            parentEnv,
+          );
           rollbackDurabilityError = rollbackResult.durabilityError;
           rollbackReceiptError = rollbackResult.receiptRestoreError;
         } catch (restoreError) {
@@ -2986,7 +2992,13 @@ async function rollbackInstalledCandidate(plan, installState, runner, parentEnv,
   let receiptRestoreError = null;
   let restoreError = null;
   try {
-    const restoreResult = await restoreDeploymentState(plan, installState, fsApi);
+    const restoreResult = await restoreDeploymentState(
+      plan,
+      installState,
+      fsApi,
+      runner,
+      parentEnv,
+    );
     durabilityError = restoreResult.durabilityError;
     receiptRestoreError = restoreResult.receiptRestoreError;
   } catch (error) {
@@ -3083,7 +3095,13 @@ async function runServiceRollback(plan, installState, runner, parentEnv) {
   );
 }
 
-async function restoreDeploymentState(plan, installState, fsApi) {
+async function restoreDeploymentState(
+  plan,
+  installState,
+  fsApi,
+  runner = null,
+  parentEnv = {},
+) {
   let configDurabilityError = null;
   let permissionRestoreError = null;
   if (installState.runnerActivation) {
@@ -3092,6 +3110,13 @@ async function restoreDeploymentState(plan, installState, fsApi) {
         plan,
         installState.runnerActivation,
         fsApi,
+      );
+      if (!runner) {
+        throw new Error('runner permission rollback requires systemd manager synchronisation');
+      }
+      await runner(
+        plan.permissionStateReloadCommand,
+        scrubEnv(parentEnv, plan.permissionStateReloadCommand.env),
       );
     } catch (error) {
       permissionRestoreError = error;
