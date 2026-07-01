@@ -76,9 +76,10 @@
   applies ensure a valid receipt, reusing a fresh receipt without rerunning
   canaries. Ordinary apply reloads an active renewal unit without disrupting
   the bot, or starts the renewal unit when the bot and renewal unit are already
-  inactive. Rollback revokes launcher permission before any config downgrade;
-  receipt-only cleanup failures retain the journal but do not block old-service
-  recovery.
+  inactive. Any out-of-band permission drop-in requires an already-ephemeral
+  live config before deploy proceeds. Rollback revokes launcher permission
+  before any config downgrade; receipt-only cleanup failures retain the journal
+  but do not block old-service recovery.
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
   The bot receives only launch-group and

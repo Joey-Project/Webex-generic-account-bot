@@ -583,6 +583,13 @@ export function buildDeployPlan(options) {
     [trustedStaticCheckScript, '--require-ephemeral-linux-user', candidateConfig],
     { ...commandDefaults, condition: 'runner-permission-active' },
   );
+  const liveRunnerPolicyCheckCommand = options.prepare
+    ? null
+    : command(
+        options.pythonBin,
+        [trustedStaticCheckScript, '--require-ephemeral-linux-user', renderedConfig],
+        { ...commandDefaults, condition: 'runner-permission-active' },
+      );
   const currentUserPolicyCheckCommand = command(
     options.pythonBin,
     [trustedStaticCheckScript, '--require-current-user', candidateConfig],
@@ -623,6 +630,7 @@ export function buildDeployPlan(options) {
     activationConfigCheckCommand,
     daemonReloadCommand,
     runnerPolicyCheckCommand,
+    liveRunnerPolicyCheckCommand,
     currentUserPolicyCheckCommand,
     skipRestart: options.skipRestart,
     serviceAction: options.skipRestart ? null : 'restart',
@@ -848,12 +856,27 @@ export async function executePlan({
     await prepareTrustedOutputDirectories(plan, fsApi);
     outputDirectoriesTrusted = true;
     throwIfAborted(signal);
+    runnerPermissionActive = await detectAndValidateRunnerPermission(
+      plan,
+      runner,
+      parentEnv,
+      fsApi,
+      signal,
+    );
     const recovery = await recoverInterruptedInstall(plan, runner, parentEnv, fsApi);
     throwIfAborted(signal);
     if (plan.activateRunner && recovery?.committed && recovery.metadata.runner_activation) {
       return recovery.metadata;
     }
-    runnerPermissionActive = await detectRunnerPermission(plan, fsApi);
+    if (recovery) {
+      runnerPermissionActive = await detectAndValidateRunnerPermission(
+        plan,
+        runner,
+        parentEnv,
+        fsApi,
+        signal,
+      );
+    }
     if (plan.activateRunner && runnerPermissionActive) {
       throw new Error(
         'ephemeral runner permission is already active; use ordinary --apply for subsequent config updates',
@@ -2853,6 +2876,24 @@ async function detectRunnerPermission(plan, fsApi) {
   return true;
 }
 
+async function detectAndValidateRunnerPermission(
+  plan,
+  runner,
+  parentEnv,
+  fsApi,
+  signal,
+) {
+  const active = await detectRunnerPermission(plan, fsApi);
+  if (!active) return false;
+  await runner(
+    plan.liveRunnerPolicyCheckCommand,
+    scrubEnv(parentEnv, plan.liveRunnerPolicyCheckCommand.env),
+    signal,
+  );
+  throwIfAborted(signal);
+  return true;
+}
+
 function assertTrustedBotServiceDropInSourceMetadata(file, stat) {
   assertTrustedRegularFileMetadata(file, stat, 'bot service drop-in source');
   if ((stat.mode & 0o022) !== 0) {
@@ -3781,6 +3822,7 @@ function allPlanCommands(plan) {
       plan.activationStopCommand,
       plan.activationStateCommand,
       plan.activationConfigCheckCommand,
+      plan.liveRunnerPolicyCheckCommand,
       ...(plan.activateRunner
         ? []
         : [plan.runnerPolicyCheckCommand, plan.currentUserPolicyCheckCommand]),

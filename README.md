@@ -406,7 +406,10 @@ version 2 activation transaction can cross the permission boundary. Active-host
 ordinary apply uses `reload-or-restart` on the renewal unit to ensure the
 receipt: an active unit reloads without stopping or restarting the bot, while
 an already inactive unit starts again before deployment continues. Dry-run
-output labels conditional steps with their permission-state conditions.
+output labels conditional steps with their permission-state conditions. If the
+permission drop-in is installed out of band, every deploy first requires the
+live rendered config to be fully ephemeral; a missing or current-user live
+config fails closed before receipt renewal, checkout, or rollback can run.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,

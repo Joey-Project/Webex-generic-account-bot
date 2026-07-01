@@ -108,7 +108,9 @@ superseded_by:
   is a fast no-op while a missing or stale receipt runs the full canaries.
   Ordinary active-runner apply reloads an active renewal unit to ensure the
   receipt without propagating a bot stop or restart. If the bot and renewal
-  unit are already inactive, it starts the renewal unit instead.
+  unit are already inactive, it starts the renewal unit instead. A permission
+  drop-in installed outside the transaction fails closed unless the live
+  rendered config is already fully ephemeral.
   Receipt-only rollback failures retain the journal and fail the action after
   restoring the prior config and service.
   Ordinary apply enforces current-user policy while permission is absent and

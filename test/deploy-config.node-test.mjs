@@ -431,6 +431,12 @@ describe('deploy-config plan', () => {
       'webex-codex-activation-renew.service',
     ]);
     assert.equal(plan.activationEnsureCommand.condition, 'runner-permission-active');
+    assert.deepEqual(plan.liveRunnerPolicyCheckCommand.args, [
+      '/opt/webex-generic-account-bot/code/scripts/config-policy/static-config-check.py',
+      '--require-ephemeral-linux-user',
+      plan.renderedConfig,
+    ]);
+    assert.equal(plan.liveRunnerPolicyCheckCommand.condition, 'runner-permission-active');
     assert.equal(plan.currentUserPolicyCheckCommand.condition, 'runner-permission-inactive');
     assert.equal(plan.serviceStopCommand.bin, '/usr/bin/systemctl');
     assert.deepEqual(plan.serviceStopCommand.args, ['stop', '--', plan.service]);
@@ -2346,11 +2352,25 @@ describe('deploy-config CLI and execution', () => {
       serialised.plan.candidate_config,
       '/var/lib/webex-generic-account-bot/rendered/production.toml.candidate',
     );
-    const runnerPolicyCommand = serialised.plan.commands.find(
+    const runnerPolicyCommands = serialised.plan.commands.filter(
       (command) => command.args.includes('--require-ephemeral-linux-user'),
     );
-    assert(runnerPolicyCommand);
-    assert.equal(runnerPolicyCommand.condition, 'runner-permission-active');
+    assert.equal(runnerPolicyCommands.length, 2);
+    assert(
+      runnerPolicyCommands.some(
+        (command) => command.args.includes(serialised.plan.rendered_config),
+      ),
+    );
+    assert(
+      runnerPolicyCommands.some(
+        (command) => command.args.includes(serialised.plan.candidate_config),
+      ),
+    );
+    assert(
+      runnerPolicyCommands.every(
+        (command) => command.condition === 'runner-permission-active',
+      ),
+    );
     const receiptEnsureCommand = serialised.plan.commands.find(
       (command) => command.args.includes('webex-codex-activation-renew.service'),
     );
@@ -3087,7 +3107,11 @@ describe('deploy-config CLI and execution', () => {
       /stop after runner activation recovery/,
     );
 
-    assert.deepEqual(calls.slice(0, 3), [
+    assert.deepEqual(calls.slice(0, 4), [
+      [
+        plan.liveRunnerPolicyCheckCommand.bin,
+        plan.liveRunnerPolicyCheckCommand.args[0],
+      ],
       ['/usr/bin/systemctl', 'stop'],
       ['/usr/bin/systemctl', 'show'],
       ['/usr/bin/git', '-c'],
@@ -3250,20 +3274,98 @@ describe('deploy-config CLI and execution', () => {
     await writeRunnerActivationTransactionFixture(plan, {
       configRevision: 'd'.repeat(40),
     });
-    let commandRan = false;
+    const calls = [];
 
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
-          commandRan = true;
+        runner: async (command) => {
+          calls.push(command);
           return { stdout: '', stderr: '' };
         },
       }),
       /interrupted runner activation requires rerunning with --activate-runner/,
     );
 
-    assert.equal(commandRan, false);
+    assert.deepEqual(calls, []);
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('rejects out-of-band runner permission over a current-user live config', async () => {
+    for (const activateRunner of [true, false]) {
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-inconsistent-test-'));
+      const plan = await createRunnerActivationTestPlan(temp, { activateRunner });
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'current-user live config\n', { mode: 0o644 });
+      await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+      await fs.chmod(plan.botServiceDropIn, 0o644);
+      const calls = [];
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          runner: async (command) => {
+            calls.push(command);
+            if (command === plan.liveRunnerPolicyCheckCommand) {
+              throw new Error('live config is not ephemeral');
+            }
+            return { stdout: '', stderr: '' };
+          },
+        }),
+        /live config is not ephemeral/,
+      );
+
+      assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
+      assert.equal(
+        await fs.readFile(plan.renderedConfig, 'utf8'),
+        'current-user live config\n',
+      );
+      assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
+      await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+      await assertLockReleased(plan.lockDir);
+    }
+  });
+
+  it('rejects out-of-band runner permission before ordinary recovery', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-recovery-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'current-user live config\n', { mode: 0o644 });
+    await fs.writeFile(plan.backupConfig, 'older current-user config\n', { mode: 0o644 });
+    await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+    await fs.chmod(plan.botServiceDropIn, 0o644);
+    await writeInstallTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      serviceRestartRequired: true,
+    });
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          if (command === plan.liveRunnerPolicyCheckCommand) {
+            throw new Error('live config is not ephemeral');
+          }
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /live config is not ephemeral/,
+    );
+
+    assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
+    assert.equal(
+      await fs.readFile(plan.renderedConfig, 'utf8'),
+      'current-user live config\n',
+    );
+    assert.equal(
+      await fs.readFile(plan.backupConfig, 'utf8'),
+      'older current-user config\n',
+    );
     await fs.access(plan.transactionFile);
     await assertLockReleased(plan.lockDir);
   });
@@ -3426,7 +3528,10 @@ describe('deploy-config CLI and execution', () => {
     await fs.access(plan.activationReceipt);
     await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
     await assert.rejects(() => fs.access(plan.backupConfig), /ENOENT/);
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, [[
+      plan.liveRunnerPolicyCheckCommand.bin,
+      plan.liveRunnerPolicyCheckCommand.args[0],
+    ]]);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -3476,20 +3581,20 @@ describe('deploy-config CLI and execution', () => {
     await fs.chmod(plan.botServiceDropIn, 0o644);
     await fs.writeFile(plan.activationReceipt, '{"receipt":"active"}\n', { mode: 0o444 });
     await fs.chmod(plan.activationReceipt, 0o444);
-    let commandRan = false;
+    const calls = [];
 
     await assert.rejects(
       () => executePlan({
         plan,
-        runner: async () => {
-          commandRan = true;
+        runner: async (command) => {
+          calls.push(command);
           return { stdout: '', stderr: '' };
         },
       }),
       /permission is already active; use ordinary --apply/,
     );
 
-    assert.equal(commandRan, false);
+    assert.deepEqual(calls, [plan.liveRunnerPolicyCheckCommand]);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'active ephemeral config\n');
     assert.match(await fs.readFile(plan.botServiceDropIn, 'utf8'), /webex-codex-launch/);
     assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"active"}\n');
@@ -3508,13 +3613,18 @@ describe('deploy-config CLI and execution', () => {
     await fs.chmod(plan.botServiceDropIn, 0o644);
     let serviceRestarted = false;
     let policyChecked = false;
+    let livePolicyChecked = false;
     let receiptEnsured = false;
 
     await assert.rejects(
       () => executePlan({
         plan,
         runner: async (command) => {
+          if (command === plan.liveRunnerPolicyCheckCommand) {
+            livePolicyChecked = true;
+          }
           if (command === plan.activationEnsureCommand) {
+            assert.equal(livePolicyChecked, true);
             assert.equal(command.args[0], 'reload-or-restart');
             receiptEnsured = true;
             await fs.writeFile(plan.activationReceipt, '{"receipt":"renewed"}\n', { mode: 0o444 });
@@ -3539,6 +3649,7 @@ describe('deploy-config CLI and execution', () => {
     );
 
     assert.equal(policyChecked, true);
+    assert.equal(livePolicyChecked, true);
     assert.equal(receiptEnsured, true);
     assert.equal(serviceRestarted, false);
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
@@ -3557,12 +3668,17 @@ describe('deploy-config CLI and execution', () => {
     await fs.chmod(plan.botServiceDropIn, 0o644);
     const calls = [];
     let renewalUnitActive = false;
+    let livePolicyChecked = false;
 
     const metadata = await executePlan({
       plan,
       runner: async (command) => {
         calls.push(command);
+        if (command === plan.liveRunnerPolicyCheckCommand) {
+          livePolicyChecked = true;
+        }
         if (command === plan.activationEnsureCommand) {
+          assert.equal(livePolicyChecked, true);
           assert.equal(renewalUnitActive, false);
           assert.equal(command.args[0], 'reload-or-restart');
           renewalUnitActive = true;
@@ -3587,6 +3703,7 @@ describe('deploy-config CLI and execution', () => {
 
     assert.equal(metadata.status, 'deployed');
     assert.equal(metadata.runner_activation, false);
+    assert.equal(livePolicyChecked, true);
     assert(calls.includes(plan.runnerPolicyCheckCommand));
     assert(calls.includes(plan.serviceCommand));
     assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
