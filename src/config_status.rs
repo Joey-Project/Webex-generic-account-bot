@@ -612,6 +612,15 @@ fn validate_runner_activation_transaction(value: &Value) -> Result<()> {
             ));
         }
     }
+    if object
+        .get("permission_had_previous")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(anyhow!(
+            "deployment transaction runner_activation.permission_had_previous must be false"
+        ));
+    }
     Ok(())
 }
 
@@ -1041,6 +1050,10 @@ mod tests {
             invalid_boolean["runner_activation"][field] = Value::String("true".into());
             malformed.push(invalid_boolean);
         }
+
+        let mut previous_permission = deployment_transaction_v2("prepared");
+        previous_permission["runner_activation"]["permission_had_previous"] = Value::Bool(true);
+        malformed.push(previous_permission);
 
         let mut restart_not_required = deployment_transaction_v2("prepared");
         restart_not_required["service_restart_required"] = Value::Bool(false);
@@ -1501,7 +1514,7 @@ mod tests {
             "activation_receipt_backup": "/var/lib/webex-generic-account-bot/activation-receipt.json.backup",
             "bot_service_drop_in": "/etc/systemd/system/webex-generic-account-bot.service.d/runner-activation.conf",
             "bot_service_drop_in_backup": "/etc/systemd/system/webex-generic-account-bot.service.d/runner-activation.conf.backup",
-            "permission_had_previous": true,
+            "permission_had_previous": false,
             "receipt_had_previous": false,
         });
         transaction

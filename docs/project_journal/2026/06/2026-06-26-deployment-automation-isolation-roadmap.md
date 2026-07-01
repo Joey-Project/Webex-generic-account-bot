@@ -110,7 +110,8 @@ superseded_by:
   receipt without propagating a bot stop or restart. If the bot and renewal
   unit are already inactive, it starts the renewal unit instead. A permission
   drop-in installed outside the transaction fails closed unless the live
-  rendered config is already fully ephemeral.
+  rendered config is already fully ephemeral. Version 2 journals require that
+  launcher permission did not predate activation.
   Receipt-only rollback failures retain the journal and fail the action after
   restoring the prior config and service.
   Ordinary apply enforces current-user policy while permission is absent and

@@ -79,7 +79,8 @@
   inactive. Any out-of-band permission drop-in requires an already-ephemeral
   live config before deploy proceeds. Rollback revokes launcher permission
   before any config downgrade; receipt-only cleanup failures retain the journal
-  but do not block old-service recovery.
+  but do not block old-service recovery. Version 2 journals reject any claim
+  that launcher permission predated activation.
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
   The bot receives only launch-group and

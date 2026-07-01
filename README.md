@@ -410,6 +410,8 @@ output labels conditional steps with their permission-state conditions. If the
 permission drop-in is installed out of band, every deploy first requires the
 live rendered config to be fully ephemeral; a missing or current-user live
 config fails closed before receipt renewal, checkout, or rollback can run.
+Version 2 activation journals also require `permission_had_previous=false`;
+activation never restores a launcher permission that predates the transaction.
 
 Child command stdout/stderr capture is bounded and each child has a deadline,
 process-group termination, and a final pipe-close deadline so a stuck fetch,

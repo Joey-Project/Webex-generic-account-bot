@@ -976,6 +976,13 @@ describe('trusted config policy', () => {
     await fs.writeFile(configPath, current, 'utf8');
     const currentAccepted = runStaticConfigPolicy(configPath, '--require-current-user');
     assert.equal(currentAccepted.status, 0, currentAccepted.stderr);
+    const currentAtHostLimit = current.replace(
+      'max_concurrent_requests = 4',
+      'max_concurrent_requests = 8',
+    );
+    await fs.writeFile(configPath, currentAtHostLimit, 'utf8');
+    const neutralCurrentAccepted = runStaticConfigPolicy(configPath);
+    assert.equal(neutralCurrentAccepted.status, 0, neutralCurrentAccepted.stderr);
     const rejected = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
     assert.equal(rejected.status, 1);
     assert.match(rejected.stderr, /codex\.isolation\.mode must be 'ephemeral-linux-user'/);
@@ -986,6 +993,15 @@ describe('trusted config policy', () => {
     await fs.writeFile(configPath, ephemeral, 'utf8');
     const accepted = runStaticConfigPolicy(configPath, '--require-ephemeral-linux-user');
     assert.equal(accepted.status, 0, accepted.stderr);
+    const ephemeralAboveLauncherLimit = ephemeral.replace(
+      'max_concurrent_requests = 4',
+      'max_concurrent_requests = 8',
+    );
+    await fs.writeFile(configPath, ephemeralAboveLauncherLimit, 'utf8');
+    const neutralEphemeralRejected = runStaticConfigPolicy(configPath);
+    assert.equal(neutralEphemeralRejected.status, 1);
+    assert.match(neutralEphemeralRejected.stderr, /server\.max_concurrent_requests/);
+    await fs.writeFile(configPath, ephemeral, 'utf8');
     const ephemeralRejected = runStaticConfigPolicy(configPath, '--require-current-user');
     assert.equal(ephemeralRejected.status, 1);
     assert.match(ephemeralRejected.stderr, /codex\.isolation\.mode must be 'current-user'/);
@@ -3369,6 +3385,80 @@ describe('deploy-config CLI and execution', () => {
     await fs.access(plan.transactionFile);
     await assertLockReleased(plan.lockDir);
   });
+
+  it('rejects a v2 journal that claims launcher permission predated activation', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-journal-policy-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.transactionFile), { recursive: true, mode: 0o755 });
+    await writeRunnerActivationTransactionFixture(plan, {
+      configRevision: 'd'.repeat(40),
+      permissionHadPrevious: true,
+    });
+    let commandRan = false;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async () => {
+          commandRan = true;
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /permission_had_previous must be false/,
+    );
+
+    assert.equal(commandRan, false);
+    await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it(
+    'rejects a launcher drop-in that appears while activation is being prepared',
+    async () => {
+      const temp = await fs.mkdtemp(
+        path.join(os.tmpdir(), 'deploy-runner-permission-race-test-'),
+      );
+      const plan = await createRunnerActivationTestPlan(temp);
+      await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+      await fs.writeFile(plan.renderedConfig, 'old current-user config\n', { mode: 0o644 });
+
+      await assert.rejects(
+        () => executePlan({
+          plan,
+          runner: async (command) => {
+            if (command.bin === '/usr/bin/bash') {
+              await fs.writeFile(plan.candidateConfig, 'candidate ephemeral config\n', {
+                mode: 0o644,
+              });
+              await fs.mkdir(path.dirname(plan.botServiceDropIn), {
+                recursive: true,
+                mode: 0o755,
+              });
+              await fs.copyFile(plan.botServiceDropInSource, plan.botServiceDropIn);
+              await fs.chmod(plan.botServiceDropIn, 0o644);
+            }
+            return {
+              stdout: command.capture === 'configRevision' ? `${'d'.repeat(40)}\n` : '',
+              stderr: '',
+            };
+          },
+        }),
+        /bot service drop-in appeared during runner activation/,
+      );
+
+      assert.equal(
+        await fs.readFile(plan.renderedConfig, 'utf8'),
+        'old current-user config\n',
+      );
+      assert.match(
+        await fs.readFile(plan.botServiceDropIn, 'utf8'),
+        /webex-codex-launch/,
+      );
+      await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+      await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
+      await assertLockReleased(plan.lockDir);
+    },
+  );
 
   it('restores a prior receipt after interruption in the renewed phase', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-receipt-recovery-test-'));

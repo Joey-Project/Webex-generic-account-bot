@@ -260,7 +260,11 @@ class Validator:
         self.require_equal(server, "server", "health_path", "/healthz")
         self.require_equal(server, "server", "sidecar_token_env", "WEBEX_SIDECAR_TOKEN")
         self.require_equal(server, "server", "allow_unauthenticated", False)
-        max_concurrent_requests = 4 if self.require_ephemeral_linux_user else 8
+        max_concurrent_requests = (
+            4
+            if self.require_ephemeral_linux_user or self.declares_ephemeral_linux_user()
+            else 8
+        )
         self.expect_int_range(
             server,
             "server",
@@ -270,6 +274,32 @@ class Validator:
             required=True,
         )
         self.require_equal(server, "server", "attempt_lease_secs", 3600)
+
+    def declares_ephemeral_linux_user(self) -> bool:
+        codex = self.document.get("codex")
+        if isinstance(codex, dict):
+            isolation = codex.get("isolation")
+            if (
+                isinstance(isolation, dict)
+                and isolation.get("mode") == "ephemeral-linux-user"
+            ):
+                return True
+        rooms = self.document.get("rooms")
+        if not isinstance(rooms, list):
+            return False
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            room_codex = room.get("codex")
+            if not isinstance(room_codex, dict):
+                continue
+            isolation = room_codex.get("isolation")
+            if (
+                isinstance(isolation, dict)
+                and isolation.get("mode") == "ephemeral-linux-user"
+            ):
+                return True
+        return False
 
     def validate_webex(self, webex: dict[str, Any]) -> None:
         self.expect_keys(webex, "webex", ALLOWED_WEBEX_KEYS)

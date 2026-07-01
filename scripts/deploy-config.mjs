@@ -2731,6 +2731,9 @@ async function prepareRunnerActivation(plan, configRevision, fsApi) {
       (file, stat) => assertTrustedBotServiceDropIn(file, stat),
       fsApi,
     );
+    if (permissionHadPrevious) {
+      throw new Error('bot service drop-in appeared during runner activation');
+    }
     receiptHadPrevious = await snapshotOptionalDeploymentFile(
       plan.activationReceipt,
       plan.activationReceiptBackup,
@@ -3607,6 +3610,11 @@ function validateRunnerActivationTransaction(activation) {
     if (typeof activation[key] !== 'boolean') {
       throw new Error(`deployment transaction has an invalid runner_activation.${key}`);
     }
+  }
+  if (activation.permission_had_previous) {
+    throw new Error(
+      'deployment transaction runner_activation.permission_had_previous must be false',
+    );
   }
 }
 
