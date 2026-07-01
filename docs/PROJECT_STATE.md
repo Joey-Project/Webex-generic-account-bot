@@ -106,11 +106,13 @@
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
   dangling-alias parents, `d_type`-independent entry classification, unit-name
-  specifier expansion, named/numeric/implicit-DynamicUser managed identity
+  specifier expansion, named/implicit-DynamicUser identities plus pre-allocation
+  rejection of static-range numeric identities,
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
   auditing that protects root, runtime, and installed policy paths from owner-modifier,
   traversal-restricting ancestor metadata, cleanup, replacement, and recursive
-  rules while validating every catalogue source file and ancestor,
+  rules, allocation ranges, normalised glob paths, and copy sources while
+  validating every catalogue source file and ancestor,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional

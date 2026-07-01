@@ -711,7 +711,11 @@ async function executeLockedApply(argv) {
 async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
   const configPullGid = await readConfigPullGroupGid(fs);
   const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
-  const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  const lockPolicy = assertTrustedProvisionLockParent(
+    parentStat,
+    configPullGid,
+    { allowInterruptedMigration },
+  );
   const lock = await fs.open(
     PROVISION_LOCK_PATH,
     fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
@@ -976,11 +980,8 @@ export async function ensureProvisionLockFile(fsApi) {
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
   }
   let lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
-  if (
-    lockPolicy.state === 'bootstrap'
-    && (parentStat.mode & 0o7777) !== DIRECTORY_MODE
-  ) {
-    await fsApi.chmod(PROVISION_LOCK_PARENT, DIRECTORY_MODE);
+  if ((parentStat.mode & 0o7777) !== lockPolicy.parentMode) {
+    await fsApi.chmod(PROVISION_LOCK_PARENT, lockPolicy.parentMode);
     await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
     lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
@@ -1038,7 +1039,11 @@ async function readConfigPullGroupGid(fsApi) {
   return snapshot.groups.get(MANAGED_GROUPS.configPull)?.gid ?? null;
 }
 
-function assertTrustedProvisionLockParent(stat, configPullGid) {
+function assertTrustedProvisionLockParent(
+  stat,
+  configPullGid,
+  { allowInterruptedMigration = true } = {},
+) {
   if (
     !stat.isDirectory()
     || stat.isSymbolicLink()
@@ -1049,10 +1054,24 @@ function assertTrustedProvisionLockParent(stat, configPullGid) {
   const mode = stat.mode & 0o7777;
   const recoverableBootstrapMode = (mode & 0o7000) === 0 && (mode & 0o022) === 0;
   if (stat.gid === 0 && recoverableBootstrapMode) {
-    return Object.freeze({ state: 'bootstrap', gid: 0, mode: 0o600 });
+    return Object.freeze({
+      state: 'bootstrap',
+      gid: 0,
+      mode: 0o600,
+      parentMode: DIRECTORY_MODE,
+    });
   }
-  if (configPullGid !== null && stat.gid === configPullGid && mode === 0o750) {
-    return Object.freeze({ state: 'deployed', gid: configPullGid, mode: 0o660 });
+  if (
+    configPullGid !== null
+    && stat.gid === configPullGid
+    && (mode === 0o750 || (allowInterruptedMigration && mode === DIRECTORY_MODE))
+  ) {
+    return Object.freeze({
+      state: 'deployed',
+      gid: configPullGid,
+      mode: 0o660,
+      parentMode: 0o750,
+    });
   }
   throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
 }
@@ -1103,7 +1122,7 @@ export function validateProvisionLockMetadata(
   configPullGid,
   options = {},
 ) {
-  const policy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  const policy = assertTrustedProvisionLockParent(parentStat, configPullGid, options);
   assertTrustedProvisionLock(lockStat, policy, options);
   return policy;
 }
@@ -1927,14 +1946,7 @@ function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, pro
     return false;
   }
   if (type === 'r') {
-    const match = id.match(/^(\d+)(?:-(\d+))?$/);
-    if (!match) return id !== '-';
-    const lower = Number(match[1]);
-    const upper = Number(match[2] ?? match[1]);
-    return [...managedIds].some((managedId) => {
-      const value = Number(managedId);
-      return value >= lower && value <= upper;
-    });
+    return true;
   }
   throw new Error(`unsupported sysusers policy type: ${type}`);
 }
@@ -1952,11 +1964,19 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   ) {
     return true;
   }
-  return pathFieldTouchesProtected(
+  if (pathFieldTouchesProtected(
     policyPath,
     tmpfilesAncestorPolicyIsSafe(fields),
     protectedPaths,
-  );
+  )) {
+    return true;
+  }
+  const argument = fields[6];
+  return type.startsWith('C')
+    && argument !== undefined
+    && argument !== '-'
+    && (!argument.startsWith('/')
+      || pathFieldTouchesProtected(argument, false, protectedPaths));
 }
 
 function normaliseTmpfilesOwner(owner) {
@@ -1964,13 +1984,14 @@ function normaliseTmpfilesOwner(owner) {
 }
 
 function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPaths) {
-  if (/(^|\/)webex(?:-|\/|$)/.test(policyPath)) return true;
   if (!policyPath.startsWith('/')) return policyPath.includes('%');
-  const wildcardOffset = policyPath.search(/[%*?[]/);
-  const literal = wildcardOffset < 0 ? path.posix.normalize(policyPath) : null;
+  const normalisedPolicyPath = path.posix.normalize(policyPath);
+  if (/(^|\/)webex(?:-|\/|$)/.test(normalisedPolicyPath)) return true;
+  const wildcardOffset = normalisedPolicyPath.search(/[%*?[]/);
+  const literal = wildcardOffset < 0 ? normalisedPolicyPath : null;
   const staticPrefix = wildcardOffset < 0
     ? literal
-    : policyPath.slice(0, wildcardOffset);
+    : normalisedPolicyPath.slice(0, wildcardOffset);
   for (const protectedPath of protectedPaths) {
     if (literal !== null) {
       if (literal === protectedPath || literal.startsWith(`${protectedPath}/`)) return true;
@@ -2356,12 +2377,15 @@ function unitNameClaimsManagedIdentity(unitName) {
 
 function systemdIdentityDirectiveUsesManagedId(value, managedIds) {
   const separator = value.indexOf('=');
-  if (separator <= 0 || managedIds.size === 0) return false;
+  if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
   if (!SYSTEMD_IDENTITY_DIRECTIVES.has(directive)) return false;
-  return parseSystemdFields(value.slice(separator + 1)).some((identity) => (
-    managedIds.has(identity)
-  ));
+  return parseSystemdFields(value.slice(separator + 1)).some((identity) => {
+    if (managedIds.has(identity)) return true;
+    if (!/^[0-9]+$/.test(identity)) return false;
+    const id = Number(identity);
+    return Number.isSafeInteger(id) && id > 0 && id <= MAX_MANAGED_ID;
+  });
 }
 
 function managedIdentityIds(snapshot) {

@@ -167,7 +167,7 @@ describe('guarded host provisioner policy', () => {
 
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
-      { state: 'bootstrap', gid: 0, mode: 0o600 },
+      { state: 'bootstrap', gid: 0, mode: 0o600, parentMode: 0o755 },
     );
     for (const interruptedMode of [0o000, 0o055, 0o500, 0o700, 0o710, 0o750]) {
       assert.deepEqual(
@@ -176,16 +176,24 @@ describe('guarded host provisioner policy', () => {
           lockStat(0, 0o600),
           null,
         ),
-        { state: 'bootstrap', gid: 0, mode: 0o600 },
+        { state: 'bootstrap', gid: 0, mode: 0o600, parentMode: 0o755 },
       );
     }
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(2003, 0o660), 2003),
-      { state: 'deployed', gid: 2003, mode: 0o660 },
+      { state: 'deployed', gid: 2003, mode: 0o660, parentMode: 0o750 },
     );
     assert.deepEqual(
       validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(0, 0o600), 2003),
-      { state: 'deployed', gid: 2003, mode: 0o660 },
+      { state: 'deployed', gid: 2003, mode: 0o660, parentMode: 0o750 },
+    );
+    assert.deepEqual(
+      validateProvisionLockMetadata(
+        directoryStat(2003, 0o755),
+        lockStat(0, 0o600),
+        2003,
+      ),
+      { state: 'deployed', gid: 2003, mode: 0o660, parentMode: 0o750 },
     );
     assert.throws(
       () => validateProvisionLockMetadata(
@@ -195,6 +203,15 @@ describe('guarded host provisioner policy', () => {
         { allowInterruptedMigration: false },
       ),
       /provision lock file is not trusted/,
+    );
+    assert.throws(
+      () => validateProvisionLockMetadata(
+        directoryStat(2003, 0o755),
+        lockStat(0, 0o600),
+        2003,
+        { allowInterruptedMigration: false },
+      ),
+      /provision lock parent is not trusted/,
     );
     assert.throws(
       () => validateProvisionLockMetadata(
@@ -214,25 +231,38 @@ describe('guarded host provisioner policy', () => {
     );
   });
 
-  it('recovers a trusted lock file interrupted by a restrictive umask', async () => {
-    const state = { gid: 0, mode: 0o000 };
-    const directoryStat = Object.freeze({
+  it('recovers safe umask and tmpfiles lock migration interruptions', async () => {
+    const state = {
+      parentGid: 2003,
+      parentMode: 0o755,
+      lockGid: 0,
+      lockMode: 0o000,
+    };
+    const directoryStat = (gid = 0, mode = 0o755) => Object.freeze({
       uid: 0,
-      gid: 0,
-      mode: 0o40755,
+      gid,
+      mode: 0o40000 | mode,
       isDirectory: () => true,
       isSymbolicLink: () => false,
     });
     const lockStat = () => Object.freeze({
       uid: 0,
-      gid: state.gid,
-      mode: 0o100000 | state.mode,
+      gid: state.lockGid,
+      mode: 0o100000 | state.lockMode,
       nlink: 1,
       isFile: () => true,
       isSymbolicLink: () => false,
     });
     const fsApi = {
-      lstat: async () => directoryStat,
+      lstat: async (candidate) => (
+        candidate === '/run/webex-config-deploy'
+          ? directoryStat(state.parentGid, state.parentMode)
+          : directoryStat()
+      ),
+      chmod: async (candidate, mode) => {
+        assert.equal(candidate, '/run/webex-config-deploy');
+        state.parentMode = mode;
+      },
       open: async (candidate, flags) => {
         if (candidate === '/etc/group') {
           const contents = Buffer.from(expectedGroupDatabase());
@@ -251,7 +281,7 @@ describe('guarded host provisioner policy', () => {
             close: async () => {},
           };
         }
-        if (candidate === '/run/webex-config-deploy') {
+        if (candidate === '/run' || candidate === '/run/webex-config-deploy') {
           return { sync: async () => {}, close: async () => {} };
         }
         if (flags & fsConstants.O_EXCL) {
@@ -262,9 +292,9 @@ describe('guarded host provisioner policy', () => {
           stat: async () => lockStat(),
           chown: async (uid, gid) => {
             assert.equal(uid, 0);
-            state.gid = gid;
+            state.lockGid = gid;
           },
-          chmod: async (mode) => { state.mode = mode; },
+          chmod: async (mode) => { state.lockMode = mode; },
           sync: async () => {},
           close: async () => {},
         };
@@ -272,7 +302,12 @@ describe('guarded host provisioner policy', () => {
     };
 
     await ensureProvisionLockFile(fsApi);
-    assert.deepEqual(state, { gid: 0, mode: 0o600 });
+    assert.deepEqual(state, {
+      parentGid: 2003,
+      parentMode: 0o750,
+      lockGid: 2003,
+      lockMode: 0o660,
+    });
   });
 
   it('rejects static membership and primary-GID drift', () => {
@@ -615,6 +650,7 @@ describe('guarded host provisioner execution', () => {
       ['sysusers', 'm webex-generic-account-bot sudo'],
       ['sysusers', 'm \\x77ebex-generic-account-bot sudo'],
       ['sysusers', 'u external /var/lib/webex-generic-account-bot/state -'],
+      ['sysusers', 'r - 61184-65519'],
       ['tmpfiles', 'd /run/webex-codex-canary 0777 root root -'],
       ['tmpfiles', 'd /run/\\x77ebex-config-deploy 0777 root root -'],
       ['tmpfiles', 'R /run/* - - - -'],
@@ -635,6 +671,8 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'd / 0000 root root -'],
       ['tmpfiles', 'd= /var/lib 0755 root root -'],
       ['tmpfiles', 'z+ /etc/systemd 0755 root root -'],
+      ['tmpfiles', 'R /var/lib/../lib/[w]ebex-generic-account-bot - - - -'],
+      ['tmpfiles', 'C /tmp/copied-state - - - - /var/lib/[w]ebex-generic-account-bot'],
       ['tmpfiles', ['R \\', '# ignored continuation comment', '/etc/systemd/system/* - - - -'].join('\n')],
     ]) {
       const fixture = await provisionFixture(context);
@@ -1151,7 +1189,6 @@ describe('guarded host provisioner execution', () => {
             ]]),
           },
         ),
-        expectedIdentitySnapshot(),
       ),
       /external systemd policy references a managed unit/,
     );

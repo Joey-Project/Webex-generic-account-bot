@@ -173,12 +173,14 @@ superseded_by:
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion,
-  named/numeric/implicit-DynamicUser managed identity assignments, and launcher-instance
+  named/implicit-DynamicUser assignments, pre-allocation rejection of
+  static-range numeric identities, and launcher-instance
   references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
-  auditing with C-escape, specifier/glob-prefix, path-derived-ID, owner
+  auditing with C-escape, normalised specifier/glob-prefix and copy-source
+  paths, path-derived-ID, allocation-range rejection, owner
   modifiers, protected root and installed-policy targets, traversal-preserving
   ancestor metadata, recursive parent handling, and root-owned stable source
   metadata for every effective catalogue file,
@@ -188,7 +190,8 @@ superseded_by:
   fail-closed recovery with full target-directory durability and a journal
   retained through final manager convergence,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate
-  and first-run lock recovery, and post-reload verification. Real host apply remains an
+  and first-run lock recovery including the group-owned pre-chmod directory
+  state, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
 ## Delivery Rules
@@ -240,7 +243,8 @@ superseded_by:
   every re-exec path ancestor, stream a bounded scan that removes only trusted
   stale candidates, and bound and reject active launcher template instances as
   well as active template units. Allow only a root-owned, non-writable
-  half-migrated first-run lock state, including safe umask-narrowed modes, then
+  half-migrated first-run lock state, including safe umask-narrowed modes and
+  the group-owned pre-chmod directory state, then
   require tmpfiles to converge and revalidate the held
   inode before success. Require each loaded unit and instance to use the fixed
   managed fragment without any

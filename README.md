@@ -242,12 +242,14 @@ alias is accepted only when its link text is clean and its target parent remains
 root-owned and non-writable. Unit-name specifiers are expanded against each
 external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
-policy may not assign a managed user or group by name, allocated numeric ID, or
-implicit DynamicUser unit name. The merged systemd sysusers and tmpfiles
+policy may not assign a managed user or group by name or implicit DynamicUser
+unit name, and external units may not use numeric identities from the static
+system-ID range before allocation. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
-specifier/glob-prefix, path-derived-ID, owner modifiers, ancestor metadata, and
-recursive-parent semantics. Every effective catalogue source and its ancestors
+specifier/glob-prefix, lexical path normalisation, copy-source, path-derived-ID,
+owner modifiers, ancestor metadata, and recursive-parent semantics. External
+sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
 must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
 every installed policy target, the transaction journal, and the shared lock are
 protected from external tmpfiles policy; ancestor maintenance must preserve
@@ -259,7 +261,9 @@ the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a
 safe mode narrowed to any value by the caller's umask before the first metadata
-update. A rerun first converges that directory to the exact bootstrap mode.
+update, or in the unique safe group-owned mode left when tmpfiles completes
+`chown` before `chmod`. A rerun first converges that directory to the exact
+bootstrap or deployed mode.
 Apply must then prove
 that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,
