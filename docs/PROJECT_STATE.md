@@ -91,6 +91,12 @@
   reviewed admin Space is pinned, and `reload` and `sync` remain invalid.
   Production stays on `current-user` until the deployment host completes the
   real-reboot challenge and activates a matching reviewed config.
+- Host deployment discovery found that the repository had privileged launcher,
+  activation, and worker units but no base bot unit or reproducible host
+  provisioner. The base contract now defines the unprivileged bot identity,
+  fixed service, and root-managed versus bot-writable filesystem layout. A
+  guarded installer remains the next slice before Configuration Space pinning
+  and real host activation.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

@@ -157,6 +157,26 @@ node scripts/deploy-config.mjs --apply
 node scripts/deploy-config.mjs --apply --activate-runner
 ```
 
+The base host service assets are:
+
+- `deploy/systemd/webex-generic-account-bot.service`
+- `deploy/systemd/webex-generic-account-bot.sysusers.conf`
+- `deploy/systemd/webex-generic-account-bot.tmpfiles.conf`
+
+They define the stable non-login `webex-generic-account-bot` identity and keep
+root-managed rendered config, token, and environment inputs separate from the
+bot-owned state, Codex home, and workspace. The base unit has no launcher,
+sealed-input, or config-worker supplementary group. Those permissions and the
+pending-input write path remain exclusive to the activation-owned
+`10-codex-launcher.conf` drop-in. The base assets do not create token or env
+files, install binaries/code, enable units, or modify the host by themselves;
+the guarded host provisioner is a separate deployment slice.
+
+`MemoryDenyWriteExecute` remains disabled in the base service because the
+trusted Jenkins helper runs under Node/V8. Prompt-controlled Codex tools do not
+inherit that broad base-service boundary after activation: they execute through
+the separately hardened launcher and immutable transient runtime.
+
 The deployment entrypoint lives in this bot repository, not in the config
 repository checkout. It treats the config checkout as data, builds fixed argv
 calls for `git`, the bot repo's trusted `scripts/config-policy/validate-config.sh`,
