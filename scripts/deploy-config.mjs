@@ -58,7 +58,7 @@ const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
 const ACTIVATION_RENEWAL_UNIT = 'webex-codex-activation-renew.service';
 const ACTIVATION_RENEW_TIMEOUT_MS = 5_500_000;
 const BOT_SERVICE_DROP_IN_RELATIVE = 'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf';
-const BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
+const BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch webex-config-pull\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
 const FLOCK_BIN = '/usr/bin/flock';
 const FLOCK_CHILD_FD = '3';
 const FLOCK_TIMEOUT_MS = 5000;

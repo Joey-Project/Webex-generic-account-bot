@@ -229,12 +229,18 @@ Before connecting, the bot resolves the fixed system account and group names and
 requires both the socket and its mode `0750` parent to be owned by
 `webex-config-deploy:webex-config-pull`. The worker is never added to the bot's
 own group, so it cannot read bot tokens, Codex state, or Jenkins credentials.
-The bot is deliberately not added to `webex-config-pull` in this slice: a Codex
-child currently inherits the bot's supplementary groups, so granting socket
-access before isolated runner execution would let ordinary-room code bypass the
-configuration Space allowlist. The service keeps `UMask=0077`; worker code
-explicitly applies and verifies mode `0660` on the socket and mode `0644` on the
-public status file after creation.
+The bot receives `webex-config-pull` only through the reviewed transactional
+`10-codex-launcher.conf` service drop-in. Runner activation installs that group
+together with the launcher permission, ephemeral config, and boot-scoped
+receipt, and rolls it back before any config downgrade. `/config pull`
+configuration is valid only when every effective Codex runner uses
+`ephemeral-linux-user`. The transient runner receives only `webex-codex-input`,
+hides `/run/webex-config-pull` with `InaccessiblePaths`, and denies the same path
+in the inner Codex permission profile. The activation canary also attempts the
+real worker socket and requires access to be denied. The permission does not
+couple the worker lifecycle to the bot. The service keeps `UMask=0077`; worker
+code explicitly applies and verifies mode `0660` on the socket and mode `0644`
+on the public status file after creation.
 
 The socket parent and lock parent are deliberately separate. The shared socket
 parent is mode `0750` at `/run/webex-config-pull`. The root-owned
@@ -303,14 +309,15 @@ changing state and only then discovering the first worker's active socket. A
 stop signal aborts the bounded stale-socket probe, waits for partial startup to
 unwind, and removes any socket already created before the process exits.
 
-The bot-side client and fixed command routing are present for integration tests,
-but configuration validation still rejects `pull`, `reload`, and `sync` and no
-config-pull worker socket-group drop-in is shipped. PR 4c1c separately adds
-only the receipt-gated Codex launcher client path. Runner activation grants the
-bot only launcher-group and pending-input access while removing the
-current-user path. A later enablement PR may allow `pull`
-only after `ephemeral-linux-user` runner isolation is deployable and verified;
-`reload` and `sync` require the later activation work as well.
+The bot-side client durably enqueues `/config pull` before acknowledging the
+Webex request. Configuration validation permits only `status` and `pull`, and
+requires fully ephemeral runner isolation whenever `pull` is allowed. The
+host policy pins `hoteng@cisco.com` and `status`/`pull`, but its Configuration
+Space ID remains explicitly unset, so this slice is not production-deployable.
+User message text cannot select an action, path, repository, revision, or
+command argument. `/config reload` and `/config sync` remain undeployable until
+staged activation, rollback, health verification, and in-flight attempt
+semantics land.
 
 Use `--skip-restart` when validating an install without restarting the service.
 That mode writes `status=installed_without_restart` instead of `status=deployed`.

@@ -100,10 +100,10 @@ impl ConfigCommandsConfig {
         if let Some(command) = self
             .allowed_commands
             .iter()
-            .find(|command| **command != ConfigCommand::Status)
+            .find(|command| matches!(command, ConfigCommand::Reload | ConfigCommand::Sync))
         {
             return Err(anyhow!(
-                "config_commands command {command:?} is not deployable until runner isolation is enabled; only status is supported"
+                "config_commands command {command:?} is not deployable until recoverable activation is enabled; only status and pull are supported"
             ));
         }
 
@@ -327,16 +327,16 @@ allowed_commands = ["status"]
     }
 
     #[test]
-    fn rejects_mutating_commands_until_runner_isolation_is_enabled() {
-        for command in [
-            ConfigCommand::Pull,
-            ConfigCommand::Reload,
-            ConfigCommand::Sync,
-        ] {
+    fn accepts_pull_but_rejects_activation_commands() {
+        let mut pull = valid_config();
+        pull.allowed_commands.push(ConfigCommand::Pull);
+        pull.validate().unwrap();
+
+        for command in [ConfigCommand::Reload, ConfigCommand::Sync] {
             let mut config = valid_config();
             config.allowed_commands = vec![command];
             let error = config.validate().unwrap_err().to_string();
-            assert!(error.contains("only status is supported"));
+            assert!(error.contains("only status and pull are supported"));
         }
     }
 

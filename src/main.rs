@@ -7756,16 +7756,15 @@ mod tests {
             room_id: ADMIN_ROOM_ID.to_owned(),
             allowed_person_ids: vec![SENDER_PERSON_ID.to_owned()],
             allowed_person_emails: vec![SENDER_EMAIL.to_owned()],
-            allowed_commands: vec![ConfigCommand::Status],
+            allowed_commands: vec![ConfigCommand::Status, ConfigCommand::Pull],
         });
+        config.codex.model = Some("gpt-5.5".to_owned());
+        config.codex.skip_git_repo_check = true;
+        config.codex.ephemeral = true;
+        config.codex.isolation.mode = IsolationMode::EphemeralLinuxUser;
+        config.codex.isolation.trusted_prompt_authors = false;
+        config.server.attempt_lease_secs = 3600;
         config.validate().unwrap();
-        // Exercise the dormant pull handoff without making it deployable.
-        config
-            .config_commands
-            .as_mut()
-            .unwrap()
-            .allowed_commands
-            .push(ConfigCommand::Pull);
         Arc::new(config)
     }
 

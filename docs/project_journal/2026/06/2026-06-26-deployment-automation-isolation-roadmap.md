@@ -3,7 +3,7 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-06-30
+updated: 2026-07-01
 branch: codex/roadmap-deploy-isolation
 pr:
 supersedes: []
@@ -25,8 +25,9 @@ superseded_by:
   (isolated execution), PR 4c1a (boot-scoped activation receipt foundation),
   PR 4c1b (root fresh-inode input sealer), PR 4c1c (gated runner wiring), PR
   4c2a1 (canary contract/probe), 4c2a2 (production-image and lifecycle
-  canaries plus receipt helper), 4c2b (transactional final activation), PR 2b2b (`/config
-  pull` enablement), and PR 2b3 (recoverable
+  canaries plus receipt helper), 4c2b (transactional final activation), PR
+  2b2b1 (config-pull permission and schema boundary), PR 2b2b2 (reviewed Space
+  and config enablement), and PR 2b3 (recoverable
   activation plus `/config reload` and `/config sync`). Mutating commands
   remain undeployable until their security dependencies land.
 - Bot PR #9 merged the PR 2a slice as `8448c5e6f4cb98fd448d461d18799d46cdb2fba5`.
@@ -125,6 +126,15 @@ superseded_by:
   activation instead of returning ordinary deployment metadata as success.
   The production host still requires
   a matching reviewed config and a successful real-reboot canary run.
+- PR 2b2b1 adds the config-worker socket group to the same fixed drop-in owned
+  by the runner activation transaction, so it cannot be independently granted
+  while current-user Codex execution is active. The Rust schema allows `pull`
+  only for a fully ephemeral effective runner configuration, while `reload`
+  and `sync` remain invalid. Transient Codex receives only the input group and
+  continues to hide and deny `/run/webex-config-pull`; the activation canary
+  probes the real worker socket. Host policy recognises the command schema but
+  keeps the admin Space pin disabled. PR 2b2b2 owns the exact room pin,
+  companion config change, deployment, and Webex E2E.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -208,13 +218,19 @@ superseded_by:
 - Keep bot socket-group access and deployable `/config pull` disabled because
   current-user Codex children inherit the bot's supplementary groups.
 
-#### PR 2b2b: Pull Enablement After Runner Isolation
+#### PR 2b2b1: Pull Permission and Schema Boundary
 - Merge PRs 3, 4a, 4b, and 4c first and prove prompt-controlled Codex
   subprocesses cannot access the worker socket, bot/deployment secrets, or host
   `/run` paths.
-- Then grant the bot socket access and enable `/config pull` only after socket
-  authorization, queue durability, duplicate-event, crash-recovery, fixed-argv,
-  ownership, symlink, and isolated-child denial tests pass.
+- Add the config-worker group to the transactional runner permission drop-in,
+  allow the `pull` schema only under fully ephemeral isolation, and keep the
+  production admin-room pin disabled.
+
+#### PR 2b2b2: Reviewed Pull Enablement
+- Pin the exact admin Space and sender, update the reviewed config repository,
+  and enable `/config pull` only after socket authorization, queue durability,
+  duplicate-event, crash-recovery, fixed-argv, ownership, symlink, and
+  isolated-child denial tests pass.
 
 #### PR 2b3: Recoverable Activation
 - Add activation of an already staged immutable revision without network fetch,

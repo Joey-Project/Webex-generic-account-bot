@@ -1055,17 +1055,20 @@ describe('trusted config policy', () => {
   it('keeps config commands disabled until host policy pins the admin Space', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
     const config = path.join(temp, 'config-commands.toml');
-    const rendered = await staticPolicyRenderedConfig(
+    const current = await staticPolicyRenderedConfig(
       '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
     );
+    const rendered = current
+      .replace('mode = "current-user"', 'mode = "ephemeral-linux-user"')
+      .replace('trusted_prompt_authors = true', 'trusted_prompt_authors = false');
     const firstRoom = rendered.indexOf('[[rooms]]');
     assert.notEqual(firstRoom, -1);
     const configCommands = [
       '[config_commands]',
       'room_id = "unreviewed-admin-room"',
-      'allowed_person_ids = ["unreviewed-person"]',
-      'allowed_person_emails = []',
-      'allowed_commands = ["status"]',
+      'allowed_person_ids = []',
+      'allowed_person_emails = ["hoteng@cisco.com"]',
+      'allowed_commands = ["status", "pull"]',
       '',
     ].join('\n');
     await fs.writeFile(
@@ -1076,7 +1079,91 @@ describe('trusted config policy', () => {
 
     const result = runStaticConfigPolicy(config);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /config\.config_commands is not an allowed production config field/);
+    assert.match(
+      result.stderr,
+      /config_commands are disabled until host policy pins the reviewed admin Space/,
+    );
+    assert.doesNotMatch(result.stderr, /config_commands\.allowed_/);
+    assert.doesNotMatch(result.stderr, /config_commands require codex\.isolation/);
+    assert.doesNotMatch(result.stderr, /not an allowed production config field/);
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
+  it('rejects per-room isolation downgrades when config commands are present', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'config-command-room-isolation.toml');
+    const current = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    const rendered = current
+      .replace('mode = "current-user"', 'mode = "ephemeral-linux-user"')
+      .replace('trusted_prompt_authors = true', 'trusted_prompt_authors = false');
+    const firstRoom = rendered.indexOf('[[rooms]]');
+    assert.notEqual(firstRoom, -1);
+    const configCommands = [
+      '[config_commands]',
+      'room_id = "unreviewed-admin-room"',
+      'allowed_person_ids = []',
+      'allowed_person_emails = ["hoteng@cisco.com"]',
+      'allowed_commands = ["status", "pull"]',
+      '',
+    ].join('\n');
+    const downgradedRoom = [
+      '',
+      '[rooms.codex.isolation]',
+      'mode = "current-user"',
+      'trusted_prompt_authors = true',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      config,
+      `${rendered.slice(0, firstRoom)}${configCommands}${rendered.slice(firstRoom)}${downgradedRoom}`,
+      'utf8',
+    );
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /config_commands require rooms\[1\]\.codex\.isolation\.mode = 'ephemeral-linux-user'/,
+    );
+    assert.match(
+      result.stderr,
+      /config_commands require rooms\[1\]\.codex\.isolation\.trusted_prompt_authors = false/,
+    );
+    await fs.rm(temp, { recursive: true, force: true });
+  });
+
+  it('rejects config command sender and action policy drift', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
+    const config = path.join(temp, 'config-command-drift.toml');
+    const current = await staticPolicyRenderedConfig(
+      '/opt/webex-generic-account-bot/code/scripts/jenkins-readonly.mjs',
+    );
+    const rendered = current
+      .replace('mode = "current-user"', 'mode = "ephemeral-linux-user"')
+      .replace('trusted_prompt_authors = true', 'trusted_prompt_authors = false');
+    const firstRoom = rendered.indexOf('[[rooms]]');
+    assert.notEqual(firstRoom, -1);
+    const configCommands = [
+      '[config_commands]',
+      'room_id = "unreviewed-admin-room"',
+      'allowed_person_ids = ["attacker-person"]',
+      'allowed_person_emails = ["attacker@example.com"]',
+      'allowed_commands = ["status", "sync"]',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      config,
+      `${rendered.slice(0, firstRoom)}${configCommands}${rendered.slice(firstRoom)}`,
+      'utf8',
+    );
+
+    const result = runStaticConfigPolicy(config);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /config_commands\.allowed_person_ids/);
+    assert.match(result.stderr, /config_commands\.allowed_person_emails/);
+    assert.match(result.stderr, /config_commands\.allowed_commands/);
     await fs.rm(temp, { recursive: true, force: true });
   });
 
@@ -2722,7 +2809,7 @@ describe('deploy-config CLI and execution', () => {
           assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
           assert.match(
             await fs.readFile(plan.botServiceDropIn, 'utf8'),
-            /SupplementaryGroups=webex-codex-launch/,
+            /^SupplementaryGroups=webex-codex-launch webex-config-pull$/m,
           );
           assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
         }
