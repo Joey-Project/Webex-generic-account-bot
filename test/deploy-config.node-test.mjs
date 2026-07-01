@@ -2839,6 +2839,59 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
+  it('transactionally migrates the exact legacy launcher-only permission', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-migration-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    const legacyDropIn = await installLegacyRunnerDropIn(plan);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"old"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let livePolicyChecked = false;
+
+    const metadata = await executePlan({
+      plan,
+      runner: async (command) => {
+        if (command === plan.liveRunnerPolicyCheckCommand) {
+          livePolicyChecked = true;
+        }
+        if (command.bin === '/usr/bin/bash') {
+          await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+        }
+        if (command === plan.activationRenewCommand) {
+          const transaction = JSON.parse(await fs.readFile(plan.transactionFile, 'utf8'));
+          assert.equal(transaction.runner_activation.permission_had_previous, true);
+          await fs.rm(plan.activationReceipt);
+          await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+          await fs.chmod(plan.activationReceipt, 0o444);
+        }
+        return {
+          stdout: command.capture === 'configRevision'
+            ? `${'a'.repeat(40)}\n`
+            : command.bin === '/usr/bin/curl'
+              ? '200'
+              : '',
+          stderr: '',
+        };
+      },
+    });
+
+    assert.equal(livePolicyChecked, true);
+    assert.equal(metadata.status, 'deployed');
+    assert.equal(metadata.runner_activation, true);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+    assert.equal(
+      await fs.readFile(plan.botServiceDropIn, 'utf8'),
+      await fs.readFile(plan.botServiceDropInSource, 'utf8'),
+    );
+    assert.notEqual(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
   it('invalidates a stale receipt when activation renewal fails', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-renewal-test-'));
     const plan = await createRunnerActivationTestPlan(temp);
@@ -3061,6 +3114,69 @@ describe('deploy-config CLI and execution', () => {
     const failure = JSON.parse(await fs.readFile(plan.metadataFile, 'utf8'));
     assert.equal(failure.status, 'failed_restart_rolled_back');
     await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('restores the legacy permission when a migration service restart fails', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-migration-rollback-test-'));
+    const plan = await createRunnerActivationTestPlan(temp);
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    const legacyDropIn = await installLegacyRunnerDropIn(plan);
+    await fs.writeFile(plan.activationReceipt, '{"receipt":"old"}\n', { mode: 0o444 });
+    await fs.chmod(plan.activationReceipt, 0o444);
+    let serviceRestarts = 0;
+    let readinessChecks = 0;
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          if (command.bin === '/usr/bin/bash') {
+            await fs.writeFile(plan.candidateConfig, 'new ephemeral config\n', { mode: 0o644 });
+          }
+          if (command === plan.activationRenewCommand) {
+            await fs.rm(plan.activationReceipt);
+            await fs.writeFile(plan.activationReceipt, '{"receipt":"new"}\n', { mode: 0o444 });
+            await fs.chmod(plan.activationReceipt, 0o444);
+          }
+          if (command === plan.activationStateCommand) {
+            return { stdout: 'inactive\n', stderr: '' };
+          }
+          if (command === plan.serviceCommand) {
+            serviceRestarts += 1;
+            if (serviceRestarts === 1) {
+              assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'new ephemeral config\n');
+              assert.notEqual(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
+              assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"new"}\n');
+            } else {
+              assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
+              assert.equal(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
+              assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"old"}\n');
+            }
+          }
+          if (command.bin === '/usr/bin/curl') {
+            readinessChecks += 1;
+            if (readinessChecks === 1) throw new Error('migrated service is not ready');
+            return { stdout: '200', stderr: '' };
+          }
+          return {
+            stdout: command.capture === 'configRevision' ? `${'c'.repeat(40)}\n` : '',
+            stderr: '',
+          };
+        },
+      }),
+      /migrated service is not ready/,
+    );
+
+    assert.equal(serviceRestarts, 2);
+    assert.equal(readinessChecks, 2);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
+    assert.equal(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
+    assert.equal(await fs.readFile(plan.activationReceipt, 'utf8'), '{"receipt":"old"}\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
+    await assert.rejects(() => fs.access(plan.botServiceDropInBackup), /ENOENT/);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -3603,12 +3719,16 @@ describe('deploy-config CLI and execution', () => {
     await assertLockReleased(plan.lockDir);
   });
 
-  it('rejects a v2 journal that claims launcher permission predated activation', async () => {
+  it('rejects a legacy-migration journal with a nonlegacy permission backup', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-journal-policy-test-'));
     const plan = await createRunnerActivationTestPlan(temp);
     await fs.mkdir(path.dirname(plan.transactionFile), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.botServiceDropInBackup), { recursive: true, mode: 0o755 });
+    await fs.mkdir(path.dirname(plan.activationReceipt), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.botServiceDropInBackup, 'unreviewed permission\n', { mode: 0o644 });
     await writeRunnerActivationTransactionFixture(plan, {
       configRevision: 'd'.repeat(40),
+      phase: 'prepared',
       permissionHadPrevious: true,
     });
     let commandRan = false;
@@ -3624,11 +3744,40 @@ describe('deploy-config CLI and execution', () => {
           return { stdout: '', stderr: '' };
         },
       }),
-      /permission_had_previous must be false/,
+      /saved bot service drop-in does not match the fixed legacy activation policy/,
     );
 
     assert.equal(commandRan, false);
     await fs.access(plan.transactionFile);
+    await assertLockReleased(plan.lockDir);
+  });
+
+  it('requires explicit activation to migrate legacy launcher-only permission', async () => {
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-runner-migration-mode-test-'));
+    const plan = await createRunnerActivationTestPlan(temp, { activateRunner: false });
+    await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
+    await fs.writeFile(plan.renderedConfig, 'old ephemeral config\n', { mode: 0o644 });
+    const legacyDropIn = await installLegacyRunnerDropIn(plan);
+    const calls = [];
+
+    await assert.rejects(
+      () => executePlan({
+        plan,
+        runner: async (command) => {
+          calls.push(command);
+          return { stdout: '', stderr: '' };
+        },
+      }),
+      /legacy launcher-only runner permission requires --apply --activate-runner/,
+    );
+
+    assert.deepEqual(calls, [
+      plan.permissionStateReloadCommand,
+      plan.liveRunnerPolicyCheckCommand,
+    ]);
+    assert.equal(await fs.readFile(plan.botServiceDropIn, 'utf8'), legacyDropIn);
+    assert.equal(await fs.readFile(plan.renderedConfig, 'utf8'), 'old ephemeral config\n');
+    await assert.rejects(() => fs.access(plan.transactionFile), /ENOENT/);
     await assertLockReleased(plan.lockDir);
   });
 
@@ -7755,6 +7904,19 @@ async function createRunnerActivationTestPlan(temp, { activateRunner = true } = 
       path.join(temp, 'run', 'webex-codex-activation', 'receipt.json'),
     ]),
   );
+}
+
+async function installLegacyRunnerDropIn(plan) {
+  const current = await fs.readFile(plan.botServiceDropInSource, 'utf8');
+  const legacy = current.replace(
+    'SupplementaryGroups=webex-codex-launch webex-config-pull',
+    'SupplementaryGroups=webex-codex-launch',
+  );
+  assert.notEqual(legacy, current);
+  await fs.mkdir(path.dirname(plan.botServiceDropIn), { recursive: true, mode: 0o755 });
+  await fs.writeFile(plan.botServiceDropIn, legacy, { mode: 0o644 });
+  await fs.chmod(plan.botServiceDropIn, 0o644);
+  return legacy;
 }
 
 function runStaticConfigPolicy(configPath, ...args) {

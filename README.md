@@ -373,8 +373,10 @@ including `--status --json`, validates the status schema and rejects malformed o
 incomplete metadata.
 
 `--apply --activate-runner` is the explicit final runner activation path. It
-is a one-time transition and refuses to run when the reviewed permission
-drop-in is already active. It first renders a candidate that is statically required to use
+refuses to run when the current reviewed permission drop-in is already active,
+but transactionally migrates the exact launcher-only drop-in installed by the
+previous activation slice. Ordinary apply fails with an explicit migration
+instruction while that legacy drop-in remains. It first renders a candidate that is statically required to use
 `ephemeral-linux-user` for every effective Codex policy. Before canaries run,
 the entrypoint writes a version 2 recovery journal and snapshots the live
 config, bot permission drop-in, and any prior boot receipt. It then restarts

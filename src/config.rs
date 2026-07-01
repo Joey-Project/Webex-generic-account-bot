@@ -96,7 +96,7 @@ impl BotConfig {
                 .context("invalid config_commands")?;
             self.validate_config_commands_room(config_commands)?;
             if config_commands.command_allowed(ConfigCommand::Pull)
-                && !self.uses_ephemeral_linux_user()
+                && !self.all_codex_configs_use_ephemeral_linux_user()
             {
                 return Err(anyhow!(
                     "config_commands pull requires ephemeral-linux-user for every Codex runner"
@@ -162,6 +162,12 @@ impl BotConfig {
         self.codex_configs()
             .into_iter()
             .any(|(_, codex)| codex.isolation.mode == IsolationMode::EphemeralLinuxUser)
+    }
+
+    fn all_codex_configs_use_ephemeral_linux_user(&self) -> bool {
+        self.codex_configs()
+            .into_iter()
+            .all(|(_, codex)| codex.isolation.mode == IsolationMode::EphemeralLinuxUser)
     }
 
     fn validate_room_ids(&self) -> Result<()> {
@@ -1065,6 +1071,40 @@ allow_all_senders = true
         .unwrap();
 
         ephemeral.validate().unwrap();
+
+        let mixed: BotConfig = toml::from_str(
+            r#"
+[server]
+attempt_lease_secs = 3600
+
+[codex]
+model = "gpt-5.5"
+skip_git_repo_check = true
+ephemeral = true
+
+[codex.isolation]
+mode = "ephemeral-linux-user"
+trusted_prompt_authors = false
+
+[config_commands]
+room_id = "admin-room"
+allowed_person_ids = []
+allowed_person_emails = ["operator@example.com"]
+allowed_commands = ["status", "pull"]
+
+[[rooms]]
+room_id = "room-1"
+allow_all_senders = true
+
+[rooms.codex.isolation]
+mode = "current-user"
+trusted_prompt_authors = true
+"#,
+        )
+        .unwrap();
+
+        let error = format!("{:#}", mixed.validate().unwrap_err());
+        assert!(error.contains("pull requires ephemeral-linux-user"));
     }
 
     #[test]

@@ -58,7 +58,11 @@ const SERVICE_READINESS_URL = 'http://127.0.0.1:8787/healthz';
 const ACTIVATION_RENEWAL_UNIT = 'webex-codex-activation-renew.service';
 const ACTIVATION_RENEW_TIMEOUT_MS = 5_500_000;
 const BOT_SERVICE_DROP_IN_RELATIVE = 'deploy/systemd/webex-generic-account-bot.service.d/10-codex-launcher.conf';
+const LEGACY_BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
 const BOT_SERVICE_DROP_IN_CONTENT = `[Unit]\nRequires=webex-codex-activation-renew.service\nAfter=webex-codex-activation-renew.service\n\n[Service]\nSupplementaryGroups=webex-codex-launch webex-config-pull\nReadWritePaths=/var/lib/webex-generic-account-bot/codex-input-staging/pending\n`;
+const RUNNER_PERMISSION_INACTIVE = 'inactive';
+const RUNNER_PERMISSION_LEGACY = 'legacy-launcher-only';
+const RUNNER_PERMISSION_CURRENT = 'current';
 const FLOCK_BIN = '/usr/bin/flock';
 const FLOCK_CHILD_FD = '3';
 const FLOCK_TIMEOUT_MS = 5000;
@@ -839,7 +843,7 @@ export async function executePlan({
   let recordedFailureStatus = null;
   let recordedFailureConfigRevision = null;
   let outputDirectoriesTrusted = false;
-  let runnerPermissionActive = false;
+  let runnerPermission = { active: false, legacy: false };
   const recordFailure = async (
     status,
     reason,
@@ -870,7 +874,7 @@ export async function executePlan({
       signal,
     );
     throwIfAborted(signal);
-    runnerPermissionActive = await detectAndValidateRunnerPermission(
+    runnerPermission = await detectAndValidateRunnerPermission(
       plan,
       runner,
       parentEnv,
@@ -883,7 +887,7 @@ export async function executePlan({
       return recovery.metadata;
     }
     if (recovery) {
-      runnerPermissionActive = await detectAndValidateRunnerPermission(
+      runnerPermission = await detectAndValidateRunnerPermission(
         plan,
         runner,
         parentEnv,
@@ -891,12 +895,17 @@ export async function executePlan({
         signal,
       );
     }
-    if (plan.activateRunner && runnerPermissionActive) {
+    if (plan.activateRunner && runnerPermission.active && !runnerPermission.legacy) {
       throw new Error(
         'ephemeral runner permission is already active; use ordinary --apply for subsequent config updates',
       );
     }
-    if (runnerPermissionActive && !plan.activateRunner) {
+    if (runnerPermission.legacy && !plan.activateRunner) {
+      throw new Error(
+        'legacy launcher-only runner permission requires --apply --activate-runner for transactional migration',
+      );
+    }
+    if (runnerPermission.active && !plan.activateRunner) {
       await runner(
         plan.activationEnsureCommand,
         scrubEnv(parentEnv, plan.activationEnsureCommand.env),
@@ -917,7 +926,7 @@ export async function executePlan({
     }
     assertConfigRevision(captures.configRevision);
     if (!plan.activateRunner) {
-      const policyCheckCommand = runnerPermissionActive
+      const policyCheckCommand = runnerPermission.active
         ? plan.runnerPolicyCheckCommand
         : plan.currentUserPolicyCheckCommand;
       await runner(
@@ -932,6 +941,7 @@ export async function executePlan({
         plan,
         captures.configRevision,
         fsApi,
+        { migrateLegacyPermission: runnerPermission.legacy },
       );
       await runner(
         plan.activationDaemonReloadCommand,
@@ -2733,7 +2743,12 @@ async function prepareCandidateInstallState(plan, configRevision, fsApi) {
   };
 }
 
-async function prepareRunnerActivation(plan, configRevision, fsApi) {
+async function prepareRunnerActivation(
+  plan,
+  configRevision,
+  fsApi,
+  { migrateLegacyPermission = false } = {},
+) {
   await assertTrustedBotServiceDropInSource(plan.botServiceDropInSource, fsApi);
   await createDirectoryDurably(path.dirname(plan.botServiceDropIn), 0o755, fsApi);
   await assertTrustedPathAncestors(
@@ -2745,21 +2760,30 @@ async function prepareRunnerActivation(plan, configRevision, fsApi) {
   let permissionHadPrevious = false;
   let receiptHadPrevious = false;
   try {
-    permissionHadPrevious = await snapshotOptionalDeploymentFile(
+    const permissionSnapshot = await snapshotOptionalDeploymentFile(
       plan.botServiceDropIn,
       plan.botServiceDropInBackup,
       (file, stat) => assertTrustedBotServiceDropIn(file, stat),
       fsApi,
     );
-    if (permissionHadPrevious) {
+    permissionHadPrevious = permissionSnapshot !== null;
+    if (migrateLegacyPermission) {
+      if (!permissionSnapshot) {
+        throw new Error('legacy bot service drop-in disappeared during runner activation');
+      }
+      if (permissionSnapshot.contents.toString('utf8') !== LEGACY_BOT_SERVICE_DROP_IN_CONTENT) {
+        throw new Error('legacy bot service drop-in changed during runner activation');
+      }
+    } else if (permissionHadPrevious) {
       throw new Error('bot service drop-in appeared during runner activation');
     }
-    receiptHadPrevious = await snapshotOptionalDeploymentFile(
+    const receiptSnapshot = await snapshotOptionalDeploymentFile(
       plan.activationReceipt,
       plan.activationReceiptBackup,
       (file, stat) => assertTrustedActivationReceiptMetadata(file, stat),
       fsApi,
     );
+    receiptHadPrevious = receiptSnapshot !== null;
     installState.runnerActivation = {
       permissionHadPrevious,
       receiptHadPrevious,
@@ -2801,12 +2825,12 @@ async function snapshotOptionalDeploymentFile(file, backup, validate, fsApi) {
   } catch (error) {
     if (error?.code === 'ENOENT') {
       await removeDurablyIfPresent(backup, fsApi).catch(() => {});
-      return false;
+      return null;
     }
     throw error;
   }
   await writeFixedFileAtomically(backup, snapshot.contents, snapshot.mode, fsApi);
-  return true;
+  return snapshot;
 }
 
 async function readStableTrustedFile(file, maxBytes, validate, fsApi) {
@@ -2889,14 +2913,18 @@ async function detectRunnerPermission(plan, fsApi) {
     );
   } catch (error) {
     if (error?.code === 'ENOENT') {
-      return false;
+      return RUNNER_PERMISSION_INACTIVE;
     }
     throw error;
   }
-  if (snapshot.contents.toString('utf8') !== BOT_SERVICE_DROP_IN_CONTENT) {
-    throw new Error('installed bot service drop-in does not match the fixed activation policy');
+  const contents = snapshot.contents.toString('utf8');
+  if (contents === BOT_SERVICE_DROP_IN_CONTENT) {
+    return RUNNER_PERMISSION_CURRENT;
   }
-  return true;
+  if (contents === LEGACY_BOT_SERVICE_DROP_IN_CONTENT) {
+    return RUNNER_PERMISSION_LEGACY;
+  }
+  throw new Error('installed bot service drop-in does not match a fixed activation policy');
 }
 
 async function detectAndValidateRunnerPermission(
@@ -2906,15 +2934,20 @@ async function detectAndValidateRunnerPermission(
   fsApi,
   signal,
 ) {
-  const active = await detectRunnerPermission(plan, fsApi);
-  if (!active) return false;
+  const state = await detectRunnerPermission(plan, fsApi);
+  if (state === RUNNER_PERMISSION_INACTIVE) {
+    return { active: false, legacy: false };
+  }
   await runner(
     plan.liveRunnerPolicyCheckCommand,
     scrubEnv(parentEnv, plan.liveRunnerPolicyCheckCommand.env),
     signal,
   );
   throwIfAborted(signal);
-  return true;
+  return {
+    active: true,
+    legacy: state === RUNNER_PERMISSION_LEGACY,
+  };
 }
 
 function assertTrustedBotServiceDropInSourceMetadata(file, stat) {
@@ -3173,11 +3206,23 @@ async function restoreDeploymentState(
 }
 
 async function restoreRunnerActivationPermission(plan, activationState, fsApi) {
-  await restoreOptionalDeploymentFile(
-    plan.botServiceDropIn,
+  if (!activationState.permissionHadPrevious) {
+    await removeDurablyIfPresent(plan.botServiceDropIn, fsApi);
+    return;
+  }
+  const snapshot = await readStableTrustedFile(
     plan.botServiceDropInBackup,
-    activationState.permissionHadPrevious,
+    1024,
     (file, stat) => assertTrustedBotServiceDropIn(file, stat),
+    fsApi,
+  );
+  if (snapshot.contents.toString('utf8') !== LEGACY_BOT_SERVICE_DROP_IN_CONTENT) {
+    throw new Error('saved bot service drop-in does not match the fixed legacy activation policy');
+  }
+  await writeFixedFileAtomically(
+    plan.botServiceDropIn,
+    snapshot.contents,
+    snapshot.mode,
     fsApi,
   );
 }
@@ -3649,11 +3694,6 @@ function validateRunnerActivationTransaction(activation) {
     if (typeof activation[key] !== 'boolean') {
       throw new Error(`deployment transaction has an invalid runner_activation.${key}`);
     }
-  }
-  if (activation.permission_had_previous) {
-    throw new Error(
-      'deployment transaction runner_activation.permission_had_previous must be false',
-    );
   }
 }
 
