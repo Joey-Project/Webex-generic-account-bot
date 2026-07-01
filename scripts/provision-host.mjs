@@ -29,7 +29,8 @@ const MAX_MANAGED_ID = 59_999;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
-const PROVISION_LOCK_PATH = '/run/webex-host-provision.lock';
+const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
+const PROVISION_LOCK_PARENT = path.dirname(PROVISION_LOCK_PATH);
 const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
@@ -384,7 +385,7 @@ export async function provisionHost(options, dependencies = {}) {
   const identityBefore = await deps.readIdentitySnapshot();
   validateIdentityPolicy(identityBefore);
   const unitStatesBefore = await deps.readUnitStates(MANAGED_UNITS);
-  assertUnitsDormant(unitStatesBefore, { requireLoaded: false });
+  assertUnitsDormant(unitStatesBefore, plan, { requireLoaded: false });
   const inspected = await inspectArtifacts(plan, deps);
 
   if (!options.apply) {
@@ -404,7 +405,7 @@ export async function provisionHost(options, dependencies = {}) {
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
     const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS);
-    assertUnitsDormant(unitStatesAfter, { requireLoaded: true });
+    assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
   } catch (error) {
     throw new Error(
       `host policy files are installed but convergence failed; rerun --apply after correction: ${error.message}`,
@@ -483,7 +484,7 @@ export function hasProvisionLock(locksText, pid, stat) {
 }
 
 async function executeLockedApply(argv) {
-  await ensureProvisionLockFile(fs);
+  await ensureProvisionLockFile(fs, runFixedCommand);
   const scriptPath = fileURLToPath(import.meta.url);
   await assertTrustedReexecFile(process.execPath, { executable: true }, fs);
   await assertTrustedReexecFile(scriptPath, { mode: FILE_MODE }, fs);
@@ -511,6 +512,9 @@ async function executeLockedApply(argv) {
 }
 
 async function assertProvisionLockHeld() {
+  const configPullGid = await readConfigPullGroupGid(runFixedCommand);
+  const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
+  const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
   const lock = await fs.open(
     PROVISION_LOCK_PATH,
     fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
@@ -518,7 +522,7 @@ async function assertProvisionLockHeld() {
   let stat;
   try {
     stat = await lock.stat();
-    assertTrustedFileMetadata(PROVISION_LOCK_PATH, stat, 0, 0, 0o600);
+    assertTrustedProvisionLock(stat, lockPolicy);
   } finally {
     await lock.close();
   }
@@ -754,14 +758,27 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
   }
 }
 
-async function ensureProvisionLockFile(fsApi) {
+async function ensureProvisionLockFile(fsApi, runCommand) {
   await assertTrustedDirectoryChain(
     '/',
-    path.dirname(PROVISION_LOCK_PATH),
+    path.dirname(PROVISION_LOCK_PARENT),
     0,
     0,
     fsApi,
   );
+  const configPullGid = await readConfigPullGroupGid(runCommand);
+  let parentStat;
+  try {
+    parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    await fsApi.mkdir(PROVISION_LOCK_PARENT, { mode: DIRECTORY_MODE });
+    await fsApi.chown(PROVISION_LOCK_PARENT, 0, 0);
+    await fsApi.chmod(PROVISION_LOCK_PARENT, DIRECTORY_MODE);
+    await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
+    parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
+  }
+  const lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
   let handle;
   try {
     handle = await fsApi.open(
@@ -772,12 +789,12 @@ async function ensureProvisionLockFile(fsApi) {
         | fsConstants.O_NOFOLLOW,
       0o600,
     );
-    await handle.chown(0, 0);
-    await handle.chmod(0o600);
+    await handle.chown(0, lockPolicy.gid);
+    await handle.chmod(lockPolicy.mode);
     await handle.sync();
     await handle.close();
     handle = null;
-    await syncDirectory(path.dirname(PROVISION_LOCK_PATH), fsApi);
+    await syncDirectory(PROVISION_LOCK_PARENT, fsApi);
   } catch (error) {
     await handle?.close().catch(() => {});
     if (error?.code !== 'EEXIST') throw error;
@@ -788,10 +805,61 @@ async function ensureProvisionLockFile(fsApi) {
     fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
   );
   try {
-    assertTrustedFileMetadata(PROVISION_LOCK_PATH, await existing.stat(), 0, 0, 0o600);
+    assertTrustedProvisionLock(await existing.stat(), lockPolicy);
   } finally {
     await existing.close();
   }
+}
+
+async function readConfigPullGroupGid(runCommand) {
+  const result = await runCommand(
+    '/usr/bin/getent',
+    ['-s', 'files', 'group', MANAGED_GROUPS.configPull],
+    [0, 2],
+  );
+  if (result.code === 2 || result.stdout.trim() === '') return null;
+  const snapshot = parseIdentityDatabases('', result.stdout);
+  if (snapshot.groups.size !== 1 || !snapshot.groups.has(MANAGED_GROUPS.configPull)) {
+    throw new Error('config-pull group lookup returned unexpected records');
+  }
+  return snapshot.groups.get(MANAGED_GROUPS.configPull).gid;
+}
+
+function assertTrustedProvisionLockParent(stat, configPullGid) {
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || stat.uid !== 0
+  ) {
+    throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
+  }
+  const mode = stat.mode & 0o7777;
+  if (stat.gid === 0 && mode === DIRECTORY_MODE) {
+    return Object.freeze({ gid: 0, mode: 0o600 });
+  }
+  if (configPullGid !== null && stat.gid === configPullGid && mode === 0o750) {
+    return Object.freeze({ gid: configPullGid, mode: 0o660 });
+  }
+  throw new Error(`provision lock parent is not trusted: ${PROVISION_LOCK_PARENT}`);
+}
+
+function assertTrustedProvisionLock(stat, policy) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.nlink !== 1
+    || stat.uid !== 0
+    || stat.gid !== policy.gid
+    || (stat.mode & 0o7777) !== policy.mode
+  ) {
+    throw new Error(`provision lock file is not trusted: ${PROVISION_LOCK_PATH}`);
+  }
+}
+
+export function validateProvisionLockMetadata(parentStat, lockStat, configPullGid) {
+  const policy = assertTrustedProvisionLockParent(parentStat, configPullGid);
+  assertTrustedProvisionLock(lockStat, policy);
+  return policy;
 }
 
 async function assertTrustedReexecFile(file, policy, fsApi) {
@@ -1196,19 +1264,25 @@ async function removeProvisionTransaction(plan, deps) {
   await syncDirectory(path.dirname(plan.transactionFile), deps.fsApi);
 }
 
-function assertUnitsDormant(states, { requireLoaded }) {
+function assertUnitsDormant(states, plan, { requireLoaded }) {
   for (const unit of MANAGED_UNITS) {
     const state = states.get(unit);
     if (!state) throw new Error(`unit state is missing: ${unit}`);
-    assertUnitDormant(unit, state, { requireLoaded });
+    assertUnitDormant(unit, state, {
+      requireLoaded,
+      expectedFragment: expectedUnitFragment(plan, unit),
+    });
   }
   for (const [unit, state] of states) {
     if (!LAUNCHER_INSTANCE_PATTERN.test(unit)) continue;
-    assertUnitDormant(unit, state, { requireLoaded });
+    assertUnitDormant(unit, state, {
+      requireLoaded,
+      expectedFragment: expectedUnitFragment(plan, 'webex-codex-launcher@.service'),
+    });
   }
 }
 
-function assertUnitDormant(unit, state, { requireLoaded }) {
+function assertUnitDormant(unit, state, { requireLoaded, expectedFragment }) {
   if (!['inactive', 'unknown'].includes(state.active)) {
     throw new Error(`managed unit is not inactive: ${unit} (${state.active})`);
   }
@@ -1218,6 +1292,24 @@ function assertUnitDormant(unit, state, { requireLoaded }) {
   if (requireLoaded && state.load !== 'loaded') {
     throw new Error(`managed unit did not load after installation: ${unit} (${state.load})`);
   }
+  if (!['loaded', 'not-found'].includes(state.load)) {
+    throw new Error(`managed unit has unexpected load state: ${unit} (${state.load})`);
+  }
+  if (state.load === 'loaded' && state.fragment !== expectedFragment) {
+    throw new Error(`managed unit loaded an unexpected fragment: ${unit} (${state.fragment})`);
+  }
+  if (state.load === 'not-found' && state.fragment !== '') {
+    throw new Error(`unloaded managed unit reported a fragment: ${unit} (${state.fragment})`);
+  }
+  if (state.dropIns !== '') {
+    throw new Error(`managed unit loaded unexpected drop-ins: ${unit} (${state.dropIns})`);
+  }
+}
+
+function expectedUnitFragment(plan, unit) {
+  const target = plan.units.find((candidate) => path.basename(candidate) === unit);
+  if (!target) throw new Error(`managed unit has no fixed fragment: ${unit}`);
+  return target;
 }
 
 async function validateSystemdUserdbBoundary(fsApi) {
@@ -1342,22 +1434,46 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand) 
   }
   const states = new Map();
   for (const unit of [...units, ...[...discovered].sort()]) {
-    const [active, enabled, load] = await Promise.all([
+    const [active, enabled, metadata] = await Promise.all([
       runCommand('/usr/bin/systemctl', ['is-active', unit], [0, 3, 4]),
       runCommand('/usr/bin/systemctl', ['is-enabled', unit], [0, 1, 3, 4]),
-      runCommand(
-        '/usr/bin/systemctl',
-        ['show', '--property=LoadState', '--value', unit],
-        [0, 1, 3, 4],
-      ),
+      runCommand('/usr/bin/systemctl', [
+        'show',
+        '--property=LoadState',
+        '--property=FragmentPath',
+        '--property=DropInPaths',
+        unit,
+      ], [0, 1, 3, 4]),
     ]);
+    const loadedPolicy = parseSystemUnitMetadata(metadata.stdout, unit);
     states.set(unit, Object.freeze({
       active: normalisedState(active.stdout, 'unknown'),
       enabled: normalisedState(enabled.stdout, 'not-found'),
-      load: normalisedState(load.stdout, 'not-found'),
+      ...loadedPolicy,
     }));
   }
   return states;
+}
+
+function parseSystemUnitMetadata(output, unit) {
+  const values = new Map();
+  const expected = new Set(['LoadState', 'FragmentPath', 'DropInPaths']);
+  for (const line of String(output).split('\n').filter((value) => value !== '')) {
+    const separator = line.indexOf('=');
+    const key = separator < 0 ? '' : line.slice(0, separator);
+    if (!expected.has(key) || values.has(key)) {
+      throw new Error(`managed unit metadata is malformed: ${unit}`);
+    }
+    values.set(key, line.slice(separator + 1));
+  }
+  if (values.size !== expected.size) {
+    throw new Error(`managed unit metadata is incomplete: ${unit}`);
+  }
+  return Object.freeze({
+    load: normalisedState(values.get('LoadState'), 'not-found'),
+    fragment: values.get('FragmentPath'),
+    dropIns: values.get('DropInPaths'),
+  });
 }
 
 function parseLauncherInstanceUnits(output) {

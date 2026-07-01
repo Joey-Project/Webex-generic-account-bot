@@ -98,11 +98,12 @@
   guarded provisioner now has a fixed non-secret allowlist, files-only static
   identity enumeration, a DynamicUser-only systemd userdb boundary,
   identity-drift checks, bounded dormant-unit preflight, device-bound kernel
-  lock verification, trusted re-exec paths, fail-closed crash recovery with
-  full target-directory durability, streamed stale-candidate cleanup,
-  transactional root-owned policy installation, explicit sysusers/tmpfiles
-  application, and post-reload verification. Real host apply remains explicit
-  before Configuration Space pinning and activation.
+  lock verification shared with config deployment, exact loaded-fragment and
+  no-drop-in checks, trusted re-exec paths, fail-closed crash recovery with full
+  target-directory durability, streamed stale-candidate cleanup, transactional
+  root-owned policy installation, explicit sysusers/tmpfiles application, and
+  post-reload verification. Real host apply remains explicit before
+  Configuration Space pinning and activation.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

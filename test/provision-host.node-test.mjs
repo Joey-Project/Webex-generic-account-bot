@@ -7,6 +7,10 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  buildDeployPlan,
+  parseArgs as parseDeployArgs,
+} from '../scripts/deploy-config.mjs';
+import {
   ARTIFACTS,
   MANAGED_UNITS,
   buildLockedApplyCommand,
@@ -20,6 +24,7 @@ import {
   runCli,
   validateIdentityPolicy,
   validateNsswitchPolicy,
+  validateProvisionLockMetadata,
 } from '../scripts/provision-host.mjs';
 
 const REPO_SYSTEMD_ROOT = fileURLToPath(
@@ -78,13 +83,17 @@ describe('guarded host provisioner policy', () => {
         '--no-fork',
         '--conflict-exit-code',
         '75',
-        '/run/webex-host-provision.lock',
+        '/run/webex-config-deploy/deploy-config.lock',
         '/trusted/node',
         '/trusted/provision-host.mjs',
         '--apply',
         '--json',
       ],
     });
+    assert.equal(
+      command.args[5],
+      buildDeployPlan(parseDeployArgs(['--apply'])).lockDir,
+    );
     assert.throws(
       () => buildLockedApplyCommand({ argv: ['--dry-run'] }),
       /requires --apply/,
@@ -133,6 +142,49 @@ describe('guarded host provisioner policy', () => {
         },
       }),
       /lock ownership is not proven/,
+    );
+  });
+
+  it('accepts only bootstrap or deployed shared lock metadata', () => {
+    const directoryStat = (gid, mode) => ({
+      uid: 0,
+      gid,
+      mode: 0o40000 | mode,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    const lockStat = (gid, mode) => ({
+      uid: 0,
+      gid,
+      mode: 0o100000 | mode,
+      nlink: 1,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    });
+
+    assert.deepEqual(
+      validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
+      { gid: 0, mode: 0o600 },
+    );
+    assert.deepEqual(
+      validateProvisionLockMetadata(directoryStat(2003, 0o750), lockStat(2003, 0o660), 2003),
+      { gid: 2003, mode: 0o660 },
+    );
+    assert.throws(
+      () => validateProvisionLockMetadata(
+        directoryStat(2004, 0o750),
+        lockStat(2004, 0o660),
+        2003,
+      ),
+      /provision lock parent is not trusted/,
+    );
+    assert.throws(
+      () => validateProvisionLockMetadata(
+        directoryStat(2003, 0o750),
+        lockStat(2003, 0o600),
+        2003,
+      ),
+      /provision lock file is not trusted/,
     );
   });
 
@@ -393,7 +445,7 @@ describe('guarded host provisioner execution', () => {
       load: 'loaded',
       active: 'inactive',
       enabled: 'disabled',
-    });
+    }, fixture.plan);
     const second = await provisionHost(
       { apply: true },
       fixture.dependencies({
@@ -481,7 +533,19 @@ describe('guarded host provisioner execution', () => {
           code: 0,
         };
       }
-      return { stdout: 'loaded\n', stderr: '', code: 0 };
+      const fragmentUnit = LAUNCHER_INSTANCE_PATTERN_FOR_TEST.test(unit)
+        ? 'webex-codex-launcher@.service'
+        : unit;
+      return {
+        stdout: [
+          'LoadState=loaded',
+          `FragmentPath=/etc/systemd/system/${fragmentUnit}`,
+          'DropInPaths=',
+          '',
+        ].join('\n'),
+        stderr: '',
+        code: 0,
+      };
     });
     assert.equal(discovered.get(instance).active, 'active');
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
@@ -510,6 +574,48 @@ describe('guarded host provisioner execution', () => {
       /too many launcher instances/,
     );
     assert.equal(stateQueries, 0);
+  });
+
+  it('rejects loaded fragments and drop-ins outside the fixed policy', async (context) => {
+    const cases = [
+      [
+        'fragment',
+        (state) => ({ ...state, fragment: '/run/systemd/system/webex-generic-account-bot.service' }),
+        /managed unit loaded an unexpected fragment/,
+      ],
+      [
+        'drop-in',
+        (state) => ({ ...state, dropIns: '/etc/systemd/system/service.d/90-untrusted.conf' }),
+        /managed unit loaded unexpected drop-ins/,
+      ],
+    ];
+    for (const [label, mutate, expected] of cases) {
+      const fixture = await provisionFixture(context);
+      const before = unitStates({
+        load: 'not-found',
+        active: 'inactive',
+        enabled: 'not-found',
+      });
+      const after = unitStates({
+        load: 'loaded',
+        active: 'inactive',
+        enabled: 'disabled',
+      }, fixture.plan);
+      const unit = MANAGED_UNITS[0];
+      after.set(unit, mutate(after.get(unit)));
+
+      await assert.rejects(
+        provisionHost(
+          { apply: true },
+          fixture.dependencies({
+            applied: true,
+            unitStateSequence: [before, after],
+          }),
+        ),
+        expected,
+        label,
+      );
+    }
   });
 
   it('rolls back the complete policy set when an atomic rename fails', async (context) => {
@@ -953,7 +1059,7 @@ async function provisionFixture(context) {
       const stateSequence = unitStateSequence ?? (applied
         ? [
           unitStates({ load: 'not-found', active: 'inactive', enabled: 'not-found' }),
-          unitStates({ load: 'loaded', active: 'inactive', enabled: 'disabled' }),
+          unitStates({ load: 'loaded', active: 'inactive', enabled: 'disabled' }, plan),
         ]
         : [unitStates({ load: 'not-found', active: 'inactive', enabled: 'not-found' })]);
       let identityIndex = 0;
@@ -1179,6 +1285,16 @@ function asyncDirectory(entries) {
   };
 }
 
-function unitStates(state) {
-  return new Map(MANAGED_UNITS.map((unit) => [unit, { ...state }]));
+const LAUNCHER_INSTANCE_PATTERN_FOR_TEST = /^webex-codex-launcher@[^@/\s]+\.service$/;
+
+function unitStates(state, plan = null) {
+  return new Map(MANAGED_UNITS.map((unit) => [unit, {
+    ...state,
+    fragment: state.fragment ?? (
+      state.load === 'loaded' && plan
+        ? plan.units.find((candidate) => path.basename(candidate) === unit)
+        : ''
+    ),
+    dropIns: state.dropIns ?? '',
+  }]));
 }

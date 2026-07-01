@@ -221,9 +221,11 @@ the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
-launcher template units. A fixed root-only `flock` serialises the complete
-apply, and the re-executed process verifies the kernel lock PID, device, and
-inode instead of trusting its environment. Apply streams a bounded number of
+launcher template units. It also requires every loaded managed unit to use the
+fixed `/etc/systemd/system` fragment with no drop-ins. The same host-wide
+`flock` used by config deployment serialises the complete apply, and the
+re-executed process verifies the kernel lock PID, device, and inode instead of
+trusting its environment. Apply streams a bounded number of
 directory entries and removes only bounded, exact-name, trusted stale
 candidates left by an interrupted prior run. It installs the complete
 policy file set transactionally,

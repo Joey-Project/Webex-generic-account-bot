@@ -165,10 +165,11 @@ superseded_by:
   fixed non-secret allowlist, files-only static identity enumeration, a
   DynamicUser-only systemd userdb boundary, identity-drift checks, dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
-  verification, trusted re-exec paths, bounded streamed stale candidate cleanup
-  and unit discovery, fail-closed recovery with full target-directory
-  durability, and post-reload verification. Real host apply remains an explicit
-  operational gate.
+  verification shared with config deployment, exact loaded-fragment and
+  no-drop-in checks, trusted re-exec paths, bounded streamed stale candidate
+  cleanup and unit discovery, fail-closed recovery with full target-directory
+  durability, and post-reload verification. Real host apply remains an
+  explicit operational gate.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -209,10 +210,12 @@ superseded_by:
   DynamicUser range, and permit only the trusted DynamicUser provider. Fsync
   every target directory and re-verify the complete old target set before
   clearing a recovery journal. Serialise the full apply with a
-  PID/device/inode-bound kernel lock, validate every re-exec path
-  ancestor, stream a bounded scan that removes only trusted stale candidates,
-  and bound and reject active launcher template instances as well as active
-  template units. If a later sysusers, tmpfiles, manager-reload, or
+  PID/device/inode-bound kernel lock shared with config deployment, validate
+  every re-exec path ancestor, stream a bounded scan that removes only trusted
+  stale candidates, and bound and reject active launcher template instances as
+  well as active template units. Require each loaded unit and instance to use
+  the fixed managed fragment without any drop-ins. If a later sysusers,
+  tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an
   explicit convergent-rerun requirement; do not claim rollback of users or
   directories already created by systemd.
