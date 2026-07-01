@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -23,9 +23,25 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
+const PROVISION_LOCK_PATH = '/run/webex-host-provision.lock';
+const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
+const PROVISION_LOCK_CONFLICT_EXIT = 75;
+const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
+const MANAGED_ACCOUNTS = Object.freeze({
+  bot: Object.freeze({
+    name: 'webex-generic-account-bot',
+    home: '/var/lib/webex-generic-account-bot',
+    shell: '/usr/sbin/nologin',
+  }),
+  worker: Object.freeze({
+    name: 'webex-config-deploy',
+    home: '/nonexistent',
+    shell: '/usr/sbin/nologin',
+  }),
+});
 const MANAGED_USERS = Object.freeze({
-  bot: 'webex-generic-account-bot',
-  worker: 'webex-config-deploy',
+  bot: MANAGED_ACCOUNTS.bot.name,
+  worker: MANAGED_ACCOUNTS.worker.name,
 });
 const MANAGED_GROUPS = Object.freeze({
   bot: 'webex-generic-account-bot',
@@ -197,7 +213,13 @@ export function parseIdentityDatabases(passwdText, groupText, effectiveGroups = 
     }
     const uid = parseDatabaseId(fields[2], 'passwd UID');
     const gid = parseDatabaseId(fields[3], 'passwd GID');
-    users.set(fields[0], Object.freeze({ name: fields[0], uid, gid }));
+    users.set(fields[0], Object.freeze({
+      name: fields[0],
+      uid,
+      gid,
+      home: fields[5],
+      shell: fields[6],
+    }));
   }
 
   const groups = new Map();
@@ -282,22 +304,14 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
   }
 
   if (bot) {
+    assertAccountContract(bot, MANAGED_ACCOUNTS.bot);
     assertPrimaryGroup(snapshot, bot, MANAGED_GROUPS.bot);
-    assertNoForbiddenEffectiveGroups(snapshot, bot, [
-      MANAGED_GROUPS.configDeploy,
-      MANAGED_GROUPS.configPull,
-      MANAGED_GROUPS.codexInput,
-      MANAGED_GROUPS.codexLaunch,
-    ]);
+    assertExactEffectiveGroups(snapshot, bot);
   }
   if (worker) {
+    assertAccountContract(worker, MANAGED_ACCOUNTS.worker);
     assertPrimaryGroup(snapshot, worker, MANAGED_GROUPS.configDeploy);
-    assertNoForbiddenEffectiveGroups(snapshot, worker, [
-      MANAGED_GROUPS.bot,
-      MANAGED_GROUPS.configPull,
-      MANAGED_GROUPS.codexInput,
-      MANAGED_GROUPS.codexLaunch,
-    ]);
+    assertExactEffectiveGroups(snapshot, worker);
   }
 }
 
@@ -356,11 +370,16 @@ export async function runCli({
   argv = process.argv.slice(2),
   stdout = process.stdout,
   dependencies = {},
+  lockHeld = process.env[PROVISION_LOCK_ENV] === '1',
+  runLockedApply = executeLockedApply,
 } = {}) {
   const options = parseArgs(argv);
   if (options.help) {
     stdout.write(`${usage()}\n`);
     return 0;
+  }
+  if (options.apply && !lockHeld) {
+    return runLockedApply(argv);
   }
   const report = await provisionHost(options, dependencies);
   if (options.json) {
@@ -372,6 +391,56 @@ export async function runCli({
     stdout.write('units_started=0\nunits_enabled=0\n');
   }
   return 0;
+}
+
+export function buildLockedApplyCommand({
+  argv,
+  nodePath = process.execPath,
+  scriptPath = fileURLToPath(import.meta.url),
+} = {}) {
+  if (!Array.isArray(argv) || !argv.includes('--apply')) {
+    throw new Error('locked provision command requires --apply');
+  }
+  return Object.freeze({
+    command: '/usr/bin/flock',
+    args: Object.freeze([
+      '--exclusive',
+      '--nonblock',
+      '--no-fork',
+      '--conflict-exit-code',
+      String(PROVISION_LOCK_CONFLICT_EXIT),
+      PROVISION_LOCK_PATH,
+      nodePath,
+      scriptPath,
+      ...argv,
+    ]),
+  });
+}
+
+async function executeLockedApply(argv) {
+  await ensureProvisionLockFile(fs);
+  await assertTrustedRuntimeExecutable(process.execPath, fs);
+  const command = buildLockedApplyCommand({ argv });
+  return new Promise((resolve, reject) => {
+    const child = spawn(command.command, command.args, {
+      cwd: '/',
+      env: {
+        PATH: '/usr/bin:/bin',
+        LANG: 'C.UTF-8',
+        LC_ALL: 'C.UTF-8',
+        [PROVISION_LOCK_ENV]: '1',
+      },
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (signal) {
+        reject(new Error(`locked provision command terminated by signal ${signal}`));
+        return;
+      }
+      resolve(code ?? 1);
+    });
+  });
 }
 
 async function inspectArtifacts(plan, deps) {
@@ -534,6 +603,64 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
     await handle?.close().catch(() => {});
     await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
     throw error;
+  }
+}
+
+async function ensureProvisionLockFile(fsApi) {
+  await assertTrustedDirectoryChain(
+    '/',
+    path.dirname(PROVISION_LOCK_PATH),
+    0,
+    0,
+    fsApi,
+  );
+  let handle;
+  try {
+    handle = await fsApi.open(
+      PROVISION_LOCK_PATH,
+      fsConstants.O_WRONLY
+        | fsConstants.O_CREAT
+        | fsConstants.O_EXCL
+        | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.chown(0, 0);
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await syncDirectory(path.dirname(PROVISION_LOCK_PATH), fsApi);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error?.code !== 'EEXIST') throw error;
+  }
+
+  const existing = await fsApi.open(
+    PROVISION_LOCK_PATH,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    assertTrustedFileMetadata(PROVISION_LOCK_PATH, await existing.stat(), 0, 0, 0o600);
+  } finally {
+    await existing.close();
+  }
+}
+
+async function assertTrustedRuntimeExecutable(executable, fsApi) {
+  if (!path.isAbsolute(executable)) {
+    throw new Error('Node runtime path is not absolute');
+  }
+  const stat = await fsApi.lstat(executable);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.nlink !== 1
+    || stat.uid !== 0
+    || stat.gid !== 0
+    || ((stat.mode & 0o7777) & 0o022) !== 0
+    || (stat.mode & 0o111) === 0
+  ) {
+    throw new Error(`Node runtime metadata is not trusted: ${executable}`);
   }
 }
 
@@ -733,12 +860,20 @@ function parseProvisionTransaction(value, plan) {
       !entry
       || typeof entry !== 'object'
       || Array.isArray(entry)
-      || Object.keys(entry).sort().join(',') !== 'existing,target'
+      || Object.keys(entry).sort().join(',') !== 'desired_sha256,existing,target'
       || entry.target !== expectedTarget
+      || typeof entry.desired_sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(entry.desired_sha256)
     ) {
       throw new Error('host policy transaction target set is invalid');
     }
-    if (entry.existing === null) return Object.freeze({ target: expectedTarget, existing: null });
+    if (entry.existing === null) {
+      return Object.freeze({
+        target: expectedTarget,
+        desiredSha256: entry.desired_sha256,
+        existing: null,
+      });
+    }
     if (
       typeof entry.existing !== 'object'
       || Array.isArray(entry.existing)
@@ -760,6 +895,7 @@ function parseProvisionTransaction(value, plan) {
     }
     return Object.freeze({
       target: expectedTarget,
+      desiredSha256: entry.desired_sha256,
       existing: Object.freeze({ contents }),
     });
   });
@@ -771,6 +907,7 @@ async function writeProvisionTransaction(inspected, plan, deps) {
     version: TRANSACTION_VERSION,
     artifacts: inspected.artifacts.map((artifact) => ({
       target: artifact.target,
+      desired_sha256: artifact.source.sha256,
       existing: artifact.existing
         ? {
           contents_base64: artifact.existing.contents.toString('base64'),
@@ -811,7 +948,34 @@ async function recoverPolicyTransaction(transaction, plan, deps) {
       deps.fsApi,
     );
   }
-  for (const artifact of [...transaction.artifacts].reverse()) {
+  const recovery = [];
+  for (const artifact of transaction.artifacts) {
+    const current = await readOptionalTrustedFile(
+      artifact.target,
+      deps.targetUid,
+      deps.targetGid,
+      FILE_MODE,
+      deps.fsApi,
+    );
+    const existingSha256 = artifact.existing
+      ? createHash('sha256').update(artifact.existing.contents).digest('hex')
+      : null;
+    if (current?.sha256 === existingSha256 || (!current && !artifact.existing)) {
+      recovery.push(Object.freeze({ artifact, current, restore: false }));
+      continue;
+    }
+    if (current?.sha256 !== artifact.desiredSha256) {
+      throw new Error(`policy target has unknown state during recovery: ${artifact.target}`);
+    }
+    recovery.push(Object.freeze({ artifact, current, restore: true }));
+  }
+  for (const entry of recovery.reverse()) {
+    if (!entry.restore) continue;
+    const { artifact } = entry;
+    await assertTargetUnchanged(
+      { target: artifact.target, existing: entry.current },
+      deps.fsApi,
+    );
     if (artifact.existing) {
       const temporary = await writeCandidate(
         artifact.target,
@@ -841,15 +1005,23 @@ function assertUnitsDormant(states, { requireLoaded }) {
   for (const unit of MANAGED_UNITS) {
     const state = states.get(unit);
     if (!state) throw new Error(`unit state is missing: ${unit}`);
-    if (!['inactive', 'unknown'].includes(state.active)) {
-      throw new Error(`managed unit is not inactive: ${unit} (${state.active})`);
-    }
-    if (!['disabled', 'indirect', 'not-found', 'static'].includes(state.enabled)) {
-      throw new Error(`managed unit is enabled or masked: ${unit} (${state.enabled})`);
-    }
-    if (requireLoaded && state.load !== 'loaded') {
-      throw new Error(`managed unit did not load after installation: ${unit} (${state.load})`);
-    }
+    assertUnitDormant(unit, state, { requireLoaded });
+  }
+  for (const [unit, state] of states) {
+    if (!LAUNCHER_INSTANCE_PATTERN.test(unit)) continue;
+    assertUnitDormant(unit, state, { requireLoaded });
+  }
+}
+
+function assertUnitDormant(unit, state, { requireLoaded }) {
+  if (!['inactive', 'unknown'].includes(state.active)) {
+    throw new Error(`managed unit is not inactive: ${unit} (${state.active})`);
+  }
+  if (!['disabled', 'indirect', 'not-found', 'static'].includes(state.enabled)) {
+    throw new Error(`managed unit is enabled or masked: ${unit} (${state.enabled})`);
+  }
+  if (requireLoaded && state.load !== 'loaded') {
+    throw new Error(`managed unit did not load after installation: ${unit} (${state.load})`);
   }
 }
 
@@ -869,9 +1041,32 @@ async function readSystemIdentitySnapshot(runCommand = runFixedCommand) {
   return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups);
 }
 
-async function readSystemUnitStates(units, runCommand = runFixedCommand) {
+export async function readSystemUnitStates(units, runCommand = runFixedCommand) {
+  const [loadedInstances, installedInstances] = await Promise.all([
+    runCommand('/usr/bin/systemctl', [
+      'list-units',
+      '--all',
+      '--full',
+      '--plain',
+      '--no-legend',
+      '--no-pager',
+      '--type=service',
+      'webex-codex-launcher@*.service',
+    ]),
+    runCommand('/usr/bin/systemctl', [
+      'list-unit-files',
+      '--full',
+      '--no-legend',
+      '--no-pager',
+      'webex-codex-launcher@*.service',
+    ]),
+  ]);
+  const discovered = new Set([
+    ...parseLauncherInstanceUnits(loadedInstances.stdout),
+    ...parseLauncherInstanceUnits(installedInstances.stdout),
+  ]);
   const states = new Map();
-  for (const unit of units) {
+  for (const unit of [...units, ...[...discovered].sort()]) {
     const [active, enabled, load] = await Promise.all([
       runCommand('/usr/bin/systemctl', ['is-active', unit], [0, 3, 4]),
       runCommand('/usr/bin/systemctl', ['is-enabled', unit], [0, 1, 3, 4]),
@@ -888,6 +1083,19 @@ async function readSystemUnitStates(units, runCommand = runFixedCommand) {
     }));
   }
   return states;
+}
+
+function parseLauncherInstanceUnits(output) {
+  const units = [];
+  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const [unit] = line.split(/\s+/);
+    if (unit === 'webex-codex-launcher@.service') continue;
+    if (!LAUNCHER_INSTANCE_PATTERN.test(unit)) {
+      throw new Error(`unexpected launcher instance listing: ${unit}`);
+    }
+    units.push(unit);
+  }
+  return units;
 }
 
 async function runFixedCommand(command, args, allowedExitCodes = [0]) {
@@ -955,14 +1163,16 @@ function assertPrimaryGroup(snapshot, user, groupName) {
   }
 }
 
-function assertNoForbiddenEffectiveGroups(snapshot, user, forbiddenNames) {
+function assertAccountContract(user, expected) {
+  if (user.home !== expected.home || user.shell !== expected.shell) {
+    throw new Error(`managed user account metadata is unexpected: ${user.name}`);
+  }
+}
+
+function assertExactEffectiveGroups(snapshot, user) {
   const effective = snapshot.effectiveGroups.get(user.name);
-  if (!effective) return;
-  for (const groupName of forbiddenNames) {
-    const group = snapshot.groups.get(groupName);
-    if (group && effective.has(group.gid)) {
-      throw new Error(`managed user has a forbidden static group: ${user.name} -> ${groupName}`);
-    }
+  if (!effective || effective.size !== 1 || !effective.has(user.gid)) {
+    throw new Error(`managed user has unexpected static groups: ${user.name}`);
   }
 }
 
@@ -996,8 +1206,12 @@ function normalisedState(value, fallback) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runCli().catch((error) => {
-    process.stderr.write(`${error.message}\n`);
-    process.exitCode = 1;
-  });
+  runCli()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
 }

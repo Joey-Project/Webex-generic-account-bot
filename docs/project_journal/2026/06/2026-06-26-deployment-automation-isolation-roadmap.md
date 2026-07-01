@@ -163,8 +163,9 @@ superseded_by:
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
   fixed non-secret allowlist, identity-drift and dormant-unit preflight, transactional
-  policy-file installation, and post-reload verification. Real host apply
-  remains an explicit operational gate.
+  policy-file installation, full-apply locking, fail-closed recovery, and
+  post-reload verification. Real host apply remains an explicit operational
+  gate.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -198,7 +199,10 @@ superseded_by:
 - Install the complete root-owned policy file set transactionally with atomic
   per-file replacement. If a later
   commit is interrupted, recover the old set from a fixed root-only journal
-  before reapplying. If a later sysusers, tmpfiles, manager-reload, or
+  before reapplying, but reject any target that matches neither the recorded
+  old nor desired digest. Serialise the full apply and reject active launcher
+  template instances as well as active template units. If a later sysusers,
+  tmpfiles, manager-reload, or
   post-verification step fails, retain that complete set and fail with an
   explicit convergent-rerun requirement; do not claim rollback of users or
   directories already created by systemd.

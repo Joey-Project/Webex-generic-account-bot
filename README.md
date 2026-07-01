@@ -207,18 +207,24 @@ from the root-owned repository deployment tree, then installs them as
 `root:root` mode `0644` files under `/etc`. The allowlist excludes secrets,
 binaries, rendered config, and the activation-owned
 `webex-generic-account-bot.service.d/10-codex-launcher.conf` drop-in.
+Apply also requires a root-owned, non-writable Node executable; do not run this
+root workflow through a user-managed Node installation.
 
 Dry-run validates source and target ancestor metadata, existing policy files,
-NSS user/group separation, and dormant unit state without creating files or
-directories. Apply additionally requires root and rejects active, enabled, or
-masked managed units. It installs the complete policy file set transactionally,
+the exact non-login account metadata and NSS group set, and dormant unit state
+without creating files or directories. Apply additionally requires root and
+rejects active, enabled, or masked managed units, including instantiated
+launcher template units. A fixed root-only `flock` serialises the complete
+apply. It installs the complete policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
 unit became active or enabled. It never starts or enables a unit. A policy-file
 transaction failure restores the old file set. Each file replacement is atomic,
 and a root-only transaction journal
-under `/etc/systemd/system` makes an interrupted multi-file commit recoverable;
-dry-run reports recovery required and the next apply restores the old set before
+under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
+Recovery accepts only the recorded old or desired digest and fails closed on
+an administrator-modified third state. Dry-run reports recovery required, and
+the next apply restores the old set before
 reapplying. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command
 can be rerun after correction.

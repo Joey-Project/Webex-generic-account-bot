@@ -8,10 +8,12 @@ import { fileURLToPath } from 'node:url';
 import {
   ARTIFACTS,
   MANAGED_UNITS,
+  buildLockedApplyCommand,
   buildProvisionPlan,
   parseArgs,
   parseIdentityDatabases,
   provisionHost,
+  readSystemUnitStates,
   runCli,
   validateIdentityPolicy,
 } from '../scripts/provision-host.mjs';
@@ -58,6 +60,44 @@ describe('guarded host provisioner policy', () => {
     assert.throws(() => parseArgs(['--apply', '--apply']), /only once/);
   });
 
+  it('wraps the complete apply in the fixed exclusive flock command', async () => {
+    const command = buildLockedApplyCommand({
+      argv: ['--apply', '--json'],
+      nodePath: '/trusted/node',
+      scriptPath: '/trusted/provision-host.mjs',
+    });
+    assert.deepEqual(command, {
+      command: '/usr/bin/flock',
+      args: [
+        '--exclusive',
+        '--nonblock',
+        '--no-fork',
+        '--conflict-exit-code',
+        '75',
+        '/run/webex-host-provision.lock',
+        '/trusted/node',
+        '/trusted/provision-host.mjs',
+        '--apply',
+        '--json',
+      ],
+    });
+    assert.throws(
+      () => buildLockedApplyCommand({ argv: ['--dry-run'] }),
+      /requires --apply/,
+    );
+
+    const calls = [];
+    assert.equal(await runCli({
+      argv: ['--apply'],
+      lockHeld: false,
+      runLockedApply: async (argv) => {
+        calls.push([...argv]);
+        return 75;
+      },
+    }), 75);
+    assert.deepEqual(calls, [['--apply']]);
+  });
+
   it('rejects static membership and primary-GID drift', () => {
     const clean = expectedIdentitySnapshot();
     validateIdentityPolicy(clean, { requireAccounts: true });
@@ -66,19 +106,19 @@ describe('guarded host provisioner policy', () => {
       () => validateIdentityPolicy(expectedIdentitySnapshot({
         botEffectiveGroups: [2001, 2002],
       })),
-      /forbidden static group.*webex-config-deploy/,
+      /unexpected static groups.*webex-generic-account-bot/,
     );
     assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
         workerEffectiveGroups: [2002, 2001],
       })),
-      /forbidden static group.*webex-generic-account-bot/,
+      /unexpected static groups.*webex-config-deploy/,
     );
     assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
         workerEffectiveGroups: [2002, 2003],
       })),
-      /forbidden static group.*webex-config-pull/,
+      /unexpected static groups.*webex-config-deploy/,
     );
     assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
@@ -95,8 +135,35 @@ describe('guarded host provisioner policy', () => {
           '',
         ].join('\n'),
         expectedGroupDatabase(),
+        {
+          'webex-generic-account-bot': [2001],
+          'webex-config-deploy': [2002],
+        },
       )),
       /static primary group for unexpected: webex-config-pull/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        botEffectiveGroups: [2001, 2999],
+      })),
+      /unexpected static groups.*webex-generic-account-bot/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        [
+          passwdRecord('webex-generic-account-bot', 1001, 2001, {
+            shell: '/bin/bash',
+          }),
+          passwdRecord('webex-config-deploy', 1002, 2002),
+          '',
+        ].join('\n'),
+        expectedGroupDatabase(),
+        {
+          'webex-generic-account-bot': [2001],
+          'webex-config-deploy': [2002],
+        },
+      )),
+      /account metadata is unexpected.*webex-generic-account-bot/,
     );
   });
 });
@@ -117,7 +184,7 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
   });
 
-  it('installs the fixed set atomically and converges without enabling units', async (context) => {
+  it('installs the fixed set transactionally and converges without enabling units', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
     const report = await provisionHost(
@@ -202,6 +269,55 @@ describe('guarded host provisioner execution', () => {
       /managed unit is not inactive/,
     );
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('discovers and rejects active launcher template instances', async (context) => {
+    const fixture = await provisionFixture(context);
+    const instance = 'webex-codex-launcher@test.service';
+    const states = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    states.set(instance, { load: 'loaded', active: 'active', enabled: 'static' });
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ unitStateSequence: [states] }),
+      ),
+      new RegExp(`managed unit is not inactive: ${instance}`),
+    );
+
+    const calls = [];
+    const discovered = await readSystemUnitStates(MANAGED_UNITS, async (command, args) => {
+      calls.push([command, [...args]]);
+      if (args[0] === 'list-units') {
+        return { stdout: `${instance} loaded active running test\n`, stderr: '', code: 0 };
+      }
+      if (args[0] === 'list-unit-files') {
+        return {
+          stdout: 'webex-codex-launcher@.service static -\nwebex-codex-launcher@boot.service enabled -\n',
+          stderr: '',
+          code: 0,
+        };
+      }
+      const unit = args.at(-1);
+      if (args[0] === 'is-active') {
+        return { stdout: unit === instance ? 'active\n' : 'inactive\n', stderr: '', code: 0 };
+      }
+      if (args[0] === 'is-enabled') {
+        return {
+          stdout: unit === 'webex-codex-launcher@boot.service' ? 'enabled\n' : 'static\n',
+          stderr: '',
+          code: 0,
+        };
+      }
+      return { stdout: 'loaded\n', stderr: '', code: 0 };
+    });
+    assert.equal(discovered.get(instance).active, 'active');
+    assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
+    assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
+    assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 1);
   });
 
   it('rolls back the complete policy set when an atomic rename fails', async (context) => {
@@ -374,6 +490,24 @@ describe('guarded host provisioner execution', () => {
     assert.equal(await fs.readFile(fixture.plan.transactionFile, 'utf8'), '{not-json}\n');
   });
 
+  it('refuses to overwrite an unknown target state during recovery', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const target = fixture.plan.artifacts[0].target;
+    await fs.writeFile(target, 'administrator repair\n', { mode: 0o644 });
+    await fs.chmod(target, 0o644);
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ applied: true }),
+      ),
+      /policy target has unknown state during recovery/,
+    );
+    assert.equal(await fs.readFile(target, 'utf8'), 'administrator repair\n');
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
   it('keeps the complete policy set after a post-install convergence failure', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
@@ -488,7 +622,11 @@ async function writeNullTransaction(fixture) {
   }
   const transaction = {
     version: 1,
-    artifacts: fixture.plan.artifacts.map(({ target }) => ({ target, existing: null })),
+    artifacts: fixture.plan.artifacts.map(({ target }) => ({
+      target,
+      desired_sha256: '0'.repeat(64),
+      existing: null,
+    })),
   };
   await fs.writeFile(
     fixture.plan.transactionFile,
@@ -532,8 +670,13 @@ function expectedGroupDatabase(configPullMembers = []) {
   ].join('\n');
 }
 
-function passwdRecord(name, uid, gid) {
-  return `${name}:x:${uid}:${gid}:${name}:/nonexistent:/usr/sbin/nologin`;
+function passwdRecord(name, uid, gid, {
+  home = name === 'webex-generic-account-bot'
+    ? '/var/lib/webex-generic-account-bot'
+    : '/nonexistent',
+  shell = '/usr/sbin/nologin',
+} = {}) {
+  return `${name}:x:${uid}:${gid}:${name}:${home}:${shell}`;
 }
 
 function groupRecord(name, gid, members = []) {
