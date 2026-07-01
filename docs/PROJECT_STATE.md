@@ -96,19 +96,21 @@
   provisioner. The base contract now defines the unprivileged bot identity,
   fixed service, and root-managed versus bot-writable filesystem layout. The
   guarded provisioner now has a fixed non-secret allowlist, stable no-follow
-  reads of the complete files identity databases, a DynamicUser-only systemd
+  reads of the complete passwd/shadow/group/gshadow identity databases, a DynamicUser-only systemd
   userdb boundary with fixed managed-name vacancy lookups, identity-drift,
-  locked-group-credential, and shadow-grant
+  locked-user/group-credential, and shadow-grant
   checks, bounded dormant-unit preflight, device-bound kernel lock verification
   shared with config deployment, exact loaded-fragment, no-drop-in,
   no-stale-manager, and no-external-activator checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
-  dangling-alias parents, unit-name specifier expansion, managed identity
+  dangling-alias parents, `d_type`-independent entry classification, unit-name
+  specifier expansion, named/numeric/implicit-DynamicUser managed identity
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
   auditing that protects root, runtime, and installed policy paths from owner-modifier,
-  ancestor-metadata, cleanup, replacement, and recursive rules,
+  traversal-restricting ancestor metadata, cleanup, replacement, and recursive
+  rules while validating every catalogue source file and ancestor,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full
   target-directory durability, streamed stale-candidate cleanup, transactional

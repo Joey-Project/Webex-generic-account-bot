@@ -91,12 +91,38 @@ const MANAGED_GROUPS = Object.freeze({
   codexInput: 'webex-codex-input',
   codexLaunch: 'webex-codex-launch',
 });
+const MANAGED_IDENTITY_NAMES = Object.freeze(
+  [...new Set([...Object.values(MANAGED_USERS), ...Object.values(MANAGED_GROUPS)])],
+);
 const MANAGED_IDENTITY_PATTERNS = Object.freeze(
-  [...new Set([...Object.values(MANAGED_USERS), ...Object.values(MANAGED_GROUPS)])]
+  MANAGED_IDENTITY_NAMES
     .map((name) => new RegExp(
       `(^|[^A-Za-z0-9_.-])${escapeRegExp(name)}([^A-Za-z0-9_.-]|$)`,
     )),
 );
+const SYSTEMD_IDENTITY_DIRECTIVES = new Set([
+  'Group',
+  'SocketGroup',
+  'SocketUser',
+  'SupplementaryGroups',
+  'User',
+]);
+const BOOT_POLICY_DIRECTORIES = Object.freeze({
+  sysusers: Object.freeze([
+    '/etc/sysusers.d',
+    '/run/sysusers.d',
+    '/usr/local/lib/sysusers.d',
+    '/usr/lib/sysusers.d',
+    '/lib/sysusers.d',
+  ]),
+  tmpfiles: Object.freeze([
+    '/etc/tmpfiles.d',
+    '/run/tmpfiles.d',
+    '/usr/local/lib/tmpfiles.d',
+    '/usr/lib/tmpfiles.d',
+    '/lib/tmpfiles.d',
+  ]),
+});
 
 export const MANAGED_UNITS = Object.freeze([
   'webex-generic-account-bot.service',
@@ -273,6 +299,7 @@ export function parseIdentityDatabases(
   groupText,
   effectiveGroups = {},
   gshadowText = '',
+  shadowText = '',
 ) {
   const users = new Map();
   for (const line of String(passwdText).split('\n').filter(Boolean)) {
@@ -284,10 +311,23 @@ export function parseIdentityDatabases(
     const gid = parseDatabaseId(fields[3], 'passwd GID');
     users.set(fields[0], Object.freeze({
       name: fields[0],
+      password: fields[1],
       uid,
       gid,
       home: fields[5],
       shell: fields[6],
+    }));
+  }
+
+  const shadowUsers = new Map();
+  for (const line of String(shadowText).split('\n').filter(Boolean)) {
+    const fields = line.split(':');
+    if (fields.length !== 9 || shadowUsers.has(fields[0])) {
+      throw new Error('shadow database is malformed or contains duplicate users');
+    }
+    shadowUsers.set(fields[0], Object.freeze({
+      name: fields[0],
+      password: fields[1],
     }));
   }
 
@@ -330,7 +370,13 @@ export function parseIdentityDatabases(
     }
     effective.set(user, new Set(gids));
   }
-  return Object.freeze({ users, groups, shadowGroups, effectiveGroups: effective });
+  return Object.freeze({
+    users,
+    shadowUsers,
+    groups,
+    shadowGroups,
+    effectiveGroups: effective,
+  });
 }
 
 export function validateNsswitchPolicy(contents) {
@@ -346,6 +392,15 @@ export function validateNsswitchPolicy(contents) {
   }
   for (const database of ['passwd', 'group']) {
     if (JSON.stringify(databases.get(database)) !== JSON.stringify(['files', 'systemd'])) {
+      throw new Error(`unsupported NSS policy for ${database}`);
+    }
+  }
+  for (const database of ['shadow', 'gshadow']) {
+    const policy = databases.get(database);
+    if (
+      JSON.stringify(policy) !== JSON.stringify(['files'])
+      && JSON.stringify(policy) !== JSON.stringify(['files', 'systemd'])
+    ) {
       throw new Error(`unsupported NSS policy for ${database}`);
     }
   }
@@ -392,6 +447,12 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
       .map((candidate) => candidate.name);
     if (aliases.length !== 1) {
       throw new Error(`managed user UID has aliases: ${user.name}`);
+    }
+    assertManagedUserCredentialLocked(user, snapshot.shadowUsers.get(user.name));
+  }
+  for (const user of Object.values(MANAGED_USERS)) {
+    if (!snapshot.users.has(user) && snapshot.shadowUsers.has(user)) {
+      throw new Error(`managed user has an orphan shadow credential: ${user}`);
     }
   }
 
@@ -470,8 +531,11 @@ export async function provisionHost(options, dependencies = {}) {
     throw new Error('host policy recovery is required; run --apply');
   }
   const commands = [];
+  let identityBefore = null;
   if (transaction) {
-    const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+    identityBefore = await deps.readIdentitySnapshot();
+    validateIdentityPolicy(identityBefore);
+    const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(recoveryUnitStates, plan, {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
@@ -479,7 +543,7 @@ export async function provisionHost(options, dependencies = {}) {
     await recoverPolicyTransaction(transaction, plan, deps, { removeTransaction: false });
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
-      const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+      const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
       assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
       await removeProvisionTransaction(plan, deps);
     } catch (error) {
@@ -490,9 +554,11 @@ export async function provisionHost(options, dependencies = {}) {
     }
   }
 
-  const identityBefore = await deps.readIdentitySnapshot();
-  validateIdentityPolicy(identityBefore);
-  const unitStatesBefore = await deps.readUnitStates(MANAGED_UNITS);
+  if (identityBefore === null) {
+    identityBefore = await deps.readIdentitySnapshot();
+    validateIdentityPolicy(identityBefore);
+  }
+  const unitStatesBefore = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
   const inspected = await inspectArtifacts(plan, deps);
   auditBootPolicyCatalogs(
     await deps.readBootPolicyCatalogs(),
@@ -507,7 +573,7 @@ export async function provisionHost(options, dependencies = {}) {
   });
   if (unitStatesNeedDaemonReload(unitStatesBefore)) {
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
-    const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS);
+    const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
   }
 
@@ -534,7 +600,7 @@ export async function provisionHost(options, dependencies = {}) {
     await deps.verifyProvisionLockConverged();
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
-    const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS);
+    const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
     assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
     if (installed.length > 0) await removeProvisionTransaction(plan, deps);
   } catch (error) {
@@ -773,7 +839,8 @@ async function cleanupStaleCandidates(plan, deps) {
         const stat = await deps.fsApi.lstat(candidate);
         const mode = stat.mode & 0o7777;
         assertTrustedFileMetadata(candidate, stat, deps.targetUid, deps.targetGid, null);
-        if (!entry.isFile() || ![0o600, FILE_MODE].includes(mode)) {
+        const interruptedCreation = (mode & ~0o600) === 0;
+        if (!stat.isFile() || (!interruptedCreation && mode !== FILE_MODE)) {
           throw new Error(`stale policy candidate metadata is not trusted: ${candidate}`);
         }
         await deps.fsApi.rm(candidate);
@@ -888,7 +955,7 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
   }
 }
 
-async function ensureProvisionLockFile(fsApi) {
+export async function ensureProvisionLockFile(fsApi) {
   await assertTrustedDirectoryChain(
     '/',
     path.dirname(PROVISION_LOCK_PARENT),
@@ -941,13 +1008,21 @@ async function ensureProvisionLockFile(fsApi) {
 
   const existing = await fsApi.open(
     PROVISION_LOCK_PATH,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
   );
   try {
+    const stat = await existing.stat();
+    if (!provisionLockMatchesPolicy(stat, lockPolicy)) {
+      assertRecoverableProvisionLock(stat, lockPolicy);
+      await existing.chown(0, lockPolicy.gid);
+      await existing.chmod(lockPolicy.mode);
+      await existing.sync();
+    }
     assertTrustedProvisionLock(await existing.stat(), lockPolicy);
   } finally {
     await existing.close();
   }
+  await syncDirectory(PROVISION_LOCK_PARENT, fsApi);
 }
 
 async function readConfigPullGroupGid(fsApi) {
@@ -998,6 +1073,25 @@ function assertTrustedProvisionLock(
     || stat.nlink !== 1
     || stat.uid !== 0
     || (!matchesPolicy && !(allowInterruptedMigration && isInterruptedMigration))
+  ) {
+    throw new Error(`provision lock file is not trusted: ${PROVISION_LOCK_PATH}`);
+  }
+}
+
+function provisionLockMatchesPolicy(stat, policy) {
+  return stat.gid === policy.gid && (stat.mode & 0o7777) === policy.mode;
+}
+
+function assertRecoverableProvisionLock(stat, policy) {
+  const mode = stat.mode & 0o7777;
+  const expectedOwner = stat.uid === 0
+    && (stat.gid === 0 || stat.gid === policy.gid);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.nlink !== 1
+    || !expectedOwner
+    || (mode & ~0o600) !== 0
   ) {
     throw new Error(`provision lock file is not trusted: ${PROVISION_LOCK_PATH}`);
   }
@@ -1614,16 +1708,25 @@ export async function readSystemIdentitySnapshot(fsApi = fs, runCommand = runFix
     group.contents.toString('utf8'),
   );
   const shadowGid = initial.groups.get('shadow')?.gid ?? 0;
-  const gshadow = await readTrustedSensitiveIdentityFile(
-    '/etc/gshadow',
-    new Set([0, shadowGid]),
-    new Set([0o600, 0o640]),
-    fsApi,
-  );
+  const [shadow, gshadow] = await Promise.all([
+    readTrustedSensitiveIdentityFile(
+      '/etc/shadow',
+      new Set([0, shadowGid]),
+      new Set([0o600, 0o640]),
+      fsApi,
+    ),
+    readTrustedSensitiveIdentityFile(
+      '/etc/gshadow',
+      new Set([0, shadowGid]),
+      new Set([0o600, 0o640]),
+      fsApi,
+    ),
+  ]);
   const passwdText = passwd.contents.toString('utf8');
   const groupText = group.contents.toString('utf8');
+  const shadowText = shadow.contents.toString('utf8');
   const gshadowText = gshadow.contents.toString('utf8');
-  const complete = parseIdentityDatabases(passwdText, groupText, {}, gshadowText);
+  const complete = parseIdentityDatabases(passwdText, groupText, {}, gshadowText, shadowText);
   const effectiveGroups = {};
   for (const user of Object.values(MANAGED_USERS)) {
     if (!complete.users.has(user)) continue;
@@ -1635,18 +1738,64 @@ export async function readSystemIdentitySnapshot(fsApi = fs, runCommand = runFix
         .map((groupRecord) => groupRecord.gid),
     ];
   }
-  return parseIdentityDatabases(passwdText, groupText, effectiveGroups, gshadowText);
+  return parseIdentityDatabases(
+    passwdText,
+    groupText,
+    effectiveGroups,
+    gshadowText,
+    shadowText,
+  );
 }
 
-export async function readSystemBootPolicyCatalogs(runCommand = runFixedCommand) {
+export async function readSystemBootPolicyCatalogs(
+  runCommand = runFixedCommand,
+  fsApi = fs,
+) {
   const [sysusers, tmpfiles] = await Promise.all([
     runCommand('/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']),
     runCommand('/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']),
   ]);
+  const sources = Object.freeze({
+    sysusers: await validateBootPolicySources('sysusers', sysusers.stdout, fsApi),
+    tmpfiles: await validateBootPolicySources('tmpfiles', tmpfiles.stdout, fsApi),
+  });
   return Object.freeze({
     sysusers: sysusers.stdout,
     tmpfiles: tmpfiles.stdout,
+    sources,
   });
+}
+
+async function validateBootPolicySources(kind, catalog, fsApi) {
+  const allowedDirectories = BOOT_POLICY_DIRECTORIES[kind];
+  const sources = new Set();
+  let currentSource = null;
+  for (const rawLine of String(catalog).split('\n')) {
+    const line = rawLine.trim();
+    if (line === '') continue;
+    if (line.startsWith('#')) {
+      const match = line.match(/^# (\/\S+)$/);
+      if (!match) throw new Error(`${kind} catalog source marker is malformed`);
+      const source = path.posix.normalize(match[1]);
+      if (
+        source !== match[1]
+        || !allowedDirectories.some((directory) => path.dirname(source) === directory)
+      ) {
+        throw new Error(`${kind} catalog source is outside trusted policy directories: ${source}`);
+      }
+      currentSource = source;
+      sources.add(source);
+      continue;
+    }
+    if (currentSource === null) {
+      throw new Error(`${kind} catalog policy is missing a source marker`);
+    }
+  }
+  for (const source of sources) {
+    await assertTrustedDirectoryChain('/', path.dirname(source), 0, 0, fsApi);
+    await readTrustedFile(source, 0, 0, null, fsApi);
+  }
+  return Object.freeze([...sources]);
 }
 
 export function auditBootPolicyCatalogs(
@@ -1849,14 +1998,15 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
 
 function tmpfilesAncestorPolicyIsSafe(fields) {
   const [type, , mode = '-', rawUser = '-', rawGroup = '-', age = '-'] = fields;
-  if (!new Set(['d', 'e', 'v', 'q', 'Q', 'z']).has(type?.[0])) return false;
+  if (!/^[devqQz][!-]*$/.test(type ?? '')) return false;
   if (age !== '-') return false;
   const user = normaliseTmpfilesOwner(rawUser);
   const group = normaliseTmpfilesOwner(rawGroup);
   if (!['-', 'root', '0'].includes(user) || !['-', 'root', '0'].includes(group)) return false;
   if (mode === '-') return true;
   if (!/^[0-7]{3,4}$/.test(mode)) return false;
-  return (Number.parseInt(mode, 8) & 0o022) === 0;
+  const parsedMode = Number.parseInt(mode, 8);
+  return (parsedMode & 0o022) === 0 && (parsedMode & 0o111) === 0o111;
 }
 
 function parseSystemdFields(line) {
@@ -1939,8 +2089,13 @@ function decodeSystemdEscape(value, offset) {
   };
 }
 
-export async function readSystemUnitStates(units, runCommand = runFixedCommand, fsApi = fs) {
-  await assertNoUnexpectedManagedUnitPolicy(fsApi);
+export async function readSystemUnitStates(
+  units,
+  runCommand = runFixedCommand,
+  fsApi = fs,
+  identitySnapshot = null,
+) {
+  await assertNoUnexpectedManagedUnitPolicy(fsApi, managedIdentityIds(identitySnapshot));
   const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
@@ -1992,7 +2147,7 @@ export async function readSystemUnitStates(units, runCommand = runFixedCommand, 
   return states;
 }
 
-async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
+async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds) {
   const budget = { entries: 0, files: 0, bytes: 0 };
   for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
     if (directory === '/lib/systemd/system' && await isUsrMergedLib(fsApi)) continue;
@@ -2026,27 +2181,49 @@ async function assertNoUnexpectedManagedUnitPolicy(fsApi) {
       if (directory === '/etc/systemd/system' && MANAGED_UNITS.includes(entry.name)) {
         continue;
       }
-      await auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested: false });
+      await auditSystemdPolicyEntry(
+        directory,
+        entry,
+        budget,
+        fsApi,
+        managedIds,
+        { nested: false },
+      );
     }
   }
 }
 
-async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested }) {
+async function auditSystemdPolicyEntry(
+  directory,
+  entry,
+  budget,
+  fsApi,
+  managedIds,
+  { nested },
+) {
   const candidate = path.join(directory, entry.name);
   const unitNames = systemdPolicyUnitNames(directory, entry.name);
-  if (nested) assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate, unitNames);
+  assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate, unitNames, managedIds);
   const unitFile = SYSTEMD_UNIT_NAME_PATTERN.test(entry.name);
   const policyDirectory = /\.(?:d|wants|requires|upholds)$/.test(entry.name);
   if (!nested && !unitFile && !policyDirectory && !entry.isDirectory?.()) return;
-  if (entry.isSymbolicLink?.()) {
-    await auditSystemdPolicySymlink(candidate, budget, fsApi, new Set(), unitNames);
+  const stat = await fsApi.lstat(candidate);
+  if (stat.isSymbolicLink()) {
+    await auditSystemdPolicySymlink(
+      candidate,
+      budget,
+      fsApi,
+      new Set(),
+      unitNames,
+      managedIds,
+    );
     return;
   }
-  if (entry.isFile?.()) {
-    await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames);
+  if (stat.isFile()) {
+    await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds);
     return;
   }
-  if (!entry.isDirectory?.()) return;
+  if (!stat.isDirectory()) return;
   if (!/\.(?:d|wants|requires|upholds)$/.test(entry.name)) return;
   const nestedEntries = await readTrustedDirectoryEntries(
     candidate,
@@ -2055,14 +2232,29 @@ async function auditSystemdPolicyEntry(directory, entry, budget, fsApi, { nested
   );
   budget.entries += nestedEntries.length;
   for (const child of nestedEntries) {
-    if (child.isDirectory?.()) {
+    const childPath = path.join(candidate, child.name);
+    if ((await fsApi.lstat(childPath)).isDirectory()) {
       throw new Error(`nested systemd policy directory is not supported: ${path.join(candidate, child.name)}`);
     }
-    await auditSystemdPolicyEntry(candidate, child, budget, fsApi, { nested: true });
+    await auditSystemdPolicyEntry(
+      candidate,
+      child,
+      budget,
+      fsApi,
+      managedIds,
+      { nested: true },
+    );
   }
 }
 
-async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited, unitNames) {
+async function auditSystemdPolicySymlink(
+  candidate,
+  budget,
+  fsApi,
+  visited,
+  unitNames,
+  managedIds,
+) {
   if (visited.has(candidate) || visited.size >= 32) {
     throw new Error(`systemd policy symlink chain is invalid: ${candidate}`);
   }
@@ -2077,6 +2269,7 @@ async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited, unit
     `${path.basename(candidate)} ${target}`,
     candidate,
     unitNames,
+    managedIds,
   );
   let resolved = path.resolve(path.dirname(candidate), target);
   if (resolved === '/dev/null') return;
@@ -2098,6 +2291,7 @@ async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited, unit
       fsApi,
       visited,
       mergeSystemdUnitNames(unitNames, path.basename(resolved)),
+      managedIds,
     );
     return;
   }
@@ -2109,10 +2303,11 @@ async function auditSystemdPolicySymlink(candidate, budget, fsApi, visited, unit
     budget,
     fsApi,
     mergeSystemdUnitNames(unitNames, path.basename(resolved)),
+    managedIds,
   );
 }
 
-async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames) {
+async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds) {
   budget.files += 1;
   if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
     throw new Error('too many systemd policy files');
@@ -2123,11 +2318,16 @@ async function auditSystemdPolicyFile(candidate, budget, fsApi, unitNames) {
     throw new Error('systemd policy files exceed the aggregate byte limit');
   }
   for (const line of policyCatalogLines(policy.contents)) {
-    assertSystemdPolicyDoesNotReferenceManaged(line, candidate, unitNames);
+    assertSystemdPolicyDoesNotReferenceManaged(line, candidate, unitNames, managedIds);
   }
 }
 
-function assertSystemdPolicyDoesNotReferenceManaged(value, source, unitNames = new Set()) {
+function assertSystemdPolicyDoesNotReferenceManaged(
+  value,
+  source,
+  unitNames = new Set(),
+  managedIds = new Set(),
+) {
   const decoded = decodeSystemdEscapesForAudit(String(value));
   const expanded = new Set([
     decoded,
@@ -2138,10 +2338,47 @@ function assertSystemdPolicyDoesNotReferenceManaged(value, source, unitNames = n
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
+      || [...unitNames].some(unitNameClaimsManagedIdentity)
+      || systemdIdentityDirectiveUsesManagedId(candidate, managedIds)
     ) {
       throw new Error(`external systemd policy references a managed unit: ${source}`);
     }
   }
+}
+
+function unitNameClaimsManagedIdentity(unitName) {
+  const suffixOffset = unitName.lastIndexOf('.');
+  if (suffixOffset <= 0) return false;
+  const stem = unitName.slice(0, suffixOffset);
+  const implicitIdentity = stem.includes('@') ? stem.slice(0, stem.indexOf('@')) : stem;
+  return MANAGED_IDENTITY_NAMES.includes(decodeSystemdEscapesForAudit(implicitIdentity));
+}
+
+function systemdIdentityDirectiveUsesManagedId(value, managedIds) {
+  const separator = value.indexOf('=');
+  if (separator <= 0 || managedIds.size === 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!SYSTEMD_IDENTITY_DIRECTIVES.has(directive)) return false;
+  return parseSystemdFields(value.slice(separator + 1)).some((identity) => (
+    managedIds.has(identity)
+  ));
+}
+
+function managedIdentityIds(snapshot) {
+  const ids = new Set();
+  if (!snapshot) return ids;
+  for (const user of Object.values(MANAGED_USERS)) {
+    const record = snapshot.users.get(user);
+    if (record) {
+      ids.add(String(record.uid));
+      ids.add(String(record.gid));
+    }
+  }
+  for (const group of Object.values(MANAGED_GROUPS)) {
+    const record = snapshot.groups.get(group);
+    if (record) ids.add(String(record.gid));
+  }
+  return ids;
 }
 
 function systemdPolicyUnitNames(directory, entryName) {
@@ -2330,9 +2567,14 @@ function provisionDependencies(dependencies) {
     readIdentitySnapshot: dependencies.readIdentitySnapshot
       ?? (() => readSystemIdentitySnapshot(dependencies.fsApi ?? fs, runCommand)),
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
-      ?? (() => readSystemBootPolicyCatalogs(runCommand)),
+      ?? (() => readSystemBootPolicyCatalogs(runCommand, dependencies.fsApi ?? fs)),
     readUnitStates: dependencies.readUnitStates
-      ?? ((units) => readSystemUnitStates(units, runCommand, dependencies.fsApi ?? fs)),
+      ?? ((units, identitySnapshot) => readSystemUnitStates(
+        units,
+        runCommand,
+        dependencies.fsApi ?? fs,
+        identitySnapshot,
+      )),
     verifyProvisionLockConverged: dependencies.verifyProvisionLockConverged
       ?? (() => assertProvisionLockHeld({ allowInterruptedMigration: false })),
   };
@@ -2372,6 +2614,19 @@ function assertManagedGroupCredentialLocked(group, shadowGroup) {
   }
   if (shadowGroup.administrators.length !== 0 || shadowGroup.members.length !== 0) {
     throw new Error(`managed group has shadow administrators or members: ${group.name}`);
+  }
+}
+
+function assertManagedUserCredentialLocked(user, shadowUser) {
+  const passwordIsLocked = /^[!*]+$/.test(user.password);
+  if (user.password !== 'x' && !passwordIsLocked) {
+    throw new Error(`managed user password is not locked: ${user.name}`);
+  }
+  if (user.password === 'x' && !shadowUser) {
+    throw new Error(`managed user shadow credential is missing: ${user.name}`);
+  }
+  if (shadowUser && !/^[!*]+$/.test(shadowUser.password)) {
+    throw new Error(`managed user shadow password is not locked: ${user.name}`);
   }
 }
 

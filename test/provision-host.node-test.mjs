@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import {
   MANAGED_UNITS,
   buildLockedApplyCommand,
   buildProvisionPlan,
+  ensureProvisionLockFile,
   hasProvisionLock,
   parseArgs,
   parseIdentityDatabases,
@@ -212,17 +214,105 @@ describe('guarded host provisioner policy', () => {
     );
   });
 
+  it('recovers a trusted lock file interrupted by a restrictive umask', async () => {
+    const state = { gid: 0, mode: 0o000 };
+    const directoryStat = Object.freeze({
+      uid: 0,
+      gid: 0,
+      mode: 0o40755,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    const lockStat = () => Object.freeze({
+      uid: 0,
+      gid: state.gid,
+      mode: 0o100000 | state.mode,
+      nlink: 1,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    });
+    const fsApi = {
+      lstat: async () => directoryStat,
+      open: async (candidate, flags) => {
+        if (candidate === '/etc/group') {
+          const contents = Buffer.from(expectedGroupDatabase());
+          const stat = Object.freeze({
+            ...lockStat(),
+            mode: 0o100644,
+            size: contents.length,
+            dev: 1,
+            ino: 1,
+            mtimeMs: 1,
+            ctimeMs: 1,
+          });
+          return {
+            stat: async () => stat,
+            readFile: async () => contents,
+            close: async () => {},
+          };
+        }
+        if (candidate === '/run/webex-config-deploy') {
+          return { sync: async () => {}, close: async () => {} };
+        }
+        if (flags & fsConstants.O_EXCL) {
+          throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+        }
+        assert.equal(candidate, '/run/webex-config-deploy/deploy-config.lock');
+        return {
+          stat: async () => lockStat(),
+          chown: async (uid, gid) => {
+            assert.equal(uid, 0);
+            state.gid = gid;
+          },
+          chmod: async (mode) => { state.mode = mode; },
+          sync: async () => {},
+          close: async () => {},
+        };
+      },
+    };
+
+    await ensureProvisionLockFile(fsApi);
+    assert.deepEqual(state, { gid: 0, mode: 0o600 });
+  });
+
   it('rejects static membership and primary-GID drift', () => {
-    validateNsswitchPolicy('passwd: files systemd\ngroup: files systemd\n');
+    validateNsswitchPolicy([
+      'passwd: files systemd',
+      'group: files systemd',
+      'shadow: files',
+      'gshadow: files',
+      '',
+    ].join('\n'));
     assert.throws(
-      () => validateNsswitchPolicy('passwd: files sss\ngroup: files systemd\n'),
+      () => validateNsswitchPolicy([
+        'passwd: files sss',
+        'group: files systemd',
+        'shadow: files',
+        'gshadow: files',
+        '',
+      ].join('\n')),
       /unsupported NSS policy for passwd/,
     );
     assert.throws(
-      () => validateNsswitchPolicy(
-        'passwd: files systemd\ngroup: files systemd\ninitgroups: files sss\n',
-      ),
+      () => validateNsswitchPolicy([
+        'passwd: files systemd',
+        'group: files systemd',
+        'shadow: files',
+        'gshadow: files',
+        'initgroups: files sss',
+        '',
+      ].join('\n')),
       /unsupported NSS policy for initgroups/,
+    );
+    assert.throws(
+      () => validateNsswitchPolicy([
+        'passwd: files systemd',
+        'group: files systemd',
+        'shadow: files sss',
+        'gshadow: files',
+        '',
+      ].join('\n')),
+      /unsupported NSS policy for shadow/,
     );
     const clean = expectedIdentitySnapshot();
     validateIdentityPolicy(clean, { requireAccounts: true });
@@ -265,6 +355,7 @@ describe('guarded host provisioner policy', () => {
           'webex-config-deploy': [2002],
         },
         expectedGshadowDatabase(),
+        expectedShadowDatabase(),
       )),
       /static primary group for unexpected: webex-config-pull/,
     );
@@ -289,6 +380,7 @@ describe('guarded host provisioner policy', () => {
           'webex-config-deploy': [2002],
         },
         expectedGshadowDatabase(),
+        expectedShadowDatabase(),
       )),
       /account metadata is unexpected.*webex-generic-account-bot/,
     );
@@ -305,6 +397,7 @@ describe('guarded host provisioner policy', () => {
           'webex-config-deploy': [2002],
         },
         expectedGshadowDatabase(),
+        expectedShadowDatabase(),
       )),
       /managed user ID is outside the local range/,
     );
@@ -321,6 +414,7 @@ describe('guarded host provisioner policy', () => {
           'webex-config-deploy': [2002],
         },
         expectedGshadowDatabase(),
+        expectedShadowDatabase(),
       ), { requireAccounts: true }),
       /managed user ID is outside the local range/,
     );
@@ -383,6 +477,34 @@ describe('guarded host provisioner policy', () => {
         gshadowDatabase: `${expectedGshadowDatabase()}docker:!:administrator:webex-generic-account-bot\n`,
       })),
       /managed user has shadow-group privileges: webex-generic-account-bot \(docker\)/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        shadowDatabase: expectedShadowDatabase().replace(
+          `${shadowRecord('webex-config-deploy')}\n`,
+          `${shadowRecord('webex-config-deploy', '$6$usable')}\n`,
+        ),
+      })),
+      /managed user shadow password is not locked: webex-config-deploy/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(expectedIdentitySnapshot({
+        shadowDatabase: expectedShadowDatabase().replace(
+          `${shadowRecord('webex-generic-account-bot')}\n`,
+          '',
+        ),
+      })),
+      /managed user shadow credential is missing: webex-generic-account-bot/,
+    );
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        '',
+        '',
+        {},
+        '',
+        `${shadowRecord('webex-config-deploy')}\n`,
+      )),
+      /managed user has an orphan shadow credential: webex-config-deploy/,
     );
   });
 
@@ -462,6 +584,13 @@ describe('guarded host provisioner policy', () => {
       ),
       /policy file changed while reading: \/etc\/group/,
     );
+    await assert.rejects(
+      readSystemIdentitySnapshot(
+        systemIdentityFs({ shadowMode: 0o644 }),
+        emptySystemdIdentityLookup(),
+      ),
+      /identity file metadata is not trusted: \/etc\/shadow/,
+    );
   });
 });
 
@@ -502,6 +631,10 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'd /var/lib 0755 root root 0'],
       ['tmpfiles', 'R / - - - -'],
       ['tmpfiles', 'd / 0777 root root -'],
+      ['tmpfiles', 'd /var/lib 0700 root root -'],
+      ['tmpfiles', 'd / 0000 root root -'],
+      ['tmpfiles', 'd= /var/lib 0755 root root -'],
+      ['tmpfiles', 'z+ /etc/systemd 0755 root root -'],
       ['tmpfiles', ['R \\', '# ignored continuation comment', '/etc/systemd/system/* - - - -'].join('\n')],
     ]) {
       const fixture = await provisionFixture(context);
@@ -532,6 +665,7 @@ describe('guarded host provisioner execution', () => {
             'q /var 0755 - - -',
             'd / 0755 root root -',
             'd /var/lib 0755 root root -',
+            'd /var/lib 0711 root root -',
             'z /etc/systemd 0755 :root :root -',
             '',
           ].join('\n'),
@@ -572,16 +706,45 @@ describe('guarded host provisioner execution', () => {
 
   it('reads the merged boot policy through fixed read-only commands', async () => {
     const commands = [];
+    const sourceFiles = new Map([
+      ['/usr/lib/sysusers.d/example.conf', Buffer.from('g example - -\n')],
+      ['/usr/lib/tmpfiles.d/example.conf', Buffer.from('d /run/example 0755 root root -\n')],
+    ]);
     const catalogs = await readSystemBootPolicyCatalogs(async (command, args) => {
       commands.push([command, [...args]]);
-      return { stdout: `${path.basename(command)} policy\n`, stderr: '', code: 0 };
-    });
+      const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+      const source = `/usr/lib/${kind}.d/example.conf`;
+      return {
+        stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+        stderr: '',
+        code: 0,
+      };
+    }, systemdUnitPathFs(new Map(), { filesByPath: sourceFiles }));
     assert.deepEqual(commands, [
       ['/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']],
       ['/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']],
     ]);
-    assert.match(catalogs.sysusers, /systemd-sysusers policy/);
-    assert.match(catalogs.tmpfiles, /systemd-tmpfiles policy/);
+    assert.match(catalogs.sysusers, /g example/);
+    assert.match(catalogs.tmpfiles, /d \/run\/example/);
+    assert.deepEqual(catalogs.sources, {
+      sysusers: ['/usr/lib/sysusers.d/example.conf'],
+      tmpfiles: ['/usr/lib/tmpfiles.d/example.conf'],
+    });
+
+    await assert.rejects(
+      readSystemBootPolicyCatalogs(
+        async (command) => {
+          const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+          const source = `/usr/lib/${kind}.d/example.conf`;
+          return { stdout: `# ${source}\npolicy\n`, stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(new Map(), {
+          filesByPath: sourceFiles,
+          fileModesByPath: new Map([['/usr/lib/tmpfiles.d/example.conf', 0o664]]),
+        }),
+      ),
+      /policy file metadata is not trusted: \/usr\/lib\/tmpfiles\.d\/example\.conf/,
+    );
   });
 
   it('preserves stale candidates in dry-run and removes them before apply', async (context) => {
@@ -594,15 +757,23 @@ describe('guarded host provisioner execution', () => {
     await fs.mkdir(path.dirname(candidate), { recursive: true, mode: 0o755 });
     await fs.writeFile(candidate, 'interrupted candidate\n', { mode: 0o600 });
     await fs.chmod(candidate, 0o600);
+    const umaskCandidate = path.join(
+      path.dirname(artifact.target),
+      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000098.tmp`,
+    );
+    await fs.writeFile(umaskCandidate, 'interrupted before chmod\n', { mode: 0o600 });
+    await fs.chmod(umaskCandidate, 0o000);
 
     await provisionHost({ apply: false }, fixture.dependencies());
     assert.equal(await fs.readFile(candidate, 'utf8'), 'interrupted candidate\n');
+    assert.equal((await fs.stat(umaskCandidate)).mode & 0o777, 0o000);
 
     await provisionHost(
       { apply: true },
       fixture.dependencies({ applied: true }),
     );
     await assert.rejects(fs.stat(candidate), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(umaskCandidate), { code: 'ENOENT' });
     assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
   });
 
@@ -960,6 +1131,48 @@ describe('guarded host provisioner execution', () => {
             ]]),
           },
         ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const numericIdentityUnit = '/etc/systemd/system/external@2003.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{ name: 'external@2003.service' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              numericIdentityUnit,
+              Buffer.from('[Service]\nGroup="%i"\n'),
+            ]]),
+          },
+        ),
+        expectedIdentitySnapshot(),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const implicitDynamicUserUnit = '/etc/systemd/system/webex-config-deploy.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{ name: 'webex-config-deploy.service' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              implicitDynamicUserUnit,
+              Buffer.from('[Service]\nDynamicUser=yes\n'),
+            ]]),
+          },
+        ),
+        expectedIdentitySnapshot(),
       ),
       /external systemd policy references a managed unit/,
     );
@@ -1906,6 +2119,7 @@ function expectedIdentitySnapshot({
   configPullMembers = [],
   groupDatabase = expectedGroupDatabase(configPullMembers),
   gshadowDatabase = expectedGshadowDatabase(),
+  shadowDatabase = expectedShadowDatabase(),
 } = {}) {
   return parseIdentityDatabases(
     [
@@ -1919,6 +2133,7 @@ function expectedIdentitySnapshot({
       'webex-config-deploy': workerEffectiveGroups,
     },
     gshadowDatabase,
+    shadowDatabase,
   );
 }
 
@@ -1944,6 +2159,18 @@ function expectedGshadowDatabase() {
     'webex-codex-launch:!::',
     '',
   ].join('\n');
+}
+
+function expectedShadowDatabase() {
+  return [
+    shadowRecord('webex-generic-account-bot'),
+    shadowRecord('webex-config-deploy'),
+    '',
+  ].join('\n');
+}
+
+function shadowRecord(name, password = '!') {
+  return [name, password, '', '', '', '', '', '', ''].join(':');
 }
 
 function passwdRecord(name, uid, gid, {
@@ -1972,11 +2199,18 @@ function systemIdentityFs({
   staticUserdbDirectory = '/etc/userdb',
   staticUserdbEntry = null,
   groupMode = 0o644,
+  shadowMode = 0o640,
   mutateGroupIdentity = false,
 } = {}) {
   const identityFiles = new Map([
     ['/etc/nsswitch.conf', {
-      contents: Buffer.from('passwd: files systemd\ngroup: files systemd\n'),
+      contents: Buffer.from([
+        'passwd: files systemd',
+        'group: files systemd',
+        'shadow: files',
+        'gshadow: files',
+        '',
+      ].join('\n')),
       gid: 0,
       mode: 0o644,
     }],
@@ -1993,6 +2227,11 @@ function systemIdentityFs({
       contents: Buffer.from(expectedGroupDatabase()),
       gid: 0,
       mode: groupMode,
+    }],
+    ['/etc/shadow', {
+      contents: Buffer.from(expectedShadowDatabase()),
+      gid: 42,
+      mode: shadowMode,
     }],
     ['/etc/gshadow', {
       contents: Buffer.from(expectedGshadowDatabase()),
@@ -2099,6 +2338,7 @@ function systemdUnitPathFs(
     usrMerged = false,
     usrMergeTarget = 'usr/lib',
     filesByPath = new Map(),
+    fileModesByPath = new Map(),
     missingPaths = new Set(),
     symlinksByPath = new Map(),
   } = {},
@@ -2124,10 +2364,10 @@ function systemdUnitPathFs(
     isDirectory: () => false,
     isSymbolicLink: () => true,
   });
-  const fileStat = (contents) => Object.freeze({
+  const fileStat = (contents, mode = 0o644) => Object.freeze({
     uid: 0,
     gid: 0,
-    mode: 0o100644,
+    mode: 0o100000 | mode,
     nlink: 1,
     dev: 1,
     ino: 3,
@@ -2158,7 +2398,9 @@ function systemdUnitPathFs(
       if (missingPaths.has(candidate)) {
         throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       }
-      if (filesByPath.has(candidate)) return fileStat(filesByPath.get(candidate));
+      if (filesByPath.has(candidate)) {
+        return fileStat(filesByPath.get(candidate), fileModesByPath.get(candidate));
+      }
       if (symlinksByPath.has(candidate)) return symlinkStat;
       return directoryStat;
     },
@@ -2172,7 +2414,7 @@ function systemdUnitPathFs(
       const contents = filesByPath.get(candidate);
       if (!contents) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       return {
-        stat: async () => fileStat(contents),
+        stat: async () => fileStat(contents, fileModesByPath.get(candidate)),
         readFile: async () => Buffer.from(contents),
         close: async () => {},
       };

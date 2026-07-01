@@ -162,9 +162,9 @@ superseded_by:
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
-  fixed non-secret allowlist, stable no-follow reads of complete files identity
-  and gshadow databases, a DynamicUser-only systemd userdb boundary,
-  fixed managed-name vacancy lookups, identity-drift, locked-group-credential,
+  fixed non-secret allowlist, stable no-follow reads of complete
+  passwd/shadow/group/gshadow databases, a DynamicUser-only systemd userdb boundary,
+  fixed managed-name vacancy lookups, identity-drift, locked-user/group-credential,
   and cross-group shadow-grant checks,
   dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
@@ -172,21 +172,23 @@ superseded_by:
   no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
-  unit-name specifier expansion, managed identity assignments, and launcher-instance
+  `d_type`-independent file classification, unit-name specifier expansion,
+  named/numeric/implicit-DynamicUser managed identity assignments, and launcher-instance
   references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
   auditing with C-escape, specifier/glob-prefix, path-derived-ID, owner
-  modifiers, protected root and installed-policy targets, safe ancestor metadata, and
-  recursive parent handling,
+  modifiers, protected root and installed-policy targets, traversal-preserving
+  ancestor metadata, recursive parent handling, and root-owned stable source
+  metadata for every effective catalogue file,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, explicit complete-target stale-cache convergence recovery,
   fail-closed recovery with full target-directory durability and a journal
   retained through final manager convergence,
-  non-rollback journal-unlink failure handling, all-mode umask-safe interrupted first-run lock
-  migration recovery, and post-reload verification. Real host apply remains an
+  non-rollback journal-unlink failure handling, umask-safe interrupted candidate
+  and first-run lock recovery, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
 ## Delivery Rules
@@ -223,10 +225,11 @@ superseded_by:
   commit is interrupted, recover the old set from a fixed root-only journal
   before reapplying, but reject any target that matches neither the recorded
   old nor desired digest. Apply the same all-target digest gate before rollback.
-  Require an exact `files systemd` NSS policy, enumerate static identities from
+  Require exact local-only passwd/shadow/group/gshadow NSS policies, enumerate static identities from
   `files`, reject static systemd userdb records and managed IDs in the
-  DynamicUser range, require locked files-backed gshadow credentials for every
-  managed privilege group, and permit only the trusted DynamicUser provider.
+  DynamicUser range, require locked files-backed shadow and gshadow credentials
+  for every managed account and privilege group, and permit only the trusted
+  DynamicUser provider.
   Fsync every target directory and re-verify the complete old target set before
   clearing a recovery journal. Keep that journal while immediately reloading
   systemd after startup recovery, and prove every managed unit and discovered

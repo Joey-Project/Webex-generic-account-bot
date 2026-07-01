@@ -211,13 +211,14 @@ Apply also requires root-owned, non-writable ancestors and files for both the
 Node executable and provisioner script; do not run this root workflow through
 a user-managed Node installation or checkout.
 
-Both modes require root so the complete files-backed `gshadow` database can be
-checked without exposing it in output. Dry-run reads `/etc/passwd`,
-`/etc/group`, and `/etc/gshadow` through stable no-follow handles with fixed
-root-owned metadata, then validates source and target ancestor metadata,
-existing policy files, the exact non-login account metadata, locked
-managed-group credentials, all shadow-group grants, NSS group state, and an exact
-`files systemd` NSS policy for passwd, group, and optional initgroups data.
+Both modes require root so the complete files-backed `shadow` and `gshadow`
+databases can be checked without exposing them in output. Dry-run reads
+`/etc/passwd`, `/etc/shadow`, `/etc/group`, and `/etc/gshadow` through stable
+no-follow handles with fixed root-owned metadata, then validates source and
+target ancestor metadata, existing policy files, the exact non-login account
+metadata, locked managed-user and managed-group credentials, all shadow-group
+grants, NSS group state, and an exact local-only NSS policy for passwd, shadow,
+group, gshadow, and optional initgroups data.
 Static identities are enumerated explicitly from the `files` database. The
 systemd user database may expose only its root-owned `DynamicUser` provider,
 static userdb records are rejected, fixed `getent -s systemd` lookups must show
@@ -239,15 +240,20 @@ symlink references to managed units, including C-escaped references, launcher
 instances, and the contents of trusted linked unit files. A dangling external
 alias is accepted only when its link text is clean and its target parent remains
 root-owned and non-writable. Unit-name specifiers are expanded against each
-external fragment, alias, and drop-in owner before matching, and external policy
-may not assign a managed user or group identity. The merged systemd
-sysusers and tmpfiles catalogues are audited before mutation and again after
+external fragment, alias, and drop-in owner before matching, directory entries
+are classified from `lstat` rather than optional `d_type` metadata, and external
+policy may not assign a managed user or group by name, allocated numeric ID, or
+implicit DynamicUser unit name. The merged systemd sysusers and tmpfiles
+catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, path-derived-ID, owner modifiers, ancestor metadata, and
-recursive-parent semantics. Runtime paths, every installed policy target, the
-transaction journal, and the shared lock are protected from external tmpfiles
-policy. Only the reviewed Webex lines may affect managed identities, IDs, or
-paths, which keeps the identity and filesystem boundary durable across reboot.
+recursive-parent semantics. Every effective catalogue source and its ancestors
+must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
+every installed policy target, the transaction journal, and the shared lock are
+protected from external tmpfiles policy; ancestor maintenance must preserve
+traversal for the managed accounts. Only the reviewed Webex lines may affect
+managed identities, IDs, or paths, which keeps the identity and filesystem
+boundary durable across reboot.
 The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
@@ -257,7 +263,10 @@ update. A rerun first converges that directory to the exact bootstrap mode.
 Apply must then prove
 that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,
-trusted stale candidates left by an interrupted prior run. It installs the complete
+trusted stale candidates left by an interrupted prior run, including a
+root-owned candidate whose initial mode was narrowed by umask before chmod. The
+shared lock applies the same bounded interrupted-creation recovery before
+converging exact metadata. It installs the complete
 policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
