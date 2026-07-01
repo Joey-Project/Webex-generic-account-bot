@@ -162,11 +162,13 @@ superseded_by:
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
-  fixed non-secret allowlist, local-only NSS and identity-drift checks,
-  dormant-unit preflight, transactional policy-file installation, device-bound
-  kernel lock verification, trusted re-exec paths, bounded streamed stale
-  candidate cleanup and unit discovery, fail-closed recovery, and post-reload
-  verification. Real host apply remains an explicit operational gate.
+  fixed non-secret allowlist, files-only static identity enumeration, a
+  DynamicUser-only systemd userdb boundary, identity-drift checks, dormant-unit
+  preflight, transactional policy-file installation, device-bound kernel lock
+  verification, trusted re-exec paths, bounded streamed stale candidate cleanup
+  and unit discovery, fail-closed recovery with full target-directory
+  durability, and post-reload verification. Real host apply remains an explicit
+  operational gate.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -202,7 +204,10 @@ superseded_by:
   commit is interrupted, recover the old set from a fixed root-only journal
   before reapplying, but reject any target that matches neither the recorded
   old nor desired digest. Apply the same all-target digest gate before rollback.
-  Require a locally enumerable `files systemd` NSS policy, serialise the full
+  Require an exact `files systemd` NSS policy, enumerate static identities from
+  `files`, reject static systemd userdb records and managed IDs in the
+  DynamicUser range, and permit only the trusted DynamicUser provider. Fsync
+  every target directory before clearing a recovery journal. Serialise the full
   apply with a PID/device/inode-bound kernel lock, validate every re-exec path
   ancestor, stream a bounded scan that removes only trusted stale candidates,
   and bound and reject active launcher template instances as well as active

@@ -212,8 +212,12 @@ Node executable and provisioner script; do not run this root workflow through
 a user-managed Node installation or checkout.
 
 Dry-run validates source and target ancestor metadata, existing policy files,
-the exact non-login account metadata and NSS group set, and a locally enumerable
+the exact non-login account metadata and NSS group set, and an exact
 `files systemd` NSS policy for passwd, group, and optional initgroups data.
+Static identities are enumerated explicitly from the `files` database. The
+systemd user database may expose only its root-owned `DynamicUser` provider,
+static userdb records are rejected, and managed UIDs/GIDs must remain below
+the dynamic allocation range.
 It also validates dormant unit state without creating files or directories.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
@@ -231,7 +235,9 @@ and a root-only transaction journal
 under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
 Rollback and recovery classify every managed target, accept only the recorded
 old or desired digest, and fail closed on an administrator-modified third
-state. Dry-run reports recovery required, and
+state. Recovery fsyncs every target directory before removing the journal,
+including targets that already match their recorded old state. Dry-run reports
+recovery required, and
 the next apply restores the old set before
 reapplying. A later sysusers, tmpfiles, or reload failure leaves the complete
 reviewed file set installed and reports a convergence error so the same command

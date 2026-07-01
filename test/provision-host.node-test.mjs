@@ -14,6 +14,7 @@ import {
   parseArgs,
   parseIdentityDatabases,
   provisionHost,
+  readSystemIdentitySnapshot,
   readSystemUnitStates,
   runCli,
   validateIdentityPolicy,
@@ -212,6 +213,74 @@ describe('guarded host provisioner policy', () => {
       )),
       /account metadata is unexpected.*webex-generic-account-bot/,
     );
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        [
+          passwdRecord('webex-generic-account-bot', 61_184, 2001),
+          passwdRecord('webex-config-deploy', 1002, 2002),
+          '',
+        ].join('\n'),
+        expectedGroupDatabase(),
+        {
+          'webex-generic-account-bot': [2001],
+          'webex-config-deploy': [2002],
+        },
+      )),
+      /managed user ID is outside the local range/,
+    );
+  });
+
+  it('enumerates static identities from files and permits only DynamicUser', async () => {
+    const commands = [];
+    const snapshot = await readSystemIdentitySnapshot(
+      async (command, args) => {
+        commands.push([command, [...args]]);
+        return {
+          command,
+          args: [...args],
+          code: 0,
+          stdout: args.at(-1) === 'passwd'
+            ? [
+              passwdRecord('webex-generic-account-bot', 1001, 2001),
+              passwdRecord('webex-config-deploy', 1002, 2002),
+              '',
+            ].join('\n')
+            : expectedGroupDatabase(),
+          stderr: '',
+        };
+      },
+      systemIdentityFs({ dynamicUserProvider: true }),
+    );
+
+    assert.deepEqual(commands, [
+      ['/usr/bin/getent', ['-s', 'files', 'passwd']],
+      ['/usr/bin/getent', ['-s', 'files', 'group']],
+    ]);
+    validateIdentityPolicy(snapshot, { requireAccounts: true });
+  });
+
+  it('rejects unsupported or static systemd userdb records before getent', async () => {
+    let commandCalled = false;
+    const runCommand = async () => {
+      commandCalled = true;
+      throw new Error('getent must not run');
+    };
+
+    await assert.rejects(
+      readSystemIdentitySnapshot(
+        runCommand,
+        systemIdentityFs({ providerName: 'io.example.Untrusted' }),
+      ),
+      /unsupported systemd userdb provider/,
+    );
+    await assert.rejects(
+      readSystemIdentitySnapshot(
+        runCommand,
+        systemIdentityFs({ staticUserdbEntry: '9000.user' }),
+      ),
+      /static systemd userdb records are not supported/,
+    );
+    assert.equal(commandCalled, false);
   });
 });
 
@@ -612,6 +681,49 @@ describe('guarded host provisioner execution', () => {
     }
   });
 
+  it('resyncs every old-state target directory before removing the journal', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const firstDirectory = path.dirname(fixture.plan.artifacts[0].target);
+    let injected = false;
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'open') return target[property];
+        return async (...args) => {
+          const handle = await target.open(...args);
+          if (args[0] !== firstDirectory || injected) return handle;
+          return new Proxy(handle, {
+            get(handleTarget, handleProperty) {
+              if (handleProperty === 'sync') {
+                return async () => {
+                  injected = true;
+                  throw new Error('injected recovery directory fsync failure');
+                };
+              }
+              const value = handleTarget[handleProperty];
+              return typeof value === 'function' ? value.bind(handleTarget) : value;
+            },
+          });
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /injected recovery directory fsync failure/,
+    );
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    await provisionHost(
+      { apply: true },
+      fixture.dependencies({ applied: true }),
+    );
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
   it('fails closed before recovery when a target directory is replaced', async (context) => {
     const fixture = await provisionFixture(context);
     const outside = path.join(fixture.root, 'outside');
@@ -837,6 +949,100 @@ function passwdRecord(name, uid, gid, {
 
 function groupRecord(name, gid, members = []) {
   return `${name}:x:${gid}:${members.join(',')}`;
+}
+
+function systemIdentityFs({
+  dynamicUserProvider = false,
+  providerName = null,
+  staticUserdbEntry = null,
+} = {}) {
+  const nsswitch = Buffer.from('passwd: files systemd\ngroup: files systemd\n');
+  const provider = providerName
+    ?? (dynamicUserProvider ? 'io.systemd.DynamicUser' : null);
+  const directoryEntries = new Map();
+  if (provider) {
+    directoryEntries.set('/run/systemd/userdb', [directoryEntry(provider, true)]);
+  }
+  if (staticUserdbEntry) {
+    directoryEntries.set('/etc/userdb', [directoryEntry(staticUserdbEntry, false)]);
+  }
+  const optionalDirectories = new Set([
+    '/run/systemd/userdb',
+    '/etc/userdb',
+    '/run/userdb',
+    '/run/host/userdb',
+    '/usr/lib/userdb',
+  ]);
+  const directoryStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o40755,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  });
+  const socketStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o140666,
+    nlink: 1,
+    isSocket: () => true,
+    isSymbolicLink: () => false,
+  });
+  const nsswitchStat = Object.freeze({
+    uid: 0,
+    gid: 0,
+    mode: 0o100644,
+    nlink: 1,
+    size: nsswitch.length,
+    dev: 1,
+    ino: 1,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  });
+  const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
+
+  return {
+    async open(file) {
+      if (file !== '/etc/nsswitch.conf') throw missing();
+      return {
+        stat: async () => nsswitchStat,
+        readFile: async () => Buffer.from(nsswitch),
+        close: async () => {},
+      };
+    },
+    async lstat(candidate) {
+      if (provider && candidate === `/run/systemd/userdb/${provider}`) {
+        return socketStat;
+      }
+      if (optionalDirectories.has(candidate) && !directoryEntries.has(candidate)) {
+        throw missing();
+      }
+      return directoryStat;
+    },
+    async opendir(directory) {
+      const entries = directoryEntries.get(directory);
+      if (!entries) throw missing();
+      return asyncDirectory(entries);
+    },
+  };
+}
+
+function directoryEntry(name, socket) {
+  return Object.freeze({
+    name,
+    isSocket: () => socket,
+  });
+}
+
+function asyncDirectory(entries) {
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield* entries;
+    },
+    close: async () => {},
+  };
 }
 
 function unitStates(state) {

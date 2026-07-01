@@ -24,6 +24,8 @@ const MAX_PROC_LOCKS_BYTES = 1024 * 1024;
 const MAX_STALE_CANDIDATES = 256;
 const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
+const MAX_SYSTEMD_USERDB_ENTRIES = 16;
+const MAX_MANAGED_ID = 59_999;
 const TRANSACTION_VERSION = 1;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
@@ -33,6 +35,14 @@ const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
+const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
+const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
+const STATIC_USERDB_DIRECTORIES = Object.freeze([
+  '/etc/userdb',
+  '/run/userdb',
+  '/run/host/userdb',
+  '/usr/lib/userdb',
+]);
 const MANAGED_ACCOUNTS = Object.freeze({
   bot: Object.freeze({
     name: 'webex-generic-account-bot',
@@ -302,6 +312,9 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
   }
 
   for (const user of [bot, worker].filter(Boolean)) {
+    if (user.uid > MAX_MANAGED_ID || user.gid > MAX_MANAGED_ID) {
+      throw new Error(`managed user ID is outside the local range: ${user.name}`);
+    }
     const aliases = [...snapshot.users.values()]
       .filter((candidate) => candidate.uid === user.uid)
       .map((candidate) => candidate.name);
@@ -313,6 +326,9 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
   for (const groupName of controlledGroups) {
     const group = snapshot.groups.get(groupName);
     if (!group) continue;
+    if (group.gid > MAX_MANAGED_ID) {
+      throw new Error(`managed group ID is outside the local range: ${groupName}`);
+    }
     const aliases = [...snapshot.groups.values()]
       .filter((candidate) => candidate.gid === group.gid)
       .map((candidate) => candidate.name);
@@ -1147,6 +1163,9 @@ async function recoverPolicyTransaction(transaction, plan, deps) {
     }
     await syncDirectory(path.dirname(artifact.target), deps.fsApi);
   }
+  for (const directory of directories) {
+    await syncDirectory(directory, deps.fsApi);
+  }
   await removeProvisionTransaction(plan, deps);
 }
 
@@ -1179,7 +1198,71 @@ function assertUnitDormant(unit, state, { requireLoaded }) {
   }
 }
 
-async function readSystemIdentitySnapshot(runCommand = runFixedCommand, fsApi = fs) {
+async function validateSystemdUserdbBoundary(fsApi) {
+  const providers = await readTrustedDirectoryEntries(
+    SYSTEMD_USERDB_DIRECTORY,
+    MAX_SYSTEMD_USERDB_ENTRIES,
+    fsApi,
+  );
+  for (const entry of providers) {
+    if (entry.name !== SYSTEMD_DYNAMIC_USER_PROVIDER) {
+      throw new Error(`unsupported systemd userdb provider: ${entry.name}`);
+    }
+    const provider = path.join(SYSTEMD_USERDB_DIRECTORY, entry.name);
+    const stat = await fsApi.lstat(provider);
+    if (
+      !entry.isSocket()
+      || !stat.isSocket()
+      || stat.isSymbolicLink()
+      || stat.nlink !== 1
+      || stat.uid !== 0
+      || stat.gid !== 0
+      || (stat.mode & 0o7777) !== 0o666
+    ) {
+      throw new Error(`systemd userdb provider is not trusted: ${provider}`);
+    }
+  }
+  for (const directory of STATIC_USERDB_DIRECTORIES) {
+    const entries = await readTrustedDirectoryEntries(
+      directory,
+      MAX_SYSTEMD_USERDB_ENTRIES,
+      fsApi,
+    );
+    if (entries.length !== 0) {
+      throw new Error(`static systemd userdb records are not supported: ${directory}`);
+    }
+  }
+}
+
+async function readTrustedDirectoryEntries(directory, maxEntries, fsApi) {
+  await assertTrustedExistingAncestors('/', directory, 0, 0, fsApi);
+  let handle;
+  try {
+    handle = await fsApi.opendir(directory);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  await assertTrustedDirectoryChain('/', directory, 0, 0, fsApi);
+  const entries = [];
+  try {
+    for await (const entry of handle) {
+      entries.push(entry);
+      if (entries.length > maxEntries) {
+        throw new Error(`too many entries in trusted directory: ${directory}`);
+      }
+    }
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      if (error?.code !== 'ERR_DIR_CLOSED') throw error;
+    }
+  }
+  return entries;
+}
+
+export async function readSystemIdentitySnapshot(runCommand = runFixedCommand, fsApi = fs) {
   const nsswitch = await readTrustedFile(
     '/etc/nsswitch.conf',
     0,
@@ -1188,17 +1271,22 @@ async function readSystemIdentitySnapshot(runCommand = runFixedCommand, fsApi = 
     fsApi,
   );
   validateNsswitchPolicy(nsswitch.contents.toString('utf8'));
+  await validateSystemdUserdbBoundary(fsApi);
   const [passwd, group] = await Promise.all([
-    runCommand('/usr/bin/getent', ['passwd']),
-    runCommand('/usr/bin/getent', ['group']),
+    runCommand('/usr/bin/getent', ['-s', 'files', 'passwd']),
+    runCommand('/usr/bin/getent', ['-s', 'files', 'group']),
   ]);
   const initial = parseIdentityDatabases(passwd.stdout, group.stdout);
   const effectiveGroups = {};
   for (const user of Object.values(MANAGED_USERS)) {
     if (!initial.users.has(user)) continue;
-    const result = await runCommand('/usr/bin/id', ['-G', user]);
-    effectiveGroups[user] = result.stdout.trim().split(/\s+/).filter(Boolean)
-      .map((gid) => parseDatabaseId(gid, `effective GID for ${user}`));
+    const record = initial.users.get(user);
+    effectiveGroups[user] = [
+      record.gid,
+      ...[...initial.groups.values()]
+        .filter((groupRecord) => groupRecord.members.includes(user))
+        .map((groupRecord) => groupRecord.gid),
+    ];
   }
   return parseIdentityDatabases(passwd.stdout, group.stdout, effectiveGroups);
 }
