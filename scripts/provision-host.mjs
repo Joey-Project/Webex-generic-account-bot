@@ -123,6 +123,13 @@ const BOOT_POLICY_DIRECTORIES = Object.freeze({
     '/lib/tmpfiles.d',
   ]),
 });
+const IDENTITY_POLICY_PATHS = Object.freeze([
+  '/etc/nsswitch.conf',
+  '/etc/passwd',
+  '/etc/shadow',
+  '/etc/group',
+  '/etc/gshadow',
+]);
 
 export const MANAGED_UNITS = Object.freeze([
   'webex-generic-account-bot.service',
@@ -1845,6 +1852,8 @@ export function auditBootPolicyCatalogs(
       .flatMap((artifact) => policyCatalogLines(artifact.source.contents))
       .map((line) => parseSystemdFields(line)[1]),
     ...inspected.artifacts.map((artifact) => artifact.targetPath),
+    ...IDENTITY_POLICY_PATHS,
+    ...SYSTEMD_SYSTEM_UNIT_LOAD_PATHS,
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
   ]);
@@ -1957,10 +1966,8 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   const user = normaliseTmpfilesOwner(fields[3] ?? '-');
   const group = normaliseTmpfilesOwner(fields[4] ?? '-');
   if (
-    managedNames.has(user)
-    || managedNames.has(group)
-    || managedIds.has(user)
-    || managedIds.has(group)
+    identityTokenTouchesManagedSurface(user, managedNames, managedIds)
+    || identityTokenTouchesManagedSurface(group, managedNames, managedIds)
   ) {
     return true;
   }
@@ -1972,15 +1979,43 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
     return true;
   }
   const argument = fields[6];
-  return type.startsWith('C')
-    && argument !== undefined
-    && argument !== '-'
-    && (!argument.startsWith('/')
-      || pathFieldTouchesProtected(argument, false, protectedPaths));
+  if (argument === undefined || argument === '-') return false;
+  if (type.startsWith('C')) {
+    return !argument.startsWith('/')
+      || pathFieldTouchesProtected(argument, false, protectedPaths);
+  }
+  if (type.startsWith('L')) {
+    const resolvedTarget = argument.startsWith('/')
+      ? argument
+      : path.posix.resolve(path.posix.dirname(policyPath), argument);
+    if (type === 'L' && policyPath === '/var/run' && resolvedTarget === '/run') {
+      return false;
+    }
+    return pathFieldTouchesProtected(resolvedTarget, false, protectedPaths);
+  }
+  if (/^[aA]/.test(type)) {
+    const acl = fields.slice(6).join(' ');
+    if (acl.includes('%')) return true;
+    return acl.split(/[^A-Za-z0-9_.+:-]+/)
+      .flatMap((entry) => entry.split(':'))
+      .some((token) => identityTokenTouchesManagedSurface(
+        normaliseTmpfilesOwner(token),
+        managedNames,
+        managedIds,
+      ));
+  }
+  return false;
 }
 
 function normaliseTmpfilesOwner(owner) {
-  return owner.startsWith(':') ? owner.slice(1) : owner;
+  return owner.replace(/^[:+]+/, '');
+}
+
+function identityTokenTouchesManagedSurface(identity, managedNames, managedIds) {
+  if (managedNames.has(identity) || managedIds.has(identity)) return true;
+  if (!/^[0-9]+$/.test(identity)) return false;
+  const id = Number(identity);
+  return Number.isSafeInteger(id) && id > 0 && id <= MAX_MANAGED_ID;
 }
 
 function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPaths) {

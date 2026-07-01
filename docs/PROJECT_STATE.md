@@ -109,9 +109,11 @@
   specifier expansion, named/implicit-DynamicUser identities plus pre-allocation
   rejection of static-range numeric identities,
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
-  auditing that protects root, runtime, and installed policy paths from owner-modifier,
-  traversal-restricting ancestor metadata, cleanup, replacement, and recursive
-  rules, allocation ranges, normalised glob paths, and copy sources while
+  auditing that protects root, runtime, identity databases and NSS policy,
+  systemd system-unit load paths, and installed policy paths from owner-modifier,
+  numeric-identity, ACL-principal, symlink-target, traversal-restricting ancestor
+  metadata, cleanup, replacement, and recursive rules, allocation ranges,
+  normalised glob paths, and copy sources while
   validating every catalogue source file and ancestor,
   trusted re-exec paths,
   fail-closed crash recovery with immediate manager reload and full

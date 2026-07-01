@@ -248,11 +248,13 @@ system-ID range before allocation. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, lexical path normalisation, copy-source, path-derived-ID,
-owner modifiers, ancestor metadata, and recursive-parent semantics. External
+owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
+metadata, and recursive-parent semantics. External
 sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
 must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
-every installed policy target, the transaction journal, and the shared lock are
-protected from external tmpfiles policy; ancestor maintenance must preserve
+the local identity databases and NSS policy, every fixed systemd system-unit
+load path, every installed policy target, the transaction journal, and the
+shared lock are protected from external tmpfiles policy; ancestor maintenance must preserve
 traversal for the managed accounts. Only the reviewed Webex lines may affect
 managed identities, IDs, or paths, which keeps the identity and filesystem
 boundary durable across reboot.

@@ -180,9 +180,11 @@ superseded_by:
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
   auditing with C-escape, normalised specifier/glob-prefix and copy-source
-  paths, path-derived-ID, allocation-range rejection, owner
-  modifiers, protected root and installed-policy targets, traversal-preserving
-  ancestor metadata, recursive parent handling, and root-owned stable source
+  paths, path-derived-ID, allocation-range rejection, owner modifiers, numeric
+  identities, ACL principals, and symlink targets, protected root, identity
+  databases and NSS policy, fixed systemd system-unit load paths, and installed
+  policy targets, traversal-preserving ancestor metadata, recursive parent
+  handling, and root-owned stable source
   metadata for every effective catalogue file,
   trusted re-exec paths, bounded streamed stale candidate cleanup and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
