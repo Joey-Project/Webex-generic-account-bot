@@ -29,6 +29,7 @@ const MAX_SYSTEMD_UNIT_PATH_ENTRIES = 4096;
 const MAX_SYSTEMD_POLICY_TREE_ENTRIES = 32_768;
 const MAX_SYSTEMD_POLICY_FILES = 8192;
 const MAX_SYSTEMD_POLICY_BYTES = 64 * 1024 * 1024;
+const MAX_CREDENTIAL_STORE_ENTRIES = 1024;
 const MAX_MANAGED_ID = 59_999;
 const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
 const TRANSACTION_VERSION = 1;
@@ -129,6 +130,30 @@ const IDENTITY_POLICY_PATHS = Object.freeze([
   '/etc/shadow',
   '/etc/group',
   '/etc/gshadow',
+]);
+const BOOT_POLICY_CREDENTIAL_NAMES = Object.freeze([
+  'sysusers.extra',
+  'tmpfiles.extra',
+]);
+const CREDENTIAL_STORE_DIRECTORIES = Object.freeze([
+  '/etc/credstore',
+  '/run/credstore',
+  '/usr/lib/credstore',
+  '/etc/credstore.encrypted',
+  '/run/credstore.encrypted',
+  '/usr/lib/credstore.encrypted',
+]);
+const BOOT_POLICY_CREDENTIAL_PATHS = Object.freeze(
+  CREDENTIAL_STORE_DIRECTORIES.flatMap((directory) => (
+    BOOT_POLICY_CREDENTIAL_NAMES.map((name) => path.join(directory, name))
+  )),
+);
+const CREDENTIAL_DIRECTIVES = new Set([
+  'ImportCredential',
+  'LoadCredential',
+  'LoadCredentialEncrypted',
+  'SetCredential',
+  'SetCredentialEncrypted',
 ]);
 
 export const MANAGED_UNITS = Object.freeze([
@@ -531,8 +556,6 @@ export async function provisionHost(options, dependencies = {}) {
     throw new Error('host provisioning requires root, including dry-run');
   }
 
-  if (options.apply) await cleanupStaleCandidates(plan, deps);
-
   const transaction = await readProvisionTransaction(plan, deps);
   if (transaction && !options.apply) {
     throw new Error('host policy recovery is required; run --apply');
@@ -588,6 +611,7 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
+  await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
   try {
@@ -814,6 +838,7 @@ async function cleanupStaleCandidates(plan, deps) {
 
   let candidateCount = 0;
   let scannedEntryCount = 0;
+  const candidates = [];
   for (const [directory, prefixes] of targetsByDirectory) {
     await assertTrustedExistingAncestors(
       plan.targetRoot,
@@ -829,7 +854,6 @@ async function cleanupStaleCandidates(plan, deps) {
       if (error?.code === 'ENOENT') continue;
       throw error;
     }
-    let changed = false;
     try {
       for await (const entry of directoryHandle) {
         scannedEntryCount += 1;
@@ -854,8 +878,7 @@ async function cleanupStaleCandidates(plan, deps) {
         if (!stat.isFile() || (!interruptedCreation && mode !== FILE_MODE)) {
           throw new Error(`stale policy candidate metadata is not trusted: ${candidate}`);
         }
-        await deps.fsApi.rm(candidate);
-        changed = true;
+        candidates.push(Object.freeze({ candidate, directory, stat }));
       }
     } finally {
       try {
@@ -864,7 +887,24 @@ async function cleanupStaleCandidates(plan, deps) {
         if (error?.code !== 'ERR_DIR_CLOSED') throw error;
       }
     }
-    if (changed) await syncDirectory(directory, deps.fsApi);
+  }
+
+  const changedDirectories = new Set();
+  for (const { candidate, directory, stat } of candidates) {
+    const current = await deps.fsApi.lstat(candidate);
+    const mode = current.mode & 0o7777;
+    assertTrustedFileMetadata(candidate, current, deps.targetUid, deps.targetGid, null);
+    if (
+      !sameFileIdentity(stat, current)
+      || ((mode & ~0o600) !== 0 && mode !== FILE_MODE)
+    ) {
+      throw new Error(`stale policy candidate changed before cleanup: ${candidate}`);
+    }
+    await deps.fsApi.rm(candidate);
+    changedDirectories.add(directory);
+  }
+  for (const directory of changedDirectories) {
+    await syncDirectory(directory, deps.fsApi);
   }
 }
 
@@ -1777,10 +1817,17 @@ export async function readSystemBootPolicyCatalogs(
   runCommand = runFixedCommand,
   fsApi = fs,
 ) {
-  const [sysusers, tmpfiles] = await Promise.all([
+  const [sysusers, tmpfiles, systemCredentials] = await Promise.all([
     runCommand('/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']),
     runCommand('/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']),
+    runCommand(
+      '/usr/bin/systemd-creds',
+      ['--system', '--no-legend', '--no-pager', 'list'],
+      [0, 1],
+    ),
   ]);
+  assertNoBootPolicySystemCredentials(systemCredentials);
+  await assertNoBootPolicyCredentialStoreFiles(fsApi);
   const sources = Object.freeze({
     sysusers: await validateBootPolicySources('sysusers', sysusers.stdout, fsApi),
     tmpfiles: await validateBootPolicySources('tmpfiles', tmpfiles.stdout, fsApi),
@@ -1790,6 +1837,45 @@ export async function readSystemBootPolicyCatalogs(
     tmpfiles: tmpfiles.stdout,
     sources,
   });
+}
+
+function assertNoBootPolicySystemCredentials(result) {
+  if (
+    result.code === 1
+    && result.stdout === ''
+    && result.stderr === 'No credentials passed to system.\n'
+  ) {
+    return;
+  }
+  if (result.code !== 0) {
+    throw new Error('system credential listing failed');
+  }
+  if (result.stderr !== '') {
+    throw new Error('system credential listing emitted unexpected stderr');
+  }
+  const output = String(result.stdout).trim();
+  if (output === '' || output === 'No credentials passed to system.') return;
+  for (const line of output.split('\n')) {
+    const [name] = line.trim().split(/\s+/);
+    if (BOOT_POLICY_CREDENTIAL_NAMES.includes(name)) {
+      throw new Error(`system credential can inject boot policy: ${name}`);
+    }
+  }
+}
+
+async function assertNoBootPolicyCredentialStoreFiles(fsApi) {
+  for (const directory of CREDENTIAL_STORE_DIRECTORIES) {
+    const entries = await readTrustedDirectoryEntries(
+      directory,
+      MAX_CREDENTIAL_STORE_ENTRIES,
+      fsApi,
+    );
+    for (const entry of entries) {
+      if (BOOT_POLICY_CREDENTIAL_NAMES.includes(entry.name)) {
+        throw new Error(`credential store can inject boot policy: ${path.join(directory, entry.name)}`);
+      }
+    }
+  }
 }
 
 async function validateBootPolicySources(kind, catalog, fsApi) {
@@ -1854,6 +1940,7 @@ export function auditBootPolicyCatalogs(
     ...inspected.artifacts.map((artifact) => artifact.targetPath),
     ...IDENTITY_POLICY_PATHS,
     ...SYSTEMD_SYSTEM_UNIT_LOAD_PATHS,
+    ...BOOT_POLICY_CREDENTIAL_PATHS,
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
   ]);
@@ -1862,19 +1949,33 @@ export function auditBootPolicyCatalogs(
     if (typeof catalogs?.[kind] !== 'string') {
       throw new Error(`boot policy catalog is missing: ${kind}`);
     }
-    const allowed = new Set(inspected.artifacts
-      .filter((artifact) => artifact.kind === kind)
+    const managedArtifacts = inspected.artifacts.filter((artifact) => artifact.kind === kind);
+    const allowed = new Set(managedArtifacts
       .flatMap((artifact) => policyCatalogLines(artifact.source.contents)));
-    const observed = new Set(policyCatalogLines(catalogs[kind]));
+    const managedSources = new Map(managedArtifacts.map((artifact) => [
+      artifact.targetPath,
+      new Set([
+        ...policyCatalogLines(artifact.source.contents),
+        ...(artifact.existing ? policyCatalogLines(artifact.existing.contents) : []),
+      ]),
+    ]));
+    const observed = policyCatalogEntries(catalogs[kind]);
+    const sourceAware = observed.some(({ source }) => source !== null);
     if (requireManagedPolicy) {
-      for (const line of allowed) {
-        if (!observed.has(line)) {
-          throw new Error(`managed ${kind} policy is not active: ${line}`);
+      for (const artifact of managedArtifacts) {
+        for (const line of policyCatalogLines(artifact.source.contents)) {
+          if (!observed.some((entry) => (
+            entry.line === line
+            && (!sourceAware || entry.source === artifact.targetPath)
+          ))) {
+            throw new Error(`managed ${kind} policy is not active: ${line}`);
+          }
         }
       }
     }
-    for (const line of observed) {
-      if (allowed.has(line)) continue;
+    for (const { line, source } of observed) {
+      const sourceLines = source === null ? null : managedSources.get(source);
+      if ((sourceAware ? sourceLines?.has(line) : allowed.has(line))) continue;
       if (bootPolicyLineTouchesManagedSurface(
         kind,
         line,
@@ -1889,10 +1990,20 @@ export function auditBootPolicyCatalogs(
 }
 
 function policyCatalogLines(contents) {
+  return policyCatalogEntries(contents).map(({ line }) => line);
+}
+
+function policyCatalogEntries(contents) {
   const logicalLines = [];
   let pending = '';
+  let source = null;
   for (const physicalLine of String(contents).split('\n')) {
     const trimmed = physicalLine.trimStart();
+    if (pending === '' && trimmed.startsWith('#')) {
+      const match = trimmed.match(/^# (\/\S+)$/);
+      if (match) source = path.posix.normalize(match[1]);
+      continue;
+    }
     if (
       pending !== ''
       && (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith(';'))
@@ -1903,14 +2014,14 @@ function policyCatalogLines(contents) {
     if (hasTrailingContinuation(line)) {
       pending = `${line.slice(0, -1)} `;
     } else {
-      logicalLines.push(line);
+      logicalLines.push(Object.freeze({ line, source }));
       pending = '';
     }
   }
   if (pending !== '') throw new Error('boot policy ends with an unterminated continuation');
   return logicalLines
-    .map((line) => line.trim())
-    .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith(';'));
+    .map((entry) => Object.freeze({ ...entry, line: entry.line.trim() }))
+    .filter(({ line }) => line !== '' && !line.startsWith('#') && !line.startsWith(';'));
 }
 
 function hasTrailingContinuation(line) {
@@ -2385,6 +2496,9 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   managedIds = new Set(),
 ) {
   const decoded = decodeSystemdEscapesForAudit(String(value));
+  if (systemdPolicyInjectsBootPolicyCredential(decoded, source)) {
+    throw new Error(`external systemd policy injects a boot policy credential: ${source}`);
+  }
   const expanded = new Set([
     decoded,
     ...[...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName)),
@@ -2395,11 +2509,45 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
-      || systemdIdentityDirectiveUsesManagedId(candidate, managedIds)
+      || systemdIdentityDirectiveUsesManagedId(candidate, managedIds, source)
     ) {
       throw new Error(`external systemd policy references a managed unit: ${source}`);
     }
   }
+}
+
+function systemdPolicyInjectsBootPolicyCredential(value, source) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!CREDENTIAL_DIRECTIVES.has(directive)) return false;
+  if (isExpectedVendorBootPolicyCredentialImport(source, value.trim())) return false;
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  if (directive === 'ImportCredential') {
+    return fields.some((selector) => BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
+      selector === name
+      || (selector.endsWith('*') && name.startsWith(selector.slice(0, -1)))
+    )));
+  }
+  return fields.some((field) => {
+    const separatorOffset = field.indexOf(':');
+    const credential = separatorOffset < 0 ? field : field.slice(0, separatorOffset);
+    return BOOT_POLICY_CREDENTIAL_NAMES.includes(credential);
+  });
+}
+
+function isExpectedVendorBootPolicyCredentialImport(source, line) {
+  const directory = path.dirname(source);
+  if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
+  const unit = path.basename(source);
+  return (
+    unit === 'systemd-sysusers.service'
+    && line === 'ImportCredential=sysusers.*'
+  ) || (
+    unit.startsWith('systemd-tmpfiles-')
+    && unit.endsWith('.service')
+    && line === 'ImportCredential=tmpfiles.*'
+  );
 }
 
 function unitNameClaimsManagedIdentity(unitName) {
@@ -2410,17 +2558,32 @@ function unitNameClaimsManagedIdentity(unitName) {
   return MANAGED_IDENTITY_NAMES.includes(decodeSystemdEscapesForAudit(implicitIdentity));
 }
 
-function systemdIdentityDirectiveUsesManagedId(value, managedIds) {
+function systemdIdentityDirectiveUsesManagedId(value, managedIds, source) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
   if (!SYSTEMD_IDENTITY_DIRECTIVES.has(directive)) return false;
-  return parseSystemdFields(value.slice(separator + 1)).some((identity) => {
+  const identities = parseSystemdFields(value.slice(separator + 1));
+  if (
+    identities.some((identity) => /%[iI]/.test(identity))
+    && !isExpectedVendorUserManagerIdentity(source, value.trim())
+  ) {
+    return true;
+  }
+  return identities.some((identity) => {
     if (managedIds.has(identity)) return true;
     if (!/^[0-9]+$/.test(identity)) return false;
     const id = Number(identity);
     return Number.isSafeInteger(id) && id > 0 && id <= MAX_MANAGED_ID;
   });
+}
+
+function isExpectedVendorUserManagerIdentity(source, line) {
+  return (
+    ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(path.dirname(source))
+    && path.basename(source) === 'user@.service'
+    && line === 'User=%i'
+  );
 }
 
 function managedIdentityIds(snapshot) {

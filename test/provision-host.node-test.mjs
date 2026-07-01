@@ -768,6 +768,9 @@ describe('guarded host provisioner execution', () => {
     ]);
     const catalogs = await readSystemBootPolicyCatalogs(async (command, args) => {
       commands.push([command, [...args]]);
+      if (command.endsWith('systemd-creds')) {
+        return { stdout: '', stderr: 'No credentials passed to system.\n', code: 1 };
+      }
       const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
       const source = `/usr/lib/${kind}.d/example.conf`;
       return {
@@ -779,6 +782,7 @@ describe('guarded host provisioner execution', () => {
     assert.deepEqual(commands, [
       ['/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']],
       ['/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']],
+      ['/usr/bin/systemd-creds', ['--system', '--no-legend', '--no-pager', 'list']],
     ]);
     assert.match(catalogs.sysusers, /g example/);
     assert.match(catalogs.tmpfiles, /d \/run\/example/);
@@ -790,6 +794,9 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(
       readSystemBootPolicyCatalogs(
         async (command) => {
+          if (command.endsWith('systemd-creds')) {
+            return { stdout: 'No credentials passed to system.\n', stderr: '', code: 0 };
+          }
           const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
           const source = `/usr/lib/${kind}.d/example.conf`;
           return { stdout: `# ${source}\npolicy\n`, stderr: '', code: 0 };
@@ -801,6 +808,79 @@ describe('guarded host provisioner execution', () => {
       ),
       /policy file metadata is not trusted: \/usr\/lib\/tmpfiles\.d\/example\.conf/,
     );
+
+    await assert.rejects(
+      readSystemBootPolicyCatalogs(
+        async (command) => {
+          if (command.endsWith('systemd-creds')) {
+            return { stdout: 'sysusers.extra insecure 42B\n', stderr: '', code: 0 };
+          }
+          const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+          const source = `/usr/lib/${kind}.d/example.conf`;
+          return {
+            stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+            stderr: '',
+            code: 0,
+          };
+        },
+        systemdUnitPathFs(new Map(), { filesByPath: sourceFiles }),
+      ),
+      /system credential can inject boot policy: sysusers\.extra/,
+    );
+
+    await assert.rejects(
+      readSystemBootPolicyCatalogs(
+        async (command) => {
+          if (command.endsWith('systemd-creds')) {
+            return { stdout: 'No credentials passed to system.\n', stderr: '', code: 0 };
+          }
+          const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+          const source = `/usr/lib/${kind}.d/example.conf`;
+          return {
+            stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+            stderr: '',
+            code: 0,
+          };
+        },
+        systemdUnitPathFs(
+          new Map([['/etc/credstore', [directoryEntry('tmpfiles.extra', false)]]]),
+          { filesByPath: sourceFiles },
+        ),
+      ),
+      /credential store can inject boot policy: \/etc\/credstore\/tmpfiles\.extra/,
+    );
+  });
+
+  it('upgrades source-associated managed boot policy from its trusted old contents', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts.find(
+      ({ sourceName }) => sourceName === 'webex-generic-account-bot.tmpfiles.conf',
+    );
+    const desired = await fs.readFile(artifact.source, 'utf8');
+    const existing = desired.replace(
+      'd /var/lib/webex-generic-account-bot/state 0700',
+      'd /var/lib/webex-generic-account-bot/state 0750',
+    );
+    assert.notEqual(existing, desired);
+    await fs.mkdir(path.dirname(artifact.target), { recursive: true, mode: 0o755 });
+    await fs.writeFile(artifact.target, existing, { mode: 0o644 });
+    await fs.chmod(artifact.target, 0o644);
+    const existingCatalogs = await sourceAssociatedBootPolicyCatalogs(
+      fixture.plan,
+      new Map([[artifact.targetPath, existing]]),
+    );
+    const desiredCatalogs = await sourceAssociatedBootPolicyCatalogs(fixture.plan);
+
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        applied: true,
+        bootPolicySequence: [existingCatalogs, desiredCatalogs],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    assert.equal(await fs.readFile(artifact.target, 'utf8'), desired);
   });
 
   it('preserves stale candidates in dry-run and removes them before apply', async (context) => {
@@ -861,6 +941,40 @@ describe('guarded host provisioner execution', () => {
       ),
       /too many policy directory entries/,
     );
+  });
+
+  it('validates every stale candidate before deleting any candidate', async (context) => {
+    const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const directory = path.dirname(artifact.target);
+    const prefix = `.${path.basename(artifact.target)}.provision-`;
+    const validName = `${prefix}00000000-0000-4000-8000-000000000099.tmp`;
+    const malformedName = `${prefix}not-a-uuid.tmp`;
+    const valid = path.join(directory, validName);
+    await fs.mkdir(directory, { recursive: true, mode: 0o755 });
+    await fs.writeFile(valid, 'valid stale candidate\n', { mode: 0o600 });
+    await fs.writeFile(path.join(directory, malformedName), 'malformed candidate\n', { mode: 0o600 });
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'opendir') return target[property];
+        return async (candidate) => {
+          if (candidate !== directory) return target.opendir(candidate);
+          return asyncDirectory([
+            directoryEntry(validName, false),
+            directoryEntry(malformedName, false),
+          ]);
+        };
+      },
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({ fsApi, applied: true }),
+      ),
+      /stale policy candidate name is malformed/,
+    );
+    assert.equal(await fs.readFile(valid, 'utf8'), 'valid stale candidate\n');
   });
 
   it('installs the fixed set transactionally and converges without enabling units', async (context) => {
@@ -962,12 +1076,19 @@ describe('guarded host provisioner execution', () => {
 
   it('rejects untrusted sources before creating target directories', async (context) => {
     const fixture = await provisionFixture(context);
+    const artifact = fixture.plan.artifacts[0];
+    const candidate = path.join(
+      path.dirname(artifact.target),
+      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000099.tmp`,
+    );
+    await fs.mkdir(path.dirname(candidate), { recursive: true, mode: 0o755 });
+    await fs.writeFile(candidate, 'preserved before preflight\n', { mode: 0o600 });
     await fs.chmod(fixture.plan.artifacts[0].source, 0o664);
     await assert.rejects(
       provisionHost({ apply: true }, fixture.dependencies({ applied: true })),
       /policy file metadata is not trusted/,
     );
-    await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+    assert.equal(await fs.readFile(candidate, 'utf8'), 'preserved before preflight\n');
   });
 
   it('rejects active or enabled managed units before writing targets', async (context) => {
@@ -1210,6 +1331,92 @@ describe('guarded host provisioner execution', () => {
       ),
       /external systemd policy references a managed unit/,
     );
+
+    const unresolvedIdentityTemplate = '/etc/systemd/system/external@.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{ name: 'external@.service' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              unresolvedIdentityTemplate,
+              Buffer.from('[Service]\nGroup=%i\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const sysusersDropInDirectory =
+      '/etc/systemd/system/systemd-sysusers.service.d';
+    const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'systemd-sysusers.service.d',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [sysusersDropInDirectory, [{ name: '50-extra-policy.conf' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              sysusersDropIn,
+              Buffer.from('[Service]\nLoadCredential=sysusers.extra:/root/policy\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy injects a boot policy credential/,
+    );
+
+    let vendorImportCommandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          vendorImportCommandCalls += 1;
+          throw new Error('systemctl reached after vendor credential import audit');
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/usr/lib/systemd/system', [
+              { name: 'systemd-sysusers.service' },
+              { name: 'systemd-tmpfiles-setup.service' },
+              { name: 'user@.service' },
+            ]],
+          ]),
+          {
+            filesByPath: new Map([
+              [
+                '/usr/lib/systemd/system/systemd-sysusers.service',
+                Buffer.from('[Service]\nImportCredential=sysusers.*\n'),
+              ],
+              [
+                '/usr/lib/systemd/system/systemd-tmpfiles-setup.service',
+                Buffer.from('[Service]\nImportCredential=tmpfiles.*\n'),
+              ],
+              [
+                '/usr/lib/systemd/system/user@.service',
+                Buffer.from('[Service]\nUser=%i\n'),
+              ],
+            ]),
+          },
+        ),
+      ),
+      /systemctl reached after vendor credential import audit/,
+    );
+    assert.equal(vendorImportCommandCalls, 2);
 
     const implicitDynamicUserUnit = '/etc/systemd/system/webex-config-deploy.service';
     await assert.rejects(
@@ -2108,6 +2315,20 @@ async function provisionFixture(context) {
         },
       };
     },
+  };
+}
+
+async function sourceAssociatedBootPolicyCatalogs(plan, overrides = new Map()) {
+  const catalogs = { sysusers: [], tmpfiles: [] };
+  for (const artifact of plan.artifacts) {
+    if (!Object.hasOwn(catalogs, artifact.kind)) continue;
+    const contents = overrides.get(artifact.targetPath)
+      ?? await fs.readFile(artifact.source, 'utf8');
+    catalogs[artifact.kind].push(`# ${artifact.targetPath}\n${contents}`);
+  }
+  return {
+    sysusers: catalogs.sysusers.join('\n'),
+    tmpfiles: catalogs.tmpfiles.join('\n'),
   };
 }
 

@@ -173,20 +173,25 @@ superseded_by:
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion,
-  named/implicit-DynamicUser assignments, pre-allocation rejection of
-  static-range numeric identities, and launcher-instance
+  named/implicit-DynamicUser assignments, unresolved identity instance
+  specifiers outside the exact vendor user-manager assignment, pre-allocation
+  rejection of static-range numeric identities,
+  boot-policy credential injection plus current system and credential-store
+  inputs, and launcher-instance
   references, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
   auditing with C-escape, normalised specifier/glob-prefix and copy-source
-  paths, path-derived-ID, allocation-range rejection, owner modifiers, numeric
+  paths, source-associated managed-policy upgrades, path-derived-ID,
+  allocation-range rejection, owner modifiers, numeric
   identities, ACL principals, and symlink targets, protected root, identity
   databases and NSS policy, fixed systemd system-unit load paths, and installed
   policy targets, traversal-preserving ancestor metadata, recursive parent
   handling, and root-owned stable source
   metadata for every effective catalogue file,
-  trusted re-exec paths, bounded streamed stale candidate cleanup and unit
+  trusted re-exec paths, bounded post-preflight stale candidate collection with
+  all-before-any validation and unit
   discovery, recovery-before-write dormancy checks, immediate recovery-time
   manager reload, explicit complete-target stale-cache convergence recovery,
   fail-closed recovery with full target-directory durability and a journal

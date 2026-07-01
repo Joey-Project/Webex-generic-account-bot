@@ -243,8 +243,13 @@ root-owned and non-writable. Unit-name specifiers are expanded against each
 external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
 policy may not assign a managed user or group by name or implicit DynamicUser
-unit name, and external units may not use numeric identities from the static
-system-ID range before allocation. The merged systemd sysusers and tmpfiles
+unit name, unresolved instance specifiers are forbidden in identity directives
+except for the exact vendor `user@.service` user-manager assignment, and
+external units may not use numeric identities from the static system-ID
+range before allocation. Direct boot-policy credential injection is rejected;
+the standard vendor `ImportCredential=` consumers remain allowed only after the
+current system credential set and all plaintext and encrypted credential stores
+prove that `sysusers.extra` and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, lexical path normalisation, copy-source, path-derived-ID,
@@ -257,7 +262,10 @@ load path, every installed policy target, the transaction journal, and the
 shared lock are protected from external tmpfiles policy; ancestor maintenance must preserve
 traversal for the managed accounts. Only the reviewed Webex lines may affect
 managed identities, IDs, or paths, which keeps the identity and filesystem
-boundary durable across reboot.
+boundary durable across reboot. Catalogue source markers bind each active line
+to its policy file, allowing a trusted installed managed version to be replaced
+by the reviewed desired version without accepting the same line from an
+unmanaged source.
 The same host-wide `flock` used by config deployment serialises the complete apply, and
 the re-executed process verifies the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
@@ -272,7 +280,9 @@ a bounded number of directory entries and removes only bounded, exact-name,
 trusted stale candidates left by an interrupted prior run, including a
 root-owned candidate whose initial mode was narrowed by umask before chmod. The
 shared lock applies the same bounded interrupted-creation recovery before
-converging exact metadata. It installs the complete
+converging exact metadata. Stale candidates are collected and fully validated
+only after the host trust preflight; no candidate is removed until the complete
+bounded candidate set is accepted. It installs the complete
 policy file set transactionally,
 applies only the fixed sysusers and tmpfiles files, reloads the manager, and
 verifies hashes, ownership, modes, account separation, load state, and that no
