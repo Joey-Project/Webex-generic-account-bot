@@ -243,7 +243,8 @@ root-owned and non-writable. Unit-name specifiers are expanded against each
 external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
 type-level and dash-prefix drop-ins keep unit-name specifiers symbolic because
-their eventual owner is not a single concrete unit. External
+their eventual owner is not a single concrete unit, including across linked
+physical policy files. External
 policy may not assign a managed user or group by name or implicit DynamicUser
 unit name, unresolved dynamic specifiers are forbidden in identity directives
 except for the exact vendor `user@.service` user-manager assignment when both
@@ -275,6 +276,8 @@ boundary durable across reboot. Catalogue source markers bind each active line
 to its policy file, allowing a trusted installed managed version to be replaced
 by the reviewed desired version without accepting the same line from an
 unmanaged source.
+The legacy compatibility rule accepts only the exact `/var/run` link text
+`../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
 The trusted Node and provisioner entrypoints are verified before first-run lock
 metadata can be created or converged, and the re-executed process then verifies

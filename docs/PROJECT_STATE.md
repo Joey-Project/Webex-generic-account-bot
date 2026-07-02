@@ -106,7 +106,8 @@
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
   dangling-alias parents, `d_type`-independent entry classification, unit-name
-  specifier expansion with symbolic shared dash-prefix drop-ins,
+  specifier expansion with symbolic shared dash-prefix drop-ins preserved
+  across physical-file symlinks,
   named/implicit-DynamicUser identities, unresolved
   dynamic-specifier rejection in identity directives with only the exact
   physical-file/logical-owner vendor user-manager identity assignment permitted,
@@ -122,7 +123,8 @@
   systemd system-unit load paths, and installed policy paths from owner-modifier,
   numeric-identity, ACL-principal, symlink-target, traversal-restricting ancestor
   metadata, cleanup, replacement, and recursive rules, allocation ranges,
-  normalised glob and trailing-slash paths including legacy `/var/run` alias globs,
+  normalised glob and trailing-slash paths including legacy `/var/run` alias
+  globs and exact compatibility-link text,
   source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
   trusted re-exec paths validated before first-run lock convergence,

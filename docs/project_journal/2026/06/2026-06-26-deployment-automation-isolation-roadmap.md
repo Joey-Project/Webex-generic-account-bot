@@ -173,7 +173,7 @@ superseded_by:
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion with
-  symbolic shared dash-prefix drop-ins,
+  symbolic shared dash-prefix drop-ins preserved across physical-file symlinks,
   named/implicit-DynamicUser assignments, unresolved dynamic identity
   specifiers outside the physical-file/logical-owner-bound vendor user-manager
   assignment plus symbolic managed-unit reachability checks for all unresolved
@@ -188,7 +188,8 @@ superseded_by:
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
   auditing with C-escape, normalised specifier/glob-prefix and trailing slash,
-  including glob access through the legacy `/var/run` alias, and copy-source
+  including glob access through the legacy `/var/run` alias and exact
+  compatibility-link text, and copy-source
   paths, source-associated managed-policy upgrades, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
   identities, ACL principals, and symlink targets, protected root, identity

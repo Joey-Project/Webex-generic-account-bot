@@ -2151,10 +2151,7 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   }
   const argument = fields[6];
   if (type === 'L' && policyPath === '/var/run' && argument !== undefined) {
-    const resolvedTarget = argument.startsWith('/')
-      ? argument
-      : path.posix.resolve(path.posix.dirname(policyPath), argument);
-    if (resolvedTarget === '/run') return false;
+    if (['../run', '/run'].includes(argument)) return false;
   }
   if (pathFieldTouchesProtected(
     policyPath,
@@ -2840,7 +2837,9 @@ function systemdPolicyUnitNames(directory, entryName) {
 
 function mergeSystemdUnitNames(unitNames, candidate) {
   const merged = new Set(unitNames);
-  if (SYSTEMD_UNIT_NAME_PATTERN.test(candidate)) merged.add(candidate);
+  if (unitNames.size > 0 && SYSTEMD_UNIT_NAME_PATTERN.test(candidate)) {
+    merged.add(candidate);
+  }
   return merged;
 }
 

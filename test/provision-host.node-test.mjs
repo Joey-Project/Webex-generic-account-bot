@@ -679,6 +679,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'R /run/ - - - -'],
       ['tmpfiles', 'R /var/run/ - - - -'],
       ['tmpfiles', 'R /var/r?n/systemd/system/* - - - -'],
+      ['tmpfiles', 'L /var/run - - - - ../run/child/..'],
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
@@ -1426,6 +1427,40 @@ describe('guarded host provisioner execution', () => {
               dashPrefixDropIn,
               Buffer.from('[Service]\nUser=%J\n'),
             ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const sharedDropInDirectory = '/etc/systemd/system/external-.service.d';
+    const sharedDropIn = path.join(sharedDropInDirectory, '50-identity.conf');
+    const sharedDropInTarget = '/usr/lib/systemd/system/benign.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-.service.d',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [sharedDropInDirectory, [{
+              name: '50-identity.conf',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              sharedDropInTarget,
+              Buffer.from('[Service]\nUser=%N\n'),
+            ]]),
+            symlinksByPath: new Map([[sharedDropIn, sharedDropInTarget]]),
           },
         ),
       ),
