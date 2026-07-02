@@ -316,20 +316,22 @@ overrides are rejected before terminal handling can skip the vendor provenance
 check. External unit execution directives may not invoke
 `systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
 or use `systemctl` with a literal, path-qualified, or specifier-reachable managed
-unit target. Unscoped mutating commands such as `preset-all`, manager reloads,
-and `--marked` operations are also rejected, including through linked helper
-units, unit-name specifier expansion, or unresolved template-instance
-executable and argument specifiers.
+unit target. Unit-file mutations with path arguments are rejected because an
+out-of-path file can hide a managed `Alias=`. Unscoped mutating commands such
+as `preset-all`, manager reloads, and `--marked` operations are also rejected,
+including through linked helper units, unit-name specifier expansion, or
+unresolved template-instance executable and argument specifiers.
 Administrator, runtime, generator, and local-vendor `Exec*` directives may not
 invoke a shell. Shell execution is accepted only from a direct package-owned
 vendor unit or its single-hop same-name dependency link; direct boot-policy
 tools and managed-unit control remain forbidden even in those vendor sources.
-The systemd `|` shell prefix, unresolved executable specifiers, and standard
-shell-family executable names are all treated as shell execution.
+The systemd `|` shell prefix on the first or any semicolon-delimited later
+command, unresolved executable specifiers, and standard shell-family executable
+names are all treated as shell execution.
 `env -S`/`--split-string` argv reinterpretation, including every accepted GNU
 long-option abbreviation, is rejected. `systemctl` may not set protected
-plaintext or encrypted system credentials through inline, path, or
-specifier-expanded arguments. Non-vendor units also cannot claim protected
+plaintext or encrypted system credentials through inline, path,
+option-interleaved, or specifier-expanded arguments. Non-vendor units also cannot claim protected
 Webex paths through systemd-managed directory source or alias directives.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis. The runtime system-credential
@@ -341,9 +343,12 @@ The same host-wide `flock` used by config deployment serialises the complete app
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
-lock. Dry-run, recovery, and apply parse bounded `/proc/self/mountinfo` data;
+lock. Dry-run, recovery, and apply read and parse bounded
+`/proc/self/mountinfo` data;
 managed tmpfiles targets, descendants, and non-standard redirected ancestors
-must not be mount points before any tmpfiles mutation. The process then verifies
+must not be mount points before any tmpfiles mutation. Standard ancestor mount
+points must have a unique filesystem device/root identity so filesystem-root
+bind mounts cannot masquerade as ordinary mounts. The process then verifies
 the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a

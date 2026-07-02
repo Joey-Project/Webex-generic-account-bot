@@ -209,7 +209,9 @@ superseded_by:
   directory source or alias claims over protected Webex paths refused,
   path-qualified and unscoped mutating `systemctl` operations and non-regular
   boot-policy consumer overrides rejected, `/var/run` rewritten before path
-  normalisation, unexpected managed-path mounts refused,
+  normalisation, path-based unit-file aliases, option-interleaved credentials,
+  later-command shell prefixes, unbounded mountinfo reads, and duplicate-root
+  managed-path mounts refused,
   `/run/credentials/@system` protected from tmpfiles, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency

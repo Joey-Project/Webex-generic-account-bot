@@ -294,6 +294,20 @@ const SYSTEMCTL_UNSCOPED_MUTATION_VERBS = new Set([
   'switch-root',
   'unset-environment',
 ]);
+const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
+  'add-requires',
+  'add-wants',
+  'disable',
+  'edit',
+  'enable',
+  'link',
+  'mask',
+  'preset',
+  'reenable',
+  'revert',
+  'set-default',
+  'unmask',
+]);
 const TRUSTED_MANAGED_MOUNT_ANCESTORS = new Set([
   '/',
   '/etc',
@@ -2821,7 +2835,13 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
     .flatMap(({ source }) => policyCatalogLines(source.contents))
     .map((line) => parseSystemdFields(line)[1])
     .map(normaliseBootPolicyPath));
-  for (const { root, mountPoint } of parseMountInfo(mountInfo)) {
+  const mounts = parseMountInfo(mountInfo);
+  const mountIdentityCounts = new Map();
+  for (const { device, root } of mounts) {
+    const identity = `${device}\0${root}`;
+    mountIdentityCounts.set(identity, (mountIdentityCounts.get(identity) ?? 0) + 1);
+  }
+  for (const { device, root, mountPoint } of mounts) {
     for (const managedPath of managedPaths) {
       if (mountPoint === managedPath || mountPoint.startsWith(`${managedPath}/`)) {
         throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
@@ -2830,7 +2850,12 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
         ? managedPath.startsWith('/')
         : managedPath.startsWith(`${mountPoint}/`);
       if (!mountIsAncestor) continue;
-      if (TRUSTED_MANAGED_MOUNT_ANCESTORS.has(mountPoint) && root === '/') continue;
+      const uniqueFilesystemRoot = mountIdentityCounts.get(`${device}\0${root}`) === 1;
+      if (
+        TRUSTED_MANAGED_MOUNT_ANCESTORS.has(mountPoint)
+        && root === '/'
+        && (mountPoint === '/' || uniqueFilesystemRoot)
+      ) continue;
       throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
     }
   }
@@ -2857,10 +2882,15 @@ function parseMountInfo(mountInfo) {
     }
     const root = decodeMountInfoPath(fields[3]);
     const mountPoint = decodeMountInfoPath(fields[4]);
+    const device = fields[2];
+    if (!/^[0-9]+:[0-9]+$/.test(device)) {
+      throw new Error('mountinfo device is malformed');
+    }
     if (!path.posix.isAbsolute(root) || !path.posix.isAbsolute(mountPoint)) {
       throw new Error('mountinfo path is not absolute');
     }
     return Object.freeze({
+      device,
       root: path.posix.normalize(root),
       mountPoint: path.posix.normalize(mountPoint),
     });
@@ -3449,10 +3479,21 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 
 function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
-  return command !== null
-    && systemdExecInvokes(command, 'systemctl')
-    && (
+  if (command === null || !systemdExecInvokes(command, 'systemctl')) return false;
+  const unitFileMutation = command.tokens.some((token) => (
+    SYSTEMCTL_UNIT_FILE_MUTATION_VERBS.has(token)
+    || systemdSpecifierFieldCouldMatch(
+      token,
+      [...SYSTEMCTL_UNIT_FILE_MUTATION_VERBS],
+    )
+  ));
+  const externalUnitPath = command.tokens.some((token) => (
+    token.includes('/')
+    && path.posix.basename(token.replace(/^[-@:+!|]+/, '')) !== 'systemctl'
+  ));
+  return (
       command.tokens.some(systemctlUnitFieldCouldMatch)
+      || (unitFileMutation && externalUnitPath)
       || command.tokens.some((token) => (
         SYSTEMCTL_UNSCOPED_MUTATION_VERBS.has(token)
         || systemdSpecifierFieldCouldMatch(
@@ -3462,7 +3503,7 @@ function systemdPolicyInvokesManagedUnitControl(value) {
         || token === '--marked'
         || systemdSpecifierFieldCouldMatch(token, ['--marked'])
       ))
-    );
+  );
 }
 
 function systemdPolicyInvokesShell(value) {
@@ -3478,8 +3519,10 @@ function systemdPolicyInvokesShell(value) {
     || shellExecutableName(executableName)
   ) return true;
   return tokens.some((token) => {
+    const prefixes = token.match(/^[-@:+!|]+/)?.[0] ?? '';
     const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
-    return shellExecutableName(name)
+    return prefixes.includes('|')
+      || shellExecutableName(name)
       || systemdSpecifierFieldCouldMatch(
         name,
         [...SYSTEMD_SHELL_EXECUTABLES],
@@ -3543,19 +3586,16 @@ function systemdPolicyInjectsSystemCredential(value) {
     )
   ));
   if (verbOffset < 0) return false;
-  const credentialToken = command.tokens
-    .slice(verbOffset + 1)
-    .find((token) => token !== '--' && !token.startsWith('-'));
-  if (!credentialToken) return false;
-  const credential = credentialToken.slice(0, credentialToken.indexOf('=') < 0
-    ? credentialToken.length
-    : credentialToken.indexOf('='));
-  return credential.includes('%')
-    || credentialNameCanInjectHostPolicy(credential)
-    || systemdSpecifierFieldCouldMatch(credential, [
-      ...BOOT_POLICY_CREDENTIAL_NAMES,
-      ...BOOT_POLICY_CREDENTIAL_PREFIXES.map((prefix) => `${prefix}root`),
-    ]);
+  return command.tokens.slice(verbOffset + 1).some((token) => {
+    const credential = token.slice(0, token.indexOf('=') < 0
+      ? token.length
+      : token.indexOf('='));
+    return credentialNameCanInjectHostPolicy(credential)
+      || systemdSpecifierFieldCouldMatch(credential, [
+        ...BOOT_POLICY_CREDENTIAL_NAMES,
+        ...BOOT_POLICY_CREDENTIAL_PREFIXES.map((prefix) => `${prefix}root`),
+      ]);
+  });
 }
 
 function parseSystemdExecCommand(value) {
@@ -4195,7 +4235,11 @@ function provisionDependencies(dependencies) {
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
       ?? (() => readSystemBootPolicyCatalogs(runCommand, fsApi)),
     readMountInfo: dependencies.readMountInfo
-      ?? (() => fsApi.readFile('/proc/self/mountinfo')),
+      ?? (() => readBoundedProcFile(
+        '/proc/self/mountinfo',
+        MAX_MOUNTINFO_BYTES,
+        fsApi,
+      )),
     readUnitStates: dependencies.readUnitStates
       ?? ((units, identitySnapshot) => readSystemUnitStates(
         units,

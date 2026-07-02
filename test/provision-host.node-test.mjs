@@ -881,6 +881,7 @@ describe('guarded host provisioner execution', () => {
       ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
       ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
       ['/redirected-var-lib', '/var/lib'],
+      ['/', '/etc'],
       ['/', '/var/lib/webex-generic-account-bot/state/nested'],
     ]) {
       const commands = [];
@@ -2107,12 +2108,13 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
-    for (const command of [
+    for (const [index, command] of [
       'systemctl --preset-mode=enable-only preset-all',
       'systemctl daemon-reload',
       'systemctl --marked reload-or-restart',
-    ]) {
-      const name = `external-global-systemctl-${command.length}.service`;
+      'systemctl enable /opt/benign.service',
+    ].entries()) {
+      const name = `external-global-systemctl-${index}.service`;
       const target = `/etc/systemd/system/${name}`;
       await assert.rejects(
         readSystemUnitStates(
@@ -2195,6 +2197,10 @@ describe('guarded host provisioner execution', () => {
         'set-credential-encrypted tmpfiles.extra /tmp/tmpfiles.extra',
       ],
       [
+        'set-credential-option-value',
+        'set-credential --property Description sysusers.extra /tmp/sysusers.extra',
+      ],
+      [
         'set-credential-template',
         'set-credenti%ial sysusers.extra /tmp/sysusers.extra',
       ],
@@ -2268,6 +2274,11 @@ describe('guarded host provisioner execution', () => {
       [
         'external-shell-prefix.service',
         '[Service]\nExecStart=|/usr/bin/echo safe\n',
+        null,
+      ],
+      [
+        'external-second-shell-prefix.service',
+        '[Service]\nExecStart=/usr/bin/true ; |/usr/bin/echo safe\n',
         null,
       ],
       ['external-ash.service', "[Service]\nExecStart=/bin/ash -c 'echo safe'\n", null],
