@@ -185,9 +185,10 @@ superseded_by:
   host-policy credential assignment rejection with
   exact/trailing-glob/glob-rename-prefix-aware selectors, fail-closed complex
   wildcard handling, physical-file/logical-owner vendor binding, current
-  system and credential-store inputs, and systemd 258 `userdb.user.*` and
-  `userdb.group.*` rejection across system credentials, credential stores,
-  tmpfiles, and unit credential directives, plus launcher-instance reference
+  system and credential-store inputs, `passwd.hashed-password.*`,
+  `passwd.plaintext-password.*`, and `passwd.shell.*` rejection, and systemd
+  258 `userdb.user.*` and `userdb.group.*` rejection across system credentials,
+  credential stores, tmpfiles, and unit credential directives, plus launcher-instance reference
   rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

@@ -119,9 +119,11 @@
   of static-range numeric identities, host-policy credential assignment
   rejection with exact/trailing-glob/glob-rename-prefix-aware selectors,
   fail-closed complex wildcard handling, physical-file/logical-owner vendor
-  binding, system-credential and credential-store absence checks, and systemd
-  258 `userdb.user.*` and `userdb.group.*` prefix rejection across credential
-  and tmpfiles channels, plus launcher-instance reference rejection. Semantic
+  binding, system-credential and credential-store absence checks,
+  `passwd.hashed-password.*`, `passwd.plaintext-password.*`, and
+  `passwd.shell.*` rejection, plus systemd 258 `userdb.user.*` and
+  `userdb.group.*` prefix rejection across credential and tmpfiles channels,
+  plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
   auditing that protects root, runtime, identity databases, NSS policy, and

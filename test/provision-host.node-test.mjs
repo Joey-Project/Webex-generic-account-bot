@@ -941,6 +941,9 @@ describe('guarded host provisioner execution', () => {
 
     for (const credential of [
       'sysusers.extra',
+      'passwd.hashed-password.webex-generic-account-bot',
+      'passwd.plaintext-password.webex-config-deploy',
+      'passwd.shell.webex-generic-account-bot',
       'userdb.user.webex-generic-account-bot',
       'userdb.group.webex-codex-launch',
     ]) {
@@ -966,6 +969,9 @@ describe('guarded host provisioner execution', () => {
 
     for (const credential of [
       'tmpfiles.extra',
+      'passwd.hashed-password.webex-generic-account-bot',
+      'passwd.plaintext-password.webex-config-deploy',
+      'passwd.shell.webex-generic-account-bot',
       'userdb.user.injected',
       'userdb.group.injected',
     ]) {
@@ -1611,6 +1617,10 @@ describe('guarded host provisioner execution', () => {
     const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
     for (const policy of [
       'LoadCredential=sysusers.extra:/root/policy',
+      'LoadCredential=passwd.hashed-password.webex-generic-account-bot:/root/password',
+      'SetCredential=passwd.plaintext-password.webex-config-deploy:secret',
+      'ImportCredential=passwd.shell.*',
+      'ImportCredential=payload.*:passwd.shell.',
       'SetCredential=userdb.user.injected:{}',
       'ImportCredential=payload:sysusers.extra',
       'ImportCredential=payload.*:sysusers.',

@@ -165,7 +165,10 @@ const BOOT_POLICY_CREDENTIAL_NAMES = Object.freeze([
   'sysusers.extra',
   'tmpfiles.extra',
 ]);
-const USERDB_CREDENTIAL_PREFIXES = Object.freeze([
+const BOOT_POLICY_CREDENTIAL_PREFIXES = Object.freeze([
+  'passwd.hashed-password.',
+  'passwd.plaintext-password.',
+  'passwd.shell.',
   'userdb.user.',
   'userdb.group.',
 ]);
@@ -2096,7 +2099,7 @@ async function assertNoBootPolicyCredentialStoreFiles(fsApi) {
 
 function credentialNameCanInjectHostPolicy(name) {
   return BOOT_POLICY_CREDENTIAL_NAMES.includes(name)
-    || USERDB_CREDENTIAL_PREFIXES.some((prefix) => name.startsWith(prefix));
+    || BOOT_POLICY_CREDENTIAL_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 async function validateBootPolicySources(kind, catalog, fsApi) {
@@ -2985,7 +2988,7 @@ function credentialSelectorCanInjectHostPolicy(selector, wildcardOffset) {
 
 function credentialPrefixCanInjectHostPolicy(prefix) {
   return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => name.startsWith(prefix))
-    || USERDB_CREDENTIAL_PREFIXES.some((managedPrefix) => (
+    || BOOT_POLICY_CREDENTIAL_PREFIXES.some((managedPrefix) => (
       managedPrefix.startsWith(prefix) || prefix.startsWith(managedPrefix)
     ));
 }

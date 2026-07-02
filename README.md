@@ -257,14 +257,16 @@ the physical file and logical unit owner match. Unresolved dynamic specifiers
 in unit-reference directives are symbolically checked against every managed
 unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
 range before allocation. Direct host-policy credential injection is rejected,
-including systemd 258 `userdb.user.*` and `userdb.group.*` credentials that
-could materialise static records under `/etc/userdb`; credential import
+including `passwd.hashed-password.*`, `passwd.plaintext-password.*`, and
+`passwd.shell.*` credentials that could make managed accounts login-capable,
+plus systemd 258 `userdb.user.*` and `userdb.group.*` credentials that could
+materialise static records under `/etc/userdb`; credential import
 selectors are evaluated across exact, trailing-glob, and
 glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
 exact physical-file/logical-owner pair after the current system credential set
 and all plaintext and encrypted credential stores prove that `sysusers.extra`
-and `tmpfiles.extra` plus all userdb credential prefixes are absent. Tmpfiles
+and `tmpfiles.extra` plus all passwd and userdb credential prefixes are absent. Tmpfiles
 may perform only tightly bounded root-owned maintenance on credential-store
 root directories; child paths, globs, and modified operation types are
 rejected. The merged systemd sysusers and tmpfiles
