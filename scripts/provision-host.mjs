@@ -230,12 +230,17 @@ const BOOT_POLICY_EXECUTABLES = new Set([
   'systemd-tmpfiles',
 ]);
 const SYSTEMD_SHELL_EXECUTABLES = new Set([
+  'ash',
   'bash',
   'busybox',
   'csh',
   'dash',
   'fish',
   'ksh',
+  'mksh',
+  'nu',
+  'pdksh',
+  'sash',
   'sh',
   'tcsh',
   'zsh',
@@ -3306,12 +3311,26 @@ function systemdPolicyInvokesShell(value) {
   const directive = value.slice(0, separator).trim();
   if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
+  const executable = fields[0] ?? '';
+  const prefixes = executable.match(/^[-@:+!|]+/)?.[0] ?? '';
+  const executableName = path.basename(executable.replace(/^[-@:+!|]+/, ''));
+  if (
+    prefixes.includes('|')
+    || hasUnresolvedSystemdSpecifier(executableName)
+    || shellExecutableName(executableName)
+  ) return true;
   const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
   return tokens.some((token) => {
     const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
-    return SYSTEMD_SHELL_EXECUTABLES.has(name)
+    return shellExecutableName(name)
       || systemdSpecifierFieldCouldMatch(name, [...SYSTEMD_SHELL_EXECUTABLES]);
   });
+}
+
+function shellExecutableName(name) {
+  return name === 'busybox'
+    || name === 'nu'
+    || /^[A-Za-z0-9_.+-]*sh$/.test(name);
 }
 
 function systemctlUnitFieldCouldMatch(field) {

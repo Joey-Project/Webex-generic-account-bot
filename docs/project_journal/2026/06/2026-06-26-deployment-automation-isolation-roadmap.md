@@ -201,7 +201,9 @@ superseded_by:
   and argument specifier expansion, including unresolved template instances,
   plus external `systemctl` commands with specifier-reachable managed-unit
   targets, implicit service suffixes, or glob targets, shell `Exec*` directives
-  restricted to direct or single-hop same-name package-vendor provenance, and
+  including the `|` prefix, unresolved executable specifiers, and standard
+  shell-family names restricted to direct or single-hop same-name package-vendor
+  provenance, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency
   directories across all managed units plus

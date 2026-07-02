@@ -2060,25 +2060,45 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
-    const shellUnit = '/etc/systemd/system/external-shell.service';
-    await assert.rejects(
-      readSystemUnitStates(
-        MANAGED_UNITS,
-        async () => ({ stdout: '', stderr: '', code: 0 }),
-        systemdUnitPathFs(
-          new Map([['/etc/systemd/system', [{ name: 'external-shell.service' }]]]),
-          {
-            filesByPath: new Map([[
-              shellUnit,
-              Buffer.from(
-                "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemd-\"sysusers\" /etc/rogue.conf'\n",
-              ),
-            ]]),
-          },
+    for (const [name, policy, activatorPolicy] of [
+      [
+        'external-shell.service',
+        "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemd-\"sysusers\" /etc/rogue.conf'\n",
+        null,
+      ],
+      [
+        'external-shell-prefix.service',
+        '[Service]\nExecStart=|/usr/bin/echo safe\n',
+        null,
+      ],
+      ['external-ash.service', "[Service]\nExecStart=/bin/ash -c 'echo safe'\n", null],
+      ['external-mksh.service', "[Service]\nExecStart=/bin/mksh -c 'echo safe'\n", null],
+      [
+        'external-shell@.service',
+        "[Service]\nExecStart=/usr/bin/mk%i -c 'echo safe'\n",
+        '[Unit]\nWants=external-shell@sh.service\n',
+      ],
+    ]) {
+      const shellUnit = `/etc/systemd/system/${name}`;
+      const activator = '/etc/systemd/system/external-shell-trigger.service';
+      const entries = [{ name }];
+      const files = [[shellUnit, Buffer.from(policy)]];
+      if (activatorPolicy !== null) {
+        entries.push({ name: 'external-shell-trigger.service' });
+        files.push([activator, Buffer.from(activatorPolicy)]);
+      }
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', entries]]),
+            { filesByPath: new Map(files) },
+          ),
         ),
-      ),
-      /external systemd policy invokes a shell/,
-    );
+        /external systemd policy invokes a shell/,
+      );
+    }
 
     const helperWants = '/etc/systemd/system/external.target.wants';
     const helperLink = `${helperWants}/external-helper.service`;

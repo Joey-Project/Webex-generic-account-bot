@@ -320,6 +320,8 @@ Administrator, runtime, generator, and local-vendor `Exec*` directives may not
 invoke a shell. Shell execution is accepted only from a direct package-owned
 vendor unit or its single-hop same-name dependency link; direct boot-policy
 tools and managed-unit control remain forbidden even in those vendor sources.
+The systemd `|` shell prefix, unresolved executable specifiers, and standard
+shell-family executable names are all treated as shell execution.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
