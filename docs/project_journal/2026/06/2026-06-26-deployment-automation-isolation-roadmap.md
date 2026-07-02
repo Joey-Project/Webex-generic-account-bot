@@ -241,8 +241,11 @@ superseded_by:
   `.conf` entries except stable root-owned `/dev/null` masks, persistent mount
   protection for identity, userdb, credential, unit, boot-policy, fixed-command,
   proc-evidence, transaction, and lock surfaces, rejection of external bind
-  aliases and protected `What=` sources, an initial-PID-namespace host-systemd
-  gate, stable mount snapshots around sysusers/tmpfiles, and
+  aliases and protected or symlink-resolved `What=`/`Where=` sources, mountinfo
+  `root=` alias detection, initial user-map/PID-namespace host-systemd gates,
+  FD-bound command entrypoints, a private non-propagating apply mount namespace,
+  stable mount snapshots around sysusers/tmpfiles, final identity-bound runtime
+  ownership revalidation, and
   pre-allocation rejection of unmaterialised external numeric UID, primary-GID,
   and group-GID claims,
   trusted re-exec paths plus a complete transaction-aware read-only host

@@ -166,10 +166,13 @@
   globs and exact compatibility-link text,
   source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
-  trusted re-exec paths, an initial-PID-namespace host-systemd/cgroup gate, and
+  trusted re-exec paths, initial user-map plus PID-namespace host-systemd/cgroup
+  gates, FD-bound `flock`/`unshare`/Node and fixed-command execution, a private
+  non-propagating apply mount namespace, and
   a complete transaction-aware read-only host preflight validated before
   first-run lock convergence, followed by protected mount snapshots around
-  sysusers/tmpfiles and repeated identity/policy checks under the held lock,
+  sysusers/tmpfiles and repeated identity/policy/runtime-ownership checks under
+  the held lock,
   managed-name-free stale candidates that remain recoverable through systemd
   policy scanning, fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full

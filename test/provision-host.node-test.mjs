@@ -31,6 +31,7 @@ import {
   readSystemIdentitySnapshot,
   readSystemBootPolicyCatalogs,
   readSystemUnitStates as readSystemUnitStatesImpl,
+  runFixedCommand,
   runCli,
   validateIdentityPolicy,
   validateNsswitchPolicy,
@@ -66,6 +67,7 @@ const SAFE_MOUNT_INFO = [
   '1 0 0:1 / / rw - overlay overlay rw',
   '2 1 0:2 / /run rw - tmpfs tmpfs rw',
   '3 1 8:1 / /var/lib rw - ext4 /dev/root rw',
+  '5 2 0:4 net:[4026532613] /run/docker/netns/test rw - nsfs nsfs rw',
   '',
 ].join('\n');
 
@@ -141,6 +143,24 @@ describe('guarded host provisioner policy', () => {
       assertSameMountNamespace(namespaceFs(42)),
       /not in PID 1 mount namespace/,
     );
+    await assert.doesNotReject(assertSameMountNamespace(namespaceFs(42), {
+      expectPrivate: true,
+      readMountInfo: async () => SAFE_MOUNT_INFO,
+    }));
+    await assert.rejects(
+      assertSameMountNamespace(namespaceFs(41), {
+        expectPrivate: true,
+        readMountInfo: async () => SAFE_MOUNT_INFO,
+      }),
+      /apply is not in a private mount namespace/,
+    );
+    await assert.rejects(
+      assertSameMountNamespace(namespaceFs(42), {
+        expectPrivate: true,
+        readMountInfo: async () => SAFE_MOUNT_INFO.replace(' / rw - ', ' / rw shared:1 - '),
+      }),
+      /mount propagation is not private/,
+    );
   });
 
   it('requires the initial PID namespace through the fixed lsns probe', async () => {
@@ -148,6 +168,8 @@ describe('guarded host provisioner policy', () => {
     const hostProcFs = boundedProcFileSystem(new Map([
       ['/proc/1/comm', 'systemd\n'],
       ['/proc/1/cgroup', '0::/init.scope\n'],
+      ['/proc/self/uid_map', '0 0 4294967295\n'],
+      ['/proc/self/gid_map', '0 0 4294967295\n'],
     ]));
     const runCommand = async (command, args) => {
       calls.push([command, args]);
@@ -173,9 +195,24 @@ describe('guarded host provisioner policy', () => {
         boundedProcFileSystem(new Map([
           ['/proc/1/comm', 'bwrap\n'],
           ['/proc/1/cgroup', '0::/\n'],
+          ['/proc/self/uid_map', '1002 0 1\n'],
+          ['/proc/self/gid_map', '1002 0 1\n'],
         ])),
       ),
       /not running under the host systemd manager/,
+    );
+    await assert.rejects(
+      assertInitialPidNamespace(
+        runCommand,
+        { pid: 2 },
+        boundedProcFileSystem(new Map([
+          ['/proc/1/comm', 'systemd\n'],
+          ['/proc/1/cgroup', '0::/init.scope\n'],
+          ['/proc/self/uid_map', '1002 0 1\n'],
+          ['/proc/self/gid_map', '1002 0 1\n'],
+        ])),
+      ),
+      /not in the initial user namespace/,
     );
   });
 
@@ -194,6 +231,11 @@ describe('guarded host provisioner policy', () => {
         '--conflict-exit-code',
         '75',
         '/run/webex-config-deploy/deploy-config.lock',
+        '/usr/bin/unshare',
+        '--mount',
+        '--propagation',
+        'private',
+        '--',
         '/trusted/node',
         '/trusted/provision-host.mjs',
         '--apply',
@@ -247,11 +289,21 @@ describe('guarded host provisioner policy', () => {
       runCli({
         argv: ['--apply'],
         lockHeld: true,
+        privateMountNamespace: true,
         verifyLockedApply: async () => {
           throw new Error('lock ownership is not proven');
         },
       }),
       /lock ownership is not proven/,
+    );
+    await assert.rejects(
+      runCli({
+        argv: ['--apply'],
+        lockHeld: true,
+        privateMountNamespace: false,
+        verifyLockedApply: async () => {},
+      }),
+      /requires a private mount namespace/,
     );
 
     const entrypoints = [];
@@ -292,7 +344,50 @@ describe('guarded host provisioner policy', () => {
     assert.deepEqual(ordering, [
       'verify:/trusted/node',
       'verify:/trusted/provision-host.mjs',
+      'verify:/usr/bin/flock',
+      'verify:/usr/bin/unshare',
       'preflight',
+    ]);
+
+    const opened = [];
+    const closed = [];
+    let spawned = null;
+    const exitCode = await executeLockedApply(['--apply'], {
+      nodePath: '/trusted/node',
+      scriptPath: '/trusted/provision-host.mjs',
+      verifyReexecFile: async () => {},
+      preflightHost: async () => {},
+      ensureLock: async () => {},
+      openExecutable: async (file) => {
+        const fd = 31 + opened.length;
+        opened.push(file);
+        return { fd, close: async () => closed.push(file) };
+      },
+      spawnProcess: (command, args, options) => {
+        spawned = { command, args, options };
+        return {
+          once(event, callback) {
+            if (event === 'exit') queueMicrotask(() => callback(0, null));
+            return this;
+          },
+        };
+      },
+    });
+    assert.equal(exitCode, 0);
+    assert.deepEqual(opened, ['/usr/bin/flock', '/usr/bin/unshare', '/trusted/node']);
+    assert.deepEqual(closed, opened);
+    assert.equal(spawned.command, '/proc/self/fd/31');
+    assert.equal(spawned.options.argv0, '/usr/bin/flock');
+    assert.deepEqual(spawned.options.stdio.slice(3), [32, 33]);
+    assert.deepEqual(spawned.args.slice(6, 14), [
+      '/proc/self/fd/3',
+      '--mount',
+      '--propagation',
+      'private',
+      '--',
+      '/proc/self/fd/4',
+      '/trusted/provision-host.mjs',
+      '--apply',
     ]);
   });
 
@@ -1017,6 +1112,63 @@ describe('guarded host provisioner policy', () => {
       /managed runtime path has an extended POSIX ACL/,
     );
   });
+
+  it('executes fixed host commands through a verified open file descriptor', async () => {
+    const directoryStat = Object.freeze({
+      uid: 0,
+      gid: 0,
+      mode: 0o40755,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    const executableStat = Object.freeze({
+      uid: 0,
+      gid: 0,
+      mode: 0o100755,
+      nlink: 1,
+      dev: 8,
+      ino: 42,
+      size: 4096,
+      mtimeMs: 1,
+      ctimeMs: 1,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    });
+    const execCalls = [];
+    const result = await runFixedCommand(
+      '/usr/bin/getfacl',
+      ['--version'],
+      [0],
+      {
+        fsApi: {
+          lstat: async () => directoryStat,
+          open: async (candidate, flags) => {
+            assert.equal(candidate, '/usr/bin/getfacl');
+            assert.equal(
+              flags,
+              fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+            );
+            return {
+              fd: 17,
+              stat: async () => executableStat,
+              close: async () => {},
+            };
+          },
+        },
+        readMountInfo: async () => SAFE_MOUNT_INFO,
+        execFileCommand: async (command, args, options) => {
+          execCalls.push([command, args, options]);
+          return { stdout: 'getfacl 2.3.2\n', stderr: '' };
+        },
+      },
+    );
+    assert.equal(result.code, 0);
+    assert.equal(result.command, '/usr/bin/getfacl');
+    assert.equal(execCalls.length, 1);
+    assert.equal(execCalls[0][0], '/proc/self/fd/17');
+    assert.deepEqual(execCalls[0][1], ['--version']);
+    assert.equal(execCalls[0][2].argv0, '/usr/bin/getfacl');
+  });
 });
 
 describe('guarded host provisioner execution', () => {
@@ -1149,6 +1301,7 @@ describe('guarded host provisioner execution', () => {
       ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
       ['/spoofed-shadow', '/etc/shadow'],
       ['/spoofed-command', '/usr/bin/getfacl'],
+      ['/etc', '/mnt/identity-alias', '0:1', /unexpected mount aliases protected host path/],
       ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
       ['/redirected-var-lib', '/var/lib'],
       ['/', '/etc'],
@@ -1164,7 +1317,7 @@ describe('guarded host provisioner execution', () => {
             mountInfoSequence: [mountInfoWith(root, mountPoint, device)],
           }),
         ),
-        expectedError ?? /unexpected mount overlaps protected host path/,
+        expectedError ?? /unexpected mount (?:overlaps|aliases) protected host path/,
       );
       assert.deepEqual(commands, []);
     }
@@ -1288,6 +1441,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f /tmp/untrusted 0600 root :02001 -'],
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
       ['tmpfiles', 'f+ /var/run/../etc/passwd 0600 root root - replacement'],
+      ['tmpfiles', 'f+ /usr/bin/getfacl 0755 root root - replacement'],
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
       ['tmpfiles', 'f /etc/credstore/userdb.user.injected 0600 root root - {}'],
       ['tmpfiles', 'f /run/credstore/* 0600 root root - payload'],
@@ -1803,7 +1957,7 @@ describe('guarded host provisioner execution', () => {
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
       ['/usr/bin/systemctl', ['daemon-reload']],
     ]);
-    assert.equal(lockConvergenceChecks, 1);
+    assert.equal(lockConvergenceChecks, 2);
     for (const artifact of fixture.plan.artifacts) {
       assert.equal(
         await fs.readFile(artifact.target, 'utf8'),
@@ -1916,6 +2070,32 @@ describe('guarded host provisioner execution', () => {
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
       ['/usr/bin/systemctl', ['daemon-reload']],
     ]);
+  });
+
+  it('rebinds managed runtime ownership to the final identity snapshot', async (context) => {
+    const fixture = await provisionFixture(context);
+    let runtimeChecks = 0;
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          identitySequence: [
+            emptyIdentitySnapshot(),
+            expectedIdentitySnapshot(),
+            renumberedIdentitySnapshot(),
+          ],
+          verifyManagedRuntimeState: async (_inspected, snapshot) => {
+            runtimeChecks += 1;
+            if (snapshot.users.get('webex-generic-account-bot').uid !== 1001) {
+              throw new Error('managed runtime ownership follows stale identity');
+            }
+          },
+        }),
+      ),
+      /host policy files are installed but convergence failed.*managed runtime ownership follows stale identity/,
+    );
+    assert.equal(runtimeChecks, 2);
   });
 
   it('rejects untrusted sources before creating target directories', async (context) => {
@@ -2605,7 +2785,7 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
-    for (const [name, policy] of [
+    for (const [name, policy, fsOptions = {}] of [
       [
         'run-webex\\x2dcodex\\x2dcanary.mount',
         '[Mount]\nWhat=tmpfs\n',
@@ -2635,6 +2815,11 @@ describe('guarded host provisioner execution', () => {
         '[Mount]\nWhat=/srv/getfacl\nWhere=/usr/bin/getfacl\n',
       ],
       [
+        'srv-alias-bin.mount',
+        '[Mount]\nWhat=/dev/vdb1\nWhere=/srv/alias/bin\n',
+        { symlinksByPath: new Map([['/srv/alias', '/usr']]) },
+      ],
+      [
         'external-mount-alias.service',
         '[Install]\nAlias=run-webex\\\\x2dconfig\\\\x2ddeploy.mount\n',
       ],
@@ -2646,7 +2831,7 @@ describe('guarded host provisioner execution', () => {
           async () => ({ stdout: '', stderr: '', code: 0 }),
           systemdUnitPathFs(
             new Map([['/etc/systemd/system', [{ name }]]]),
-            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+            { ...fsOptions, filesByPath: new Map([[target, Buffer.from(policy)]]) },
           ),
         ),
         /external systemd policy mounts a protected directory/,
@@ -2888,6 +3073,10 @@ describe('guarded host provisioner execution', () => {
       [
         'external-runtime.service',
         '[Service]\nRuntimeDirectory=webex-config-deploy\n',
+      ],
+      [
+        'external-sysusers-runtime.service',
+        '[Service]\nRuntimeDirectory=sysusers.d\n',
       ],
       [
         'external-config.service',
@@ -5136,6 +5325,31 @@ function expectedIdentitySnapshot({
     },
     gshadowDatabase,
     shadowDatabase,
+  );
+}
+
+function renumberedIdentitySnapshot() {
+  return parseIdentityDatabases(
+    [
+      passwdRecord('webex-generic-account-bot', 1101, 2101),
+      passwdRecord('webex-config-deploy', 1102, 2102),
+      '',
+    ].join('\n'),
+    [
+      groupRecord('shadow', 42),
+      groupRecord('webex-generic-account-bot', 2101),
+      groupRecord('webex-config-deploy', 2102),
+      groupRecord('webex-config-pull', 2103),
+      groupRecord('webex-codex-input', 2104),
+      groupRecord('webex-codex-launch', 2105),
+      '',
+    ].join('\n'),
+    {
+      'webex-generic-account-bot': [2101],
+      'webex-config-deploy': [2102],
+    },
+    expectedGshadowDatabase(),
+    expectedShadowDatabase(),
   );
 }
 

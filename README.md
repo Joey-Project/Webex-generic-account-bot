@@ -215,7 +215,9 @@ Both modes require root so the complete files-backed `shadow` and `gshadow`
 databases can be checked without exposing them in output. They also require the
 initial PID namespace from a fixed `lsns` probe, PID 1 named `systemd`, and the
 host cgroup-v2 manager at `0::/init.scope`; a container-local PID 1 is not an
-acceptable host anchor. Dry-run reads
+acceptable host anchor. UID and GID maps must each be the single full initial
+namespace mapping, so an inaccessible user-namespace parent cannot masquerade
+as `lsns` parent zero. Dry-run reads
 `/etc/passwd`, `/etc/shadow`, `/etc/group`, and `/etc/gshadow` through stable
 non-blocking, no-follow handles with fixed root-owned metadata, then validates source and
 target ancestor metadata, existing policy files, the exact non-login account
@@ -354,7 +356,9 @@ Path-derived `.mount` and `.automount` names, `Where=`, protected `What=`
 sources, install aliases, and dependency links also cannot mount over a
 protected host path on a later boot. External bind and recursive-bind mount
 policy is rejected because it creates a second lexical path around tmpfiles
-auditing.
+auditing. Existing path-component symlinks in `Where=` and `What=` are resolved
+stably before the comparison, and current mount aliases are derived from both
+mountinfo `root=` and `mountPoint=` rather than only the visible target.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis, including unescaped unit
 specifiers that can generate a `$` marker only after template instantiation.
@@ -376,9 +380,15 @@ The same host-wide `flock` used by config deployment serialises the complete app
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
-lock. The provisioner opens and compares its own and PID 1's mount namespace
-identities before inspection and immediately before every mutation path,
-including fd-backed writes and metadata changes.
+lock. Apply executes the verified `flock`, `unshare`, and Node inodes through
+inherited file descriptors, then runs inside `unshare --mount --propagation
+private`; the private namespace must differ from PID 1 and expose no shared,
+master, propagate-from, or unbindable records. Host mount changes therefore
+cannot enter the mutation namespace. The provisioner still checks its mount
+namespace identity immediately before every mutation path, including fd-backed
+writes and metadata changes. Every other fixed host command is opened through a
+stable root-owned executable handle, bracketed by command-path mount snapshots,
+and executed through `/proc/self/fd`.
 Dry-run, recovery, and apply loop through short reads while collecting and
 parsing bounded `/proc/self/mountinfo` data through a non-blocking regular-file
 handle. The snapshot must contain exactly one root mount;
@@ -387,7 +397,9 @@ files, fixed command entrypoints, proc evidence, credentials, unit policy,
 transaction state, and shared locks must not be hidden by unexpected mounts.
 The relevant raw mount records are compared immediately before and after both
 sysusers and tmpfiles execution, and identity plus boot policy is re-read after
-the final manager reload. Standard ancestor mount
+the final manager reload. Managed runtime ownership and ACLs are then checked a
+second time against that final identity snapshot, so a valid UID/GID renumbering
+cannot commit stale ownership. Standard ancestor mount
 points must have a unique filesystem device/root identity so filesystem-root
 bind mounts cannot masquerade as ordinary mounts; the root mount itself must
 also have a unique mountpoint and device/root identity. Persistent mount and

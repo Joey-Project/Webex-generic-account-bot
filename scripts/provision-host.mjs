@@ -40,6 +40,7 @@ const TRANSACTION_PATH =
 const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
 const PROVISION_LOCK_PARENT = path.dirname(PROVISION_LOCK_PATH);
 const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
+const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
@@ -260,6 +261,7 @@ const FIXED_HOST_EXECUTABLE_PATHS = Object.freeze([
   '/usr/bin/systemd-creds',
   '/usr/bin/systemd-sysusers',
   '/usr/bin/systemd-tmpfiles',
+  '/usr/bin/unshare',
 ]);
 const SYSTEMD_SHELL_EXECUTABLES = new Set([
   'ash',
@@ -782,6 +784,13 @@ export async function provisionHost(options, dependencies = {}) {
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
     throw new Error('host provisioning requires root, including dry-run');
   }
+  if (
+    options.apply
+    && deps.requirePrivateMountNamespace
+    && deps.processApi.env?.[PRIVATE_MOUNT_NAMESPACE_ENV] !== '1'
+  ) {
+    throw new Error('host provisioning apply requires the private mount namespace re-exec');
+  }
   await deps.verifyPidNamespace();
   await deps.verifyMountNamespace('inspection');
   const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
@@ -959,6 +968,8 @@ export async function provisionHost(options, dependencies = {}) {
       { requireManagedPolicy: true },
     );
     assertNoUnexpectedManagedMounts(plan, inspected, await deps.readMountInfo());
+    await verifyManagedRuntimeState(inspected, identityFinal);
+    await deps.verifyProvisionLockConverged();
     try {
       const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityFinal);
       assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
@@ -1042,6 +1053,7 @@ export async function runCli({
   stdout = process.stdout,
   dependencies = {},
   lockHeld = process.env[PROVISION_LOCK_ENV] === '1',
+  privateMountNamespace = process.env[PRIVATE_MOUNT_NAMESPACE_ENV] === '1',
   runLockedApply = executeLockedApply,
   verifyLockedApply = assertProvisionLockHeld,
 } = {}) {
@@ -1052,6 +1064,9 @@ export async function runCli({
   }
   if (options.apply && !lockHeld) {
     return runLockedApply(argv);
+  }
+  if (options.apply && !privateMountNamespace) {
+    throw new Error('locked host provisioning apply requires a private mount namespace');
   }
   if (options.apply) await verifyLockedApply();
   const report = await provisionHost(options, dependencies);
@@ -1070,6 +1085,7 @@ export function buildLockedApplyCommand({
   argv,
   nodePath = process.execPath,
   scriptPath = fileURLToPath(import.meta.url),
+  unsharePath = '/usr/bin/unshare',
 } = {}) {
   if (!Array.isArray(argv) || !argv.includes('--apply')) {
     throw new Error('locked provision command requires --apply');
@@ -1083,6 +1099,11 @@ export function buildLockedApplyCommand({
       '--conflict-exit-code',
       String(PROVISION_LOCK_CONFLICT_EXIT),
       PROVISION_LOCK_PATH,
+      unsharePath,
+      '--mount',
+      '--propagation',
+      'private',
+      '--',
       nodePath,
       scriptPath,
       ...argv,
@@ -1115,33 +1136,52 @@ export async function executeLockedApply(argv, {
     recoveryPreflight: true,
   }),
   ensureLock = ensureProvisionLockFile,
+  openExecutable = (file) => openTrustedExecutable(file, fsApi),
   spawnProcess = spawn,
 } = {}) {
   await verifyReexecFile(nodePath, { executable: true }, fsApi);
   await verifyReexecFile(scriptPath, { mode: FILE_MODE }, fsApi);
+  await verifyReexecFile('/usr/bin/flock', { executable: true }, fsApi);
+  await verifyReexecFile('/usr/bin/unshare', { executable: true }, fsApi);
   await preflightHost();
   await ensureLock(fsApi, () => assertSameMountNamespace(fsApi));
-  const command = buildLockedApplyCommand({ argv, nodePath, scriptPath });
-  return new Promise((resolve, reject) => {
-    const child = spawnProcess(command.command, command.args, {
-      cwd: '/',
-      env: {
-        PATH: '/usr/bin:/bin',
-        LANG: 'C.UTF-8',
-        LC_ALL: 'C.UTF-8',
-        [PROVISION_LOCK_ENV]: '1',
-      },
-      stdio: 'inherit',
+  const executableHandles = [];
+  try {
+    executableHandles.push(await openExecutable('/usr/bin/flock'));
+    executableHandles.push(await openExecutable('/usr/bin/unshare'));
+    executableHandles.push(await openExecutable(nodePath));
+    const [flockHandle, unshareHandle, nodeHandle] = executableHandles;
+    const command = buildLockedApplyCommand({
+      argv,
+      nodePath: '/proc/self/fd/4',
+      scriptPath,
+      unsharePath: '/proc/self/fd/3',
     });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      if (signal) {
-        reject(new Error(`locked provision command terminated by signal ${signal}`));
-        return;
-      }
-      resolve(code ?? 1);
+    return await new Promise((resolve, reject) => {
+      const child = spawnProcess(`/proc/self/fd/${flockHandle.fd}`, command.args, {
+        argv0: '/usr/bin/flock',
+        cwd: '/',
+        env: {
+          PATH: '/usr/bin:/bin',
+          LANG: 'C.UTF-8',
+          LC_ALL: 'C.UTF-8',
+          [PROVISION_LOCK_ENV]: '1',
+          [PRIVATE_MOUNT_NAMESPACE_ENV]: '1',
+        },
+        stdio: ['inherit', 'inherit', 'inherit', unshareHandle.fd, nodeHandle.fd],
+      });
+      child.once('error', reject);
+      child.once('exit', (code, signal) => {
+        if (signal) {
+          reject(new Error(`locked provision command terminated by signal ${signal}`));
+          return;
+        }
+        resolve(code ?? 1);
+      });
     });
-  });
+  } finally {
+    await Promise.all(executableHandles.map((handle) => handle.close()));
+  }
 }
 
 async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
@@ -1210,6 +1250,7 @@ async function inspectArtifacts(plan, deps) {
     );
     artifacts.push(Object.freeze({
       ...artifact,
+      sourcePath: artifact.source,
       source,
       existing,
       changed: existing?.sha256 !== source.sha256,
@@ -1765,13 +1806,17 @@ export async function assertInitialPidNamespace(
   processApi = process,
   fsApi = fs,
 ) {
-  const [managerName, managerCgroup] = await Promise.all([
+  const [managerName, managerCgroup, uidMap, gidMap] = await Promise.all([
     readBoundedProcFile('/proc/1/comm', 64, fsApi),
     readBoundedProcFile('/proc/1/cgroup', 4096, fsApi),
+    readBoundedProcFile('/proc/self/uid_map', 4096, fsApi),
+    readBoundedProcFile('/proc/self/gid_map', 4096, fsApi),
   ]);
   if (managerName !== 'systemd\n' || managerCgroup !== '0::/init.scope\n') {
     throw new Error('host provisioner is not running under the host systemd manager');
   }
+  assertInitialIdNamespaceMap(uidMap, 'UID');
+  assertInitialIdNamespaceMap(gidMap, 'GID');
   const result = await runCommand('/usr/bin/lsns', [
     '--noheadings',
     '--output',
@@ -1786,7 +1831,30 @@ export async function assertInitialPidNamespace(
   }
 }
 
-export async function assertSameMountNamespace(fsApi = fs) {
+function assertInitialIdNamespaceMap(contents, label) {
+  const lines = String(contents).trim().split('\n');
+  const fields = lines.length === 1 ? lines[0].trim().split(/\s+/) : [];
+  if (
+    fields.length !== 3
+    || fields[0] !== '0'
+    || fields[1] !== '0'
+    || fields[2] !== '4294967295'
+  ) {
+    throw new Error(`host provisioner is not in the initial user namespace (${label})`);
+  }
+}
+
+export async function assertSameMountNamespace(
+  fsApi = fs,
+  {
+    expectPrivate = process.env[PRIVATE_MOUNT_NAMESPACE_ENV] === '1',
+    readMountInfo = () => readBoundedProcFile(
+      '/proc/self/mountinfo',
+      MAX_MOUNTINFO_BYTES,
+      fsApi,
+    ),
+  } = {},
+) {
   const readNamespaceIdentity = async (file) => {
     const handle = await fsApi.open(file, fsConstants.O_RDONLY);
     try {
@@ -1800,11 +1868,68 @@ export async function assertSameMountNamespace(fsApi = fs) {
     readNamespaceIdentity('/proc/self/ns/mnt'),
     readNamespaceIdentity('/proc/1/ns/mnt'),
   ]);
-  if (
-    selfNamespace.dev !== managerNamespace.dev
-    || selfNamespace.ino !== managerNamespace.ino
-  ) {
+  const namespacesMatch = selfNamespace.dev === managerNamespace.dev
+    && selfNamespace.ino === managerNamespace.ino;
+  if (!expectPrivate && !namespacesMatch) {
     throw new Error('host provisioner is not in PID 1 mount namespace');
+  }
+  if (expectPrivate) {
+    if (namespacesMatch) {
+      throw new Error('host provisioner apply is not in a private mount namespace');
+    }
+    assertMountPropagationIsPrivate(await readMountInfo());
+  }
+}
+
+function assertMountPropagationIsPrivate(mountInfo) {
+  for (const { raw } of parseMountInfo(mountInfo)) {
+    const fields = raw.split(' ');
+    const separator = fields.indexOf('-');
+    if (fields.slice(6, separator).some((field) => (
+      field === 'unbindable'
+      || field.startsWith('shared:')
+      || field.startsWith('master:')
+      || field.startsWith('propagate_from:')
+    ))) {
+      throw new Error('host provisioner apply mount propagation is not private');
+    }
+  }
+}
+
+async function openTrustedExecutable(file, fsApi) {
+  if (!path.isAbsolute(file)) throw new Error(`fixed executable path is not absolute: ${file}`);
+  await assertTrustedDirectoryChain('/', path.dirname(file), 0, 0, fsApi);
+  const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
+    new Set([file]),
+    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+  );
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const stat = await handle.stat();
+    const mode = stat.mode & 0o7777;
+    if (
+      !stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.nlink !== 1
+      || stat.uid !== 0
+      || stat.gid !== 0
+      || (mode & 0o7022) !== 0
+      || (mode & 0o100) === 0
+    ) {
+      throw new Error(`fixed executable is not trusted: ${file}`);
+    }
+    const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
+      new Set([file]),
+      await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+    );
+    assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
   }
 }
 
@@ -2639,6 +2764,7 @@ export function auditBootPolicyCatalogs(
       .flatMap((artifact) => policyCatalogLines(artifact.source.contents))
       .map((line) => parseSystemdFields(line)[1]),
     ...inspected.artifacts.map((artifact) => artifact.targetPath),
+    ...inspected.artifacts.map((artifact) => artifact.sourcePath).filter(Boolean),
     ...IDENTITY_POLICY_PATHS,
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
@@ -2646,6 +2772,9 @@ export function auditBootPolicyCatalogs(
     ...SYSTEMD_PROTECTED_UNIT_PATHS,
     ...Object.values(BOOT_POLICY_DIRECTORIES).flat(),
     ...BOOT_POLICY_CREDENTIAL_PATHS,
+    ...FIXED_HOST_EXECUTABLE_PATHS,
+    process.execPath,
+    fileURLToPath(import.meta.url),
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
   ]);
@@ -3157,7 +3286,13 @@ function normaliseBootPolicyPath(policyPath) {
 }
 
 function assertNoUnexpectedManagedMounts(plan, inspected, mountInfo) {
-  const protectedPaths = protectedHostMountPaths(plan, inspected);
+  return assertNoUnexpectedMountsForPaths(
+    protectedHostMountPaths(plan, inspected),
+    mountInfo,
+  );
+}
+
+function assertNoUnexpectedMountsForPaths(protectedPaths, mountInfo) {
   const mounts = parseMountInfo(mountInfo);
   const mountIdentityCounts = new Map();
   const mountPointCounts = new Map();
@@ -3167,7 +3302,16 @@ function assertNoUnexpectedManagedMounts(plan, inspected, mountInfo) {
     mountPointCounts.set(mountPoint, (mountPointCounts.get(mountPoint) ?? 0) + 1);
   }
   const relevantMounts = [];
-  for (const { device, root, mountPoint, raw } of mounts) {
+  for (const mount of mounts) {
+    const {
+      device,
+      root,
+      mountPoint,
+      raw,
+    } = mount;
+    if (mountAliasesProtectedPath(mount, mounts, protectedPaths)) {
+      throw new Error(`unexpected mount aliases protected host path: ${mountPoint}`);
+    }
     for (const protectedPath of protectedPaths) {
       if (!systemdPathsOverlap(mountPoint, protectedPath)) continue;
       relevantMounts.push(raw);
@@ -3190,6 +3334,25 @@ function assertNoUnexpectedManagedMounts(plan, inspected, mountInfo) {
     }
   }
   return Object.freeze([...new Set(relevantMounts)].sort());
+}
+
+function mountAliasesProtectedPath(mount, mounts, protectedPaths) {
+  if (!path.posix.isAbsolute(mount.root)) return false;
+  return mounts.some((anchor) => {
+    if (anchor.mountId === mount.mountId || anchor.device !== mount.device) return false;
+    if (!path.posix.isAbsolute(anchor.root)) return false;
+    const rootWithinAnchor = anchor.root === '/'
+      ? mount.root.startsWith('/')
+      : mount.root === anchor.root || mount.root.startsWith(`${anchor.root}/`);
+    if (!rootWithinAnchor) return false;
+    const relativeRoot = path.posix.relative(anchor.root, mount.root);
+    const sourcePath = normaliseBootPolicyPath(
+      path.posix.join(anchor.mountPoint, relativeRoot),
+    );
+    return [...protectedPaths].some((protectedPath) => (
+      systemdPathsOverlap(sourcePath, protectedPath)
+    ));
+  });
 }
 
 function protectedHostMountPaths(plan, inspected) {
@@ -3236,15 +3399,25 @@ function parseMountInfo(mountInfo) {
     const root = decodeMountInfoPath(fields[3]);
     const mountPoint = decodeMountInfoPath(fields[4]);
     const device = fields[2];
+    const mountId = fields[0];
+    const parentId = fields[1];
+    if (!/^[1-9][0-9]*$/.test(mountId) || !/^[0-9]+$/.test(parentId)) {
+      throw new Error('mountinfo identity is malformed');
+    }
     if (!/^[0-9]+:[0-9]+$/.test(device)) {
       throw new Error('mountinfo device is malformed');
     }
-    if (!path.posix.isAbsolute(root) || !path.posix.isAbsolute(mountPoint)) {
-      throw new Error('mountinfo path is not absolute');
+    if (!path.posix.isAbsolute(mountPoint)) {
+      throw new Error('mountinfo mount point is not absolute');
+    }
+    if (!path.posix.isAbsolute(root) && !/^[A-Za-z0-9_.-]+:\[[0-9]+\]$/.test(root)) {
+      throw new Error('mountinfo root is malformed');
     }
     return Object.freeze({
+      mountId,
+      parentId,
       device,
-      root: path.posix.normalize(root),
+      root: path.posix.isAbsolute(root) ? path.posix.normalize(root) : root,
       mountPoint: path.posix.normalize(mountPoint),
       raw: line,
     });
@@ -3723,7 +3896,8 @@ async function auditSystemdPolicyFile(
   if (budget.bytes > MAX_SYSTEMD_POLICY_BYTES) {
     throw new Error('systemd policy files exceed the aggregate byte limit');
   }
-  for (const line of policyCatalogLines(policy.contents)) {
+  const lines = policyCatalogLines(policy.contents);
+  for (const line of lines) {
     assertSystemdPolicyDoesNotReferenceManaged(
       line,
       candidate,
@@ -3733,6 +3907,79 @@ async function auditSystemdPolicyFile(
       symlinkDepth,
     );
   }
+  await assertSystemdMountPathsResolveOutsideProtectedSurface(
+    lines,
+    unitNames,
+    fsApi,
+    candidate,
+  );
+}
+
+async function assertSystemdMountPathsResolveOutsideProtectedSurface(
+  lines,
+  unitNames,
+  fsApi,
+  source,
+) {
+  for (const line of lines) {
+    const decoded = decodeSystemdEscapesForAudit(line);
+    const expanded = unitNames.size === 0
+      ? [decoded]
+      : [...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName));
+    for (const value of expanded) {
+      const separator = value.indexOf('=');
+      if (separator <= 0) continue;
+      const directive = value.slice(0, separator).trim();
+      if (!['What', 'Where'].includes(directive)) continue;
+      for (const field of parseSystemdFields(value.slice(separator + 1))) {
+        if (!path.posix.isAbsolute(field) || hasUnresolvedSystemdSpecifier(field)) continue;
+        const resolved = await resolveExistingSystemdPath(field, fsApi);
+        if (protectedSystemdMountPaths().some((protectedPath) => (
+          systemdPathsOverlap(resolved, protectedPath)
+        ))) {
+          throw new Error(`external systemd policy mounts a protected directory: ${source}`);
+        }
+      }
+    }
+  }
+}
+
+async function resolveExistingSystemdPath(value, fsApi) {
+  let components = normaliseBootPolicyPath(value).split('/').filter(Boolean);
+  let current = '/';
+  const visited = new Set();
+  while (components.length > 0) {
+    const component = components.shift();
+    const candidate = path.posix.join(current, component);
+    let before;
+    try {
+      before = await fsApi.lstat(candidate);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return normaliseBootPolicyPath(path.posix.join(candidate, ...components));
+      }
+      throw error;
+    }
+    if (!before.isSymbolicLink()) {
+      current = candidate;
+      continue;
+    }
+    if (visited.has(candidate) || visited.size >= 32) {
+      throw new Error(`systemd mount path symlink chain is invalid: ${value}`);
+    }
+    visited.add(candidate);
+    const target = await fsApi.readlink(candidate);
+    const after = await fsApi.lstat(candidate);
+    if (!after.isSymbolicLink() || !sameFileIdentity(before, after)) {
+      throw new Error(`systemd mount path symlink changed while reading: ${candidate}`);
+    }
+    const resolvedTarget = path.posix.isAbsolute(target)
+      ? normaliseBootPolicyPath(target)
+      : normaliseBootPolicyPath(path.posix.join(path.posix.dirname(candidate), target));
+    components = [...resolvedTarget.split('/').filter(Boolean), ...components];
+    current = '/';
+  }
+  return normaliseBootPolicyPath(current);
 }
 
 function assertSystemdPolicyDoesNotReferenceManaged(
@@ -3983,7 +4230,7 @@ function systemdPolicyClaimsProtectedDirectory(value) {
       if (!directoryName) return false;
       if (hasUnresolvedSystemdSpecifier(directoryName)) return true;
       const claimedPath = path.resolve(root, directoryName);
-      return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+      return protectedSystemdMountPaths().some((protectedPath) => (
         systemdPathsOverlap(claimedPath, protectedPath)
       ));
     });
@@ -4728,27 +4975,84 @@ function parseLauncherInstanceUnits(output) {
   return units;
 }
 
-async function runFixedCommand(command, args, allowedExitCodes = [0]) {
+export async function runFixedCommand(
+  command,
+  args,
+  allowedExitCodes = [0],
+  {
+    fsApi = fs,
+    execFileCommand = execFileAsync,
+    readMountInfo = () => readBoundedProcFile(
+      '/proc/self/mountinfo',
+      MAX_MOUNTINFO_BYTES,
+      fsApi,
+    ),
+  } = {},
+) {
+  await assertTrustedDirectoryChain('/', path.dirname(command), 0, 0, fsApi);
+  const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
+    new Set([command]),
+    await readMountInfo(),
+  );
+  const handle = await fsApi.open(
+    command,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   try {
-    const result = await execFileAsync(command, args, {
-      cwd: '/',
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' },
-      encoding: 'utf8',
-      maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
-      timeout: 120_000,
-    });
-    return Object.freeze({ command, args: Object.freeze([...args]), code: 0, ...result });
-  } catch (error) {
-    if (Number.isInteger(error?.code) && allowedExitCodes.includes(error.code)) {
+    const before = await handle.stat();
+    const mode = before.mode & 0o7777;
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.nlink !== 1
+      || before.uid !== 0
+      || before.gid !== 0
+      || (mode & 0o7022) !== 0
+      || (mode & 0o100) === 0
+    ) {
+      throw new Error(`fixed command is not trusted: ${command}`);
+    }
+    const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
+      new Set([command]),
+      await readMountInfo(),
+    );
+    assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
+    let result;
+    let executionError = null;
+    try {
+      result = await execFileCommand(`/proc/self/fd/${handle.fd}`, args, {
+        argv0: command,
+        cwd: '/',
+        env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' },
+        encoding: 'utf8',
+        maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
+        timeout: 120_000,
+      });
+    } catch (error) {
+      executionError = error;
+    }
+    const after = await handle.stat();
+    if (!sameFileIdentity(before, after)) {
+      throw new Error(`fixed command changed during execution: ${command}`);
+    }
+    if (executionError === null) {
+      return Object.freeze({ command, args: Object.freeze([...args]), code: 0, ...result });
+    }
+    if (
+      Number.isInteger(executionError.code)
+      && allowedExitCodes.includes(executionError.code)
+    ) {
       return Object.freeze({
         command,
         args: Object.freeze([...args]),
-        code: error.code,
-        stdout: String(error.stdout ?? ''),
-        stderr: String(error.stderr ?? ''),
+        code: executionError.code,
+        stdout: String(executionError.stdout ?? ''),
+        stderr: String(executionError.stderr ?? ''),
       });
     }
-    throw error;
+    throw executionError;
+  } finally {
+    await handle.close();
   }
 }
 
@@ -4761,6 +5065,8 @@ function provisionDependencies(dependencies) {
     processApi,
     randomUUID: dependencies.randomUUID ?? randomUUID,
     requireRoot: dependencies.requireRoot ?? true,
+    requirePrivateMountNamespace: dependencies.requirePrivateMountNamespace
+      ?? (dependencies.requireRoot ?? true),
     allowTestRoot: dependencies.allowTestRoot ?? false,
     sourceTrustRoot: path.resolve(dependencies.sourceTrustRoot ?? '/'),
     sourceUid: dependencies.sourceUid ?? 0,
