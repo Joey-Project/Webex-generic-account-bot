@@ -3207,8 +3207,15 @@ function systemdPolicyInvokesBootPolicyTool(value) {
   const fields = parseSystemdFields(value.slice(separator + 1));
   const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
   const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
-  if (names.some((name) => BOOT_POLICY_EXECUTABLES.has(name))) return true;
-  return names.includes('systemd-userdbd') && tokens.includes('--load-credentials');
+  if (names.some((name) => (
+    BOOT_POLICY_EXECUTABLES.has(name)
+    || systemdSpecifierFieldCouldMatch(name, [...BOOT_POLICY_EXECUTABLES])
+  ))) return true;
+  const invokesUserdbLoader = names.some((name) => (
+    name === 'systemd-userdbd'
+    || systemdSpecifierFieldCouldMatch(name, ['systemd-userdbd'])
+  ));
+  return invokesUserdbLoader && tokens.includes('--load-credentials');
 }
 
 function systemdPolicyInjectsBootPolicyCredential(

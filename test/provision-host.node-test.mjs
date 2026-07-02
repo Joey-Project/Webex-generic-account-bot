@@ -1946,6 +1946,40 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const [instance, executable, arguments_] of [
+      ['tmpfiles', 'systemd-%i', '--create /etc/rogue.conf'],
+      ['sysusers', 'systemd-%I', '/etc/rogue.conf'],
+      ['userdbd', 'systemd-%i', '--load-credentials'],
+    ]) {
+      const template = '/etc/systemd/system/external@.service';
+      const activator = '/etc/systemd/system/external-trigger.service';
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [
+              { name: 'external@.service' },
+              { name: 'external-trigger.service' },
+            ]]]),
+            {
+              filesByPath: new Map([
+                [
+                  template,
+                  Buffer.from(`[Service]\nExecStart=/usr/bin/${executable} ${arguments_}\n`),
+                ],
+                [
+                  activator,
+                  Buffer.from(`[Unit]\nWants=external@${instance}.service\n`),
+                ],
+              ]),
+            },
+          ),
+        ),
+        /external systemd policy invokes a boot policy tool/,
+      );
+    }
+
     const helperWants = '/etc/systemd/system/external.target.wants';
     const helperLink = `${helperWants}/external-helper.service`;
     const helperTarget = '/usr/lib/systemd/system/external-helper.service';

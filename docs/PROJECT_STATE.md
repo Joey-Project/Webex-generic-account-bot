@@ -129,7 +129,8 @@
   fragments to those same vendor sources without overrides, exact/shared
   drop-ins, consumer-owned dependency directories, masks, dangling links, or
   non-regular symlink targets, and reject direct boot-policy tool execution from
-  external or linked helper units after unit-name specifier expansion,
+  external or linked helper units after concrete or unresolved template
+  unit-name specifier expansion,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

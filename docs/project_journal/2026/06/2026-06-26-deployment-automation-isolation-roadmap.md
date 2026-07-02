@@ -198,7 +198,7 @@ superseded_by:
   their commands can bypass merged catalogue auditing, and rejects masks,
   dangling links, non-regular consumer symlink targets, and direct boot-policy
   tool execution from external or linked helper units after unit-name specifier
-  expansion, plus
+  expansion, including unresolved template instances, plus
   launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
