@@ -928,6 +928,8 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f /etc/credstore/userdb.user.injected 0600 root root - {}'],
       ['tmpfiles', 'f /run/credstore/* 0600 root root - payload'],
       ['tmpfiles', 'f /run/credentials/@system/sysusers.extra 0600 root root - payload'],
+      ['tmpfiles', 'f /var//run/credentials/@system/sysusers.extra 0600 root root - payload'],
+      ['tmpfiles', 'f /var/./run/credentials/@system/tmpfiles.extra 0600 root root - payload'],
       ['tmpfiles', 'd+ /run/credstore 0700 root root -'],
       ['tmpfiles', 'L+ /dev/host-creds - - - - /run/credentials/@system'],
       ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
@@ -2077,7 +2079,9 @@ describe('guarded host provisioner execution', () => {
       ['generic-account-bot', 'webex-%i.service'],
       ['generic-account-bot', '/etc/systemd/system/webex-%i.service'],
       ['smoke', 'webex-codex-launcher@%I.service'],
+      ['smoke', 'webex-codex-launcher@%I.socket'],
       ['literal', 'webex-codex-activation-renew'],
+      ['literal', 'webex-codex-activation-renew.timer'],
       ['glob', 'webex-*'],
     ]) {
       const template = '/etc/systemd/system/external@.service';
@@ -2109,11 +2113,32 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const name of [
+      'webex-codex-activation-renew.timer',
+      'webex-codex-activation-renew.path',
+      'webex-codex-launcher@smoke.socket',
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from('[Unit]\nDescription=implicit\n')]]) },
+          ),
+        ),
+        /external systemd policy references a managed unit/,
+      );
+    }
+
     for (const [index, command] of [
       'systemctl --preset-mode=enable-only preset-all',
       'systemctl daemon-reload',
       'systemctl --marked reload-or-restart',
+      'systemctl --mark reload-or-restart',
       'systemctl enable /opt/benign.service',
+      'systemctl enable %t-foreign.socket',
       'systemctl edit --full --stdin benign.service',
     ].entries()) {
       const name = `external-global-systemctl-${index}.service`;

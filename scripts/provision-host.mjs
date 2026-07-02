@@ -2820,14 +2820,20 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
 }
 
 function normaliseBootPolicyPath(policyPath) {
-  const runtimePath = policyPath === '/var/run'
-    ? '/run'
-    : policyPath.startsWith('/var/run/')
-      ? `/run/${policyPath.slice('/var/run/'.length)}`
-      : policyPath;
-  let normalised = path.posix.normalize(runtimePath);
-  if (normalised.length > 1) normalised = normalised.replace(/\/+$/, '');
-  return normalised;
+  if (!policyPath.startsWith('/')) return path.posix.normalize(policyPath);
+  const components = [];
+  for (const component of policyPath.split('/')) {
+    if (component === '' || component === '.') continue;
+    if (component === '..') {
+      components.pop();
+      continue;
+    }
+    components.push(component);
+    if (components.length === 2 && components[0] === 'var' && components[1] === 'run') {
+      components.splice(0, components.length, 'run');
+    }
+  }
+  return `/${components.join('/')}`;
 }
 
 function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
@@ -3449,6 +3455,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
       || systemdPolicyInvokesManagedUnitControl(candidate)
+      || [...unitNames].some(systemctlUnitFieldCouldMatch)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
       || systemdIdentityDirectiveUsesManagedId(
@@ -3493,7 +3500,7 @@ function systemdPolicyInvokesManagedUnitControl(value) {
     )
   ));
   const externalUnitPath = command.tokens.some((token) => (
-    token.includes('/')
+    (token.includes('/') || hasUnresolvedSystemdSpecifier(token))
     && path.posix.basename(token.replace(/^[-@:+!|]+/, '')) !== 'systemctl'
   ));
   return (
@@ -3505,10 +3512,16 @@ function systemdPolicyInvokesManagedUnitControl(value) {
           token,
           [...SYSTEMCTL_UNSCOPED_MUTATION_VERBS],
         )
-        || token === '--marked'
-        || systemdSpecifierFieldCouldMatch(token, ['--marked'])
+        || systemctlOptionCouldBeMarked(token)
       ))
   );
+}
+
+function systemctlOptionCouldBeMarked(token) {
+  const option = token.slice(0, token.indexOf('=') < 0
+    ? token.length
+    : token.indexOf('='));
+  return option.length > 2 && '--marked'.startsWith(option);
 }
 
 function systemdPolicyInvokesShell(value) {
@@ -3647,7 +3660,10 @@ function shellExecutableName(name) {
 function systemctlUnitFieldCouldMatch(field) {
   const basename = path.posix.basename(field);
   return [...new Set([field, basename])]
-    .flatMap((candidate) => [candidate, `${candidate}.service`])
+    .flatMap((candidate) => {
+      const implicitService = candidate.replace(/\.(?:path|socket|timer)$/, '.service');
+      return [candidate, `${candidate}.service`, implicitService];
+    })
     .some((candidate) => {
       const tokens = systemdUnitPatternTokens(candidate);
       const pattern = tokens.map((token) => {

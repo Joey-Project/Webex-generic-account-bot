@@ -145,7 +145,9 @@
   reject path-based unit-file aliases, option-interleaved credentials,
   later-command shell prefixes, unbounded mountinfo reads, and duplicate-root
   or stacked-root mounts overlapping managed tmpfiles paths, plus opaque
-  `systemctl edit` replacement and full-path executable specifiers,
+  `systemctl edit` replacement, full-path executable specifiers, path-generating
+  systemctl specifiers, `--marked` abbreviations, equivalent `/var/run` paths,
+  and implicit timer/path/socket service activation,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

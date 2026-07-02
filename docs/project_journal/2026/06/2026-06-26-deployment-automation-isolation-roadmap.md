@@ -212,7 +212,9 @@ superseded_by:
   normalisation, path-based unit-file aliases, option-interleaved credentials,
   later-command shell prefixes, unbounded mountinfo reads, and duplicate-root
   or stacked-root managed-path mounts refused, plus opaque `systemctl edit`
-  replacement and full-path executable specifiers,
+  replacement, full-path executable specifiers, path-generating systemctl
+  specifiers, `--marked` abbreviations, equivalent `/var/run` paths, and
+  implicit timer/path/socket service activation,
   `/run/credentials/@system` protected from tmpfiles, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency

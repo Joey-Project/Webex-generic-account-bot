@@ -317,7 +317,10 @@ check. External unit execution directives may not invoke
 `systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
 or use `systemctl` with a literal, path-qualified, or specifier-reachable managed
 unit target. Unit-file mutations with path arguments are rejected because an
-out-of-path file can hide a managed `Alias=`. Unscoped mutating commands such
+out-of-path file can hide a managed `Alias=`; unresolved specifiers are treated
+as path-capable. Same-basename `.timer`, `.path`, and `.socket` units and
+systemctl targets are mapped to their implicit `.service` activation target.
+Unscoped mutating commands such
 as `preset-all`, manager reloads, `--marked` operations, and opaque
 `edit --stdin` policy replacement are also rejected,
 including through linked helper units, unit-name specifier expansion, or
@@ -339,7 +342,9 @@ incomplete cross-directive data-flow analysis. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths
 and symlink targets.
 The legacy compatibility rule accepts only the exact `/var/run` link text
-`../run` or `/run`; lexically equivalent paths are rejected.
+`../run` or `/run`; path auditing resolves redundant separators, dot segments,
+parent traversal, and the `/var/run` symlink in component order. Lexically
+equivalent link text remains rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
