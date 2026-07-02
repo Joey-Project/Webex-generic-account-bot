@@ -67,10 +67,6 @@ function readSystemUnitStates(units, runCommand, fsApi, identitySnapshot = null)
       if (args[0] === 'is-active' && result.code === 0 && result.stdout === 'inactive\n') {
         return { ...result, code: 3 };
       }
-      if (args[0] === 'is-enabled' && result.code === 0) {
-        if (result.stdout === 'disabled\n') return { ...result, code: 1 };
-        if (result.stdout === 'not-found\n') return { ...result, code: 1 };
-      }
       return result;
     },
     fsApi,
@@ -1322,19 +1318,13 @@ describe('guarded host provisioner execution', () => {
       if (args[0] === 'is-active') {
         return { stdout: unit === instance ? 'active\n' : 'inactive\n', stderr: '', code: 0 };
       }
-      if (args[0] === 'is-enabled') {
-        return {
-          stdout: unit === 'webex-codex-launcher@boot.service' ? 'enabled\n' : 'static\n',
-          stderr: '',
-          code: 0,
-        };
-      }
       const fragmentUnit = LAUNCHER_INSTANCE_PATTERN_FOR_TEST.test(unit)
         ? 'webex-codex-launcher@.service'
         : unit;
       return {
         stdout: [
           'LoadState=loaded',
+          `UnitFileState=${unit === 'webex-codex-launcher@boot.service' ? 'enabled' : 'static'}`,
           `FragmentPath=/etc/systemd/system/${fragmentUnit}`,
           'DropInPaths=',
           'NeedDaemonReload=no',
@@ -1355,6 +1345,7 @@ describe('guarded host provisioner execution', () => {
     assert.equal(discovered.get('webex-codex-launcher@boot.service').enabled, 'enabled');
     assert.equal(calls.filter(([, args]) => args[0] === 'list-units').length, 1);
     assert.equal(calls.filter(([, args]) => args[0] === 'list-unit-files').length, 1);
+    assert.equal(calls.filter(([, args]) => args[0] === 'is-enabled').length, 0);
 
     let stateQueries = 0;
     await assert.rejects(
@@ -2096,9 +2087,6 @@ describe('guarded host provisioner execution', () => {
         if (args[0] === 'is-active') {
           return { stdout: 'inactive\n', stderr: '', code: 3 };
         }
-        if (args[0] === 'is-enabled') {
-          return { stdout: 'not-found\n', stderr: '', code: 1 };
-        }
         return { stdout: systemdUnitMetadata('not-found'), stderr: '', code: 0 };
       },
       systemdUnitPathFs(new Map(), { usrMerged: false }),
@@ -2111,33 +2099,45 @@ describe('guarded host provisioner execution', () => {
       [
         'empty active output',
         { stdout: '', stderr: '', code: 3 },
-        { stdout: 'not-found\n', stderr: '', code: 4 },
         systemdUnitMetadata('not-found'),
         /managed unit active state query is malformed/,
       ],
       [
         'active query diagnostics',
         { stdout: 'inactive\n', stderr: 'Failed to connect to bus\n', code: 3 },
-        { stdout: 'not-found\n', stderr: '', code: 4 },
         systemdUnitMetadata('not-found'),
         /managed unit active state query is malformed/,
       ],
       [
         'loaded metadata with missing state queries',
         { stdout: 'inactive\n', stderr: '', code: 4 },
-        { stdout: 'not-found\n', stderr: '', code: 4 },
         systemdUnitMetadata('loaded', '/etc/systemd/system/webex-generic-account-bot.service'),
         /managed unit query state disagrees with load state/,
       ],
       [
         'blank load state',
         { stdout: 'inactive\n', stderr: '', code: 3 },
-        { stdout: 'not-found\n', stderr: '', code: 1 },
         systemdUnitMetadata(''),
         /managed unit load state is malformed/,
       ],
+      [
+        'loaded unit missing file state',
+        { stdout: 'inactive\n', stderr: '', code: 3 },
+        systemdUnitMetadata(
+          'loaded',
+          '/etc/systemd/system/webex-generic-account-bot.service',
+          '',
+        ),
+        /managed unit file state is malformed/,
+      ],
+      [
+        'missing unit with installed file state',
+        { stdout: 'inactive\n', stderr: '', code: 3 },
+        systemdUnitMetadata('not-found', '', 'disabled'),
+        /managed unit file state disagrees with load state/,
+      ],
     ];
-    for (const [label, active, enabled, metadata, expected] of cases) {
+    for (const [label, active, metadata, expected] of cases) {
       await assert.rejects(
         readSystemUnitStatesImpl(
           MANAGED_UNITS,
@@ -2149,7 +2149,6 @@ describe('guarded host provisioner execution', () => {
               return { stdout: '', stderr: '', code: 0 };
             }
             if (args[0] === 'is-active') return active;
-            if (args[0] === 'is-enabled') return enabled;
             return { stdout: metadata, stderr: '', code: 0 };
           },
           systemdUnitPathFs(),
@@ -3813,9 +3812,14 @@ function systemdUnitPathFs(
 
 const LAUNCHER_INSTANCE_PATTERN_FOR_TEST = /^webex-codex-launcher@[^@/\s]+\.service$/;
 
-function systemdUnitMetadata(loadState, fragmentPath = '') {
+function systemdUnitMetadata(
+  loadState,
+  fragmentPath = '',
+  unitFileState = loadState === 'not-found' ? '' : 'disabled',
+) {
   return [
     `LoadState=${loadState}`,
+    `UnitFileState=${unitFileState}`,
     `FragmentPath=${fragmentPath}`,
     'DropInPaths=',
     'NeedDaemonReload=no',

@@ -225,6 +225,20 @@ const REVERSE_ACTIVATION_PROPERTIES = Object.freeze([
   'OnFailureOf',
   'OnSuccessOf',
 ]);
+const SYSTEMD_UNIT_FILE_STATES = new Set([
+  'alias',
+  'disabled',
+  'enabled',
+  'enabled-runtime',
+  'generated',
+  'indirect',
+  'linked',
+  'linked-runtime',
+  'masked',
+  'masked-runtime',
+  'static',
+  'transient',
+]);
 
 export const ARTIFACTS = Object.freeze([
   policyArtifact(
@@ -2569,12 +2583,12 @@ export async function readSystemUnitStates(
   }
   const states = new Map();
   for (const unit of [...units, ...[...discovered].sort()]) {
-    const [active, enabled, metadata] = await Promise.all([
+    const [active, metadata] = await Promise.all([
       runCommand('/usr/bin/systemctl', ['is-active', unit], [0, 3, 4]),
-      runCommand('/usr/bin/systemctl', ['is-enabled', unit], [0, 1, 3, 4]),
       runCommand('/usr/bin/systemctl', [
         'show',
         '--property=LoadState',
+        '--property=UnitFileState',
         '--property=FragmentPath',
         '--property=DropInPaths',
         '--property=NeedDaemonReload',
@@ -2583,20 +2597,16 @@ export async function readSystemUnitStates(
       ]),
     ]);
     const activeState = parseSystemctlStateQuery(active, unit, 'active');
-    const enabledState = parseSystemctlStateQuery(enabled, unit, 'enabled');
     assertSystemctlCommandSucceeded(metadata, `managed unit metadata query: ${unit}`);
     const loadedPolicy = parseSystemUnitMetadata(metadata.stdout, unit);
     assertSystemctlStateMatchesLoadState(
       unit,
       active,
       activeState,
-      enabled,
-      enabledState,
       loadedPolicy.load,
     );
     states.set(unit, Object.freeze({
       active: activeState,
-      enabled: enabledState,
       ...loadedPolicy,
     }));
   }
@@ -2644,16 +2654,12 @@ function assertSystemctlStateMatchesLoadState(
   unit,
   activeResult,
   activeState,
-  enabledResult,
-  enabledState,
   loadState,
 ) {
   if (loadState === 'not-found') {
     if (
       ![3, 4].includes(activeResult.code)
       || activeState !== 'inactive'
-      || ![1, 4].includes(enabledResult.code)
-      || enabledState !== 'not-found'
     ) {
       throw new Error(`managed unit query state disagrees with load state: ${unit}`);
     }
@@ -2668,27 +2674,7 @@ function assertSystemctlStateMatchesLoadState(
       activeResult.code === 3
       && ['failed', 'inactive'].includes(activeState)
     );
-    const enabledCodeMatchesState = (
-      enabledResult.code === 0
-      && [
-        'alias',
-        'enabled',
-        'enabled-runtime',
-        'generated',
-        'indirect',
-        'linked',
-        'linked-runtime',
-        'static',
-        'transient',
-      ].includes(enabledState)
-    ) || (
-      enabledResult.code === 1
-      && ['disabled', 'masked', 'masked-runtime'].includes(enabledState)
-    );
-    if (
-      !activeCodeMatchesState
-      || !enabledCodeMatchesState
-    ) {
+    if (!activeCodeMatchesState) {
       throw new Error(`managed unit query state disagrees with load state: ${unit}`);
     }
   }
@@ -3277,6 +3263,7 @@ function parseSystemUnitMetadata(output, unit) {
   const values = new Map();
   const expected = new Set([
     'LoadState',
+    'UnitFileState',
     'FragmentPath',
     'DropInPaths',
     'NeedDaemonReload',
@@ -3301,6 +3288,19 @@ function parseSystemUnitMetadata(output, unit) {
   if (!/^[a-z][a-z-]*$/.test(loadState)) {
     throw new Error(`managed unit load state is malformed: ${unit}`);
   }
+  const unitFileState = values.get('UnitFileState');
+  let enabled;
+  if (loadState === 'not-found') {
+    if (unitFileState !== '') {
+      throw new Error(`managed unit file state disagrees with load state: ${unit}`);
+    }
+    enabled = 'not-found';
+  } else {
+    if (!SYSTEMD_UNIT_FILE_STATES.has(unitFileState)) {
+      throw new Error(`managed unit file state is malformed: ${unit}`);
+    }
+    enabled = unitFileState;
+  }
   const reverseActivators = new Set();
   for (const property of REVERSE_ACTIVATION_PROPERTIES) {
     for (const activator of values.get(property).split(/\s+/).filter(Boolean)) {
@@ -3312,6 +3312,7 @@ function parseSystemUnitMetadata(output, unit) {
   }
   return Object.freeze({
     load: loadState,
+    enabled,
     fragment: values.get('FragmentPath'),
     dropIns: values.get('DropInPaths'),
     needDaemonReload: needDaemonReload === 'yes',

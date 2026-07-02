@@ -103,7 +103,7 @@
   shared with config deployment, exact loaded-fragment, no-drop-in,
   no-stale-manager, no-external-activator, profile-exact PID 1 `UnitPath` with
   one-for-one disk scanning, and strict portable systemctl
-  exit/output/diagnostic/load-state checks, bounded policy-path
+  exit/output/diagnostic/`LoadState`/`UnitFileState` checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted

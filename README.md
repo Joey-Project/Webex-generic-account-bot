@@ -236,9 +236,10 @@ reordered manager search paths fail closed before any state is accepted. An
 usr-merged host must expose the exact root-owned `/lib -> usr/lib` compatibility
 link and requires every loaded managed unit to use the fixed
 `/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
-no external reverse activator. Every `is-active`, `is-enabled`, and metadata
-query must have a consistent exit code, single state output, empty diagnostics,
-and an explicit non-empty `LoadState`. Enabled external unit dependency graphs are
+no external reverse activator. Every `is-active` and metadata query must have a
+consistent exit code, single state output, and empty diagnostics. PID 1 must
+report an explicit non-empty `LoadState`; installed units must have a recognised
+`UnitFileState`, while missing units require an empty `UnitFileState`. Enabled external unit dependency graphs are
 not inferred from a potentially stale manager cache: every trusted system unit
 load path is scanned directly for external unit, drop-in, alias, and dependency
 symlink references to managed units, including C-escaped references, launcher

@@ -171,7 +171,7 @@ superseded_by:
   verification shared with config deployment, exact loaded-fragment and
   no-drop-in, no-stale-manager, no-external-reverse-activator, profile-exact
   PID 1 `UnitPath` with one-for-one disk scanning, and strict portable
-  systemctl exit/output/diagnostic/explicit-load-state checks,
+  systemctl exit/output/diagnostic/explicit-`LoadState`/`UnitFileState` checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion with
