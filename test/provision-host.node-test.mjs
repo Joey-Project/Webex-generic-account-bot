@@ -3077,6 +3077,85 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
+  it('retains recovery after a partial credential commit and manager safety rollback', async (context) => {
+    const fixture = await provisionFixture(context);
+    const failedInstall = fixture.dependencies({ applied: true });
+    failedInstall.runCommand = async () => {
+      throw new Error('injected sysusers partial commit');
+    };
+    await assert.rejects(
+      provisionHost({ apply: true }, failedInstall),
+      /injected sysusers partial commit/,
+    );
+
+    const partialIdentity = expectedIdentitySnapshot({
+      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+      gshadowDatabase: expectedGshadowDatabase().replace(
+        'webex-config-pull:!::\n',
+        '',
+      ),
+    });
+    const absent = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const unsafe = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    unsafe.set(MANAGED_UNITS[0], {
+      ...unsafe.get(MANAGED_UNITS[0]),
+      reverseActivators: ['external-boot.service'],
+    });
+    const rollbackCommands = [];
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          commands: rollbackCommands,
+          identitySequence: [partialIdentity],
+          unitStateSequence: [absent, unsafe, absent],
+        }),
+      ),
+      /host policy safety validation failed and the old policy set was restored/,
+    );
+    assert.deepEqual(rollbackCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    const loaded = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    const retryCommands = [];
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        commands: retryCommands,
+        identitySequence: [partialIdentity, expectedIdentitySnapshot()],
+        unitStateSequence: [absent, absent, absent, loaded],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    assert.deepEqual(retryCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
   it('does not reload systemd until the held lock metadata has converged', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];

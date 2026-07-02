@@ -604,15 +604,12 @@ export async function provisionHost(options, dependencies = {}) {
   }
   const commands = [];
   let identityBefore = null;
+  let identityRecoveryRequired = false;
   let recoveryState = null;
   if (transaction) {
-    const transactionInspection = await inspectPolicyTransactionRecovery(transaction, plan, deps);
+    await inspectPolicyTransactionRecovery(transaction, plan, deps);
     identityBefore = await deps.readIdentitySnapshot();
-    if (transactionInspection.resumeDesiredState) {
-      validateIdentityPolicyForDesiredRecovery(identityBefore);
-    } else {
-      validateIdentityPolicy(identityBefore);
-    }
+    identityRecoveryRequired = validateIdentityPolicyForTransactionRecovery(identityBefore);
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     const recoveryInspected = await inspectArtifacts(plan, deps);
     auditBootPolicyCatalogs(
@@ -641,6 +638,7 @@ export async function provisionHost(options, dependencies = {}) {
           deps,
           commands,
           identityBefore,
+          identityRecoveryRequired,
         );
       }
       throw new Error(
@@ -675,17 +673,6 @@ export async function provisionHost(options, dependencies = {}) {
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
   }
-  if (recoveryState === 'old') {
-    try {
-      await removeProvisionTransaction(plan, deps);
-    } catch (error) {
-      throw new Error(
-        `host policy recovery finalisation failed; rerun --apply after correction: ${error.message}`,
-        { cause: error },
-      );
-    }
-  }
-
   if (!options.apply) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
@@ -725,6 +712,7 @@ export async function provisionHost(options, dependencies = {}) {
           deps,
           commands,
           identityAfter,
+          false,
         );
       }
       throw error;
@@ -740,6 +728,16 @@ export async function provisionHost(options, dependencies = {}) {
     );
   }
   return provisionReport('applied', plan, inspected, commands, installed);
+}
+
+function validateIdentityPolicyForTransactionRecovery(snapshot) {
+  try {
+    validateIdentityPolicy(snapshot);
+    return false;
+  } catch {
+    validateIdentityPolicyForDesiredRecovery(snapshot);
+    return true;
+  }
 }
 
 function validateIdentityPolicyForDesiredRecovery(snapshot) {
@@ -1735,6 +1733,7 @@ async function rollbackPolicyAfterSafetyFailure(
   deps,
   commands,
   identitySnapshot,
+  identityRecoveryRequired,
 ) {
   try {
     const recoveredState = await recoverPolicyTransaction(
@@ -1749,7 +1748,9 @@ async function rollbackPolicyAfterSafetyFailure(
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identitySnapshot);
     assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
-    await removeProvisionTransaction(plan, deps);
+    if (!identityRecoveryRequired) {
+      await removeProvisionTransaction(plan, deps);
+    }
   } catch (rollbackError) {
     throw new PolicySafetyRollbackError(
       `${safetyError.message}; safety rollback failed: ${rollbackError.message}`,
