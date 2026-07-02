@@ -1828,6 +1828,37 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const [name, target, missingPaths] of [
+      ['systemd-tmpfiles-clean.service', '/dev/null', new Set()],
+      [
+        'systemd-sysusers.service',
+        '/usr/lib/systemd/system/missing-systemd-sysusers.service',
+        new Set(['/usr/lib/systemd/system/missing-systemd-sysusers.service']),
+      ],
+      ['systemd-userdb-load-credentials.service', '/opt/systemd/non-regular', new Set()],
+    ]) {
+      const candidate = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{
+              name,
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]]]),
+            {
+              missingPaths,
+              symlinksByPath: new Map([[candidate, target]]),
+            },
+          ),
+        ),
+        /boot policy systemd consumer symlink target is not trusted/,
+      );
+    }
+
     let vendorImportCommandCalls = 0;
     const sysinitWants = '/usr/lib/systemd/system/sysinit.target.wants';
     const linkedSysusers = `${sysinitWants}/systemd-sysusers.service`;

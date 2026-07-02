@@ -195,7 +195,8 @@ superseded_by:
   while top-level, multi-hop, and renamed aliases remain rejected, plus
   consumer fragment provenance that rejects sysusers/userdb/tmpfiles overrides
   plus exact/shared drop-ins and consumer-owned dependency directories before
-  their commands can bypass merged catalogue auditing, plus
+  their commands can bypass merged catalogue auditing, and rejects masks,
+  dangling links, and non-regular consumer symlink targets, plus
   launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

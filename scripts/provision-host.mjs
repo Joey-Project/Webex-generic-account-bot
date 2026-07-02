@@ -3039,7 +3039,10 @@ async function auditSystemdPolicySymlink(
     visited.size,
   );
   let resolved = path.resolve(path.dirname(candidate), target);
-  if (resolved === '/dev/null') return;
+  if (resolved === '/dev/null') {
+    assertBootPolicySystemdConsumerSymlinkTarget(unitNames, logicalSource);
+    return;
+  }
   if (resolved === '/lib/systemd/system' || resolved.startsWith('/lib/systemd/system/')) {
     if (await isUsrMergedLib(fsApi)) resolved = `/usr${resolved}`;
   }
@@ -3048,7 +3051,10 @@ async function auditSystemdPolicySymlink(
   try {
     targetStat = await fsApi.lstat(resolved);
   } catch (error) {
-    if (error?.code === 'ENOENT') return;
+    if (error?.code === 'ENOENT') {
+      assertBootPolicySystemdConsumerSymlinkTarget(unitNames, logicalSource);
+      return;
+    }
     throw error;
   }
   if (targetStat.isSymbolicLink()) {
@@ -3064,6 +3070,7 @@ async function auditSystemdPolicySymlink(
     return;
   }
   if (!targetStat.isFile()) {
+    assertBootPolicySystemdConsumerSymlinkTarget(unitNames, logicalSource);
     throw new Error(`systemd policy symlink target is not a regular file: ${candidate}`);
   }
   await auditSystemdPolicyFile(
@@ -3269,6 +3276,14 @@ function assertBootPolicySystemdConsumerSource(
     )
   ) {
     throw new Error(`boot policy systemd consumer is not trusted: ${logicalSource}`);
+  }
+}
+
+function assertBootPolicySystemdConsumerSymlinkTarget(unitNames, logicalSource) {
+  if ([...unitNames].some((unit) => BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit))) {
+    throw new Error(
+      `boot policy systemd consumer symlink target is not trusted: ${logicalSource}`,
+    );
   }
 }
 

@@ -303,7 +303,9 @@ The sysusers, userdb credential loader, and tmpfiles consumer services must
 also remain direct vendor fragments or single-hop same-name dependency links.
 Overrides, exact or shared drop-ins, and consumer-owned dependency directories
 are rejected so explicit out-of-catalogue command arguments or helper units
-cannot bypass the merged policy audit.
+cannot bypass the merged policy audit. Consumer masks, dangling links, and
+non-regular symlink targets are rejected before terminal-link handling can skip
+the vendor provenance check.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.

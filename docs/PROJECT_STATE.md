@@ -127,7 +127,8 @@
   accept direct single-hop same-name dependency links but reject top-level,
   multi-hop, and renamed aliases, and bind sysusers/userdb/tmpfiles consumer
   fragments to those same vendor sources without overrides, exact/shared
-  drop-ins, or consumer-owned dependency directories,
+  drop-ins, consumer-owned dependency directories, masks, dangling links, or
+  non-regular symlink targets,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
