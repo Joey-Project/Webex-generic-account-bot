@@ -14,6 +14,7 @@ const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
 const IDENTITY_RECOVERY_CHILD_ENV = 'WEBEX_HOST_IDENTITY_RECOVERY_CHILD';
 const IDENTITY_LOCK_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PID';
+const IDENTITY_LOCK_PARENT_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PARENT_PID';
 const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
 const FD_REEXEC_BOOTSTRAP = [
   'const { readFileSync } = await import("node:fs");',
@@ -43,6 +44,7 @@ const MAX_POLICY_FILE_BYTES = 256 * 1024;
 const MAX_TRANSACTION_BYTES = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROC_LOCKS_BYTES = 1024 * 1024;
+const MAX_PROC_FD_ENTRIES = 1024;
 const MAX_STALE_CANDIDATES = 256;
 const MAX_SCANNED_DIRECTORY_ENTRIES = 4096;
 const MAX_LAUNCHER_INSTANCES = 128;
@@ -1224,6 +1226,12 @@ export async function executeLockedApply(argv, {
 export async function executeIdentityRecovery({
   fsApi = fs,
   openExecutable = (file) => openTrustedExecutable(file, fsApi),
+  processApi = process,
+  resolveProvisionLock = () => assertProvisionLockHeld({
+    allowInterruptedMigration: false,
+    fsApi,
+    processApi,
+  }),
   spawnProcess = spawn,
   allowTestInvocation = false,
 } = {}) {
@@ -1233,6 +1241,10 @@ export async function executeIdentityRecovery({
     || PROVISION_SCRIPT_PATH !== FD_REEXEC_SCRIPT_PATH
   )) {
     throw new Error('identity recovery requires the locked private host provisioner');
+  }
+  const provisionLock = await resolveProvisionLock();
+  if (!Number.isInteger(provisionLock?.fd) || provisionLock.fd < 3) {
+    throw new Error('identity recovery requires the inherited host provision lock descriptor');
   }
   const helper = await openExecutable(IDENTITY_LOCK_HELPER_PATH);
   try {
@@ -1244,8 +1256,9 @@ export async function executeIdentityRecovery({
           PATH: '/usr/bin:/bin',
           LANG: 'C.UTF-8',
           LC_ALL: 'C.UTF-8',
+          [IDENTITY_LOCK_PARENT_PID_ENV]: String(processApi.pid),
         },
-        stdio: ['inherit', 'inherit', 'inherit', 4, 'ignore', 5],
+        stdio: ['inherit', 'inherit', 'inherit', 4, 'ignore', 5, provisionLock.fd],
       });
       child.once('error', reject);
       child.once('exit', (code, signal) => {
@@ -1340,15 +1353,19 @@ export async function runIdentityRecoveryChild({
   return 0;
 }
 
-async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
-  const configPullGid = await readConfigPullGroupGid(fs);
-  const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
+async function assertProvisionLockHeld({
+  allowInterruptedMigration = true,
+  fsApi = fs,
+  processApi = process,
+} = {}) {
+  const configPullGid = await readConfigPullGroupGid(fsApi);
+  const parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
   const lockPolicy = assertTrustedProvisionLockParent(
     parentStat,
     configPullGid,
     { allowInterruptedMigration },
   );
-  const lock = await fs.open(
+  const lock = await fsApi.open(
     PROVISION_LOCK_PATH,
     fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
   );
@@ -1359,10 +1376,42 @@ async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}
   } finally {
     await lock.close();
   }
-  const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fs);
-  if (!hasProvisionLock(procLocks, process.pid, stat)) {
+  const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fsApi);
+  if (!hasProvisionLock(procLocks, processApi.pid, stat)) {
     throw new Error('current process does not hold the host provision lock');
   }
+  return Object.freeze({
+    fd: await findOpenFileDescriptor(stat, { fsApi }),
+    stat,
+  });
+}
+
+export async function findOpenFileDescriptor(
+  expected,
+  { fsApi = fs, procFdRoot = '/proc/self/fd' } = {},
+) {
+  const entries = await fsApi.readdir(procFdRoot);
+  if (entries.length > MAX_PROC_FD_ENTRIES) {
+    throw new Error('process file descriptor table exceeds the audit limit');
+  }
+  const matches = [];
+  for (const entry of entries) {
+    if (!/^[0-9]+$/.test(entry)) continue;
+    const fd = Number(entry);
+    if (!Number.isSafeInteger(fd) || fd < 3) continue;
+    let stat;
+    try {
+      stat = await fsApi.stat(path.join(procFdRoot, entry));
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (stat.dev === expected.dev && stat.ino === expected.ino) matches.push(fd);
+  }
+  if (matches.length !== 1) {
+    throw new Error('host provision lock descriptor is missing or ambiguous');
+  }
+  return matches[0];
 }
 
 async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {}) {

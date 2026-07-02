@@ -302,7 +302,11 @@ superseded_by:
   manager reload, and post-install verification.
 - Add the fixed-purpose `webex-host-identity-lock` native supervisor so
   version 3 identity recovery shares systemd-sysusers' glibc-compatible account
-  database lock without exposing a general root command wrapper.
+  database lock without exposing a general root command wrapper. Pass and
+  retain the exact shared deployment-lock open-file-description across this
+  supervisor boundary, and bind the supervisor and child to expected-parent
+  death so an outer crash cannot orphan identity mutation without the global
+  lock.
 - Before installation, reject pre-existing static bot membership in every
   launcher, input, config-pull, or config-deploy group because systemd extends
   user-database groups even after an empty `SupplementaryGroups=` assignment.

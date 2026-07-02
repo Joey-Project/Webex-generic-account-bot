@@ -172,7 +172,9 @@
   a complete transaction-aware read-only host preflight validated before
   first-run lock convergence, followed by protected mount snapshots around
   sysusers/tmpfiles and repeated identity/policy/runtime-ownership checks under
-  the held lock,
+  the held lock, including explicit inheritance of that deployment-lock
+  open-file-description into the native identity supervisor and parent-death
+  binding for both supervisor and recovery child,
   managed-name-free stale candidates that remain recoverable through systemd
   policy scanning, fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full

@@ -24,6 +24,7 @@ import {
   buildProvisionPlan,
   ensureProvisionLockFile,
   executeIdentityRecovery,
+  findOpenFileDescriptor,
   executeLockedApply,
   hasIdentityLock,
   hasProvisionLock,
@@ -473,6 +474,8 @@ describe('guarded host provisioner policy', () => {
     const identityClosed = [];
     await executeIdentityRecovery({
       allowTestInvocation: true,
+      resolveProvisionLock: async () => ({ fd: 46 }),
+      processApi: { pid: 4321 },
       openExecutable: async (file) => {
         assert.equal(
           file,
@@ -503,15 +506,43 @@ describe('guarded host provisioner policy', () => {
       4,
       'ignore',
       5,
+      46,
     ]);
     assert.deepEqual(Object.keys(identitySpawn.options.env).sort(), [
       'LANG',
       'LC_ALL',
       'PATH',
+      'WEBEX_HOST_IDENTITY_LOCK_PARENT_PID',
     ]);
+    assert.equal(identitySpawn.options.env.WEBEX_HOST_IDENTITY_LOCK_PARENT_PID, '4321');
     assert.deepEqual(identityClosed, [
       '/opt/webex-generic-account-bot/bin/webex-host-identity-lock',
     ]);
+
+    const descriptorFile = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'webex-provision-fd-test-')),
+      'lock',
+    );
+    await fs.writeFile(descriptorFile, '');
+    const descriptorHandle = await fs.open(descriptorFile, fsConstants.O_RDONLY);
+    try {
+      assert.equal(
+        await findOpenFileDescriptor(await descriptorHandle.stat()),
+        descriptorHandle.fd,
+      );
+      const duplicateHandle = await fs.open(descriptorFile, fsConstants.O_RDONLY);
+      try {
+        await assert.rejects(
+          findOpenFileDescriptor(await descriptorHandle.stat()),
+          /descriptor is missing or ambiguous/,
+        );
+      } finally {
+        await duplicateHandle.close();
+      }
+    } finally {
+      await descriptorHandle.close();
+      await fs.rm(path.dirname(descriptorFile), { recursive: true, force: true });
+    }
 
     const provisionScript = fileURLToPath(
       new URL('../scripts/provision-host.mjs', import.meta.url),
