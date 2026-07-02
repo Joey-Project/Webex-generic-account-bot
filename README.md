@@ -346,7 +346,9 @@ Webex paths through systemd-managed directory source or alias directives.
 Path-derived `.mount` and `.automount` names, `Where=`, install aliases, and
 dependency links also cannot mount over a protected Webex path on a later boot.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
-incomplete cross-directive data-flow analysis. Every existing sysusers and
+incomplete cross-directive data-flow analysis, including unescaped unit
+specifiers that can generate a `$` marker only after template instantiation.
+Every existing sysusers and
 tmpfiles search directory is validated before and after catalogue collection,
 even when the directory contributes no active file. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths

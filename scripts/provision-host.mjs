@@ -769,7 +769,7 @@ export async function provisionHost(options, dependencies = {}) {
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
     throw new Error('host provisioning requires root, including dry-run');
   }
-  await deps.verifyMountNamespace();
+  await deps.verifyMountNamespace('inspection');
   const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
     ?? ((runtimeInspected) => assertManagedRuntimeAncestorsTraversable(
       plan,
@@ -827,9 +827,9 @@ export async function provisionHost(options, dependencies = {}) {
     if (options.recoveryPreflight) {
       return provisionReport('dry-run', plan, recoveryInspected, commands);
     }
-    await deps.verifyMountNamespace();
     recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
     try {
+      await deps.verifyMountNamespace('daemon-reload-recovery');
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
       const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
       assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
@@ -875,7 +875,7 @@ export async function provisionHost(options, dependencies = {}) {
     if (options.recoveryPreflight) {
       return provisionReport('dry-run', plan, inspected, commands);
     }
-    await deps.verifyMountNamespace();
+    await deps.verifyMountNamespace('daemon-reload-cache');
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
@@ -884,7 +884,6 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
-  await deps.verifyMountNamespace();
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps, {
@@ -892,6 +891,7 @@ export async function provisionHost(options, dependencies = {}) {
   });
   const safetyRollbackTransaction = transactionFromInspected(inspected);
   try {
+    await deps.verifyMountNamespace('systemd-sysusers');
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
     const identityAfter = await deps.readIdentitySnapshot();
     validateIdentityPolicy(identityAfter, { requireAccounts: true });
@@ -902,12 +902,14 @@ export async function provisionHost(options, dependencies = {}) {
       { requireManagedPolicy: true },
     );
     assertNoUnexpectedManagedMounts(inspected, await deps.readMountInfo());
+    await deps.verifyMountNamespace('systemd-tmpfiles');
     commands.push(await deps.runCommand('/usr/bin/systemd-tmpfiles', [
       '--create',
       ...plan.tmpfiles,
     ]));
     await verifyManagedRuntimeState(inspected, identityAfter);
     await deps.verifyProvisionLockConverged();
+    await deps.verifyMountNamespace('daemon-reload-final');
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
     try {
@@ -1071,7 +1073,7 @@ export async function executeLockedApply(argv, {
   await verifyReexecFile(nodePath, { executable: true }, fsApi);
   await verifyReexecFile(scriptPath, { mode: FILE_MODE }, fsApi);
   await preflightHost();
-  await ensureLock(fsApi);
+  await ensureLock(fsApi, () => assertSameMountNamespace(fsApi));
   const command = buildLockedApplyCommand({ argv, nodePath, scriptPath });
   return new Promise((resolve, reject) => {
     const child = spawnProcess(command.command, command.args, {
@@ -1178,6 +1180,7 @@ async function ensureTargetDirectories(plan, deps) {
       deps.targetUid,
       deps.targetGid,
       deps.fsApi,
+      deps.verifyMountNamespace,
     );
   }
 }
@@ -1249,6 +1252,7 @@ async function cleanupStaleCandidates(plan, deps) {
     ) {
       throw new Error(`stale policy candidate changed before cleanup: ${candidate}`);
     }
+    await deps.verifyMountNamespace('stale-candidate-remove');
     await deps.fsApi.rm(candidate);
     changedDirectories.add(directory);
   }
@@ -1279,6 +1283,7 @@ async function installPolicySetAtomically(
     }
     for (const entry of staged) {
       await assertTargetUnchanged(entry.artifact, deps.fsApi);
+      await deps.verifyMountNamespace('policy-install-rename');
       await deps.fsApi.rename(entry.temporary, entry.artifact.target);
       entry.temporary = null;
       await syncDirectory(path.dirname(entry.artifact.target), deps.fsApi);
@@ -1297,7 +1302,10 @@ async function installPolicySetAtomically(
   } finally {
     await Promise.allSettled(staged
       .filter(({ temporary }) => temporary)
-      .map(({ temporary }) => deps.fsApi.rm(temporary, { force: true })));
+      .map(async ({ temporary }) => {
+        await deps.verifyMountNamespace('candidate-cleanup');
+        await deps.fsApi.rm(temporary, { force: true });
+      }));
   }
   return changed.map(({ target }) => target);
 }
@@ -1345,6 +1353,7 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
   );
   let handle;
   try {
+    await deps.verifyMountNamespace('candidate-create');
     handle = await deps.fsApi.open(
       temporary,
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -1359,12 +1368,16 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
     return temporary;
   } catch (error) {
     await handle?.close().catch(() => {});
+    await deps.verifyMountNamespace('candidate-cleanup');
     await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
 }
 
-export async function ensureProvisionLockFile(fsApi) {
+export async function ensureProvisionLockFile(
+  fsApi,
+  verifyMountNamespace = () => assertSameMountNamespace(fsApi),
+) {
   await assertTrustedDirectoryChain(
     '/',
     path.dirname(PROVISION_LOCK_PARENT),
@@ -1378,14 +1391,18 @@ export async function ensureProvisionLockFile(fsApi) {
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
+    await verifyMountNamespace('provision-lock-parent-create');
     await fsApi.mkdir(PROVISION_LOCK_PARENT, { mode: DIRECTORY_MODE });
+    await verifyMountNamespace('provision-lock-parent-chown');
     await fsApi.chown(PROVISION_LOCK_PARENT, 0, 0);
+    await verifyMountNamespace('provision-lock-parent-chmod');
     await fsApi.chmod(PROVISION_LOCK_PARENT, DIRECTORY_MODE);
     await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
   }
   let lockPolicy = assertTrustedProvisionLockParent(parentStat, configPullGid);
   if ((parentStat.mode & 0o7777) !== lockPolicy.parentMode) {
+    await verifyMountNamespace('provision-lock-parent-chmod');
     await fsApi.chmod(PROVISION_LOCK_PARENT, lockPolicy.parentMode);
     await syncDirectory(path.dirname(PROVISION_LOCK_PARENT), fsApi);
     parentStat = await fsApi.lstat(PROVISION_LOCK_PARENT);
@@ -1393,6 +1410,7 @@ export async function ensureProvisionLockFile(fsApi) {
   }
   let handle;
   try {
+    await verifyMountNamespace('provision-lock-create');
     handle = await fsApi.open(
       PROVISION_LOCK_PATH,
       fsConstants.O_WRONLY
@@ -1732,7 +1750,14 @@ async function assertTrustedDirectoryChain(root, directory, uid, gid, fsApi) {
   }
 }
 
-async function createTrustedDirectoryChain(root, directory, uid, gid, fsApi) {
+async function createTrustedDirectoryChain(
+  root,
+  directory,
+  uid,
+  gid,
+  fsApi,
+  verifyMountNamespace,
+) {
   for (const candidate of pathComponentsWithin(root, directory)) {
     try {
       const stat = await fsApi.lstat(candidate);
@@ -1740,8 +1765,11 @@ async function createTrustedDirectoryChain(root, directory, uid, gid, fsApi) {
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
       const parent = path.dirname(candidate);
+      await verifyMountNamespace('target-directory-create');
       await fsApi.mkdir(candidate, { mode: DIRECTORY_MODE });
+      await verifyMountNamespace('target-directory-chown');
       await fsApi.chown(candidate, uid, gid);
+      await verifyMountNamespace('target-directory-chmod');
       await fsApi.chmod(candidate, DIRECTORY_MODE);
       await syncDirectory(parent, fsApi);
       const stat = await fsApi.lstat(candidate);
@@ -1926,9 +1954,11 @@ async function writeProvisionTransactionRecord(
     deps,
   );
   try {
+    await deps.verifyMountNamespace('transaction-rename');
     await deps.fsApi.rename(temporary, plan.transactionFile);
     await syncDirectory(path.dirname(plan.transactionFile), deps.fsApi);
   } catch (error) {
+    await deps.verifyMountNamespace('candidate-cleanup');
     await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
@@ -1961,8 +1991,10 @@ async function recoverPolicyTransaction(
           { target: artifact.target, existing: entry.current },
           deps.fsApi,
         );
+        await deps.verifyMountNamespace('policy-recovery-rename');
         await deps.fsApi.rename(temporary, artifact.target);
       } catch (error) {
+        await deps.verifyMountNamespace('candidate-cleanup');
         await deps.fsApi.rm(temporary, { force: true }).catch(() => {});
         throw error;
       }
@@ -1971,6 +2003,7 @@ async function recoverPolicyTransaction(
         { target: artifact.target, existing: entry.current },
         deps.fsApi,
       );
+      await deps.verifyMountNamespace('policy-recovery-remove');
       await deps.fsApi.rm(artifact.target, { force: true });
     }
     await syncDirectory(path.dirname(artifact.target), deps.fsApi);
@@ -2022,6 +2055,7 @@ async function rollbackPolicyAfterSafetyFailure(
     if (recoveredState !== 'old') {
       throw new Error('safety rollback did not restore the old policy set');
     }
+    await deps.verifyMountNamespace('daemon-reload-rollback');
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identitySnapshot);
     assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
@@ -2089,6 +2123,7 @@ async function inspectPolicyTransactionRecovery(transaction, plan, deps) {
 }
 
 async function removeProvisionTransaction(plan, deps) {
+  await deps.verifyMountNamespace('transaction-remove');
   await deps.fsApi.rm(plan.transactionFile, { force: true });
   await syncDirectory(path.dirname(plan.transactionFile), deps.fsApi);
 }
@@ -3684,7 +3719,22 @@ function systemdPolicyReinterpretsCommandArguments(value) {
 
 function systemdPolicyUsesEnvironmentExpansion(value) {
   const command = parseSystemdExecCommand(value);
-  return command !== null && command.fields.some((field) => field.includes('$'));
+  return command !== null && command.fields.some((field) => (
+    field.includes('$') || systemdSpecifierCanIntroduceEnvironmentExpansion(field)
+  ));
+}
+
+function systemdSpecifierCanIntroduceEnvironmentExpansion(field) {
+  for (let offset = 0; offset < field.length; offset += 1) {
+    if (field[offset] !== '%') continue;
+    if (field[offset + 1] === '%') {
+      offset += 1;
+      continue;
+    }
+    if (['I', 'P', 'J', 'f'].includes(field[offset + 1])) return true;
+    if (offset + 1 < field.length) offset += 1;
+  }
+  return false;
 }
 
 function systemdPolicyClaimsProtectedDirectory(value) {

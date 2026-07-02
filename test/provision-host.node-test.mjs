@@ -410,7 +410,7 @@ describe('guarded host provisioner policy', () => {
       },
     };
 
-    await ensureProvisionLockFile(fsApi);
+    await ensureProvisionLockFile(fsApi, async () => {});
     assert.deepEqual(state, {
       parentGid: 2003,
       parentMode: 0o750,
@@ -919,6 +919,87 @@ describe('guarded host provisioner execution', () => {
     assert.equal(namespaceChecks, 2);
     assert.deepEqual(commands, []);
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('guards each policy and host-command mutation boundary with mount namespace identity', async (context) => {
+    for (const failureBoundary of [
+      'policy-install-rename',
+      'systemd-sysusers',
+      'systemd-tmpfiles',
+      'daemon-reload-final',
+    ]) {
+      const fixture = await provisionFixture(context);
+      const commands = [];
+      const checkedBoundaries = [];
+      let injected = false;
+      await assert.rejects(
+        provisionHost(
+          { apply: true },
+          fixture.dependencies({
+            applied: true,
+            commands,
+            verifyMountNamespace: async (boundary) => {
+              checkedBoundaries.push(boundary);
+              if (!injected && boundary === failureBoundary) {
+                injected = true;
+                throw new Error(`mount namespace changed before ${boundary}`);
+              }
+            },
+          }),
+        ),
+        new RegExp(`mount namespace changed before ${failureBoundary}`),
+        failureBoundary,
+      );
+      assert.equal(injected, true, failureBoundary);
+      assert.ok(checkedBoundaries.includes(failureBoundary), failureBoundary);
+      if (failureBoundary === 'policy-install-rename') {
+        assert.equal(commands.some(([command]) => command.endsWith('systemd-sysusers')), false);
+      }
+      if (failureBoundary === 'systemd-sysusers') {
+        assert.equal(commands.some(([command]) => command.endsWith('systemd-sysusers')), false);
+      }
+      if (failureBoundary === 'systemd-tmpfiles') {
+        assert.equal(commands.some(([command]) => command.endsWith('systemd-tmpfiles')), false);
+      }
+    }
+  });
+
+  it('guards policy recovery mutations with mount namespace identity', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    const checkedBoundaries = [];
+    const before = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const unsafe = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    unsafe.set(MANAGED_UNITS[0], {
+      ...unsafe.get(MANAGED_UNITS[0]),
+      active: 'active',
+    });
+    const dependencies = fixture.dependencies({
+      applied: true,
+      commands,
+      unitStateSequence: [before, unsafe],
+      verifyMountNamespace: async (boundary) => {
+        checkedBoundaries.push(boundary);
+        if (boundary === 'policy-recovery-remove') {
+          throw new Error(`mount namespace changed before ${boundary}`);
+        }
+      },
+    });
+
+    await assert.rejects(
+      provisionHost({ apply: true }, dependencies),
+      /mount namespace changed before policy-recovery-remove/,
+    );
+    assert.ok(checkedBoundaries.includes('policy-recovery-remove'));
+    assert.equal(commands.filter(([, args]) => args[0] === 'daemon-reload').length, 1);
   });
 
   it('rejects unexpected mounts overlapping managed tmpfiles paths', async (context) => {
@@ -2217,7 +2298,7 @@ describe('guarded host provisioner execution', () => {
             },
           ),
         ),
-        /external systemd policy references a managed unit/,
+        /external systemd policy (?:references a managed unit|uses environment expansion)/,
       );
     }
 
@@ -2420,6 +2501,24 @@ describe('guarded host provisioner execution', () => {
                 'ExecStart=/usr/bin/env ${HELPER} /etc/rogue.conf',
                 '',
               ].join('\n')),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy uses environment expansion/,
+    );
+
+    const specifierEnvironmentUnit = '/etc/systemd/system/external@.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external@.service' }]]]),
+          {
+            filesByPath: new Map([[
+              specifierEnvironmentUnit,
+              Buffer.from('[Service]\nExecStart=/usr/bin/echo --target=%I\n'),
             ]]),
           },
         ),
