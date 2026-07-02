@@ -352,6 +352,14 @@ const SYSTEMCTL_UNSCOPED_MUTATION_VERBS = new Set([
   'switch-root',
   'unset-environment',
 ]);
+const SYSTEMD_GLOBAL_CONTROL_EXECUTABLES = new Set([
+  'halt',
+  'init',
+  'poweroff',
+  'reboot',
+  'shutdown',
+  'telinit',
+]);
 const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
   'add-requires',
   'add-wants',
@@ -4924,7 +4932,15 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 
 function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
-  if (command === null || !systemdExecInvokes(command, 'systemctl')) return false;
+  if (command === null) return false;
+  if (command.names.some((name) => (
+    SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
+    || systemdSpecifierFieldCouldMatch(
+      name,
+      [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+    )
+  ))) return true;
+  if (!systemdExecInvokes(command, 'systemctl')) return false;
   const unitFileMutation = command.tokens.some((token) => (
     SYSTEMCTL_UNIT_FILE_MUTATION_VERBS.has(token)
     || systemdSpecifierFieldCouldMatch(

@@ -3478,6 +3478,13 @@ describe('guarded host provisioner execution', () => {
       'systemctl --job-mode=isolate start rescue.target',
       'systemctl --marked reload-or-restart',
       'systemctl --mark reload-or-restart',
+      'halt',
+      'init 1',
+      'poweroff',
+      'reboot',
+      'shutdown -r now',
+      'telinit 1',
+      'env telinit 1',
       'systemctl enable /opt/benign.service',
       'systemctl enable %t-foreign.socket',
       'systemctl edit --full --stdin benign.service',
@@ -3501,6 +3508,27 @@ describe('guarded host provisioner execution', () => {
         /external systemd policy references a managed unit/,
       );
     }
+
+    const compatibilitySpecifierUnit =
+      '/etc/systemd/system/external@telinit.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: 'external@telinit.service',
+          }]]]),
+          {
+            filesByPath: new Map([[
+              compatibilitySpecifierUnit,
+              Buffer.from('[Service]\nExecStart=/usr/sbin/%i 1\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
 
     const markedSpecifierUnit = '/etc/systemd/system/external@k.service';
     await assert.rejects(
