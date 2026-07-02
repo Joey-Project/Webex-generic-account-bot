@@ -197,9 +197,11 @@ superseded_by:
   plus exact/shared drop-ins and consumer-owned dependency directories before
   their commands can bypass merged catalogue auditing, and rejects masks,
   dangling links, non-regular consumer symlink targets, and direct boot-policy
-  tool execution from external or linked helper units after unit-name specifier
-  expansion, including unresolved template instances, plus
-  launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
+  tool execution from external or linked helper units after unit-name executable
+  and argument specifier expansion, including unresolved template instances,
+  plus external `systemctl` commands with specifier-reachable managed-unit
+  targets and launcher-instance reference rejection, fixed-path scanning for
+  unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, code-zero/diagnostic-free/non-empty merged

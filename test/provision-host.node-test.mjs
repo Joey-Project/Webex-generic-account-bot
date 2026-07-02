@@ -1994,6 +1994,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'systemd-%i', '--create /etc/rogue.conf'],
       ['sysusers', 'systemd-%I', '/etc/rogue.conf'],
       ['userdbd', 'systemd-%i', '--load-credentials'],
+      ['--load-credentials', 'systemd-userdbd', '%i'],
     ]) {
       const template = '/etc/systemd/system/external@.service';
       const activator = '/etc/systemd/system/external-trigger.service';
@@ -2021,6 +2022,39 @@ describe('guarded host provisioner execution', () => {
           ),
         ),
         /external systemd policy invokes a boot policy tool/,
+      );
+    }
+
+    for (const [instance, target] of [
+      ['generic-account-bot', 'webex-%i.service'],
+      ['smoke', 'webex-codex-launcher@%I.service'],
+    ]) {
+      const template = '/etc/systemd/system/external@.service';
+      const activator = '/etc/systemd/system/external-trigger.service';
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [
+              { name: 'external@.service' },
+              { name: 'external-trigger.service' },
+            ]]]),
+            {
+              filesByPath: new Map([
+                [
+                  template,
+                  Buffer.from(`[Service]\nExecStart=/usr/bin/systemctl start ${target}\n`),
+                ],
+                [
+                  activator,
+                  Buffer.from(`[Unit]\nWants=external@${instance}.service\n`),
+                ],
+              ]),
+            },
+          ),
+        ),
+        /external systemd policy references a managed unit/,
       );
     }
 

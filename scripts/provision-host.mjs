@@ -3225,6 +3225,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
+      || systemdPolicyInvokesManagedUnitControl(candidate)
       || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
       || systemdIdentityDirectiveUsesManagedId(
@@ -3256,7 +3257,31 @@ function systemdPolicyInvokesBootPolicyTool(value) {
     name === 'systemd-userdbd'
     || systemdSpecifierFieldCouldMatch(name, ['systemd-userdbd'])
   ));
-  return invokesUserdbLoader && tokens.includes('--load-credentials');
+  return invokesUserdbLoader && tokens.some((token) => (
+    token === '--load-credentials'
+    || systemdSpecifierFieldCouldMatch(token, ['--load-credentials'])
+  ));
+}
+
+function systemdPolicyInvokesManagedUnitControl(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
+  const invokesSystemctl = tokens.some((token) => {
+    const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
+    return name === 'systemctl'
+      || systemdSpecifierFieldCouldMatch(name, ['systemctl']);
+  });
+  return invokesSystemctl && tokens.some((token) => (
+    systemdSpecifierFieldCouldMatch(
+      token,
+      MANAGED_UNITS,
+      { includeLauncherInstances: true },
+    )
+  ));
 }
 
 function systemdPolicyInjectsBootPolicyCredential(
@@ -3410,10 +3435,18 @@ function unresolvedSpecifierCouldReferenceManagedUnit(value) {
   const directive = value.slice(0, separator).trim();
   if (!SYSTEMD_UNIT_REFERENCE_DIRECTIVES.has(directive)) return false;
   return parseSystemdFields(value.slice(separator + 1))
-    .some((field) => systemdSpecifierFieldCouldMatch(field, MANAGED_UNITS));
+    .some((field) => systemdSpecifierFieldCouldMatch(
+      field,
+      MANAGED_UNITS,
+      { includeLauncherInstances: true },
+    ));
 }
 
-function systemdSpecifierFieldCouldMatch(field, candidates) {
+function systemdSpecifierFieldCouldMatch(
+  field,
+  candidates,
+  { includeLauncherInstances = false } = {},
+) {
   let pattern = '';
   let hasUnresolvedSpecifier = false;
   const tokens = [];
@@ -3437,7 +3470,10 @@ function systemdSpecifierFieldCouldMatch(field, candidates) {
   if (!hasUnresolvedSpecifier) return false;
   const reference = new RegExp(`^${pattern}$`);
   return candidates.some((candidate) => reference.test(candidate))
-    || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
+    || (
+      includeLauncherInstances
+      && systemdTokenPatternsIntersect(tokens, launcherReferenceTokens())
+    );
 }
 
 function launcherReferenceTokens() {

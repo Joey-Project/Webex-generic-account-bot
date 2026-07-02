@@ -130,7 +130,8 @@
   drop-ins, consumer-owned dependency directories, masks, dangling links, or
   non-regular symlink targets, and reject direct boot-policy tool execution from
   external or linked helper units after concrete or unresolved template
-  unit-name specifier expansion,
+  unit-name executable and argument specifier expansion, and reject external
+  `systemctl` commands with specifier-reachable managed-unit targets,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
