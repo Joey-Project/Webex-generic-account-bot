@@ -2276,6 +2276,10 @@ export function auditBootPolicyCatalogs(
     const record = identitySnapshot.groups.get(group);
     if (record) managedIds.add(String(record.gid));
   }
+  const occupiedIds = Object.freeze({
+    users: new Set([...identitySnapshot.users.values()].map(({ uid }) => uid)),
+    groups: new Set([...identitySnapshot.groups.values()].map(({ gid }) => gid)),
+  });
   const protectedPaths = new Set([
     ...inspected.artifacts
       .filter((artifact) => artifact.kind === 'tmpfiles')
@@ -2328,6 +2332,7 @@ export function auditBootPolicyCatalogs(
         line,
         managedNames,
         managedIds,
+        occupiedIds,
         protectedPaths,
       )) {
         throw new Error(`unmanaged ${kind} policy touches the Webex boundary: ${line}`);
@@ -2523,11 +2528,18 @@ function bootPolicyLineTouchesManagedSurface(
   line,
   managedNames,
   managedIds,
+  occupiedIds,
   protectedPaths,
 ) {
   const fields = parseSystemdFields(line);
   if (kind === 'sysusers') {
-    return sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths);
+    return sysusersLineTouchesManagedSurface(
+      fields,
+      managedNames,
+      managedIds,
+      occupiedIds,
+      protectedPaths,
+    );
   }
   if (kind === 'tmpfiles') {
     return tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths);
@@ -2535,7 +2547,13 @@ function bootPolicyLineTouchesManagedSurface(
   throw new Error(`unsupported boot policy kind: ${kind}`);
 }
 
-function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths) {
+function sysusersLineTouchesManagedSurface(
+  fields,
+  managedNames,
+  managedIds,
+  occupiedIds,
+  protectedPaths,
+) {
   if (fields.length < 3) throw new Error('sysusers policy line is malformed');
   const [type, name, id] = fields;
   if (managedNames.has(name) || [...managedNames].some((managed) => id === managed)) return true;
@@ -2543,6 +2561,7 @@ function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   if (type === 'm') return managedNames.has(name) || managedNames.has(id);
   if (['u', 'u!', 'g', 'g!'].includes(type)) {
     if (id.startsWith('/')) return true;
+    if (sysusersIdClaimsUnmaterialisedLocalId(type, id, occupiedIds)) return true;
     for (const component of id.split(':')) {
       if (managedIds.has(component) || managedNames.has(component)) return true;
     }
@@ -2555,6 +2574,27 @@ function sysusersLineTouchesManagedSurface(fields, managedNames, managedIds, pro
     return true;
   }
   throw new Error(`unsupported sysusers policy type: ${type}`);
+}
+
+function sysusersIdClaimsUnmaterialisedLocalId(type, id, occupiedIds) {
+  const components = id.split(':');
+  if (components.length > 2) return true;
+  const [userOrGroupId, primaryGroupId] = components;
+  if (type === 'g' || type === 'g!') {
+    return localIdentityIdIsUnmaterialised(userOrGroupId, occupiedIds.groups);
+  }
+  if (localIdentityIdIsUnmaterialised(userOrGroupId, occupiedIds.users)) return true;
+  const groupId = primaryGroupId === undefined ? userOrGroupId : primaryGroupId;
+  return localIdentityIdIsUnmaterialised(groupId, occupiedIds.groups);
+}
+
+function localIdentityIdIsUnmaterialised(id, occupiedIds) {
+  if (!/^[0-9]+$/.test(id)) return false;
+  const parsed = Number(id);
+  return Number.isSafeInteger(parsed)
+    && parsed > 0
+    && parsed <= MAX_MANAGED_ID
+    && !occupiedIds.has(parsed);
 }
 
 function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, protectedPaths) {

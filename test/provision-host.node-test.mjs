@@ -874,6 +874,9 @@ describe('guarded host provisioner execution', () => {
       ['sysusers', 'm webex-generic-account-bot sudo'],
       ['sysusers', 'm \\x77ebex-generic-account-bot sudo'],
       ['sysusers', 'u external /var/lib/webex-generic-account-bot/state -'],
+      ['sysusers', 'u external-user 999 -'],
+      ['sysusers', 'u external-user -:998 -'],
+      ['sysusers', 'g external-group 997 -'],
       ['sysusers', 'r - 61184-65519'],
       ['tmpfiles', 'd /run/webex-codex-canary 0777 root root -'],
       ['tmpfiles', 'd /run/\\x77ebex-config-deploy 0777 root root -'],
@@ -953,6 +956,37 @@ describe('guarded host provisioner execution', () => {
         new RegExp(`unmanaged ${kind} policy touches the Webex boundary`),
       );
     }
+  });
+
+  it('accepts materialised external sysusers numeric IDs', async (context) => {
+    const fixture = await provisionFixture(context);
+    const identity = parseIdentityDatabases(
+      `${passwdRecord('external-user', 999, 999)}\n`,
+      [
+        groupRecord('external-user', 999),
+        groupRecord('external-primary', 998),
+        groupRecord('external-group', 997),
+        '',
+      ].join('\n'),
+    );
+    const report = await provisionHost(
+      { apply: false },
+      fixture.dependencies({
+        identitySequence: [identity],
+        bootPolicySequence: [{
+          ...fixture.bootPolicyCatalogs,
+          sysusers: [
+            fixture.bootPolicyCatalogs.sysusers,
+            'u external-user 999 -',
+            'u deferred-user -:998 -',
+            'g external-primary 998 -',
+            'g external-group 997 -',
+          ].join('\n'),
+        }],
+      }),
+    );
+
+    assert.equal(report.mode, 'dry-run');
   });
 
   it('accepts non-writable root maintenance for protected-path ancestors', async (context) => {

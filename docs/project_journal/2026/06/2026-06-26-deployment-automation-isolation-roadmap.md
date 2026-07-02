@@ -214,10 +214,12 @@ superseded_by:
   protected root, identity
   databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
   system-unit load paths, installed policy targets, and every sysusers and
-  tmpfiles policy search directory, traversal-preserving ancestor metadata, recursive parent
-  handling, pre-apply unmanaged-ancestor and managed-target checks, post-tmpfiles exact
-  managed path type/mode/UID/GID convergence, and root-owned stable source
-  metadata for every effective catalogue file,
+  tmpfiles policy search directory, traversal-preserving ancestor metadata,
+  recursive parent handling, pre-apply unmanaged-ancestor and managed-target
+  checks, post-tmpfiles exact managed path type/mode/UID/GID convergence,
+  root-owned stable source metadata for every effective catalogue file, and
+  pre-allocation rejection of unmaterialised external numeric UID, primary-GID,
+  and group-GID claims,
   trusted re-exec paths plus a complete transaction-aware read-only host
   preflight checked before first-run lock convergence, with the checks repeated
   under the held lock, bounded managed-name-free stale candidates that remain

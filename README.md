@@ -289,7 +289,10 @@ specifier/glob-prefix, lexical path and trailing-slash normalisation including
 glob-capable access through the legacy `/var/run` alias, copy-source, path-derived-ID,
 owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
 metadata, and recursive-parent semantics. External
-sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
+sysusers allocation-range directives are rejected. Before managed account
+allocation, external numeric UID, primary-GID, and group-GID claims within the
+managed local range must already be materialised in the complete identity
+databases. Every effective catalogue source and its ancestors
 must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
 the local identity databases and NSS policy, every static and runtime systemd
 userdb path, every fixed systemd system-unit

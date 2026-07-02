@@ -141,7 +141,8 @@
   numeric-identity, ACL-principal, fail-closed specifier-bearing symlink-target,
   traversal-restricting ancestor and pre-mutation managed-target
   type/symlink/hardlink
-  metadata, cleanup, replacement, and recursive rules, allocation ranges,
+  metadata, cleanup, replacement, and recursive rules, allocation ranges and
+  unmaterialised external numeric UID/primary-GID/group-GID claims,
   with pre-apply unmanaged-ancestor and managed-target checks and post-tmpfiles exact
   managed path type/mode/UID/GID convergence,
   normalised glob and trailing-slash paths including legacy `/var/run` alias
