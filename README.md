@@ -325,6 +325,9 @@ as `preset-all`, manager reloads, `--marked` operations, and opaque
 `edit --stdin` policy replacement are also rejected,
 including through linked helper units, unit-name specifier expansion, or
 unresolved template-instance executable and argument specifiers.
+Globbed same-basename activator names are matched against their implicit
+service targets, and each managed unit must report an empty systemd `Job=`
+property as well as an inactive state.
 Administrator, runtime, generator, and local-vendor `Exec*` directives may not
 invoke a shell. Shell execution is accepted only from a direct package-owned
 vendor unit or its single-hop same-name dependency link; direct boot-policy
@@ -333,12 +336,14 @@ The systemd `|` shell prefix and unresolved full executable-path specifiers on
 the first or any semicolon-delimited later command, plus standard shell-family
 executable names, are all treated as shell execution.
 `env -S`/`--split-string` argv reinterpretation, including every accepted GNU
-long-option abbreviation, is rejected. `systemctl` may not set protected
+long-option abbreviation and specifier-generated option, is rejected. `systemctl` may not set protected
 plaintext or encrypted system credentials through inline, path,
 option-interleaved, or specifier-expanded arguments. Non-vendor units also cannot claim protected
 Webex paths through systemd-managed directory source or alias directives.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
-incomplete cross-directive data-flow analysis. The runtime system-credential
+incomplete cross-directive data-flow analysis. Every existing sysusers and
+tmpfiles search directory is validated before and after catalogue collection,
+even when the directory contributes no active file. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths
 and symlink targets.
 The legacy compatibility rule accepts only the exact `/var/run` link text
@@ -349,8 +354,8 @@ The same host-wide `flock` used by config deployment serialises the complete app
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
-lock. Dry-run, recovery, and apply read and parse bounded
-`/proc/self/mountinfo` data;
+lock. Dry-run, recovery, and apply loop through short reads while collecting and
+parsing bounded `/proc/self/mountinfo` data;
 managed tmpfiles targets, descendants, and non-standard redirected ancestors
 must not be mount points before any tmpfiles mutation. Standard ancestor mount
 points must have a unique filesystem device/root identity so filesystem-root

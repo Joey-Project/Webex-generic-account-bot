@@ -309,6 +309,19 @@ const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
   'set-default',
   'unmask',
 ]);
+const SYSTEMCTL_MARKED_OPTION_PREFIXES = Object.freeze(Array.from(
+  { length: '--marked'.length - 2 },
+  (_, index) => '--marked'.slice(0, index + 3),
+));
+const ENV_SPLIT_STRING_OPTION_PREFIXES = Object.freeze(Array.from(
+  { length: '--split-string'.length - 2 },
+  (_, index) => '--split-string'.slice(0, index + 3),
+));
+const SYSTEMD_IMPLICIT_SERVICE_ACTIVATOR_SUFFIXES = Object.freeze([
+  '.path',
+  '.socket',
+  '.timer',
+]);
 const TRUSTED_MANAGED_MOUNT_ANCESTORS = new Set([
   '/',
   '/etc',
@@ -325,6 +338,18 @@ export const MANAGED_UNITS = Object.freeze([
   'webex-codex-launcher.socket',
   'webex-codex-launcher@.service',
   'webex-codex-activation-renew.service',
+]);
+const MANAGED_UNIT_CONTROL_TARGETS = Object.freeze([
+  ...new Set(MANAGED_UNITS.flatMap((unit) => (
+    unit.endsWith('.service')
+      ? [
+        unit,
+        ...SYSTEMD_IMPLICIT_SERVICE_ACTIVATOR_SUFFIXES.map(
+          (suffix) => `${unit.slice(0, -'.service'.length)}${suffix}`,
+        ),
+      ]
+      : [unit]
+  ))),
 ]);
 const MANAGED_UNIT_POLICY_DIRECTORY_NAMES = Object.freeze(
   [...new Set(MANAGED_UNITS.flatMap((unit) => [
@@ -1623,13 +1648,23 @@ async function readTrustedSensitiveIdentityFile(file, allowedGids, allowedModes,
   }
 }
 
-async function readBoundedProcFile(file, maxBytes, fsApi) {
+export async function readBoundedProcFile(file, maxBytes, fsApi) {
   const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const buffer = Buffer.alloc(maxBytes + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > maxBytes) throw new Error(`proc file is too large: ${file}`);
-    return buffer.subarray(0, bytesRead).toString('utf8');
+    let totalBytesRead = 0;
+    while (totalBytesRead < buffer.length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        totalBytesRead,
+        buffer.length - totalBytesRead,
+        null,
+      );
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    if (totalBytesRead > maxBytes) throw new Error(`proc file is too large: ${file}`);
+    return buffer.subarray(0, totalBytesRead).toString('utf8');
   } finally {
     await handle.close();
   }
@@ -2237,6 +2272,7 @@ export async function readSystemBootPolicyCatalogs(
   runCommand = runFixedCommand,
   fsApi = fs,
 ) {
+  await assertTrustedBootPolicySearchDirectories(fsApi);
   const [sysusers, tmpfiles, systemCredentials] = await Promise.all([
     runCommand('/usr/bin/systemd-sysusers', ['--cat-config', '--tldr', '--no-pager']),
     runCommand('/usr/bin/systemd-tmpfiles', ['--cat-config', '--tldr', '--no-pager']),
@@ -2254,11 +2290,27 @@ export async function readSystemBootPolicyCatalogs(
     sysusers: await validateBootPolicySources('sysusers', sysusers.stdout, fsApi),
     tmpfiles: await validateBootPolicySources('tmpfiles', tmpfiles.stdout, fsApi),
   });
+  await assertTrustedBootPolicySearchDirectories(fsApi);
   return Object.freeze({
     sysusers: sysusers.stdout,
     tmpfiles: tmpfiles.stdout,
     sources,
   });
+}
+
+async function assertTrustedBootPolicySearchDirectories(fsApi) {
+  const usrMerged = await isUsrMergedLib(fsApi);
+  const directories = new Set(Object.values(BOOT_POLICY_DIRECTORIES).flat());
+  for (const directory of directories) {
+    if (usrMerged && directory.startsWith('/lib/')) continue;
+    try {
+      await fsApi.lstat(directory);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    await assertTrustedDirectoryChain('/', directory, 0, 0, fsApi);
+  }
 }
 
 function assertBootPolicyCatalogCommand(kind, result) {
@@ -3057,6 +3109,7 @@ export async function readSystemUnitStates(
       runCommand('/usr/bin/systemctl', ['is-active', unit], [0, 3, 4]),
       runCommand('/usr/bin/systemctl', [
         'show',
+        '--property=Job',
         '--property=LoadState',
         '--property=UnitFileState',
         '--property=FragmentPath',
@@ -3521,7 +3574,8 @@ function systemctlOptionCouldBeMarked(token) {
   const option = token.slice(0, token.indexOf('=') < 0
     ? token.length
     : token.indexOf('='));
-  return option.length > 2 && '--marked'.startsWith(option);
+  return SYSTEMCTL_MARKED_OPTION_PREFIXES.includes(option)
+    || systemdSpecifierFieldCouldMatch(option, SYSTEMCTL_MARKED_OPTION_PREFIXES);
 }
 
 function systemdPolicyInvokesShell(value) {
@@ -3575,7 +3629,12 @@ function systemdPolicyReinterpretsCommandArguments(value) {
       const longOption = token.slice(0, token.indexOf('=') < 0
         ? token.length
         : token.indexOf('='));
-      return longOption.length > 2 && '--split-string'.startsWith(longOption);
+      return ENV_SPLIT_STRING_OPTION_PREFIXES.includes(longOption)
+        || systemdSpecifierFieldCouldMatch(
+          longOption,
+          ENV_SPLIT_STRING_OPTION_PREFIXES,
+        )
+        || systemdSpecifierCouldEnableEnvSplitShortOption(token);
     });
 }
 
@@ -3660,10 +3719,7 @@ function shellExecutableName(name) {
 function systemctlUnitFieldCouldMatch(field) {
   const basename = path.posix.basename(field);
   return [...new Set([field, basename])]
-    .flatMap((candidate) => {
-      const implicitService = candidate.replace(/\.(?:path|socket|timer)$/, '.service');
-      return [candidate, `${candidate}.service`, implicitService];
-    })
+    .flatMap((candidate) => [candidate, `${candidate}.service`])
     .some((candidate) => {
       const tokens = systemdUnitPatternTokens(candidate);
       const pattern = tokens.map((token) => {
@@ -3671,8 +3727,13 @@ function systemctlUnitFieldCouldMatch(field) {
         return token.repeat ? '[^\\s/]*' : '[^\\s/]';
       }).join('');
       const reference = new RegExp(`^${pattern}$`);
-      return MANAGED_UNITS.some((unit) => reference.test(unit))
-        || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
+      return MANAGED_UNIT_CONTROL_TARGETS.some((unit) => reference.test(unit))
+        || ['.service', ...SYSTEMD_IMPLICIT_SERVICE_ACTIVATOR_SUFFIXES].some(
+          (suffix) => systemdTokenPatternsIntersect(
+            tokens,
+            launcherReferenceTokens(suffix),
+          ),
+        );
     });
 }
 
@@ -3893,27 +3954,11 @@ function systemdSpecifierFieldCouldMatch(
     includeShellFamilies = false,
   } = {},
 ) {
-  let pattern = '';
-  let hasUnresolvedSpecifier = false;
-  const tokens = [];
-  for (let offset = 0; offset < field.length; offset += 1) {
-    if (field[offset] !== '%') {
-      pattern += escapeRegExp(field[offset]);
-      tokens.push({ literal: field[offset], repeat: false });
-      continue;
-    }
-    if (field[offset + 1] === '%') {
-      pattern += escapeRegExp('%');
-      tokens.push({ literal: '%', repeat: false });
-      offset += 1;
-      continue;
-    }
-    hasUnresolvedSpecifier = true;
-    pattern += '[^\\s/]*';
-    tokens.push({ characterClass: 'unit', repeat: true });
-    if (offset + 1 < field.length) offset += 1;
-  }
+  const { hasUnresolvedSpecifier, tokens } = systemdSpecifierPatternTokens(field);
   if (!hasUnresolvedSpecifier) return false;
+  const pattern = tokens.map((token) => (
+    token.literal !== undefined ? escapeRegExp(token.literal) : '[^\\s/]*'
+  )).join('');
   const reference = new RegExp(`^${pattern}$`);
   return candidates.some((candidate) => reference.test(candidate))
     || (
@@ -3926,12 +3971,43 @@ function systemdSpecifierFieldCouldMatch(
     );
 }
 
-function launcherReferenceTokens() {
+function systemdSpecifierPatternTokens(field) {
+  let hasUnresolvedSpecifier = false;
+  const tokens = [];
+  for (let offset = 0; offset < field.length; offset += 1) {
+    if (field[offset] !== '%') {
+      tokens.push({ literal: field[offset], repeat: false });
+      continue;
+    }
+    if (field[offset + 1] === '%') {
+      tokens.push({ literal: '%', repeat: false });
+      offset += 1;
+      continue;
+    }
+    hasUnresolvedSpecifier = true;
+    tokens.push({ characterClass: 'unit', repeat: true });
+    if (offset + 1 < field.length) offset += 1;
+  }
+  return Object.freeze({ hasUnresolvedSpecifier, tokens: Object.freeze(tokens) });
+}
+
+function systemdSpecifierCouldEnableEnvSplitShortOption(field) {
+  const { hasUnresolvedSpecifier, tokens } = systemdSpecifierPatternTokens(field);
+  if (!hasUnresolvedSpecifier) return false;
+  return systemdTokenPatternsIntersect(tokens, [
+    { literal: '-', repeat: false },
+    { characterClass: 'env-short-option', repeat: true },
+    { literal: 'S', repeat: false },
+    { characterClass: 'unit', repeat: true },
+  ]);
+}
+
+function launcherReferenceTokens(suffix = '.service') {
   return [
     ...[...'webex-codex-launcher@'].map((literal) => ({ literal, repeat: false })),
     { characterClass: 'launcher-instance', repeat: false },
     { characterClass: 'launcher-instance', repeat: true },
-    ...[...'.service'].map((literal) => ({ literal, repeat: false })),
+    ...[...suffix].map((literal) => ({ literal, repeat: false })),
   ];
 }
 
@@ -3977,6 +4053,7 @@ function systemdTokenCharactersIntersect(left, right) {
 
 function systemdTokenAllows(token, character) {
   if (/[\s/]/.test(character)) return false;
+  if (token.characterClass === 'env-short-option') return character !== '-';
   if (token.characterClass === 'launcher-instance') return character !== '@';
   if (token.characterClass === 'shell-name') return /[A-Za-z0-9_.+-]/.test(character);
   return true;
@@ -4158,6 +4235,7 @@ async function isUsrMergedLib(fsApi) {
 function parseSystemUnitMetadata(output, unit) {
   const values = new Map();
   const expected = new Set([
+    'Job',
     'LoadState',
     'UnitFileState',
     'FragmentPath',
@@ -4175,6 +4253,9 @@ function parseSystemUnitMetadata(output, unit) {
   }
   if (values.size !== expected.size) {
     throw new Error(`managed unit metadata is incomplete: ${unit}`);
+  }
+  if (values.get('Job') !== '') {
+    throw new Error(`managed unit has a pending job: ${unit}`);
   }
   const needDaemonReload = values.get('NeedDaemonReload');
   if (!['yes', 'no'].includes(needDaemonReload)) {

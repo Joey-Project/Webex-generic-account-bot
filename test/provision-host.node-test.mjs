@@ -23,6 +23,7 @@ import {
   parseArgs,
   parseIdentityDatabases,
   provisionHost,
+  readBoundedProcFile,
   readSystemIdentitySnapshot,
   readSystemBootPolicyCatalogs,
   readSystemUnitStates as readSystemUnitStatesImpl,
@@ -900,6 +901,33 @@ describe('guarded host provisioner execution', () => {
     }
   });
 
+  it('reads complete proc mount data across short reads and preserves the byte bound', async (context) => {
+    const fixture = await provisionFixture(context);
+    const mountInfo = mountInfoWith(
+      '/sensitive-state',
+      '/var/lib/webex-generic-account-bot/state/nested',
+    );
+    const dependencies = fixture.dependencies();
+    dependencies.readMountInfo = () => readBoundedProcFile(
+      '/proc/self/mountinfo',
+      Buffer.byteLength(mountInfo),
+      shortReadFileSystem(mountInfo, 17),
+    );
+
+    await assert.rejects(
+      provisionHost({ apply: false }, dependencies),
+      /unexpected mount overlaps managed tmpfiles path/,
+    );
+    await assert.rejects(
+      readBoundedProcFile(
+        '/proc/self/mountinfo',
+        Buffer.byteLength(mountInfo) - 1,
+        shortReadFileSystem(mountInfo, 11),
+      ),
+      /proc file is too large/,
+    );
+  });
+
   it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
     for (const [kind, policy] of [
       ['sysusers', 'm webex-generic-account-bot sudo'],
@@ -1108,6 +1136,37 @@ describe('guarded host provisioner execution', () => {
       sysusers: ['/usr/lib/sysusers.d/example.conf'],
       tmpfiles: ['/usr/lib/tmpfiles.d/example.conf'],
     });
+
+    for (const [label, fsApi] of [
+      [
+        'writable empty search directory',
+        systemdUnitPathFs(new Map(), {
+          filesByPath: sourceFiles,
+          directoryModesByPath: new Map([['/run/tmpfiles.d', 0o777]]),
+        }),
+      ],
+      [
+        'search directory symlink',
+        systemdUnitPathFs(new Map(), {
+          filesByPath: sourceFiles,
+          symlinksByPath: new Map([['/run/sysusers.d', '/opt/untrusted/sysusers.d']]),
+        }),
+      ],
+    ]) {
+      let commandCalls = 0;
+      await assert.rejects(
+        readSystemBootPolicyCatalogs(
+          async () => {
+            commandCalls += 1;
+            throw new Error('boot policy command reached');
+          },
+          fsApi,
+        ),
+        /policy directory is not trusted/,
+        label,
+      );
+      assert.equal(commandCalls, 0, label);
+    }
 
     for (const [kind, result] of [
       ['sysusers', { stdout: '', stderr: '', code: 0 }],
@@ -1545,6 +1604,7 @@ describe('guarded host provisioner execution', () => {
         : unit;
       return {
         stdout: [
+          'Job=',
           'LoadState=loaded',
           `UnitFileState=${unit === 'webex-codex-launcher@boot.service' ? 'enabled' : 'static'}`,
           `FragmentPath=/etc/systemd/system/${fragmentUnit}`,
@@ -2080,8 +2140,11 @@ describe('guarded host provisioner execution', () => {
       ['generic-account-bot', '/etc/systemd/system/webex-%i.service'],
       ['smoke', 'webex-codex-launcher@%I.service'],
       ['smoke', 'webex-codex-launcher@%I.socket'],
+      ['smoke', 'webex-codex-launcher@*.t?mer'],
       ['literal', 'webex-codex-activation-renew'],
       ['literal', 'webex-codex-activation-renew.timer'],
+      ['glob-activator', 'webex-codex-activation-renew.[t]imer'],
+      ['glob-activator', 'webex-codex-activation-renew.t?mer'],
       ['glob', 'webex-*'],
     ]) {
       const template = '/etc/systemd/system/external@.service';
@@ -2161,6 +2224,26 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    const markedSpecifierUnit = '/etc/systemd/system/external@k.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external@k.service' }]]]),
+          {
+            filesByPath: new Map([[
+              markedSpecifierUnit,
+              Buffer.from(
+                '[Service]\nExecStart=/usr/bin/systemctl --mar%ied reload-or-restart\n',
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
     const splitEnvUnit = '/etc/systemd/system/external-env-split.service';
     for (const option of [
       '"--split-string=/usr/bin/echo safe"',
@@ -2178,6 +2261,29 @@ describe('guarded host provisioner execution', () => {
             {
               filesByPath: new Map([[
                 splitEnvUnit,
+                Buffer.from(`[Service]\nExecStart=/usr/bin/env ${option}\n`),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd policy reinterprets command arguments/,
+      );
+    }
+
+    for (const [name, option] of [
+      ['external@it-str.service', '"--spl%iing=/usr/bin/echo safe"'],
+      ['external@S.service', '"-i%i/usr/bin/echo safe"'],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
                 Buffer.from(`[Service]\nExecStart=/usr/bin/env ${option}\n`),
               ]]),
             },
@@ -2968,6 +3074,12 @@ describe('guarded host provisioner execution', () => {
         { stdout: 'inactive\n', stderr: '', code: 3 },
         systemdUnitMetadata('not-found', '', 'disabled'),
         /managed unit file state disagrees with load state/,
+      ],
+      [
+        'inactive unit with a queued job',
+        { stdout: 'inactive\n', stderr: '', code: 3 },
+        systemdUnitMetadata('not-found').replace('Job=\n', 'Job=42\n'),
+        /managed unit has a pending job/,
       ],
     ];
     for (const [label, active, metadata, expected] of cases) {
@@ -4666,6 +4778,29 @@ function asyncDirectory(entries) {
   };
 }
 
+function shortReadFileSystem(contents, maxChunkBytes) {
+  const payload = Buffer.from(contents);
+  return {
+    async open(file, flags) {
+      assert.equal(file, '/proc/self/mountinfo');
+      assert.equal(flags, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      let cursor = 0;
+      return {
+        async read(buffer, offset, length, position) {
+          assert.equal(position, null);
+          const bytesRead = Math.min(maxChunkBytes, length, payload.length - cursor);
+          if (bytesRead > 0) {
+            payload.copy(buffer, offset, cursor, cursor + bytesRead);
+            cursor += bytesRead;
+          }
+          return { bytesRead, buffer };
+        },
+        close: async () => {},
+      };
+    },
+  };
+}
+
 function systemdUnitPathFs(
   entriesByDirectory = new Map(),
   {
@@ -4673,14 +4808,15 @@ function systemdUnitPathFs(
     usrMergeTarget = 'usr/lib',
     filesByPath = new Map(),
     fileModesByPath = new Map(),
+    directoryModesByPath = new Map(),
     missingPaths = new Set(),
     symlinksByPath = new Map(),
   } = {},
 ) {
-  const directoryStat = Object.freeze({
+  const directoryStat = (candidate) => Object.freeze({
     uid: 0,
     gid: 0,
-    mode: 0o40755,
+    mode: 0o40000 | (directoryModesByPath.get(candidate) ?? 0o755),
     isFile: () => false,
     isDirectory: () => true,
     isSymbolicLink: () => false,
@@ -4736,7 +4872,7 @@ function systemdUnitPathFs(
         return fileStat(filesByPath.get(candidate), fileModesByPath.get(candidate));
       }
       if (symlinksByPath.has(candidate)) return symlinkStat;
-      return directoryStat;
+      return directoryStat(candidate);
     },
     readlink: async (candidate) => {
       if (symlinksByPath.has(candidate)) return symlinksByPath.get(candidate);
@@ -4764,6 +4900,7 @@ function systemdUnitMetadata(
   unitFileState = loadState === 'not-found' ? '' : 'disabled',
 ) {
   return [
+    'Job=',
     `LoadState=${loadState}`,
     `UnitFileState=${unitFileState}`,
     `FragmentPath=${fragmentPath}`,
