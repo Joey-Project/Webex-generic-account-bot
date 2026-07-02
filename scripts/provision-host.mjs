@@ -2287,13 +2287,14 @@ async function removeInterruptedIdentityRecoveryCandidate(
     throw error;
   }
   const mode = stat.mode & 0o7777;
+  const interruptedCreation = (mode & ~0o600) === 0;
   if (
     !stat.isFile()
     || stat.isSymbolicLink()
     || stat.nlink !== 1
     || stat.uid !== expected.uid
     || !new Set([0, expected.gid]).has(stat.gid)
-    || !new Set([0o600, expected.mode]).has(mode)
+    || (!interruptedCreation && mode !== expected.mode)
     || stat.size < 0
     || stat.size > MAX_IDENTITY_FILE_BYTES
   ) {

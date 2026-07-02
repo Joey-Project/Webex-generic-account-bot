@@ -484,7 +484,10 @@ plus a PPID race check. Immediately before exec, it rejects a
 privileged-file exec would clear the parent-death signal. An outer provisioner
 crash therefore cannot orphan identity mutation after releasing the shared deployment lock.
 That process copies verified backup contents into fixed private candidates and
-atomically installs those candidates, preserving the standard `*-` backups.
+atomically installs those candidates, preserving the standard `*-` backups. A
+retry removes a fixed candidate left before its final `chmod` only when its
+mode is a safe umask-narrowed subset of `0600`; group or other access still
+fails closed.
 Legacy version 1 and 2 journals do not bind identity-file digests, so a partial
 identity commit under either legacy format fails closed and requires explicit
 manual repair instead of trusting potentially stale system backups.

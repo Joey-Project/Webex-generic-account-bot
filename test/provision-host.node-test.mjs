@@ -1331,6 +1331,24 @@ describe('guarded host provisioner policy', () => {
           /injected identity recovery interruption/,
         );
       }
+      const staleCandidate = path.join(
+        phaseRoot,
+        'etc/.webex-host-identity-recovery-group.tmp',
+      );
+      if (committedCount === 1) {
+        await fs.writeFile(staleCandidate, Buffer.alloc(0), { mode: 0o600 });
+        await fs.chmod(staleCandidate, 0o604);
+        await assert.rejects(
+          restoreInterruptedIdentityDatabases(transaction, snapshot, {
+            ...options,
+            apply: true,
+          }),
+          /identity recovery candidate is not trusted/,
+        );
+        await fs.rm(staleCandidate);
+      }
+      await fs.writeFile(staleCandidate, Buffer.alloc(0), { mode: 0o600 });
+      await fs.chmod(staleCandidate, [0o000, 0o200, 0o400][committedCount - 1]);
       await restoreInterruptedIdentityDatabases(transaction, snapshot, {
         ...options,
         apply: true,
