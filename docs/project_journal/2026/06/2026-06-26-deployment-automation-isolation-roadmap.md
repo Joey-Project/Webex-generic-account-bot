@@ -196,7 +196,8 @@ superseded_by:
   consumer fragment provenance that rejects sysusers/userdb/tmpfiles overrides
   plus exact/shared drop-ins and consumer-owned dependency directories before
   their commands can bypass merged catalogue auditing, and rejects masks,
-  dangling links, and non-regular consumer symlink targets, plus
+  dangling links, non-regular consumer symlink targets, and direct boot-policy
+  tool execution from external or linked helper units, plus
   launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
@@ -205,14 +206,15 @@ superseded_by:
   with C-escape, normalised specifier/glob-prefix and trailing slash,
   including glob access through the legacy `/var/run` alias and exact
   compatibility-link text, and copy-source
-  paths, source-associated managed-policy upgrades, path-derived-ID,
+  paths, source-associated managed-policy upgrades, pre-mutation managed-target
+  type/symlink/hardlink checks, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
   identities, ACL principals, and fail-closed specifier-bearing symlink targets,
   protected root, identity
   databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
   system-unit load paths, and installed
   policy targets, traversal-preserving ancestor metadata, recursive parent
-  handling, pre-apply unmanaged-ancestor traversal checks, post-tmpfiles exact
+  handling, pre-apply unmanaged-ancestor and managed-target checks, post-tmpfiles exact
   managed path type/mode/UID/GID convergence, and root-owned stable source
   metadata for every effective catalogue file,
   trusted re-exec paths plus a complete transaction-aware read-only host

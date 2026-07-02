@@ -128,7 +128,8 @@
   multi-hop, and renamed aliases, and bind sysusers/userdb/tmpfiles consumer
   fragments to those same vendor sources without overrides, exact/shared
   drop-ins, consumer-owned dependency directories, masks, dangling links, or
-  non-regular symlink targets,
+  non-regular symlink targets, and reject direct boot-policy tool execution from
+  external or linked helper units,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
@@ -136,9 +137,10 @@
   static/runtime systemd userdb paths,
   systemd system-unit load paths, and installed policy paths from owner-modifier,
   numeric-identity, ACL-principal, fail-closed specifier-bearing symlink-target,
-  traversal-restricting ancestor
+  traversal-restricting ancestor and pre-mutation managed-target
+  type/symlink/hardlink
   metadata, cleanup, replacement, and recursive rules, allocation ranges,
-  with pre-apply unmanaged-ancestor traversal checks and post-tmpfiles exact
+  with pre-apply unmanaged-ancestor and managed-target checks and post-tmpfiles exact
   managed path type/mode/UID/GID convergence,
   normalised glob and trailing-slash paths including legacy `/var/run` alias
   globs and exact compatibility-link text,

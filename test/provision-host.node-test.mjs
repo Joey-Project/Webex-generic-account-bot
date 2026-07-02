@@ -757,7 +757,9 @@ describe('guarded host provisioner policy', () => {
       uid: UID,
       gid: GID,
       mode: 0o40755,
+      nlink: 1,
       isDirectory: () => true,
+      isFile: () => true,
       isSymbolicLink: () => false,
     });
     await assertManagedRuntimeAncestorsTraversable(
@@ -768,6 +770,35 @@ describe('guarded host provisioner policy', () => {
         targetUid: UID,
         targetGid: GID,
       },
+    );
+
+    const hardLinkTarget = `${root}/var/lib/webex-example.lock`;
+    const hardLinkInspection = {
+      artifacts: [{
+        kind: 'tmpfiles',
+        source: { contents: Buffer.from('f /var/lib/webex-example.lock 0660 root root -\n') },
+      }],
+    };
+    const hardLinkStat = Object.freeze({
+      uid: UID,
+      gid: GID,
+      mode: 0o100660,
+      nlink: 2,
+      isDirectory: () => false,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    });
+    await assert.rejects(
+      assertManagedRuntimeAncestorsTraversable(plan, hardLinkInspection, {
+        fsApi: {
+          lstat: async (candidate) => candidate === hardLinkTarget
+            ? hardLinkStat
+            : trustedDirectory,
+        },
+        targetUid: UID,
+        targetGid: GID,
+      }),
+      /managed runtime path is not safe to mutate/,
     );
   });
 
@@ -1858,6 +1889,70 @@ describe('guarded host provisioner execution', () => {
         /boot policy systemd consumer symlink target is not trusted/,
       );
     }
+
+    for (const [name, policy] of [
+      [
+        'external-tmpfiles.service',
+        '[Service]\nExecStart=/usr/bin/systemd-tmpfiles --create /etc/rogue.conf\n',
+      ],
+      [
+        'external-sysusers.service',
+        '[Service]\nExecStart=/bin/sh -c "/usr/bin/systemd-sysusers /etc/rogue.conf"\n',
+      ],
+      [
+        'external-userdb.service',
+        '[Service]\nExecStart=/usr/lib/systemd/systemd-userdbd --load-credentials\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy invokes a boot policy tool/,
+      );
+    }
+
+    const helperWants = '/etc/systemd/system/external.target.wants';
+    const helperLink = `${helperWants}/external-helper.service`;
+    const helperTarget = '/usr/lib/systemd/system/external-helper.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [helperWants, [{
+              name: 'external-helper.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              helperTarget,
+              Buffer.from(
+                '[Service]\nExecStart=/usr/bin/systemd-sysusers /etc/rogue.conf\n',
+              ),
+            ]]),
+            symlinksByPath: new Map([[helperLink, helperTarget]]),
+          },
+        ),
+      ),
+      /external systemd policy invokes a boot policy tool/,
+    );
 
     let vendorImportCommandCalls = 0;
     const sysinitWants = '/usr/lib/systemd/system/sysinit.target.wants';

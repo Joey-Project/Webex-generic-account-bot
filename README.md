@@ -228,7 +228,9 @@ every managed user and group name unclaimed, and managed UIDs/GIDs must remain
 below the dynamic allocation range.
 It also validates dormant unit state and requires every unmanaged ancestor of
 the managed tmpfiles paths to be root-owned, non-writable, and traversable
-without creating files or directories. Apply rechecks those ancestors after
+without creating files or directories. Before tmpfiles can mutate host state,
+existing managed targets must already have the expected object type, must not be
+symlinks, and managed files must have a single link. Apply rechecks those ancestors after
 tmpfiles and verifies every managed directory and lock file has its exact type,
 mode, and resolved UID/GID before the transaction can complete.
 Apply additionally requires root and
@@ -305,7 +307,9 @@ Overrides, exact or shared drop-ins, and consumer-owned dependency directories
 are rejected so explicit out-of-catalogue command arguments or helper units
 cannot bypass the merged policy audit. Consumer masks, dangling links, and
 non-regular symlink targets are rejected before terminal-link handling can skip
-the vendor provenance check.
+the vendor provenance check. External unit execution directives may not invoke
+`systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
+including through linked helper units.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.

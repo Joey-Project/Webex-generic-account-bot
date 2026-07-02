@@ -225,6 +225,10 @@ const BOOT_POLICY_SYSTEMD_CONSUMER_POLICY_DIRECTORY_NAMES = new Set(
     `${unit}.upholds`,
   ]),
 );
+const BOOT_POLICY_EXECUTABLES = new Set([
+  'systemd-sysusers',
+  'systemd-tmpfiles',
+]);
 
 class PolicySafetyRollbackError extends Error {}
 
@@ -2361,6 +2365,23 @@ export async function assertManagedRuntimeAncestorsTraversable(
       throw new Error(`managed runtime ancestor is not traversable: ${ancestor}`);
     }
   }
+  for (const entry of entries) {
+    let stat;
+    try {
+      stat = await fsApi.lstat(entry.target);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    const correctType = entry.type === 'd' ? stat.isDirectory() : stat.isFile();
+    if (
+      !correctType
+      || stat.isSymbolicLink()
+      || (entry.type === 'f' && stat.nlink !== 1)
+    ) {
+      throw new Error(`managed runtime path is not safe to mutate: ${entry.target}`);
+    }
+  }
 }
 
 export async function verifyManagedTmpfilesState(
@@ -3130,6 +3151,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
 ) {
   const raw = String(value);
   const decoded = decodeSystemdEscapesForAudit(raw);
+  if (
+    systemdPolicyInvokesBootPolicyTool(decoded)
+    && !isExpectedVendorBootPolicyConsumerSource(
+      source,
+      unitNames,
+      logicalSource,
+      symlinkDepth,
+    )
+  ) {
+    throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
+  }
   if (systemdPolicyInjectsBootPolicyCredential(
     decoded,
     source,
@@ -3165,6 +3197,18 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy references a managed unit: ${source}`);
     }
   }
+}
+
+function systemdPolicyInvokesBootPolicyTool(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
+  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!]+/, '')));
+  if (names.some((name) => BOOT_POLICY_EXECUTABLES.has(name))) return true;
+  return names.includes('systemd-userdbd') && tokens.includes('--load-credentials');
 }
 
 function systemdPolicyInjectsBootPolicyCredential(
