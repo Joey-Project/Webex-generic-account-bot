@@ -877,11 +877,12 @@ describe('guarded host provisioner execution', () => {
 
   it('rejects unexpected mounts overlapping managed tmpfiles paths', async (context) => {
     const fixture = await provisionFixture(context);
-    for (const [root, mountPoint] of [
+    for (const [root, mountPoint, device] of [
       ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
       ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
       ['/redirected-var-lib', '/var/lib'],
       ['/', '/etc'],
+      ['/', '/', '0:1'],
       ['/', '/var/lib/webex-generic-account-bot/state/nested'],
     ]) {
       const commands = [];
@@ -890,7 +891,7 @@ describe('guarded host provisioner execution', () => {
           { apply: false },
           fixture.dependencies({
             commands,
-            mountInfoSequence: [mountInfoWith(root, mountPoint)],
+            mountInfoSequence: [mountInfoWith(root, mountPoint, device)],
           }),
         ),
         /unexpected mount overlaps managed tmpfiles path/,
@@ -2113,6 +2114,7 @@ describe('guarded host provisioner execution', () => {
       'systemctl daemon-reload',
       'systemctl --marked reload-or-restart',
       'systemctl enable /opt/benign.service',
+      'systemctl edit --full --stdin benign.service',
     ].entries()) {
       const name = `external-global-systemctl-${index}.service`;
       const target = `/etc/systemd/system/${name}`;
@@ -2279,6 +2281,16 @@ describe('guarded host provisioner execution', () => {
       [
         'external-second-shell-prefix.service',
         '[Service]\nExecStart=/usr/bin/true ; |/usr/bin/echo safe\n',
+        null,
+      ],
+      [
+        'external-executable-specifier@.service',
+        '[Service]\nExecStart=/run/%i/helper\n',
+        null,
+      ],
+      [
+        'external-second-executable-specifier@.service',
+        '[Service]\nExecStart=/usr/bin/true ; /usr/bin/helper-%i.bin\n',
         null,
       ],
       ['external-ash.service', "[Service]\nExecStart=/bin/ash -c 'echo safe'\n", null],
@@ -4243,8 +4255,8 @@ describe('guarded host provisioner execution', () => {
   });
 });
 
-function mountInfoWith(root, mountPoint) {
-  return `${SAFE_MOUNT_INFO}4 1 8:1 ${root} ${mountPoint} rw - ext4 /dev/root rw\n`;
+function mountInfoWith(root, mountPoint, device = '8:1') {
+  return `${SAFE_MOUNT_INFO}4 1 ${device} ${root} ${mountPoint} rw - ext4 /dev/root rw\n`;
 }
 
 async function provisionFixture(context) {

@@ -271,6 +271,7 @@ const SYSTEMCTL_UNSCOPED_MUTATION_VERBS = new Set([
   'daemon-reexec',
   'daemon-reload',
   'default',
+  'edit',
   'emergency',
   'exit',
   'halt',
@@ -2837,9 +2838,11 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
     .map(normaliseBootPolicyPath));
   const mounts = parseMountInfo(mountInfo);
   const mountIdentityCounts = new Map();
-  for (const { device, root } of mounts) {
+  const mountPointCounts = new Map();
+  for (const { device, root, mountPoint } of mounts) {
     const identity = `${device}\0${root}`;
     mountIdentityCounts.set(identity, (mountIdentityCounts.get(identity) ?? 0) + 1);
+    mountPointCounts.set(mountPoint, (mountPointCounts.get(mountPoint) ?? 0) + 1);
   }
   for (const { device, root, mountPoint } of mounts) {
     for (const managedPath of managedPaths) {
@@ -2851,10 +2854,12 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
         : managedPath.startsWith(`${mountPoint}/`);
       if (!mountIsAncestor) continue;
       const uniqueFilesystemRoot = mountIdentityCounts.get(`${device}\0${root}`) === 1;
+      const uniqueMountPoint = mountPointCounts.get(mountPoint) === 1;
       if (
         TRUSTED_MANAGED_MOUNT_ANCESTORS.has(mountPoint)
         && root === '/'
-        && (mountPoint === '/' || uniqueFilesystemRoot)
+        && uniqueFilesystemRoot
+        && uniqueMountPoint
       ) continue;
       throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
     }
@@ -3510,14 +3515,16 @@ function systemdPolicyInvokesShell(value) {
   const command = parseSystemdExecCommand(value);
   if (!command) return false;
   const { fields, tokens } = command;
-  const executable = fields[0] ?? '';
-  const prefixes = executable.match(/^[-@:+!|]+/)?.[0] ?? '';
-  const executableName = path.basename(executable.replace(/^[-@:+!|]+/, ''));
-  if (
-    prefixes.includes('|')
-    || hasUnresolvedSystemdSpecifier(executableName)
-    || shellExecutableName(executableName)
-  ) return true;
+  for (const executable of systemdExecCommandExecutables(fields)) {
+    const prefixes = executable.match(/^[-@:+!|]+/)?.[0] ?? '';
+    const executablePath = executable.replace(/^[-@:+!|]+/, '');
+    const executableName = path.basename(executablePath);
+    if (
+      prefixes.includes('|')
+      || hasUnresolvedSystemdSpecifier(executablePath)
+      || shellExecutableName(executableName)
+    ) return true;
+  }
   return tokens.some((token) => {
     const prefixes = token.match(/^[-@:+!|]+/)?.[0] ?? '';
     const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
@@ -3529,6 +3536,21 @@ function systemdPolicyInvokesShell(value) {
         { includeShellFamilies: true },
       );
   });
+}
+
+function systemdExecCommandExecutables(fields) {
+  const executables = [];
+  let expectsExecutable = true;
+  for (const field of fields) {
+    if (field === ';') {
+      expectsExecutable = true;
+      continue;
+    }
+    if (!expectsExecutable) continue;
+    executables.push(field);
+    expectsExecutable = false;
+  }
+  return executables;
 }
 
 function systemdPolicyReinterpretsCommandArguments(value) {

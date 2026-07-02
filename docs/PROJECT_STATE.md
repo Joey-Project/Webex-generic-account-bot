@@ -144,7 +144,8 @@
   `/run/credentials/@system`; rewrite `/var/run` before path normalisation and
   reject path-based unit-file aliases, option-interleaved credentials,
   later-command shell prefixes, unbounded mountinfo reads, and duplicate-root
-  mounts overlapping managed tmpfiles paths,
+  or stacked-root mounts overlapping managed tmpfiles paths, plus opaque
+  `systemctl edit` replacement and full-path executable specifiers,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
