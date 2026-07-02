@@ -154,6 +154,8 @@
   passwd/shadow or group/gshadow counterpart interruptions before rerunning
   sysusers, with a versioned marker preserving that bounded recovery after a
   forced-old safety rollback while unmarked old/mixed transactions stay strict,
+  carries that marker across replacement policy transactions until strict
+  identity convergence,
   and stale-cache outer preflight remains read-only, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.

@@ -749,7 +749,9 @@ export async function provisionHost(options, dependencies = {}) {
 
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
-  const installed = await installPolicySetAtomically(inspected, plan, deps);
+  const installed = await installPolicySetAtomically(inspected, plan, deps, {
+    identityRecoveryRequired,
+  });
   const safetyRollbackTransaction = transactionFromInspected(inspected);
   try {
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
@@ -1116,11 +1118,16 @@ async function cleanupStaleCandidates(plan, deps) {
   }
 }
 
-async function installPolicySetAtomically(inspected, plan, deps) {
+async function installPolicySetAtomically(
+  inspected,
+  plan,
+  deps,
+  { identityRecoveryRequired = false } = {},
+) {
   const changed = inspected.artifacts.filter(({ changed }) => changed);
   const staged = [];
-  const rollbackTransaction = transactionFromInspected(inspected);
-  await writeProvisionTransaction(inspected, plan, deps);
+  const rollbackTransaction = transactionFromInspected(inspected, { identityRecoveryRequired });
+  await writeProvisionTransaction(inspected, plan, deps, { identityRecoveryRequired });
   if (changed.length === 0) return [];
   try {
     for (const artifact of changed) {
@@ -1156,10 +1163,13 @@ async function installPolicySetAtomically(inspected, plan, deps) {
   return changed.map(({ target }) => target);
 }
 
-function transactionFromInspected(inspected) {
+function transactionFromInspected(
+  inspected,
+  { identityRecoveryRequired = false } = {},
+) {
   return Object.freeze({
     version: TRANSACTION_VERSION,
-    identityRecoveryRequired: false,
+    identityRecoveryRequired,
     artifacts: Object.freeze(inspected.artifacts.map((artifact) => Object.freeze({
       target: artifact.target,
       desiredSha256: artifact.source.sha256,
@@ -1701,8 +1711,17 @@ function parseProvisionTransaction(value, plan) {
   });
 }
 
-async function writeProvisionTransaction(inspected, plan, deps) {
-  await writeProvisionTransactionRecord(transactionFromInspected(inspected), plan, deps);
+async function writeProvisionTransaction(
+  inspected,
+  plan,
+  deps,
+  { identityRecoveryRequired = false } = {},
+) {
+  await writeProvisionTransactionRecord(
+    transactionFromInspected(inspected, { identityRecoveryRequired }),
+    plan,
+    deps,
+  );
 }
 
 async function writeProvisionTransactionRecord(

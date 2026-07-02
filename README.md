@@ -344,6 +344,8 @@ sysusers and requires the complete strict identity contract before continuing.
 If manager safety rollback restores the old policy while such a partial commit
 still exists, the provisioner first persists an explicit versioned identity
 recovery marker; old or mixed target sets without that marker remain strict.
+The marker is carried into any replacement policy transaction until sysusers
+has restored and strictly validated the complete identity state.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.

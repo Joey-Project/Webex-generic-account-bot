@@ -227,7 +227,8 @@ superseded_by:
   manager safety failures, narrowly bounded locked credential-counterpart
   recovery before rerunning sysusers, a versioned marker that preserves only
   that recovery after forced-old safety rollback while unmarked old/mixed
-  transactions remain strict, read-only stale-cache outer preflight,
+  transactions remain strict and follows replacement policy transactions until
+  strict identity convergence, read-only stale-cache outer preflight,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate
   and first-run lock recovery including the group-owned pre-chmod directory
   state, and post-reload verification. Real host apply remains an

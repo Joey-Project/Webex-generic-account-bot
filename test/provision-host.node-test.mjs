@@ -3338,6 +3338,67 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
+  it('carries identity recovery into a newer interrupted policy transaction', async (context) => {
+    const fixture = await provisionFixture(context);
+    const failedInstall = fixture.dependencies({ applied: true });
+    failedInstall.runCommand = async () => {
+      throw new Error('injected sysusers partial commit');
+    };
+    await assert.rejects(
+      provisionHost({ apply: true }, failedInstall),
+      /injected sysusers partial commit/,
+    );
+
+    const partialIdentity = expectedIdentitySnapshot({
+      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+    });
+    const unitArtifact = fixture.plan.artifacts.find(({ kind }) => kind === 'unit');
+    await fs.writeFile(unitArtifact.source, '[Unit]\nDescription=new revision\n', {
+      mode: 0o644,
+    });
+    await fs.chmod(unitArtifact.source, 0o644);
+    const fsApi = new Proxy(fs, {
+      get(target, property) {
+        if (property !== 'rename') return target[property];
+        return async (source, destination) => {
+          if (destination === unitArtifact.target) {
+            throw new Error('injected newer policy install interruption');
+          }
+          return target.rename(source, destination);
+        };
+      },
+    });
+    const loaded = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          fsApi,
+          identitySequence: [partialIdentity],
+          unitStateSequence: [loaded, loaded, loaded],
+        }),
+      ),
+      /injected newer policy install interruption/,
+    );
+    const interrupted = JSON.parse(await fs.readFile(fixture.plan.transactionFile, 'utf8'));
+    assert.equal(interrupted.version, 2);
+    assert.equal(interrupted.identity_recovery_required, true);
+
+    const preflight = await provisionHost(
+      { apply: false, recoveryPreflight: true },
+      fixture.dependencies({
+        identitySequence: [partialIdentity],
+        unitStateSequence: [loaded],
+      }),
+    );
+    assert.equal(preflight.mode, 'dry-run');
+  });
+
   it('journals a zero-policy-change sysusers partial commit for recovery', async (context) => {
     const fixture = await provisionFixture(context);
     for (const artifact of fixture.plan.artifacts) {
