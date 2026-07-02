@@ -218,7 +218,9 @@ no-follow handles with fixed root-owned metadata, then validates source and
 target ancestor metadata, existing policy files, the exact non-login account
 metadata, locked managed-user and managed-group credentials, all shadow-group
 grants, NSS group state, and an exact local-only NSS policy for passwd, shadow,
-group, gshadow, and optional initgroups data.
+group, gshadow, and optional initgroups data. Every static passwd primary GID
+must already resolve to an existing group before sysusers can allocate managed
+groups.
 Static identities are enumerated explicitly from the `files` database. The
 systemd user database may expose only its root-owned `DynamicUser` provider,
 static userdb records are rejected, fixed `getent -s systemd` lookups must show
@@ -339,6 +341,9 @@ passwd/shadow or group/gshadow counterpart may be missing or orphaned only when
 the observed credential is locked and every structural identity check still
 passes. The outer preflight remains read-only, then the locked apply reruns
 sysusers and requires the complete strict identity contract before continuing.
+If manager safety rollback restores the old policy while such a partial commit
+still exists, the provisioner first persists an explicit versioned identity
+recovery marker; old or mixed target sets without that marker remain strict.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.

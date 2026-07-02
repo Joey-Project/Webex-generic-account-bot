@@ -32,7 +32,7 @@ const MAX_SYSTEMD_POLICY_BYTES = 64 * 1024 * 1024;
 const MAX_CREDENTIAL_STORE_ENTRIES = 1024;
 const MAX_MANAGED_ID = 59_999;
 const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
-const TRANSACTION_VERSION = 1;
+const TRANSACTION_VERSION = 2;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
 const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
@@ -560,6 +560,11 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
       throw new Error(`managed user has an orphan shadow credential: ${user}`);
     }
   }
+  for (const user of snapshot.users.values()) {
+    if (![...snapshot.groups.values()].some((group) => group.gid === user.gid)) {
+      throw new Error(`static user primary GID has no group: ${user.name} (${user.gid})`);
+    }
+  }
   for (const groupName of controlledGroups) {
     const group = snapshot.groups.get(groupName);
     const shadowGroup = snapshot.shadowGroups.get(groupName);
@@ -666,9 +671,13 @@ export async function provisionHost(options, dependencies = {}) {
   let identityRecoveryRequired = false;
   let recoveryState = null;
   if (transaction) {
-    await inspectPolicyTransactionRecovery(transaction, plan, deps);
+    const transactionInspection = await inspectPolicyTransactionRecovery(transaction, plan, deps);
     identityBefore = await deps.readIdentitySnapshot();
-    identityRecoveryRequired = validateIdentityPolicyForTransactionRecovery(identityBefore);
+    if (transactionInspection.resumeDesiredState || transaction.identityRecoveryRequired) {
+      identityRecoveryRequired = validateIdentityPolicyForTransactionRecovery(identityBefore);
+    } else {
+      validateIdentityPolicy(identityBefore);
+    }
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     const recoveryInspected = await inspectArtifacts(plan, deps);
     auditBootPolicyCatalogs(
@@ -1150,6 +1159,7 @@ async function installPolicySetAtomically(inspected, plan, deps) {
 function transactionFromInspected(inspected) {
   return Object.freeze({
     version: TRANSACTION_VERSION,
+    identityRecoveryRequired: false,
     artifacts: Object.freeze(inspected.artifacts.map((artifact) => Object.freeze({
       target: artifact.target,
       desiredSha256: artifact.source.sha256,
@@ -1623,12 +1633,17 @@ async function readProvisionTransaction(plan, deps) {
 }
 
 function parseProvisionTransaction(value, plan) {
+  const legacy = value?.version === 1;
+  const expectedKeys = legacy
+    ? 'artifacts,version'
+    : 'artifacts,identity_recovery_required,version';
   if (
     !value
     || typeof value !== 'object'
     || Array.isArray(value)
-    || value.version !== TRANSACTION_VERSION
-    || Object.keys(value).sort().join(',') !== 'artifacts,version'
+    || (!legacy && value.version !== TRANSACTION_VERSION)
+    || Object.keys(value).sort().join(',') !== expectedKeys
+    || (!legacy && typeof value.identity_recovery_required !== 'boolean')
     || !Array.isArray(value.artifacts)
     || value.artifacts.length !== plan.artifacts.length
   ) {
@@ -1679,19 +1694,33 @@ function parseProvisionTransaction(value, plan) {
       existing: Object.freeze({ contents }),
     });
   });
-  return Object.freeze({ version: TRANSACTION_VERSION, artifacts: Object.freeze(artifacts) });
+  return Object.freeze({
+    version: TRANSACTION_VERSION,
+    identityRecoveryRequired: legacy ? false : value.identity_recovery_required,
+    artifacts: Object.freeze(artifacts),
+  });
 }
 
 async function writeProvisionTransaction(inspected, plan, deps) {
+  await writeProvisionTransactionRecord(transactionFromInspected(inspected), plan, deps);
+}
+
+async function writeProvisionTransactionRecord(
+  transaction,
+  plan,
+  deps,
+  identityRecoveryRequired = transaction.identityRecoveryRequired,
+) {
   const value = {
     version: TRANSACTION_VERSION,
-    artifacts: inspected.artifacts.map((artifact) => ({
+    identity_recovery_required: identityRecoveryRequired,
+    artifacts: transaction.artifacts.map((artifact) => ({
       target: artifact.target,
-      desired_sha256: artifact.source.sha256,
+      desired_sha256: artifact.desiredSha256,
       existing: artifact.existing
         ? {
           contents_base64: artifact.existing.contents.toString('base64'),
-          sha256: artifact.existing.sha256,
+          sha256: createHash('sha256').update(artifact.existing.contents).digest('hex'),
         }
         : null,
     })),
@@ -1791,6 +1820,9 @@ async function rollbackPolicyAfterSafetyFailure(
   identityRecoveryRequired,
 ) {
   try {
+    if (identityRecoveryRequired) {
+      await writeProvisionTransactionRecord(transaction, plan, deps, true);
+    }
     const recoveredState = await recoverPolicyTransaction(
       transaction,
       plan,
@@ -2350,7 +2382,7 @@ function managedTmpfilesEntries(plan, inspected, identitySnapshot = null) {
       const policyPath = normaliseBootPolicyPath(rawPath);
       if (
         !['d', 'f'].includes(type)
-        || age !== '-'
+        || !['-', '1d'].includes(age)
         || !path.posix.isAbsolute(rawPath)
         || policyPath !== rawPath
         || !/^[0-7]{3,4}$/.test(rawMode)

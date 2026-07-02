@@ -439,6 +439,13 @@ describe('guarded host provisioner policy', () => {
       )),
       /managed user has static group privileges: webex-config-deploy \(external-operators\)/,
     );
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        `${passwdRecord('external-user', 1500, 2002)}\n`,
+        `${groupRecord('external-group', 1500)}\n`,
+      )),
+      /static user primary GID has no group: external-user \(2002\)/,
+    );
 
     assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
@@ -737,6 +744,30 @@ describe('guarded host provisioner policy', () => {
         targetGid: GID,
       }),
       /managed runtime ancestor is not traversable/,
+    );
+
+    const fixture = await provisionFixture(context);
+    const allowlistInspection = {
+      artifacts: await Promise.all(fixture.plan.artifacts.map(async (artifact) => ({
+        ...artifact,
+        source: { contents: await fs.readFile(artifact.source) },
+      }))),
+    };
+    const trustedDirectory = Object.freeze({
+      uid: UID,
+      gid: GID,
+      mode: 0o40755,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    await assertManagedRuntimeAncestorsTraversable(
+      fixture.plan,
+      allowlistInspection,
+      {
+        fsApi: { lstat: async () => trustedDirectory },
+        targetUid: UID,
+        targetGid: GID,
+      },
     );
   });
 
@@ -3206,6 +3237,23 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
+  it('rejects counterpart drift for an unmarked old-state transaction', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const partialIdentity = expectedIdentitySnapshot({
+      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+    });
+
+    await assert.rejects(
+      provisionHost(
+        { apply: false, recoveryPreflight: true },
+        fixture.dependencies({ identitySequence: [partialIdentity] }),
+      ),
+      /managed user shadow credential is missing: webex-generic-account-bot/,
+    );
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
   it('retains recovery after a partial credential commit and manager safety rollback', async (context) => {
     const fixture = await provisionFixture(context);
     const failedInstall = fixture.dependencies({ applied: true });
@@ -3259,6 +3307,11 @@ describe('guarded host provisioner execution', () => {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+    const markedTransaction = JSON.parse(
+      await fs.readFile(fixture.plan.transactionFile, 'utf8'),
+    );
+    assert.equal(markedTransaction.version, 2);
+    assert.equal(markedTransaction.identity_recovery_required, true);
 
     const loaded = unitStates({
       load: 'loaded',

@@ -98,7 +98,7 @@
   guarded provisioner now has a fixed non-secret allowlist, stable no-follow
   reads of the complete passwd/shadow/group/gshadow identity databases, a DynamicUser-only systemd
   userdb boundary with fixed managed-name vacancy lookups, identity-drift,
-  locked-user/group-credential, and shadow-grant
+  orphan-primary-GID, locked-user/group-credential, and shadow-grant
   checks, bounded dormant-unit preflight, device-bound kernel lock verification
   shared with config deployment, exact loaded-fragment, no-drop-in,
   no-stale-manager, no-external-activator, profile-exact PID 1 `UnitPath` with
@@ -152,7 +152,9 @@
   failures force the current installation journal's old set, reload, and
   dormant revalidation, complete-desired recovery admits only locked
   passwd/shadow or group/gshadow counterpart interruptions before rerunning
-  sysusers, and stale-cache outer preflight remains read-only, explicit
+  sysusers, with a versioned marker preserving that bounded recovery after a
+  forced-old safety rollback while unmarked old/mixed transactions stay strict,
+  and stale-cache outer preflight remains read-only, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.
 

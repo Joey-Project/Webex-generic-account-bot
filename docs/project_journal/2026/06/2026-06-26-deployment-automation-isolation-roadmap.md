@@ -164,7 +164,8 @@ superseded_by:
   activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
   fixed non-secret allowlist, stable no-follow reads of complete
   passwd/shadow/group/gshadow databases, a DynamicUser-only systemd userdb boundary,
-  fixed managed-name vacancy lookups, identity-drift, locked-user/group-credential,
+  fixed managed-name vacancy lookups, identity-drift, orphan-primary-GID,
+  locked-user/group-credential,
   and cross-group shadow-grant checks,
   dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
@@ -224,7 +225,9 @@ superseded_by:
   journal retained after installation rollback and through final manager convergence,
   current-installation forced-old reload and dormant revalidation after final
   manager safety failures, narrowly bounded locked credential-counterpart
-  recovery before rerunning sysusers, read-only stale-cache outer preflight,
+  recovery before rerunning sysusers, a versioned marker that preserves only
+  that recovery after forced-old safety rollback while unmarked old/mixed
+  transactions remain strict, read-only stale-cache outer preflight,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate
   and first-run lock recovery including the group-owned pre-chmod directory
   state, and post-reload verification. Real host apply remains an
