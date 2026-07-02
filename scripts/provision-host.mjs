@@ -3196,10 +3196,10 @@ function isExpectedVendorBootPolicyCredentialImport(
   unitNames,
   logicalSource,
 ) {
-  if (source !== logicalSource) return false;
   const directory = path.dirname(source);
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
+  if (path.basename(logicalSource) !== unit) return false;
   return (
     unit === 'systemd-sysusers.service'
     && systemdUnitNamesEqual(unitNames, unit)

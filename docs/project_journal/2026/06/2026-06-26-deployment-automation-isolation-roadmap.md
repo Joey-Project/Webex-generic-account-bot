@@ -191,7 +191,8 @@ superseded_by:
   258 `userdb.user.*`, `userdb.group.*`, and `userdb.transient.*` rejection
   across system credentials, credential stores,
   tmpfiles, and unit credential directives, with exact physical/logical vendor
-  import exceptions, plus launcher-instance reference
+  import exceptions for direct files and same-name dependency links while
+  renamed aliases remain rejected, plus launcher-instance reference
   rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

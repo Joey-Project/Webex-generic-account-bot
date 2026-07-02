@@ -1761,6 +1761,8 @@ describe('guarded host provisioner execution', () => {
     }
 
     let vendorImportCommandCalls = 0;
+    const sysinitWants = '/usr/lib/systemd/system/sysinit.target.wants';
+    const linkedSysusers = `${sysinitWants}/systemd-sysusers.service`;
     await assert.rejects(
       readSystemUnitStates(
         MANAGED_UNITS,
@@ -1776,7 +1778,19 @@ describe('guarded host provisioner execution', () => {
               { name: 'systemd-tmpfiles-setup.service' },
               { name: 'systemd-pcrfs@.service' },
               { name: 'user@.service' },
+              {
+                name: 'sysinit.target.wants',
+                isFile: () => false,
+                isDirectory: () => true,
+                isSymbolicLink: () => false,
+              },
             ]],
+            [sysinitWants, [{
+              name: 'systemd-sysusers.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
           ]),
           {
             filesByPath: new Map([
@@ -1822,6 +1836,10 @@ describe('guarded host provisioner execution', () => {
                 ].join('\n')),
               ],
             ]),
+            symlinksByPath: new Map([[
+              linkedSysusers,
+              '../systemd-sysusers.service',
+            ]]),
           },
         ),
       ),
