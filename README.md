@@ -230,10 +230,14 @@ rejects active, enabled, or masked managed units, including instantiated
 launcher template units. It rejects unloaded policy and dependency directories
 for every fixed managed unit, template or instance launcher overrides, and
 systemd type-level or dash-prefix drop-ins from every fixed systemd system-unit
-load path. It accepts only the exact root-owned `/lib -> usr/lib` compatibility
+load path. PID 1 must report the exact reviewed `UnitPath`; custom or reordered
+manager search paths fail closed before any state is accepted. It accepts only
+the exact root-owned `/lib -> usr/lib` compatibility
 link and requires every loaded managed unit to use the fixed
 `/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
-no external reverse activator. Enabled external unit dependency graphs are
+no external reverse activator. Every `is-active`, `is-enabled`, and metadata
+query must have a consistent exit code, single state output, empty diagnostics,
+and `LoadState`. Enabled external unit dependency graphs are
 not inferred from a potentially stale manager cache: every trusted system unit
 load path is scanned directly for external unit, drop-in, alias, and dependency
 symlink references to managed units, including C-escaped references, launcher
@@ -340,7 +344,11 @@ reviewed file set installed and reports a convergence error so the same command
 can be rerun after correction. If that leaves the complete desired file set on
 disk with `NeedDaemonReload=yes`, only an explicit apply may reload the manager,
 revalidate the complete dormant policy, and resume convergence; dry-run still
-fails closed on the stale cache.
+fails closed on the stale cache. In contrast, a final manager safety validation
+failure after reload forces the transaction back to the recorded old policy
+set, reloads the manager, rechecks dormant state, and clears the journal only
+after that rollback is proven safe. The same forced-old path protects a resumed
+complete desired transaction that fails its first post-reload safety check.
 
 The deployment entrypoint lives in this bot repository, not in the config
 repository checkout. It treats the config checkout as data, builds fixed argv

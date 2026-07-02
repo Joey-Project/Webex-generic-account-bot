@@ -101,7 +101,8 @@
   locked-user/group-credential, and shadow-grant
   checks, bounded dormant-unit preflight, device-bound kernel lock verification
   shared with config deployment, exact loaded-fragment, no-drop-in,
-  no-stale-manager, and no-external-activator checks, bounded policy-path
+  no-stale-manager, no-external-activator, exact PID 1 `UnitPath`, and strict
+  systemctl exit/output/diagnostic/load-state checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
@@ -140,7 +141,8 @@
   target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional
   root-owned policy installation whose rollback journal distinguishes partial
   rollback from complete-desired convergence resume and remains through manager
-  convergence without unsafe post-unlink rollback, explicit
+  convergence without unsafe post-unlink rollback, while final manager safety
+  failures force the recorded old set, reload, and dormant revalidation, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.
 

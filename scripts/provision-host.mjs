@@ -48,7 +48,7 @@ const SYSTEMD_UNIT_NAME_PATTERN =
   /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
 const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
-const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
+const SYSTEMD_MANAGER_UNIT_PATHS = Object.freeze([
   '/etc/systemd/system.control',
   '/run/systemd/system.control',
   '/run/systemd/transient',
@@ -60,8 +60,12 @@ const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
   '/run/systemd/generator',
   '/usr/local/lib/systemd/system',
   '/usr/lib/systemd/system',
-  '/lib/systemd/system',
   '/run/systemd/generator.late',
+]);
+const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
+  ...SYSTEMD_MANAGER_UNIT_PATHS.slice(0, -1),
+  '/lib/systemd/system',
+  SYSTEMD_MANAGER_UNIT_PATHS.at(-1),
 ]);
 const STATIC_USERDB_DIRECTORIES = Object.freeze([
   '/etc/userdb',
@@ -192,6 +196,8 @@ const VENDOR_TMPFILES_CREDENTIAL_UNITS = new Set([
   'systemd-tmpfiles-setup-dev.service',
   'systemd-tmpfiles-setup.service',
 ]);
+
+class PolicySafetyRollbackError extends Error {}
 
 export const MANAGED_UNITS = Object.freeze([
   'webex-generic-account-bot.service',
@@ -624,6 +630,16 @@ export async function provisionHost(options, dependencies = {}) {
       const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
       assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
     } catch (error) {
+      if (recoveryState === 'desired') {
+        await rollbackPolicyAfterSafetyFailure(
+          error,
+          transaction,
+          plan,
+          deps,
+          commands,
+          identityBefore,
+        );
+      }
       throw new Error(
         `host policy recovery finalisation failed; rerun --apply after correction: ${error.message}`,
         { cause: error },
@@ -668,6 +684,7 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
+  const safetyRollbackTransaction = transaction ?? transactionFromInspected(inspected);
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
@@ -688,12 +705,27 @@ export async function provisionHost(options, dependencies = {}) {
     await deps.verifyProvisionLockConverged();
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
-    const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
-    assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
+    try {
+      const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
+      assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
+    } catch (error) {
+      if (installed.length > 0 || recoveryState === 'desired') {
+        await rollbackPolicyAfterSafetyFailure(
+          error,
+          safetyRollbackTransaction,
+          plan,
+          deps,
+          commands,
+          identityAfter,
+        );
+      }
+      throw error;
+    }
     if (installed.length > 0 || recoveryState === 'desired') {
       await removeProvisionTransaction(plan, deps);
     }
   } catch (error) {
+    if (error instanceof PolicySafetyRollbackError) throw error;
     throw new Error(
       `host policy files are installed but convergence failed; rerun --apply after correction: ${error.message}`,
       { cause: error },
@@ -1583,12 +1615,14 @@ async function recoverPolicyTransaction(
   transaction,
   plan,
   deps,
+  { forceOld = false } = {},
 ) {
   const {
     directories,
     recovery,
-    resumeDesiredState,
+    resumeDesiredState: inspectedResumeDesiredState,
   } = await inspectPolicyTransactionRecovery(transaction, plan, deps);
+  const resumeDesiredState = !forceOld && inspectedResumeDesiredState;
   for (const entry of [...recovery].reverse()) {
     if (resumeDesiredState) break;
     if (!entry.restore) continue;
@@ -1641,6 +1675,40 @@ async function recoverPolicyTransaction(
     }
   }
   return resumeDesiredState ? 'desired' : 'old';
+}
+
+async function rollbackPolicyAfterSafetyFailure(
+  safetyError,
+  transaction,
+  plan,
+  deps,
+  commands,
+  identitySnapshot,
+) {
+  try {
+    const recoveredState = await recoverPolicyTransaction(
+      transaction,
+      plan,
+      deps,
+      { forceOld: true },
+    );
+    if (recoveredState !== 'old') {
+      throw new Error('safety rollback did not restore the old policy set');
+    }
+    commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
+    const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identitySnapshot);
+    assertUnitsDormant(recoveredUnitStates, plan, { requireLoaded: false });
+    await removeProvisionTransaction(plan, deps);
+  } catch (rollbackError) {
+    throw new PolicySafetyRollbackError(
+      `${safetyError.message}; safety rollback failed: ${rollbackError.message}`,
+      { cause: safetyError },
+    );
+  }
+  throw new PolicySafetyRollbackError(
+    `host policy safety validation failed and the old policy set was restored: ${safetyError.message}`,
+    { cause: safetyError },
+  );
 }
 
 async function inspectPolicyTransactionRecovery(transaction, plan, deps) {
@@ -1725,7 +1793,7 @@ function assertUnitDormant(
   state,
   { requireLoaded, allowDaemonReloadRequired, expectedFragment },
 ) {
-  if (!['inactive', 'unknown'].includes(state.active)) {
+  if (state.active !== 'inactive') {
     throw new Error(`managed unit is not inactive: ${unit} (${state.active})`);
   }
   if (!['disabled', 'indirect', 'not-found', 'static'].includes(state.enabled)) {
@@ -2398,6 +2466,7 @@ export async function readSystemUnitStates(
   identitySnapshot = null,
 ) {
   await assertNoUnexpectedManagedUnitPolicy(fsApi, managedIdentityIds(identitySnapshot));
+  await assertSystemdManagerUnitPath(runCommand);
   const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
@@ -2417,6 +2486,8 @@ export async function readSystemUnitStates(
       'webex-codex-launcher@*.service',
     ]),
   ]);
+  assertSystemctlCommandSucceeded(loadedInstances, 'launcher runtime unit listing');
+  assertSystemctlCommandSucceeded(installedInstances, 'launcher installed unit listing');
   const discovered = new Set([
     ...parseLauncherInstanceUnits(loadedInstances.stdout),
     ...parseLauncherInstanceUnits(installedInstances.stdout),
@@ -2437,16 +2508,111 @@ export async function readSystemUnitStates(
         '--property=NeedDaemonReload',
         ...REVERSE_ACTIVATION_PROPERTIES.map((property) => `--property=${property}`),
         unit,
-      ], [0, 1, 3, 4]),
+      ]),
     ]);
+    const activeState = parseSystemctlStateQuery(active, unit, 'active');
+    const enabledState = parseSystemctlStateQuery(enabled, unit, 'enabled');
+    assertSystemctlCommandSucceeded(metadata, `managed unit metadata query: ${unit}`);
     const loadedPolicy = parseSystemUnitMetadata(metadata.stdout, unit);
+    assertSystemctlStateMatchesLoadState(
+      unit,
+      active,
+      activeState,
+      enabled,
+      enabledState,
+      loadedPolicy.load,
+    );
     states.set(unit, Object.freeze({
-      active: normalisedState(active.stdout, 'unknown'),
-      enabled: normalisedState(enabled.stdout, 'not-found'),
+      active: activeState,
+      enabled: enabledState,
       ...loadedPolicy,
     }));
   }
   return states;
+}
+
+async function assertSystemdManagerUnitPath(runCommand) {
+  const result = await runCommand('/usr/bin/systemctl', [
+    'show',
+    '--property=UnitPath',
+    '--value',
+  ]);
+  const expected = `${SYSTEMD_MANAGER_UNIT_PATHS.join(' ')}\n`;
+  if (result.code !== 0 || result.stderr !== '' || result.stdout !== expected) {
+    throw new Error('systemd manager unit path is not the reviewed fixed path');
+  }
+}
+
+function assertSystemctlCommandSucceeded(result, label) {
+  if (result.code !== 0 || result.stderr !== '') {
+    throw new Error(`${label} failed`);
+  }
+}
+
+function parseSystemctlStateQuery(result, unit, kind) {
+  const output = String(result.stdout ?? '');
+  if (
+    !Number.isInteger(result.code)
+    || result.stderr !== ''
+    || !/^[a-z][a-z-]*\n$/.test(output)
+  ) {
+    throw new Error(`managed unit ${kind} state query is malformed: ${unit}`);
+  }
+  return output.slice(0, -1);
+}
+
+function assertSystemctlStateMatchesLoadState(
+  unit,
+  activeResult,
+  activeState,
+  enabledResult,
+  enabledState,
+  loadState,
+) {
+  if (loadState === 'not-found') {
+    if (
+      activeResult.code !== 4
+      || activeState !== 'inactive'
+      || enabledResult.code !== 4
+      || enabledState !== 'not-found'
+    ) {
+      throw new Error(`managed unit query state disagrees with load state: ${unit}`);
+    }
+    return;
+  }
+  if (loadState === 'loaded') {
+    const activeCodeMatchesState = (
+      activeResult.code === 0
+      && ['active', 'activating', 'deactivating', 'maintenance', 'refreshing', 'reloading']
+        .includes(activeState)
+    ) || (
+      activeResult.code === 3
+      && ['failed', 'inactive'].includes(activeState)
+    );
+    const enabledCodeMatchesState = (
+      enabledResult.code === 0
+      && [
+        'alias',
+        'enabled',
+        'enabled-runtime',
+        'generated',
+        'indirect',
+        'linked',
+        'linked-runtime',
+        'static',
+        'transient',
+      ].includes(enabledState)
+    ) || (
+      enabledResult.code === 1
+      && ['disabled', 'masked', 'masked-runtime'].includes(enabledState)
+    );
+    if (
+      !activeCodeMatchesState
+      || !enabledCodeMatchesState
+    ) {
+      throw new Error(`managed unit query state disagrees with load state: ${unit}`);
+    }
+  }
 }
 
 async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds) {

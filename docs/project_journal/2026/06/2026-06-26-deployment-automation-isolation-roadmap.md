@@ -169,7 +169,8 @@ superseded_by:
   dormant-unit
   preflight, transactional policy-file installation, device-bound kernel lock
   verification shared with config deployment, exact loaded-fragment and
-  no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
+  no-drop-in, no-stale-manager, no-external-reverse-activator, exact PID 1
+  `UnitPath`, and strict systemctl exit/output/diagnostic/load-state checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion with
@@ -215,7 +216,8 @@ superseded_by:
   fail-closed recovery with full target-directory durability, partial-commit
   rollback versus complete-desired convergence-resume classification, and a
   journal retained after installation rollback and through final manager convergence,
-  non-rollback journal-unlink failure handling, umask-safe interrupted candidate
+  forced-old reload and dormant revalidation after final manager safety
+  failures, non-rollback journal-unlink failure handling, umask-safe interrupted candidate
   and first-run lock recovery including the group-owned pre-chmod directory
   state, and post-reload verification. Real host apply remains an
   explicit operational gate.
@@ -276,12 +278,14 @@ superseded_by:
   managed fragment without any
   drop-ins, and reject unloaded unit overrides, drop-ins, wants, requires, and upholds
   for every managed unit and launcher instance from every fixed systemd
-  system-unit load path while
+  system-unit load path, require PID 1 to report exactly that reviewed search
+  path, and validate every state query's exit/output/diagnostic combination while
   accepting only the exact root-owned `/lib -> usr/lib` compatibility link. If
-  a later sysusers, tmpfiles, manager-reload, or
-  post-verification step fails, retain that complete set and fail with an
-  explicit convergent-rerun requirement; do not claim rollback of users or
-  directories already created by systemd.
+  a later sysusers, tmpfiles, or manager-reload step fails, retain that complete
+  set and fail with an explicit convergent-rerun requirement. If final manager
+  safety validation fails, force the recorded old policy set, reload, recheck
+  dormant state, and retain the journal unless that rollback is fully proven;
+  do not claim rollback of users or directories already created by systemd.
 - Never copy secrets, install the activation-owned bot drop-in, enable the bot,
   or run the real reboot challenge as an implicit side effect.
 

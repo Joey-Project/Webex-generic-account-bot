@@ -24,7 +24,7 @@ import {
   provisionHost,
   readSystemIdentitySnapshot,
   readSystemBootPolicyCatalogs,
-  readSystemUnitStates,
+  readSystemUnitStates as readSystemUnitStatesImpl,
   runCli,
   validateIdentityPolicy,
   validateNsswitchPolicy,
@@ -37,6 +37,42 @@ const REPO_SYSTEMD_ROOT = fileURLToPath(
 const UID = process.getuid();
 const GID = process.getgid();
 const PROVISION_CANDIDATE_PREFIX = '.webex-host-policy.provision-';
+const SYSTEMD_MANAGER_UNIT_PATH = [
+  '/etc/systemd/system.control',
+  '/run/systemd/system.control',
+  '/run/systemd/transient',
+  '/run/systemd/generator.early',
+  '/etc/systemd/system',
+  '/etc/systemd/system.attached',
+  '/run/systemd/system',
+  '/run/systemd/system.attached',
+  '/run/systemd/generator',
+  '/usr/local/lib/systemd/system',
+  '/usr/lib/systemd/system',
+  '/run/systemd/generator.late',
+].join(' ');
+
+function readSystemUnitStates(units, runCommand, fsApi, identitySnapshot = null) {
+  return readSystemUnitStatesImpl(
+    units,
+    async (command, args, allowedExitCodes) => {
+      if (args.join('\0') === 'show\0--property=UnitPath\0--value') {
+        return { stdout: `${SYSTEMD_MANAGER_UNIT_PATH}\n`, stderr: '', code: 0 };
+      }
+      const result = await runCommand(command, args, allowedExitCodes);
+      if (args[0] === 'is-active' && result.code === 0 && result.stdout === 'inactive\n') {
+        return { ...result, code: 3 };
+      }
+      if (args[0] === 'is-enabled' && result.code === 0) {
+        if (result.stdout === 'disabled\n') return { ...result, code: 1 };
+        if (result.stdout === 'not-found\n') return { ...result, code: 4 };
+      }
+      return result;
+    },
+    fsApi,
+    identitySnapshot,
+  );
+}
 
 describe('guarded host provisioner policy', () => {
   it('pins the complete non-secret allowlist and excludes activation permission', () => {
@@ -1942,6 +1978,98 @@ describe('guarded host provisioner execution', () => {
     assert.equal(commandCalls, 0);
   });
 
+  it('binds disk policy scanning to the manager unit path', async () => {
+    const candidateName =
+      `${PROVISION_CANDIDATE_PREFIX}00000000-0000-4000-8000-000000000099.tmp`;
+    const fsApi = systemdUnitPathFs(new Map([
+      ['/etc/systemd/system', [{
+        name: candidateName,
+        isFile: () => true,
+        isDirectory: () => false,
+        isSymbolicLink: () => false,
+      }]],
+    ]));
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStatesImpl(
+        MANAGED_UNITS,
+        async (_command, args) => {
+          commandCalls += 1;
+          assert.deepEqual(args, ['show', '--property=UnitPath', '--value']);
+          return {
+            stdout: `${SYSTEMD_MANAGER_UNIT_PATH} /opt/unreviewed/systemd/system\n`,
+            stderr: '',
+            code: 0,
+          };
+        },
+        fsApi,
+      ),
+      /systemd manager unit path is not the reviewed fixed path/,
+    );
+    assert.equal(commandCalls, 1);
+
+    let listingCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          listingCalls += 1;
+          throw new Error('systemctl listing reached after candidate audit');
+        },
+        fsApi,
+      ),
+      /systemctl listing reached after candidate audit/,
+    );
+    assert.equal(listingCalls, 2);
+  });
+
+  it('rejects malformed or load-inconsistent systemctl state queries', async () => {
+    const cases = [
+      [
+        'empty active output',
+        { stdout: '', stderr: '', code: 3 },
+        { stdout: 'not-found\n', stderr: '', code: 4 },
+        systemdUnitMetadata('not-found'),
+        /managed unit active state query is malformed/,
+      ],
+      [
+        'active query diagnostics',
+        { stdout: 'inactive\n', stderr: 'Failed to connect to bus\n', code: 3 },
+        { stdout: 'not-found\n', stderr: '', code: 4 },
+        systemdUnitMetadata('not-found'),
+        /managed unit active state query is malformed/,
+      ],
+      [
+        'loaded metadata with missing state queries',
+        { stdout: 'inactive\n', stderr: '', code: 4 },
+        { stdout: 'not-found\n', stderr: '', code: 4 },
+        systemdUnitMetadata('loaded', '/etc/systemd/system/webex-generic-account-bot.service'),
+        /managed unit query state disagrees with load state/,
+      ],
+    ];
+    for (const [label, active, enabled, metadata, expected] of cases) {
+      await assert.rejects(
+        readSystemUnitStatesImpl(
+          MANAGED_UNITS,
+          async (_command, args) => {
+            if (args.join('\0') === 'show\0--property=UnitPath\0--value') {
+              return { stdout: `${SYSTEMD_MANAGER_UNIT_PATH}\n`, stderr: '', code: 0 };
+            }
+            if (args[0] === 'list-units' || args[0] === 'list-unit-files') {
+              return { stdout: '', stderr: '', code: 0 };
+            }
+            if (args[0] === 'is-active') return active;
+            if (args[0] === 'is-enabled') return enabled;
+            return { stdout: metadata, stderr: '', code: 0 };
+          },
+          systemdUnitPathFs(),
+        ),
+        expected,
+        label,
+      );
+    }
+  });
+
   it('rejects loaded policy, stale manager state, and reverse activators', async (context) => {
     const cases = [
       [
@@ -1979,19 +2107,78 @@ describe('guarded host provisioner execution', () => {
       }, fixture.plan);
       const unit = MANAGED_UNITS[0];
       after.set(unit, mutate(after.get(unit)));
+      const commands = [];
 
       await assert.rejects(
         provisionHost(
           { apply: true },
           fixture.dependencies({
             applied: true,
-            unitStateSequence: [before, after],
+            commands,
+            unitStateSequence: [before, after, before],
           }),
         ),
         expected,
         label,
       );
+      assert.deepEqual(commands, [
+        ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+        ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+        ['/usr/bin/systemctl', ['daemon-reload']],
+        ['/usr/bin/systemctl', ['daemon-reload']],
+      ], label);
+      for (const artifact of fixture.plan.artifacts) {
+        await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+      }
+      await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
     }
+  });
+
+  it('retains the journal when a safety rollback reload cannot be proven', async (context) => {
+    const fixture = await provisionFixture(context);
+    const before = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const unsafe = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    unsafe.set(MANAGED_UNITS[0], {
+      ...unsafe.get(MANAGED_UNITS[0]),
+      dropIns: '/run/systemd/system/service.d/90-untrusted.conf',
+    });
+    const commands = [];
+    const dependencies = fixture.dependencies({
+      applied: true,
+      unitStateSequence: [before, unsafe],
+    });
+    let reloads = 0;
+    dependencies.runCommand = async (command, args) => {
+      commands.push([command, [...args]]);
+      if (command === '/usr/bin/systemctl') {
+        reloads += 1;
+        if (reloads === 2) throw new Error('injected safety rollback reload failure');
+      }
+      return { command, args: [...args], code: 0, stdout: '', stderr: '' };
+    };
+
+    await assert.rejects(
+      provisionHost({ apply: true }, dependencies),
+      /safety rollback failed: injected safety rollback reload failure/,
+    );
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
   it('rolls back the complete policy set when an atomic rename fails', async (context) => {
@@ -2649,6 +2836,55 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
+  it('rolls back a complete desired recovery when manager safety validation fails', async (context) => {
+    const fixture = await provisionFixture(context);
+    const failedInstall = fixture.dependencies({ applied: true });
+    failedInstall.runCommand = async () => {
+      throw new Error('injected initial sysusers failure');
+    };
+    await assert.rejects(
+      provisionHost({ apply: true }, failedInstall),
+      /injected initial sysusers failure/,
+    );
+
+    const before = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const unsafe = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    const unit = MANAGED_UNITS[0];
+    unsafe.set(unit, {
+      ...unsafe.get(unit),
+      reverseActivators: ['external-boot.service'],
+    });
+    const commands = [];
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          unitStateSequence: [before, unsafe, before],
+        }),
+      ),
+      /host policy safety validation failed and the old policy set was restored.*external reverse activator/,
+    );
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
   it('does not reload systemd until the held lock metadata has converged', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
@@ -3164,6 +3400,23 @@ function systemdUnitPathFs(
 }
 
 const LAUNCHER_INSTANCE_PATTERN_FOR_TEST = /^webex-codex-launcher@[^@/\s]+\.service$/;
+
+function systemdUnitMetadata(loadState, fragmentPath = '') {
+  return [
+    `LoadState=${loadState}`,
+    `FragmentPath=${fragmentPath}`,
+    'DropInPaths=',
+    'NeedDaemonReload=no',
+    'RequiredBy=',
+    'WantedBy=',
+    'UpheldBy=',
+    'BoundBy=',
+    'TriggeredBy=',
+    'OnFailureOf=',
+    'OnSuccessOf=',
+    '',
+  ].join('\n');
+}
 
 function unitStates(state, plan = null) {
   return new Map(MANAGED_UNITS.map((unit) => [unit, {
