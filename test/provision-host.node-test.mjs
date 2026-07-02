@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -410,13 +411,20 @@ describe('guarded host provisioner policy', () => {
       },
     };
 
-    await ensureProvisionLockFile(fsApi, async () => {});
+    const namespaceBoundaries = [];
+    await ensureProvisionLockFile(
+      fsApi,
+      async (boundary) => namespaceBoundaries.push(boundary),
+    );
     assert.deepEqual(state, {
       parentGid: 2003,
       parentMode: 0o750,
       lockGid: 2003,
       lockMode: 0o660,
     });
+    assert.ok(namespaceBoundaries.includes('provision-lock-parent-chmod'));
+    assert.ok(namespaceBoundaries.includes('provision-lock-existing-chown'));
+    assert.ok(namespaceBoundaries.includes('provision-lock-existing-chmod'));
   });
 
   it('rejects static membership and primary-GID drift', () => {
@@ -923,6 +931,9 @@ describe('guarded host provisioner execution', () => {
 
   it('guards each policy and host-command mutation boundary with mount namespace identity', async (context) => {
     for (const failureBoundary of [
+      'candidate-write',
+      'candidate-chown',
+      'candidate-chmod',
       'policy-install-rename',
       'systemd-sysusers',
       'systemd-tmpfiles',
@@ -1068,8 +1079,13 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'R /run/* - - - -'],
       ['tmpfiles', 'R /run/ - - - -'],
       ['tmpfiles', 'R /var/run/ - - - -'],
+      ['tmpfiles', 'R /var/*/../etc/passwd - - - -'],
+      ['tmpfiles', 'R /var/r?n/../etc/passwd - - - -'],
+      ['tmpfiles', 'R /var/[r]un/../etc/passwd - - - -'],
       ['tmpfiles', 'R /var/r?n/systemd/system/* - - - -'],
       ['tmpfiles', 'L /var/run - - - - ../run/child/..'],
+      ['tmpfiles', 'L /var/run/external - - - - ../etc/passwd'],
+      ['tmpfiles', 'L /var/lib/innocent - - - - ../run/../etc/passwd'],
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
@@ -1684,6 +1700,21 @@ describe('guarded host provisioner execution', () => {
         fixture.dependencies({ unitStateSequence: [activeStates] }),
       ),
       /managed unit is not inactive/,
+    );
+    await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('rejects a source FIFO through non-blocking metadata inspection', async (context) => {
+    const fixture = await provisionFixture(context);
+    const source = fixture.plan.artifacts[0].source;
+    await fs.rm(source);
+    const mkfifo = spawnSync('/usr/bin/mkfifo', [source]);
+    assert.equal(mkfifo.status, 0, mkfifo.error?.message ?? mkfifo.stderr.toString('utf8'));
+    await fs.chmod(source, 0o644);
+
+    await assert.rejects(
+      provisionHost({ apply: false }, fixture.dependencies()),
+      /policy file metadata is not trusted/,
     );
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
   });

@@ -214,7 +214,7 @@ a user-managed Node installation or checkout.
 Both modes require root so the complete files-backed `shadow` and `gshadow`
 databases can be checked without exposing them in output. Dry-run reads
 `/etc/passwd`, `/etc/shadow`, `/etc/group`, and `/etc/gshadow` through stable
-no-follow handles with fixed root-owned metadata, then validates source and
+non-blocking, no-follow handles with fixed root-owned metadata, then validates source and
 target ancestor metadata, existing policy files, the exact non-login account
 metadata, locked managed-user and managed-group credentials, all shadow-group
 grants, NSS group state, and an exact local-only NSS policy for passwd, shadow,
@@ -355,14 +355,17 @@ directory `/run/credentials/@system` is protected from external tmpfiles paths
 and symlink targets.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; path auditing resolves redundant separators, dot segments,
-parent traversal, and the `/var/run` symlink in component order. Lexically
+parent traversal, glob patterns, relative link targets, and the `/var/run`
+symlink in component order. Pattern paths containing parent traversal fail
+closed. Lexically
 equivalent link text remains rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
 lock. The provisioner opens and compares its own and PID 1's mount namespace
-identities before inspection and immediately before every mutation path.
+identities before inspection and immediately before every mutation path,
+including fd-backed writes and metadata changes.
 Dry-run, recovery, and apply loop through short reads while collecting and
 parsing bounded `/proc/self/mountinfo` data;
 managed tmpfiles targets, descendants, and non-standard redirected ancestors

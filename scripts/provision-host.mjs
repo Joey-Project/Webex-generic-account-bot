@@ -1107,7 +1107,7 @@ async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}
   );
   const lock = await fs.open(
     PROVISION_LOCK_PATH,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
   );
   let stat;
   try {
@@ -1359,8 +1359,11 @@ async function writeCandidateWithMode(target, contents, mode, deps) {
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
       0o600,
     );
+    await deps.verifyMountNamespace('candidate-write');
     await handle.writeFile(contents);
+    await deps.verifyMountNamespace('candidate-chown');
     await handle.chown(deps.targetUid, deps.targetGid);
+    await deps.verifyMountNamespace('candidate-chmod');
     await handle.chmod(mode);
     await handle.sync();
     await handle.close();
@@ -1419,7 +1422,9 @@ export async function ensureProvisionLockFile(
         | fsConstants.O_NOFOLLOW,
       0o600,
     );
+    await verifyMountNamespace('provision-lock-create-chown');
     await handle.chown(0, lockPolicy.gid);
+    await verifyMountNamespace('provision-lock-create-chmod');
     await handle.chmod(lockPolicy.mode);
     await handle.sync();
     await handle.close();
@@ -1432,13 +1437,15 @@ export async function ensureProvisionLockFile(
 
   const existing = await fsApi.open(
     PROVISION_LOCK_PATH,
-    fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDWR | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
   );
   try {
     const stat = await existing.stat();
     if (!provisionLockMatchesPolicy(stat, lockPolicy)) {
       assertRecoverableProvisionLock(stat, lockPolicy);
+      await verifyMountNamespace('provision-lock-existing-chown');
       await existing.chown(0, lockPolicy.gid);
+      await verifyMountNamespace('provision-lock-existing-chmod');
       await existing.chmod(lockPolicy.mode);
       await existing.sync();
     }
@@ -1553,7 +1560,10 @@ export function validateProvisionLockMetadata(
 async function assertTrustedReexecFile(file, policy, fsApi) {
   if (!path.isAbsolute(file)) throw new Error(`re-exec path is not absolute: ${file}`);
   await assertTrustedDirectoryChain('/', path.dirname(file), 0, 0, fsApi);
-  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   try {
     const stat = await handle.stat();
     if (policy.mode !== undefined) {
@@ -1614,7 +1624,10 @@ async function readTrustedFile(
   fsApi,
   maxBytes = MAX_POLICY_FILE_BYTES,
 ) {
-  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   try {
     const before = await handle.stat();
     assertTrustedFileMetadata(file, before, uid, gid, mode);
@@ -1640,7 +1653,10 @@ async function readTrustedFile(
 }
 
 async function readTrustedSensitiveIdentityFile(file, allowedGids, allowedModes, fsApi) {
-  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   try {
     const before = await handle.stat();
     const mode = before.mode & 0o7777;
@@ -2836,8 +2852,8 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   if (type.startsWith('L')) {
     if (argument.includes('%')) return true;
     const resolvedTarget = argument.startsWith('/')
-      ? argument
-      : path.posix.resolve(path.posix.dirname(policyPath), argument);
+      ? normaliseBootPolicyPath(argument)
+      : resolveBootPolicyRelativePath(path.posix.dirname(policyPath), argument);
     return pathFieldTouchesProtected(resolvedTarget, false, protectedPaths);
   }
   if (/^[aA]/.test(type)) {
@@ -2890,6 +2906,7 @@ function identityTokenTouchesManagedSurface(identity, managedNames, managedIds) 
 
 function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPaths) {
   if (!policyPath.startsWith('/')) return policyPath.includes('%');
+  if (bootPolicyPatternHasParentTraversal(policyPath)) return true;
   const normalisedPolicyPath = normaliseBootPolicyPath(policyPath);
   if (/(^|\/)webex(?:-|\/|$)/.test(normalisedPolicyPath)) return true;
   const wildcardOffset = normalisedPolicyPath.search(/[%*?[]/);
@@ -2930,6 +2947,17 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
     }
   }
   return false;
+}
+
+function bootPolicyPatternHasParentTraversal(policyPath) {
+  const components = policyPath.split('/');
+  const hasPattern = components.some((component) => /[%*?[\]]/.test(component));
+  return hasPattern && components.includes('..');
+}
+
+function resolveBootPolicyRelativePath(basePath, relativePath) {
+  const normalisedBase = normaliseBootPolicyPath(basePath);
+  return normaliseBootPolicyPath(`${normalisedBase}/${relativePath}`);
 }
 
 function normaliseBootPolicyPath(policyPath) {
