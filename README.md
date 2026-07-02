@@ -219,8 +219,9 @@ from the root-owned repository deployment tree, then installs them as
 binaries, rendered config, and the activation-owned
 `webex-generic-account-bot.service.d/10-codex-launcher.conf` drop-in.
 Apply also requires root-owned, non-writable ancestors and files for both the
-Node executable and provisioner script; do not run this root workflow through
-a user-managed Node installation or checkout.
+Node executable, provisioner script, and fixed
+`/opt/webex-generic-account-bot/bin/webex-host-identity-lock` supervisor; do not
+run this root workflow through a user-managed Node installation or checkout.
 
 Both modes require root so the complete files-backed `shadow` and `gshadow`
 databases can be checked without exposing them in output. They also require the
@@ -462,7 +463,14 @@ record changed. The locked apply restores changed databases in reverse commit
 order with atomic renames and directory fsyncs, then reruns sysusers and
 requires the complete strict identity contract. A recovery interrupted during
 those reverse renames converges on the next apply; a missing, modified, or stale
-backup fails closed instead of overwriting administrator changes.
+backup fails closed instead of overwriting administrator changes. The native
+identity-lock supervisor holds glibc's system password-database lock while a
+fixed FD-bound recovery child repeats the complete read-only recovery preflight.
+That child copies verified backup contents into fixed private candidates and
+atomically installs those candidates, preserving the standard `*-` backups.
+Legacy version 1 and 2 journals do not bind identity-file digests, so a partial
+identity commit under either legacy format fails closed and requires explicit
+manual repair instead of trusting potentially stale system backups.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.

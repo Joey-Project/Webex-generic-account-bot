@@ -181,9 +181,12 @@
   rollback from complete-desired convergence resume and remains through manager
   convergence without unsafe post-unlink rollback, while final manager safety
   failures force the current installation journal's old set, reload, and
-  dormant revalidation, complete-desired recovery admits only locked
+  dormant revalidation, complete-desired version 3 recovery admits only locked
   passwd/shadow or group/gshadow counterpart interruptions before rerunning
-  sysusers, with a versioned marker preserving that bounded recovery after a
+  sysusers, with glibc password-database locking, a supervised FD-bound recovery
+  child, preserved standard backups, and private atomic recovery candidates.
+  Legacy journals with partial identity commits require manual repair. A
+  versioned marker preserves bounded version 3 recovery after a
   forced-old safety rollback while unmarked old/mixed transactions stay strict,
   carries that marker across replacement policy transactions until strict
   identity convergence,

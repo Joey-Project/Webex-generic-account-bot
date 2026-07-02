@@ -23,7 +23,9 @@ import {
   buildLockedApplyCommand,
   buildProvisionPlan,
   ensureProvisionLockFile,
+  executeIdentityRecovery,
   executeLockedApply,
+  hasIdentityLock,
   hasProvisionLock,
   parseArgs,
   parseIdentityDatabases,
@@ -35,6 +37,7 @@ import {
   restoreInterruptedIdentityDatabases,
   runFixedCommand,
   runCli,
+  runIdentityRecoveryChild,
   validateIdentityPolicy,
   validateNsswitchPolicy,
   validateProvisionLockMetadata,
@@ -326,6 +329,22 @@ describe('guarded host provisioner policy', () => {
       false,
     );
     assert.equal(
+      hasIdentityLock(
+        '8: POSIX ADVISORY WRITE 321 00:2a:654 0 EOF\n',
+        321,
+        { dev: 0x2a, ino: 654 },
+      ),
+      true,
+    );
+    assert.equal(
+      hasIdentityLock(
+        '8: POSIX ADVISORY WRITE 322 00:2a:654 0 EOF\n',
+        321,
+        { dev: 0x2a, ino: 654 },
+      ),
+      false,
+    );
+    assert.equal(
       hasProvisionLock(
         '7: FLOCK ADVISORY WRITE 123 00:2b:456 0 EOF\n',
         123,
@@ -394,6 +413,7 @@ describe('guarded host provisioner policy', () => {
       'verify:/trusted/provision-host.mjs',
       'verify:/usr/bin/flock',
       'verify:/usr/bin/unshare',
+      'verify:/opt/webex-generic-account-bot/bin/webex-host-identity-lock',
       'preflight',
     ]);
 
@@ -447,6 +467,50 @@ describe('guarded host provisioner policy', () => {
       fdBootstrap,
       '--',
       '--apply',
+    ]);
+
+    let identitySpawn = null;
+    const identityClosed = [];
+    await executeIdentityRecovery({
+      allowTestInvocation: true,
+      openExecutable: async (file) => {
+        assert.equal(
+          file,
+          '/opt/webex-generic-account-bot/bin/webex-host-identity-lock',
+        );
+        return { fd: 44, close: async () => identityClosed.push(file) };
+      },
+      spawnProcess: (command, args, options) => {
+        identitySpawn = { command, args, options };
+        return {
+          once(event, callback) {
+            if (event === 'exit') queueMicrotask(() => callback(0, null));
+            return this;
+          },
+        };
+      },
+    });
+    assert.equal(identitySpawn.command, '/proc/self/fd/44');
+    assert.deepEqual(identitySpawn.args, []);
+    assert.equal(
+      identitySpawn.options.argv0,
+      '/opt/webex-generic-account-bot/bin/webex-host-identity-lock',
+    );
+    assert.deepEqual(identitySpawn.options.stdio, [
+      'inherit',
+      'inherit',
+      'inherit',
+      4,
+      'ignore',
+      5,
+    ]);
+    assert.deepEqual(Object.keys(identitySpawn.options.env).sort(), [
+      'LANG',
+      'LC_ALL',
+      'PATH',
+    ]);
+    assert.deepEqual(identityClosed, [
+      '/opt/webex-generic-account-bot/bin/webex-host-identity-lock',
     ]);
 
     const provisionScript = fileURLToPath(
@@ -1103,6 +1167,7 @@ describe('guarded host provisioner policy', () => {
       const options = {
         fsApi: fs,
         targetRoot: phaseRoot,
+        verifyIdentityLock: async () => {},
         verifyMountNamespace: async () => {},
         readMountInfo: async () => SAFE_MOUNT_INFO,
       };
@@ -1115,23 +1180,14 @@ describe('guarded host provisioner policy', () => {
           }))),
         });
         const legacyTransaction = Object.freeze({ identityFiles: null });
-        await restoreInterruptedIdentityDatabases(
-          legacyTransaction,
-          legacySnapshot,
-          options,
+        await assert.rejects(
+          restoreInterruptedIdentityDatabases(
+            legacyTransaction,
+            legacySnapshot,
+            options,
+          ),
+          /legacy identity recovery requires explicit manual repair/,
         );
-        await restoreInterruptedIdentityDatabases(
-          legacyTransaction,
-          legacySnapshot,
-          { ...options, apply: true },
-        );
-        for (const [file, mode] of modes) {
-          const target = path.join(phaseRoot, file.slice(1));
-          await fs.writeFile(target, current.get(file), { mode });
-          await fs.chmod(target, mode);
-          await fs.writeFile(`${target}-`, original.get(file), { mode });
-          await fs.chmod(`${target}-`, mode);
-        }
       }
       await restoreInterruptedIdentityDatabases(transaction, snapshot, options);
       assert.deepEqual(
@@ -1164,7 +1220,9 @@ describe('guarded host provisioner policy', () => {
         apply: true,
       });
       for (const [file, contents] of original) {
-        assert.deepEqual(await fs.readFile(path.join(phaseRoot, file.slice(1))), contents);
+        const target = path.join(phaseRoot, file.slice(1));
+        assert.deepEqual(await fs.readFile(target), contents);
+        assert.deepEqual(await fs.readFile(`${target}-`), contents);
       }
     }
 
@@ -1213,6 +1271,42 @@ describe('guarded host provisioner policy', () => {
       ),
       /unmanaged identity records changed during recovery: \/etc\/passwd/,
     );
+  });
+
+  it('rechecks dormant units under the identity lock before recovery mutation', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeIdentityRecoveryTransaction(fixture);
+    const partialIdentity = expectedIdentitySnapshot({ shadowDatabase: '' });
+    const activeStates = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    activeStates.set(MANAGED_UNITS[0], {
+      load: 'loaded',
+      active: 'active',
+      enabled: 'disabled',
+      fragment: fixture.plan.units.find(
+        (candidate) => path.basename(candidate) === MANAGED_UNITS[0],
+      ),
+      dropIns: '',
+    });
+    const recoveryModes = [];
+
+    await assert.rejects(
+      runIdentityRecoveryChild({
+        allowTestInvocation: true,
+        dependencies: fixture.dependencies({
+          identitySequence: [partialIdentity],
+          unitStateSequence: [activeStates],
+        }),
+        restoreIdentityDatabases: async (_transaction, _snapshot, options) => {
+          recoveryModes.push(options.apply);
+        },
+      }),
+      /managed unit is not inactive/,
+    );
+    assert.deepEqual(recoveryModes, [false]);
   });
 
   it('rejects restrictive unmanaged runtime ancestors before mutation', async (context) => {
@@ -5150,7 +5244,7 @@ describe('guarded host provisioner execution', () => {
     );
 
     assert.equal(report.mode, 'applied');
-    assert.deepEqual(recoveryModes, [false, true]);
+    assert.deepEqual(recoveryModes, [false, false, true]);
     assert.deepEqual(report.installed_artifacts, []);
     assert.deepEqual(commands, [
       ['/usr/bin/systemctl', ['daemon-reload']],
@@ -5558,6 +5652,7 @@ async function provisionFixture(context) {
       recoverIdentityDatabases = async (_transaction, snapshot) => {
         validateIdentityPolicy(snapshot);
       },
+      verifyIdentityLock = async () => {},
       verifyLegacyPaths = async () => {},
       verifyPidNamespace = async () => {},
       verifyMountNamespace = async () => {},
@@ -5608,6 +5703,7 @@ async function provisionFixture(context) {
         verifyManagerInstalledArtifacts,
         readIdentityFileState,
         recoverIdentityDatabases,
+        verifyIdentityLock,
         verifyLegacyPaths,
         verifyPidNamespace,
         verifyMountNamespace,
@@ -5648,6 +5744,36 @@ async function writeNullTransaction(fixture) {
   }
   const transaction = {
     version: 1,
+    artifacts: fixture.plan.artifacts.map(({ target }) => ({
+      target,
+      desired_sha256: '0'.repeat(64),
+      existing: null,
+    })),
+  };
+  await fs.writeFile(
+    fixture.plan.transactionFile,
+    `${JSON.stringify(transaction)}\n`,
+    { mode: 0o600 },
+  );
+  await fs.chmod(fixture.plan.transactionFile, 0o600);
+}
+
+async function writeIdentityRecoveryTransaction(fixture) {
+  for (const directory of new Set(
+    fixture.plan.artifacts.map(({ target }) => path.dirname(target)),
+  )) {
+    await fs.mkdir(directory, { recursive: true, mode: 0o755 });
+  }
+  const transaction = {
+    version: 3,
+    identity_recovery_required: true,
+    identity_files: testIdentityFileState().map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      uid: entry.uid,
+      gid: entry.gid,
+      mode: entry.mode,
+    })),
     artifacts: fixture.plan.artifacts.map(({ target }) => ({
       target,
       desired_sha256: '0'.repeat(64),

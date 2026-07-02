@@ -12,6 +12,8 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
+const IDENTITY_RECOVERY_CHILD_ENV = 'WEBEX_HOST_IDENTITY_RECOVERY_CHILD';
+const IDENTITY_LOCK_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PID';
 const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
 const FD_REEXEC_BOOTSTRAP = [
   'const { readFileSync } = await import("node:fs");',
@@ -61,6 +63,9 @@ const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
 const PROVISION_LOCK_PARENT = path.dirname(PROVISION_LOCK_PATH);
 const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
+const IDENTITY_LOCK_HELPER_PATH =
+  '/opt/webex-generic-account-bot/bin/webex-host-identity-lock';
+const IDENTITY_LOCK_PATH = '/etc/.pwd.lock';
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const PROVISION_CANDIDATE_PREFIX = '.webex-host-policy.provision-';
@@ -208,6 +213,14 @@ const IDENTITY_DATABASE_COMMIT_ORDER = Object.freeze([
   '/etc/passwd',
   '/etc/shadow',
 ]);
+const IDENTITY_RECOVERY_CANDIDATE_PATHS = Object.freeze(
+  IDENTITY_DATABASE_COMMIT_ORDER.map((file) => (
+    path.posix.join(
+      path.posix.dirname(file),
+      `.webex-host-identity-recovery-${path.posix.basename(file)}.tmp`,
+    )
+  )),
+);
 const BOOT_POLICY_CREDENTIAL_NAMES = Object.freeze([
   'sysusers.extra',
   'tmpfiles.extra',
@@ -277,6 +290,7 @@ const BOOT_POLICY_EXECUTABLES = new Set([
   'systemd-tmpfiles',
 ]);
 const FIXED_HOST_EXECUTABLE_PATHS = Object.freeze([
+  IDENTITY_LOCK_HELPER_PATH,
   '/usr/bin/flock',
   '/usr/bin/getent',
   '/usr/bin/getfacl',
@@ -859,14 +873,9 @@ export async function provisionHost(options, dependencies = {}) {
         validateIdentityPolicy(identityBefore);
       } catch {
         await deps.recoverIdentityDatabases(transaction, identityBefore, {
-          apply: !options.recoveryPreflight,
+          apply: false,
         });
         identityRecoveryRequired = true;
-        if (!options.recoveryPreflight) {
-          identityBefore = await deps.readIdentitySnapshot();
-          validateIdentityPolicy(identityBefore);
-          identityRecoveryRequired = false;
-        }
       }
     } else {
       validateIdentityPolicy(identityBefore);
@@ -890,6 +899,12 @@ export async function provisionHost(options, dependencies = {}) {
     });
     if (options.recoveryPreflight) {
       return provisionReport('dry-run', plan, recoveryInspected, commands);
+    }
+    if (identityRecoveryRequired) {
+      await deps.recoverIdentityDatabases(transaction, identityBefore, { apply: true });
+      identityBefore = await deps.readIdentitySnapshot();
+      validateIdentityPolicy(identityBefore);
+      identityRecoveryRequired = false;
     }
     recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
     try {
@@ -1123,6 +1138,21 @@ export function hasProvisionLock(locksText, pid, stat) {
   });
 }
 
+export function hasIdentityLock(locksText, pid, stat) {
+  const expectedPid = String(pid);
+  const expectedInode = String(stat.ino);
+  const expectedDevice = linuxDeviceNumbers(stat.dev);
+  return String(locksText).split('\n').some((line) => {
+    const match = line.match(
+      /^\d+:\s+POSIX\s+ADVISORY\s+WRITE\s+(\d+)\s+([0-9a-f]+):([0-9a-f]+):(\d+)\s+0\s+(?:0|EOF)$/i,
+    );
+    return match?.[1] === expectedPid
+      && BigInt(`0x${match[2]}`) === expectedDevice.major
+      && BigInt(`0x${match[3]}`) === expectedDevice.minor
+      && match[4] === expectedInode;
+  });
+}
+
 export async function executeLockedApply(argv, {
   fsApi = fs,
   nodePath = process.execPath,
@@ -1141,6 +1171,7 @@ export async function executeLockedApply(argv, {
   await verifyReexecFile(scriptPath, { mode: FILE_MODE }, fsApi);
   await verifyReexecFile('/usr/bin/flock', { executable: true }, fsApi);
   await verifyReexecFile('/usr/bin/unshare', { executable: true }, fsApi);
+  await verifyReexecFile(IDENTITY_LOCK_HELPER_PATH, { executable: true }, fsApi);
   await preflightHost();
   await ensureLock(fsApi, () => assertSameMountNamespace(fsApi));
   const reexecHandles = [];
@@ -1190,6 +1221,125 @@ export async function executeLockedApply(argv, {
   }
 }
 
+export async function executeIdentityRecovery({
+  fsApi = fs,
+  openExecutable = (file) => openTrustedExecutable(file, fsApi),
+  spawnProcess = spawn,
+  allowTestInvocation = false,
+} = {}) {
+  if (!allowTestInvocation && (
+    process.env[PROVISION_LOCK_ENV] !== '1'
+    || process.env[PRIVATE_MOUNT_NAMESPACE_ENV] !== '1'
+    || PROVISION_SCRIPT_PATH !== FD_REEXEC_SCRIPT_PATH
+  )) {
+    throw new Error('identity recovery requires the locked private host provisioner');
+  }
+  const helper = await openExecutable(IDENTITY_LOCK_HELPER_PATH);
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawnProcess(`/proc/self/fd/${helper.fd}`, [], {
+        argv0: IDENTITY_LOCK_HELPER_PATH,
+        cwd: '/',
+        env: {
+          PATH: '/usr/bin:/bin',
+          LANG: 'C.UTF-8',
+          LC_ALL: 'C.UTF-8',
+        },
+        stdio: ['inherit', 'inherit', 'inherit', 4, 'ignore', 5],
+      });
+      child.once('error', reject);
+      child.once('exit', (code, signal) => {
+        if (signal) {
+          reject(new Error(`identity recovery supervisor terminated by signal ${signal}`));
+          return;
+        }
+        if (code !== 0) {
+          reject(new Error(`identity recovery supervisor failed with exit code ${code ?? 1}`));
+          return;
+        }
+        resolve();
+      });
+    });
+  } finally {
+    await helper.close();
+  }
+}
+
+export async function runIdentityRecoveryChild({
+  dependencies = {},
+  allowTestInvocation = false,
+  restoreIdentityDatabases = restoreInterruptedIdentityDatabases,
+} = {}) {
+  const deps = provisionDependencies(dependencies);
+  const plan = dependencies.plan ?? buildProvisionPlan();
+  if (!allowTestInvocation && process.env[IDENTITY_RECOVERY_CHILD_ENV] !== '1') {
+    throw new Error('identity recovery child invocation is not authorised');
+  }
+  if (plan.targetRoot !== '/' && !deps.allowTestRoot) {
+    throw new Error('non-production target roots are test-only');
+  }
+  if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
+    throw new Error('identity recovery child requires root');
+  }
+  await deps.verifyIdentityLock();
+  await deps.verifyPidNamespace();
+  await deps.verifyMountNamespace('identity-recovery-inspection');
+  await deps.verifyLegacyPaths();
+  const transaction = await readProvisionTransaction(plan, deps);
+  if (!transaction) throw new Error('identity recovery transaction is missing');
+  const transactionInspection = await inspectPolicyTransactionRecovery(transaction, plan, deps);
+  if (!transactionInspection.resumeDesiredState && !transaction.identityRecoveryRequired) {
+    throw new Error('identity recovery is not permitted for this transaction state');
+  }
+  const snapshot = await deps.readIdentitySnapshot();
+  let recoveryRequired = false;
+  try {
+    validateIdentityPolicy(snapshot);
+  } catch {
+    recoveryRequired = true;
+    await restoreIdentityDatabases(transaction, snapshot, {
+      apply: false,
+      fsApi: deps.fsApi,
+      verifyMountNamespace: deps.verifyMountNamespace,
+      readMountInfo: deps.readMountInfo,
+      verifyIdentityLock: deps.verifyIdentityLock,
+    });
+  }
+  if (!recoveryRequired) throw new Error('identity recovery is not required');
+  const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, snapshot);
+  assertUnitsDormant(recoveryUnitStates, plan, {
+    requireLoaded: false,
+    allowDaemonReloadRequired: true,
+  });
+  const recoveryInspected = await inspectArtifacts(plan, deps);
+  auditBootPolicyCatalogs(
+    await deps.readBootPolicyCatalogs(),
+    recoveryInspected,
+    snapshot,
+  );
+  assertNoUnexpectedManagedMounts(plan, recoveryInspected, await deps.readMountInfo());
+  await assertManagedRuntimeAncestorsTraversable(plan, recoveryInspected, {
+    fsApi: deps.fsApi,
+    targetUid: deps.targetUid,
+    targetGid: deps.targetGid,
+    verifyNoExtendedPosixAcl: deps.verifyNoExtendedPosixAcl,
+  });
+  const finalRecoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, snapshot);
+  assertUnitsDormant(finalRecoveryUnitStates, plan, {
+    requireLoaded: false,
+    allowDaemonReloadRequired: true,
+  });
+  await restoreIdentityDatabases(transaction, snapshot, {
+    apply: true,
+    fsApi: deps.fsApi,
+    verifyMountNamespace: deps.verifyMountNamespace,
+    readMountInfo: deps.readMountInfo,
+    verifyIdentityLock: deps.verifyIdentityLock,
+  });
+  validateIdentityPolicy(await deps.readIdentitySnapshot());
+  return 0;
+}
+
 async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}) {
   const configPullGid = await readConfigPullGroupGid(fs);
   const parentStat = await fs.lstat(PROVISION_LOCK_PARENT);
@@ -1212,6 +1362,45 @@ async function assertProvisionLockHeld({ allowInterruptedMigration = true } = {}
   const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fs);
   if (!hasProvisionLock(procLocks, process.pid, stat)) {
     throw new Error('current process does not hold the host provision lock');
+  }
+}
+
+async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {}) {
+  const lockPid = processApi.env?.[IDENTITY_LOCK_PID_ENV];
+  if (!/^[1-9][0-9]*$/.test(lockPid ?? '') || String(processApi.ppid) !== lockPid) {
+    throw new Error('identity recovery child is not supervised by the lock holder');
+  }
+  await assertTrustedDirectoryChain('/', path.dirname(IDENTITY_LOCK_PATH), 0, 0, fsApi);
+  const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
+    new Set([IDENTITY_LOCK_PATH]),
+    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+  );
+  const lock = await fsApi.open(
+    IDENTITY_LOCK_PATH,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
+  let stat;
+  try {
+    stat = await lock.stat();
+    if (
+      !stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.nlink !== 1
+      || ((stat.mode & 0o7777) & 0o077) !== 0
+    ) {
+      throw new Error('system identity database lock file is not trusted');
+    }
+  } finally {
+    await lock.close();
+  }
+  const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
+    new Set([IDENTITY_LOCK_PATH]),
+    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+  );
+  assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
+  const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fsApi);
+  if (!hasIdentityLock(procLocks, lockPid, stat)) {
+    throw new Error('identity recovery supervisor does not hold the system identity lock');
   }
 }
 
@@ -1829,22 +2018,24 @@ export async function restoreInterruptedIdentityDatabases(
       MAX_MOUNTINFO_BYTES,
       fsApi,
     ),
+    verifyIdentityLock = assertIdentityLockHeld,
   } = {},
 ) {
+  if (!Array.isArray(transaction.identityFiles)) {
+    throw new Error('legacy identity recovery requires explicit manual repair');
+  }
   const currentFiles = new Map();
   const originalFiles = new Map();
   const changed = [];
   const protectedPaths = new Set(IDENTITY_DATABASE_COMMIT_ORDER.flatMap((file) => {
     const target = rootedPath(targetRoot, file);
-    return [target, `${target}-`];
+    return [target, `${target}-`, identityRecoveryCandidatePath(target)];
   }));
   const mountsBeforeRecovery = assertNoUnexpectedMountsForPaths(
     protectedPaths,
     await readMountInfo(),
   );
-  const identityFiles = Array.isArray(transaction.identityFiles)
-    ? transaction.identityFiles
-    : await inferLegacyIdentityRecoveryFiles(snapshot, { fsApi, targetRoot });
+  const identityFiles = transaction.identityFiles;
   assertIdentityRecoveryFileSet(identityFiles);
   for (const expected of identityFiles) {
     const target = rootedPath(targetRoot, expected.path);
@@ -1874,28 +2065,55 @@ export async function restoreInterruptedIdentityDatabases(
   ));
   if (!apply) return;
 
-  for (const entry of [...changed].reverse()) {
-    const current = await readTrustedIdentityRecoveryFile(
-      entry.target,
-      entry.expected,
-      fsApi,
-    );
-    const backup = await readTrustedIdentityRecoveryFile(
-      `${entry.target}-`,
-      entry.expected,
-      fsApi,
-    );
-    if (
-      !sameFileIdentity(current.stat, entry.current.stat)
-      || current.sha256 !== entry.current.sha256
-      || !sameFileIdentity(backup.stat, entry.backup.stat)
-      || backup.sha256 !== entry.expected.sha256
-    ) {
-      throw new Error(`identity database changed during recovery: ${entry.expected.path}`);
+  await verifyIdentityLock();
+  const candidates = new Map();
+  try {
+    for (const entry of changed) {
+      const candidate = await prepareIdentityRecoveryCandidate(
+        entry,
+        fsApi,
+        verifyMountNamespace,
+      );
+      candidates.set(entry.expected.path, candidate);
     }
-    await verifyMountNamespace('identity-recovery-rename');
-    await fsApi.rename(`${entry.target}-`, entry.target);
-    await syncDirectory(path.dirname(entry.target), fsApi);
+    for (const entry of [...changed].reverse()) {
+      await verifyIdentityLock();
+      const current = await readTrustedIdentityRecoveryFile(
+        entry.target,
+        entry.expected,
+        fsApi,
+      );
+      const backup = await readTrustedIdentityRecoveryFile(
+        `${entry.target}-`,
+        entry.expected,
+        fsApi,
+      );
+      const candidate = await readTrustedIdentityRecoveryFile(
+        candidates.get(entry.expected.path).path,
+        entry.expected,
+        fsApi,
+      );
+      if (
+        !sameFileIdentity(current.stat, entry.current.stat)
+        || current.sha256 !== entry.current.sha256
+        || !sameFileIdentity(backup.stat, entry.backup.stat)
+        || backup.sha256 !== entry.expected.sha256
+        || !sameFileIdentity(candidate.stat, candidates.get(entry.expected.path).stat)
+        || candidate.sha256 !== entry.expected.sha256
+      ) {
+        throw new Error(`identity database changed during recovery: ${entry.expected.path}`);
+      }
+      await verifyMountNamespace('identity-recovery-rename');
+      await fsApi.rename(candidates.get(entry.expected.path).path, entry.target);
+      candidates.delete(entry.expected.path);
+      await syncDirectory(path.dirname(entry.target), fsApi);
+    }
+  } finally {
+    await Promise.allSettled([...candidates.values()].map(async ({ path: candidate }) => {
+      await verifyMountNamespace('identity-recovery-candidate-cleanup');
+      await fsApi.rm(candidate, { force: true });
+      await syncDirectory(path.dirname(candidate), fsApi);
+    }));
   }
 
   for (const expected of identityFiles) {
@@ -1913,34 +2131,6 @@ export async function restoreInterruptedIdentityDatabases(
     await readMountInfo(),
   );
   assertProtectedMountSnapshotUnchanged(mountsBeforeRecovery, mountsAfterRecovery);
-}
-
-async function inferLegacyIdentityRecoveryFiles(snapshot, { fsApi, targetRoot }) {
-  if (!Array.isArray(snapshot.identityFiles)) {
-    throw new Error('legacy identity recovery metadata is unavailable');
-  }
-  const inferred = [];
-  for (const recorded of snapshot.identityFiles) {
-    const target = rootedPath(targetRoot, recorded.path);
-    const current = await readTrustedIdentityRecoveryFile(target, recorded, fsApi);
-    if (current.sha256 !== recorded.sha256) {
-      throw new Error(`identity snapshot changed before legacy recovery: ${recorded.path}`);
-    }
-    let backup = null;
-    try {
-      backup = await readTrustedIdentityRecoveryFile(`${target}-`, recorded, fsApi);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-    inferred.push(Object.freeze({
-      path: recorded.path,
-      sha256: backup?.sha256 ?? current.sha256,
-      uid: recorded.uid,
-      gid: recorded.gid,
-      mode: recorded.mode,
-    }));
-  }
-  return Object.freeze(inferred);
 }
 
 function assertIdentityRecoveryFileSet(identityFiles) {
@@ -1961,6 +2151,83 @@ function assertIdentityRecoveryFileSet(identityFiles) {
   ) {
     throw new Error('identity recovery metadata is invalid');
   }
+}
+
+function identityRecoveryCandidatePath(target) {
+  return path.join(
+    path.dirname(target),
+    `.webex-host-identity-recovery-${path.basename(target)}.tmp`,
+  );
+}
+
+async function prepareIdentityRecoveryCandidate(entry, fsApi, verifyMountNamespace) {
+  const candidate = identityRecoveryCandidatePath(entry.target);
+  await removeInterruptedIdentityRecoveryCandidate(
+    candidate,
+    entry.expected,
+    fsApi,
+    verifyMountNamespace,
+  );
+  let handle;
+  try {
+    await verifyMountNamespace('identity-recovery-candidate-create');
+    handle = await fsApi.open(
+      candidate,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(entry.backup.contents);
+    await handle.chown(entry.expected.uid, entry.expected.gid);
+    await handle.chmod(entry.expected.mode);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    const staged = await readTrustedIdentityRecoveryFile(candidate, entry.expected, fsApi);
+    if (staged.sha256 !== entry.expected.sha256) {
+      throw new Error(`identity recovery candidate digest mismatch: ${entry.expected.path}`);
+    }
+    return Object.freeze({ path: candidate, stat: staged.stat });
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await removeInterruptedIdentityRecoveryCandidate(
+      candidate,
+      entry.expected,
+      fsApi,
+      verifyMountNamespace,
+    ).catch(() => {});
+    throw error;
+  }
+}
+
+async function removeInterruptedIdentityRecoveryCandidate(
+  candidate,
+  expected,
+  fsApi,
+  verifyMountNamespace,
+) {
+  let stat;
+  try {
+    stat = await fsApi.lstat(candidate);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const mode = stat.mode & 0o7777;
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.nlink !== 1
+    || stat.uid !== expected.uid
+    || !new Set([0, expected.gid]).has(stat.gid)
+    || !new Set([0o600, expected.mode]).has(mode)
+    || stat.size < 0
+    || stat.size > MAX_IDENTITY_FILE_BYTES
+  ) {
+    throw new Error(`identity recovery candidate is not trusted: ${candidate}`);
+  }
+  await verifyMountNamespace('identity-recovery-candidate-cleanup');
+  await fsApi.rm(candidate);
+  await syncDirectory(path.dirname(candidate), fsApi);
 }
 
 async function readTrustedIdentityRecoveryFile(file, expected, fsApi) {
@@ -3215,6 +3482,8 @@ export function auditBootPolicyCatalogs(
     ...inspected.artifacts.map((artifact) => artifact.sourcePath).filter(Boolean),
     ...IDENTITY_POLICY_PATHS,
     ...IDENTITY_DATABASE_COMMIT_ORDER.map((file) => `${file}-`),
+    ...IDENTITY_RECOVERY_CANDIDATE_PATHS,
+    IDENTITY_LOCK_PATH,
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
     SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
@@ -4775,6 +5044,8 @@ function protectedSystemdMountPaths() {
     ...SYSTEMD_PROTECTED_DIRECTORY_PATHS,
     ...IDENTITY_POLICY_PATHS,
     ...IDENTITY_DATABASE_COMMIT_ORDER.map((file) => `${file}-`),
+    ...IDENTITY_RECOVERY_CANDIDATE_PATHS,
+    IDENTITY_LOCK_PATH,
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
     SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
@@ -5545,6 +5816,8 @@ function provisionDependencies(dependencies) {
       MAX_MOUNTINFO_BYTES,
       fsApi,
     ));
+  const verifyIdentityLock = dependencies.verifyIdentityLock
+    ?? (() => assertIdentityLockHeld({ fsApi, processApi }));
   return {
     fsApi,
     processApi,
@@ -5569,10 +5842,20 @@ function provisionDependencies(dependencies) {
         return snapshot.identityFiles;
       }),
     recoverIdentityDatabases: dependencies.recoverIdentityDatabases
-      ?? ((transaction, snapshot, options) => restoreInterruptedIdentityDatabases(
-        transaction,
-        snapshot,
-        { ...options, fsApi, verifyMountNamespace, readMountInfo },
+      ?? ((transaction, snapshot, options) => (
+        options.apply
+          ? executeIdentityRecovery({ fsApi })
+          : restoreInterruptedIdentityDatabases(
+            transaction,
+            snapshot,
+            {
+              ...options,
+              fsApi,
+              verifyMountNamespace,
+              readMountInfo,
+              verifyIdentityLock,
+            },
+          )
       )),
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
       ?? (() => readSystemBootPolicyCatalogs(runCommand, fsApi)),
@@ -5590,6 +5873,7 @@ function provisionDependencies(dependencies) {
         targetGid: dependencies.targetGid ?? 0,
       })),
     verifyMountNamespace,
+    verifyIdentityLock,
     verifyPidNamespace: dependencies.verifyPidNamespace
       ?? (() => assertInitialPidNamespace(runCommand, processApi, fsApi)),
     verifyLegacyPaths: dependencies.verifyLegacyPaths

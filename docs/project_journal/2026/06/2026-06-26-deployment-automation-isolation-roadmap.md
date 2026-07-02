@@ -262,9 +262,12 @@ superseded_by:
   rollback versus complete-desired convergence-resume classification, and a
   journal retained after installation rollback and through final manager convergence,
   current-installation forced-old reload and dormant revalidation after final
-  manager safety failures, narrowly bounded locked credential-counterpart
-  recovery before rerunning sysusers, a versioned marker that preserves only
-  that recovery after forced-old safety rollback while unmarked old/mixed
+  manager safety failures, narrowly bounded version 3 credential-counterpart
+  recovery before rerunning sysusers under glibc password-database locking and
+  a supervised FD-bound child, with private atomic candidates that preserve the
+  standard backups. Legacy partial identity commits require manual repair. A
+  versioned marker preserves only version 3 recovery after forced-old safety
+  rollback while unmarked old/mixed
   transactions remain strict and follows replacement policy transactions until
   strict identity convergence, read-only stale-cache outer preflight,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate
@@ -297,6 +300,9 @@ superseded_by:
 - Add a default-dry-run, explicit-apply provisioner with a fixed artifact
   allowlist, atomic root-owned installation, sysusers/tmpfiles application,
   manager reload, and post-install verification.
+- Add the fixed-purpose `webex-host-identity-lock` native supervisor so
+  version 3 identity recovery shares systemd-sysusers' glibc-compatible account
+  database lock without exposing a general root command wrapper.
 - Before installation, reject pre-existing static bot membership in every
   launcher, input, config-pull, or config-deploy group because systemd extends
   user-database groups even after an empty `SupplementaryGroups=` assignment.
