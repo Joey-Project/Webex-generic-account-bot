@@ -122,7 +122,8 @@
   binding, system-credential and credential-store absence checks, and systemd
   258 `userdb.user.*` and `userdb.group.*` prefix rejection across credential
   and tmpfiles channels, plus launcher-instance reference rejection. Semantic
-  merged boot sysusers/tmpfiles policy
+  merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
+  non-empty source catalogue requirements
   auditing that protects root, runtime, identity databases, NSS policy, and
   static/runtime systemd userdb paths,
   systemd system-unit load paths, and installed policy paths from owner-modifier,

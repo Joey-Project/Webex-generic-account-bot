@@ -2029,6 +2029,8 @@ export async function readSystemBootPolicyCatalogs(
       [0, 1],
     ),
   ]);
+  assertBootPolicyCatalogCommand('sysusers', sysusers);
+  assertBootPolicyCatalogCommand('tmpfiles', tmpfiles);
   assertNoBootPolicySystemCredentials(systemCredentials);
   await assertNoBootPolicyCredentialStoreFiles(fsApi);
   const sources = Object.freeze({
@@ -2040,6 +2042,16 @@ export async function readSystemBootPolicyCatalogs(
     tmpfiles: tmpfiles.stdout,
     sources,
   });
+}
+
+function assertBootPolicyCatalogCommand(kind, result) {
+  if (
+    result.code !== 0
+    || result.stderr !== ''
+    || String(result.stdout).trim() === ''
+  ) {
+    throw new Error(`${kind} catalog listing is incomplete`);
+  }
 }
 
 function assertNoBootPolicySystemCredentials(result) {
@@ -3281,6 +3293,10 @@ function parseSystemUnitMetadata(output, unit) {
   if (!['yes', 'no'].includes(needDaemonReload)) {
     throw new Error(`managed unit daemon-reload state is malformed: ${unit}`);
   }
+  const loadState = values.get('LoadState');
+  if (!/^[a-z][a-z-]*$/.test(loadState)) {
+    throw new Error(`managed unit load state is malformed: ${unit}`);
+  }
   const reverseActivators = new Set();
   for (const property of REVERSE_ACTIVATION_PROPERTIES) {
     for (const activator of values.get(property).split(/\s+/).filter(Boolean)) {
@@ -3291,7 +3307,7 @@ function parseSystemUnitMetadata(output, unit) {
     }
   }
   return Object.freeze({
-    load: normalisedState(values.get('LoadState'), 'not-found'),
+    load: loadState,
     fragment: values.get('FragmentPath'),
     dropIns: values.get('DropInPaths'),
     needDaemonReload: needDaemonReload === 'yes',

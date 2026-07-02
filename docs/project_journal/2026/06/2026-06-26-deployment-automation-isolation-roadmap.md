@@ -171,7 +171,7 @@ superseded_by:
   verification shared with config deployment, exact loaded-fragment and
   no-drop-in, no-stale-manager, no-external-reverse-activator, profile-exact
   PID 1 `UnitPath` with one-for-one disk scanning, and strict portable
-  systemctl exit/output/diagnostic/load-state checks,
+  systemctl exit/output/diagnostic/explicit-load-state checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
   `d_type`-independent file classification, unit-name specifier expansion with
@@ -191,8 +191,9 @@ superseded_by:
   rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
-  usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
-  auditing with C-escape, normalised specifier/glob-prefix and trailing slash,
+  usr-merge compatibility, code-zero/diagnostic-free/non-empty merged
+  sysusers/tmpfiles catalogue requirements, and semantic boot-policy auditing
+  with C-escape, normalised specifier/glob-prefix and trailing slash,
   including glob access through the legacy `/var/run` alias and exact
   compatibility-link text, and copy-source
   paths, source-associated managed-policy upgrades, path-derived-ID,

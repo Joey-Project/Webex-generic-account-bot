@@ -238,7 +238,7 @@ link and requires every loaded managed unit to use the fixed
 `/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
 no external reverse activator. Every `is-active`, `is-enabled`, and metadata
 query must have a consistent exit code, single state output, empty diagnostics,
-and `LoadState`. Enabled external unit dependency graphs are
+and an explicit non-empty `LoadState`. Enabled external unit dependency graphs are
 not inferred from a potentially stale manager cache: every trusted system unit
 load path is scanned directly for external unit, drop-in, alias, and dependency
 symlink references to managed units, including C-escaped references, launcher
@@ -268,7 +268,8 @@ and `tmpfiles.extra` plus all userdb credential prefixes are absent. Tmpfiles
 may perform only tightly bounded root-owned maintenance on credential-store
 root directories; child paths, globs, and modified operation types are
 rejected. The merged systemd sysusers and tmpfiles
-catalogues are audited before mutation and again after
+catalogue commands must return code zero, empty diagnostics, and non-empty
+source-associated output. Their catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, lexical path and trailing-slash normalisation including
 glob-capable access through the legacy `/var/run` alias, copy-source, path-derived-ID,

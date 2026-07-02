@@ -888,6 +888,32 @@ describe('guarded host provisioner execution', () => {
       tmpfiles: ['/usr/lib/tmpfiles.d/example.conf'],
     });
 
+    for (const [kind, result] of [
+      ['sysusers', { stdout: '', stderr: '', code: 0 }],
+      ['tmpfiles', { stdout: 'catalog\n', stderr: 'warning\n', code: 0 }],
+      ['sysusers', { stdout: 'catalog\n', stderr: '', code: 1 }],
+    ]) {
+      await assert.rejects(
+        readSystemBootPolicyCatalogs(
+          async (command) => {
+            if (command.endsWith('systemd-creds')) {
+              return { stdout: 'No credentials passed to system.\n', stderr: '', code: 0 };
+            }
+            const commandKind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+            if (commandKind === kind) return result;
+            const source = `/usr/lib/${commandKind}.d/example.conf`;
+            return {
+              stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+              stderr: '',
+              code: 0,
+            };
+          },
+          systemdUnitPathFs(new Map(), { filesByPath: sourceFiles }),
+        ),
+        new RegExp(`${kind} catalog listing is incomplete`),
+      );
+    }
+
     await assert.rejects(
       readSystemBootPolicyCatalogs(
         async (command) => {
@@ -2085,6 +2111,13 @@ describe('guarded host provisioner execution', () => {
         { stdout: 'not-found\n', stderr: '', code: 4 },
         systemdUnitMetadata('loaded', '/etc/systemd/system/webex-generic-account-bot.service'),
         /managed unit query state disagrees with load state/,
+      ],
+      [
+        'blank load state',
+        { stdout: 'inactive\n', stderr: '', code: 3 },
+        { stdout: 'not-found\n', stderr: '', code: 1 },
+        systemdUnitMetadata(''),
+        /managed unit load state is malformed/,
       ],
     ];
     for (const [label, active, enabled, metadata, expected] of cases) {
