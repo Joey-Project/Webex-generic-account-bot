@@ -212,6 +212,19 @@ const VENDOR_USERDB_CREDENTIAL_IMPORTS = new Set([
   'ImportCredential=userdb.transient.user.*',
   'ImportCredential=userdb.transient.group.*',
 ]);
+const BOOT_POLICY_SYSTEMD_CONSUMER_UNITS = new Set([
+  'systemd-sysusers.service',
+  'systemd-userdb-load-credentials.service',
+  ...VENDOR_TMPFILES_CREDENTIAL_UNITS,
+]);
+const BOOT_POLICY_SYSTEMD_CONSUMER_POLICY_DIRECTORY_NAMES = new Set(
+  [...BOOT_POLICY_SYSTEMD_CONSUMER_UNITS].flatMap((unit) => [
+    ...systemdDropInDirectoryNames(unit),
+    `${unit}.wants`,
+    `${unit}.requires`,
+    `${unit}.upholds`,
+  ]),
+);
 
 class PolicySafetyRollbackError extends Error {}
 
@@ -2909,8 +2922,15 @@ async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds, unitPaths)
         /^webex-codex-launcher@(?:[^@/\s]+)?\.service(?:\.d|\.wants|\.requires|\.upholds)$/
           .test(entry.name);
       const managedUnitPolicyDirectory = MANAGED_UNIT_POLICY_DIRECTORY_NAMES.includes(entry.name);
+      const bootPolicyConsumerPolicyDirectory =
+        BOOT_POLICY_SYSTEMD_CONSUMER_POLICY_DIRECTORY_NAMES.has(entry.name);
       const managedFragmentOutsideTarget = MANAGED_UNITS.includes(entry.name)
         && directory !== '/etc/systemd/system';
+      if (bootPolicyConsumerPolicyDirectory) {
+        throw new Error(
+          `boot policy systemd consumer policy directory is not trusted: ${path.join(directory, entry.name)}`,
+        );
+      }
       if (
         instanceUnit
         || policyDirectory
@@ -3066,6 +3086,12 @@ async function auditSystemdPolicyFile(
   logicalSource,
   symlinkDepth = 0,
 ) {
+  assertBootPolicySystemdConsumerSource(
+    candidate,
+    unitNames,
+    logicalSource,
+    symlinkDepth,
+  );
   budget.files += 1;
   if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
     throw new Error('too many systemd policy files');
@@ -3205,9 +3231,58 @@ function isExpectedVendorBootPolicyCredentialImport(
   logicalSource,
   symlinkDepth,
 ) {
+  if (!isExpectedVendorBootPolicyConsumerSource(
+    source,
+    unitNames,
+    logicalSource,
+    symlinkDepth,
+  )) return false;
+  const unit = path.basename(source);
+  return (
+    unit === 'systemd-sysusers.service'
+    && VENDOR_SYSUSERS_CREDENTIAL_IMPORTS.has(line)
+  ) || (
+    unit === 'systemd-userdb-load-credentials.service'
+    && VENDOR_USERDB_CREDENTIAL_IMPORTS.has(line)
+  ) || (
+    VENDOR_TMPFILES_CREDENTIAL_UNITS.has(unit)
+    && line === 'ImportCredential=tmpfiles.*'
+  );
+}
+
+function assertBootPolicySystemdConsumerSource(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
+  const consumers = [...unitNames]
+    .filter((unit) => BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit));
+  if (consumers.length === 0) return;
+  if (
+    consumers.length !== 1
+    || !isExpectedVendorBootPolicyConsumerSource(
+      source,
+      unitNames,
+      logicalSource,
+      symlinkDepth,
+    )
+  ) {
+    throw new Error(`boot policy systemd consumer is not trusted: ${logicalSource}`);
+  }
+}
+
+function isExpectedVendorBootPolicyConsumerSource(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
   const directory = path.dirname(source);
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
+  if (!BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit)) return false;
+  if (!systemdUnitNamesEqual(unitNames, unit)) return false;
   const directVendorFile = symlinkDepth === 0 && logicalSource === source;
   const directDependencyLink = (
     symlinkDepth === 1
@@ -3215,20 +3290,7 @@ function isExpectedVendorBootPolicyCredentialImport(
     && /\.(?:wants|requires|upholds)$/.test(path.basename(path.dirname(logicalSource)))
     && SYSTEMD_PROTECTED_UNIT_PATHS.includes(path.dirname(path.dirname(logicalSource)))
   );
-  if (!directVendorFile && !directDependencyLink) return false;
-  return (
-    unit === 'systemd-sysusers.service'
-    && systemdUnitNamesEqual(unitNames, unit)
-    && VENDOR_SYSUSERS_CREDENTIAL_IMPORTS.has(line)
-  ) || (
-    unit === 'systemd-userdb-load-credentials.service'
-    && systemdUnitNamesEqual(unitNames, unit)
-    && VENDOR_USERDB_CREDENTIAL_IMPORTS.has(line)
-  ) || (
-    VENDOR_TMPFILES_CREDENTIAL_UNITS.has(unit)
-    && systemdUnitNamesEqual(unitNames, unit)
-    && line === 'ImportCredential=tmpfiles.*'
-  );
+  return directVendorFile || directDependencyLink;
 }
 
 function systemdUnitNamesEqual(unitNames, unit) {

@@ -193,6 +193,9 @@ superseded_by:
   tmpfiles, and unit credential directives, with exact physical/logical vendor
   import exceptions for direct files and single-hop same-name dependency links
   while top-level, multi-hop, and renamed aliases remain rejected, plus
+  consumer fragment provenance that rejects sysusers/userdb/tmpfiles overrides
+  plus exact/shared drop-ins and consumer-owned dependency directories before
+  their commands can bypass merged catalogue auditing, plus
   launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

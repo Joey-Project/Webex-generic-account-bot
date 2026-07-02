@@ -1714,9 +1714,9 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy references a managed unit/,
     );
 
-    const sysusersDropInDirectory =
-      '/etc/systemd/system/systemd-sysusers.service.d';
-    const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
+    const credentialDropInDirectory =
+      '/etc/systemd/system/external.service.d';
+    const credentialDropIn = path.join(credentialDropInDirectory, '50-extra-policy.conf');
     for (const policy of [
       'LoadCredential=sysusers.extra:/root/policy',
       'LoadCredential=passwd.hashed-password.webex-generic-account-bot:/root/password',
@@ -1741,22 +1741,90 @@ describe('guarded host provisioner execution', () => {
           systemdUnitPathFs(
             new Map([
               ['/etc/systemd/system', [{
-                name: 'systemd-sysusers.service.d',
+                name: 'external.service.d',
                 isFile: () => false,
                 isDirectory: () => true,
                 isSymbolicLink: () => false,
               }]],
-              [sysusersDropInDirectory, [{ name: '50-extra-policy.conf' }]],
+              [credentialDropInDirectory, [{ name: '50-extra-policy.conf' }]],
             ]),
             {
               filesByPath: new Map([[
-                sysusersDropIn,
+                credentialDropIn,
                 Buffer.from(`[Service]\n${policy}\n`),
               ]]),
             },
           ),
         ),
         /external systemd policy injects a host policy credential/,
+      );
+    }
+
+    const sysusersDropInDirectory =
+      '/etc/systemd/system/systemd-sysusers.service.d';
+    const sysusersExecDropIn = path.join(sysusersDropInDirectory, '50-exec.conf');
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'systemd-sysusers.service.d',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [sysusersDropInDirectory, [{ name: '50-exec.conf' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              sysusersExecDropIn,
+              Buffer.from(
+                '[Service]\nExecStartPost=/usr/bin/systemd-sysusers /etc/rogue.conf\n',
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /boot policy systemd consumer/,
+    );
+
+    const overriddenSysusers = '/etc/systemd/system/systemd-sysusers.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'systemd-sysusers.service' }]]]),
+          {
+            filesByPath: new Map([[
+              overriddenSysusers,
+              Buffer.from('[Service]\nExecStart=/usr/bin/systemd-sysusers /etc/rogue.conf\n'),
+            ]]),
+          },
+        ),
+      ),
+      /boot policy systemd consumer is not trusted/,
+    );
+
+    for (const directoryName of [
+      'service.d',
+      'systemd-.service.d',
+      'systemd-sysusers.service.wants',
+    ]) {
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(new Map([['/etc/systemd/system', [{
+            name: directoryName,
+            isFile: () => false,
+            isDirectory: () => true,
+            isSymbolicLink: () => false,
+          }]]])),
+        ),
+        /boot policy systemd consumer policy directory is not trusted/,
       );
     }
 
@@ -1880,19 +1948,19 @@ describe('guarded host provisioner execution', () => {
         'external-sysusers.service',
         '/usr/lib/systemd/system/systemd-sysusers.service',
         '[Service]\nImportCredential=sysusers.*\n',
-        /external systemd policy injects a host policy credential/,
+        /boot policy systemd consumer is not trusted/,
       ],
       [
         'systemd-sysusers.service',
         '/usr/lib/systemd/system/systemd-sysusers.service',
         '[Service]\nImportCredential=sysusers.*\n',
-        /external systemd policy injects a host policy credential/,
+        /boot policy systemd consumer is not trusted/,
       ],
       [
         'external-userdb.service',
         '/usr/lib/systemd/system/systemd-userdb-load-credentials.service',
         '[Service]\nImportCredential=userdb.user.*\n',
-        /external systemd policy injects a host policy credential/,
+        /boot policy systemd consumer is not trusted/,
       ],
     ]) {
       const alias = `/etc/systemd/system/${name}`;
@@ -1951,7 +2019,7 @@ describe('guarded host provisioner execution', () => {
           },
         ),
       ),
-      /external systemd policy injects a host policy credential/,
+      /boot policy systemd consumer is not trusted/,
     );
 
     const fakeVendorUnit =
@@ -2166,7 +2234,9 @@ describe('guarded host provisioner execution', () => {
             ]],
           ])),
         ),
-        new RegExp(`unexpected managed unit policy.*${policyName.replaceAll('.', '\\.')}`),
+        policyName === 'service.d'
+          ? /boot policy systemd consumer policy directory is not trusted/
+          : new RegExp(`unexpected managed unit policy.*${policyName.replaceAll('.', '\\.')}`),
       );
       assert.equal(commandCalls, 0);
     }
