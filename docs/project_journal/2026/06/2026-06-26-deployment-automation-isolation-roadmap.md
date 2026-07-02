@@ -172,7 +172,8 @@ superseded_by:
   no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
   direct next-boot disk inspection of external units, drop-ins, aliases,
   dependency symlinks, linked policy contents, trusted dangling-alias parents,
-  `d_type`-independent file classification, unit-name specifier expansion,
+  `d_type`-independent file classification, unit-name specifier expansion with
+  symbolic shared dash-prefix drop-ins,
   named/implicit-DynamicUser assignments, unresolved dynamic identity
   specifiers outside the physical-file/logical-owner-bound vendor user-manager
   assignment plus symbolic managed-unit reachability checks for all unresolved
@@ -186,8 +187,8 @@ superseded_by:
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
-  auditing with C-escape, normalised specifier/glob-prefix including the legacy
-  `/var/run` alias, and copy-source
+  auditing with C-escape, normalised specifier/glob-prefix and trailing slash,
+  including glob access through the legacy `/var/run` alias, and copy-source
   paths, source-associated managed-policy upgrades, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
   identities, ACL principals, and symlink targets, protected root, identity
@@ -203,8 +204,9 @@ superseded_by:
   boot-policy, and credential checks, immediate recovery-time manager reload,
   delayed journal removal until the recovered state passes common preflight,
   explicit complete-target stale-cache convergence recovery,
-  fail-closed recovery with full target-directory durability and a journal
-  retained after installation rollback and through final manager convergence,
+  fail-closed recovery with full target-directory durability, partial-commit
+  rollback versus complete-desired convergence-resume classification, and a
+  journal retained after installation rollback and through final manager convergence,
   non-rollback journal-unlink failure handling, umask-safe interrupted candidate
   and first-run lock recovery including the group-owned pre-chmod directory
   state, and post-reload verification. Real host apply remains an

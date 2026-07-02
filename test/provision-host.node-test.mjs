@@ -676,6 +676,9 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'd /run/webex-codex-canary 0777 root root -'],
       ['tmpfiles', 'd /run/\\x77ebex-config-deploy 0777 root root -'],
       ['tmpfiles', 'R /run/* - - - -'],
+      ['tmpfiles', 'R /run/ - - - -'],
+      ['tmpfiles', 'R /var/run/ - - - -'],
+      ['tmpfiles', 'R /var/r?n/systemd/system/* - - - -'],
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
@@ -1400,6 +1403,34 @@ describe('guarded host provisioner execution', () => {
         /external systemd policy references a managed unit/,
       );
     }
+
+    const dashPrefixDropInDirectory =
+      '/etc/systemd/system/external-.service.d';
+    const dashPrefixDropIn = path.join(dashPrefixDropInDirectory, '50-identity.conf');
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external-.service.d',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [dashPrefixDropInDirectory, [{ name: '50-identity.conf' }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              dashPrefixDropIn,
+              Buffer.from('[Service]\nUser=%J\n'),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
 
     const sysusersDropInDirectory =
       '/etc/systemd/system/systemd-sysusers.service.d';
@@ -2423,6 +2454,40 @@ describe('guarded host provisioner execution', () => {
       assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
     }
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    const failedRetryCommands = [];
+    const failedRetryDependencies = fixture.dependencies({ applied: true });
+    failedRetryDependencies.runCommand = async (command, args) => {
+      failedRetryCommands.push([command, [...args]]);
+      if (command === '/usr/bin/systemd-sysusers') {
+        throw new Error('injected resumed sysusers failure');
+      }
+      return { command, args: [...args], code: 0, stdout: '', stderr: '' };
+    };
+    await assert.rejects(
+      provisionHost({ apply: true }, failedRetryDependencies),
+      /policy files are installed but convergence failed.*resumed sysusers failure/,
+    );
+    assert.deepEqual(failedRetryCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+    ]);
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    const retryCommands = [];
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({ applied: true, commands: retryCommands }),
+    );
+    assert.equal(report.changed_artifact_count, 0);
+    assert.deepEqual(report.installed_artifacts, []);
+    assert.deepEqual(retryCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
   it('does not reload systemd until the held lock metadata has converged', async (context) => {

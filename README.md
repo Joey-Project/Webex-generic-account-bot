@@ -242,6 +242,8 @@ alias is accepted only when its link text is clean and its target parent remains
 root-owned and non-writable. Unit-name specifiers are expanded against each
 external fragment, alias, and drop-in owner before matching, directory entries
 are classified from `lstat` rather than optional `d_type` metadata, and external
+type-level and dash-prefix drop-ins keep unit-name specifiers symbolic because
+their eventual owner is not a single concrete unit. External
 policy may not assign a managed user or group by name or implicit DynamicUser
 unit name, unresolved dynamic specifiers are forbidden in identity directives
 except for the exact vendor `user@.service` user-manager assignment when both
@@ -257,8 +259,8 @@ and all plaintext and encrypted credential stores prove that `sysusers.extra`
 and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
-specifier/glob-prefix, lexical path normalisation including the legacy
-`/var/run` alias, copy-source, path-derived-ID,
+specifier/glob-prefix, lexical path and trailing-slash normalisation including
+glob-capable access through the legacy `/var/run` alias, copy-source, path-derived-ID,
 owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
 metadata, and recursive-parent semantics. External
 sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
@@ -316,7 +318,9 @@ startup recovery keeps the journal while immediately reloading systemd and
 rechecking dormant unit state, so later validation failures cannot leave a
 half-committed unit cached by the manager. Dry-run reports recovery required,
 and the next apply first proves every managed unit and discovered instance
-dormant, then restores the old set before reapplying. Once a desired policy set
+dormant, then restores a partial commit to the old set before reapplying. A
+journal whose complete target set already matches the desired digests resumes
+sysusers/tmpfiles and manager convergence without restoring old policy. Once a desired policy set
 is fully installed and verified, a journal unlink durability failure no longer
 starts a second rollback; it leaves that complete desired set for a convergent
 rerun. A later sysusers, tmpfiles, or reload failure leaves the complete

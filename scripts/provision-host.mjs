@@ -595,7 +595,7 @@ export async function provisionHost(options, dependencies = {}) {
   }
   const commands = [];
   let identityBefore = null;
-  let recoveryPending = false;
+  let recoveryState = null;
   if (transaction) {
     identityBefore = await deps.readIdentitySnapshot();
     validateIdentityPolicy(identityBefore);
@@ -610,7 +610,7 @@ export async function provisionHost(options, dependencies = {}) {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
     });
-    await recoverPolicyTransaction(transaction, plan, deps);
+    recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
       const recoveredUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
@@ -621,7 +621,6 @@ export async function provisionHost(options, dependencies = {}) {
         { cause: error },
       );
     }
-    recoveryPending = true;
   }
 
   if (identityBefore === null) {
@@ -646,7 +645,7 @@ export async function provisionHost(options, dependencies = {}) {
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
   }
-  if (recoveryPending) {
+  if (recoveryState === 'old') {
     try {
       await removeProvisionTransaction(plan, deps);
     } catch (error) {
@@ -683,7 +682,9 @@ export async function provisionHost(options, dependencies = {}) {
     await verifyInstalledArtifacts(inspected, deps);
     const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
     assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
-    if (installed.length > 0) await removeProvisionTransaction(plan, deps);
+    if (installed.length > 0 || recoveryState === 'desired') {
+      await removeProvisionTransaction(plan, deps);
+    }
   } catch (error) {
     throw new Error(
       `host policy files are installed but convergence failed; rerun --apply after correction: ${error.message}`,
@@ -1601,16 +1602,24 @@ async function recoverPolicyTransaction(
     const existingSha256 = artifact.existing
       ? createHash('sha256').update(artifact.existing.contents).digest('hex')
       : null;
-    if (current?.sha256 === existingSha256 || (!current && !artifact.existing)) {
-      recovery.push(Object.freeze({ artifact, current, restore: false }));
-      continue;
-    }
-    if (current?.sha256 !== artifact.desiredSha256) {
+    const matchesOldState = artifact.existing
+      ? current?.sha256 === existingSha256
+      : !current;
+    const matchesDesiredState = current?.sha256 === artifact.desiredSha256;
+    if (!matchesOldState && !matchesDesiredState) {
       throw new Error(`policy target has unknown state during recovery: ${artifact.target}`);
     }
-    recovery.push(Object.freeze({ artifact, current, restore: true }));
+    recovery.push(Object.freeze({
+      artifact,
+      current,
+      restore: matchesDesiredState && !matchesOldState,
+    }));
   }
-  for (const entry of recovery.reverse()) {
+  const resumeDesiredState = recovery.every(
+    ({ artifact, current }) => current?.sha256 === artifact.desiredSha256,
+  );
+  for (const entry of [...recovery].reverse()) {
+    if (resumeDesiredState) break;
     if (!entry.restore) continue;
     const { artifact } = entry;
     if (artifact.existing) {
@@ -1649,16 +1658,18 @@ async function recoverPolicyTransaction(
       FILE_MODE,
       deps.fsApi,
     );
-    const existingSha256 = artifact.existing
-      ? createHash('sha256').update(artifact.existing.contents).digest('hex')
-      : null;
-    const matchesOldState = artifact.existing
-      ? current?.sha256 === existingSha256
-      : !current;
-    if (!matchesOldState) {
+    const matchesExpectedState = resumeDesiredState
+      ? current?.sha256 === artifact.desiredSha256
+      : artifact.existing
+        ? current?.sha256 === createHash('sha256')
+          .update(artifact.existing.contents)
+          .digest('hex')
+        : !current;
+    if (!matchesExpectedState) {
       throw new Error(`policy target changed after recovery: ${artifact.target}`);
     }
   }
+  return resumeDesiredState ? 'desired' : 'old';
 }
 
 async function removeProvisionTransaction(plan, deps) {
@@ -2197,6 +2208,16 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
   const staticPrefix = wildcardOffset < 0
     ? literal
     : normalisedPolicyPath.slice(0, wildcardOffset);
+  if (
+    wildcardOffset >= 0
+    && (
+      '/var/run'.startsWith(staticPrefix)
+      || staticPrefix === '/var/run'
+      || staticPrefix.startsWith('/var/run/')
+    )
+  ) {
+    return true;
+  }
   for (const protectedPath of protectedPaths) {
     if (literal !== null) {
       if (literal === protectedPath || literal.startsWith(`${protectedPath}/`)) return true;
@@ -2223,7 +2244,8 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
 }
 
 function normaliseBootPolicyPath(policyPath) {
-  const normalised = path.posix.normalize(policyPath);
+  let normalised = path.posix.normalize(policyPath);
+  if (normalised.length > 1) normalised = normalised.replace(/\/+$/, '');
   if (normalised === '/var/run') return '/run';
   if (normalised.startsWith('/var/run/')) return `/run/${normalised.slice('/var/run/'.length)}`;
   return normalised;
@@ -2809,7 +2831,9 @@ function systemdPolicyUnitNames(directory, entryName) {
   const parent = path.basename(directory);
   if (parent.endsWith('.d')) {
     const owner = parent.slice(0, -2);
-    if (SYSTEMD_UNIT_NAME_PATTERN.test(owner)) unitNames.add(owner);
+    const suffixOffset = owner.lastIndexOf('.');
+    const sharedDashPrefix = suffixOffset > 0 && owner.slice(0, suffixOffset).endsWith('-');
+    if (SYSTEMD_UNIT_NAME_PATTERN.test(owner) && !sharedDashPrefix) unitNames.add(owner);
   }
   return unitNames;
 }

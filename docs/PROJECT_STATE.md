@@ -106,7 +106,8 @@
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
   dangling-alias parents, `d_type`-independent entry classification, unit-name
-  specifier expansion, named/implicit-DynamicUser identities, unresolved
+  specifier expansion with symbolic shared dash-prefix drop-ins,
+  named/implicit-DynamicUser identities, unresolved
   dynamic-specifier rejection in identity directives with only the exact
   physical-file/logical-owner vendor user-manager identity assignment permitted,
   symbolic managed-unit reachability checks for unresolved dynamic specifiers
@@ -121,14 +122,15 @@
   systemd system-unit load paths, and installed policy paths from owner-modifier,
   numeric-identity, ACL-principal, symlink-target, traversal-restricting ancestor
   metadata, cleanup, replacement, and recursive rules, allocation ranges,
-  normalised glob paths including the legacy `/var/run` alias,
+  normalised glob and trailing-slash paths including legacy `/var/run` alias globs,
   source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
   trusted re-exec paths validated before first-run lock convergence,
   fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full
   target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional
-  root-owned policy installation whose rollback journal remains through manager
+  root-owned policy installation whose rollback journal distinguishes partial
+  rollback from complete-desired convergence resume and remains through manager
   convergence without unsafe post-unlink rollback, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.
