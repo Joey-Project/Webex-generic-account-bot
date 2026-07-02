@@ -212,7 +212,10 @@ Node executable and provisioner script; do not run this root workflow through
 a user-managed Node installation or checkout.
 
 Both modes require root so the complete files-backed `shadow` and `gshadow`
-databases can be checked without exposing them in output. Dry-run reads
+databases can be checked without exposing them in output. They also require the
+initial PID namespace from a fixed `lsns` probe, PID 1 named `systemd`, and the
+host cgroup-v2 manager at `0::/init.scope`; a container-local PID 1 is not an
+acceptable host anchor. Dry-run reads
 `/etc/passwd`, `/etc/shadow`, `/etc/group`, and `/etc/gshadow` through stable
 non-blocking, no-follow handles with fixed root-owned metadata, then validates source and
 target ancestor metadata, existing policy files, the exact non-login account
@@ -228,7 +231,8 @@ every managed user and group name unclaimed, and managed UIDs/GIDs must remain
 below the dynamic allocation range.
 It also validates dormant unit state and requires every unmanaged ancestor of
 the managed tmpfiles paths to be root-owned, non-writable, and traversable
-without creating files or directories. Before tmpfiles can mutate host state,
+without creating files or directories, with no extended POSIX ACL that could
+override mode-bit traversal. Before tmpfiles can mutate host state,
 existing managed targets must already have the expected object type, must not be
 symlinks, and managed files must have a single link. Apply rechecks those ancestors after
 tmpfiles and verifies every managed directory and lock file has its exact type,
@@ -346,8 +350,11 @@ plaintext or encrypted system credentials through inline, path,
 option-interleaved, or specifier-expanded arguments; unresolved credential-name
 arguments fail closed. Non-vendor units also cannot claim protected
 Webex paths through systemd-managed directory source or alias directives.
-Path-derived `.mount` and `.automount` names, `Where=`, install aliases, and
-dependency links also cannot mount over a protected Webex path on a later boot.
+Path-derived `.mount` and `.automount` names, `Where=`, protected `What=`
+sources, install aliases, and dependency links also cannot mount over a
+protected host path on a later boot. External bind and recursive-bind mount
+policy is rejected because it creates a second lexical path around tmpfiles
+auditing.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis, including unescaped unit
 specifiers that can generate a `$` marker only after template instantiation.
@@ -375,13 +382,18 @@ including fd-backed writes and metadata changes.
 Dry-run, recovery, and apply loop through short reads while collecting and
 parsing bounded `/proc/self/mountinfo` data through a non-blocking regular-file
 handle. The snapshot must contain exactly one root mount;
-managed tmpfiles targets, descendants, and non-standard redirected ancestors
-must not be mount points before any tmpfiles mutation. Standard ancestor mount
+managed tmpfiles targets, identity and NSS databases, policy source and target
+files, fixed command entrypoints, proc evidence, credentials, unit policy,
+transaction state, and shared locks must not be hidden by unexpected mounts.
+The relevant raw mount records are compared immediately before and after both
+sysusers and tmpfiles execution, and identity plus boot policy is re-read after
+the final manager reload. Standard ancestor mount
 points must have a unique filesystem device/root identity so filesystem-root
 bind mounts cannot masquerade as ordinary mounts; the root mount itself must
 also have a unique mountpoint and device/root identity. Persistent mount and
 automount policy is rejected when it overlaps runtime, identity database,
-userdb, credential, system-unit, boot-policy, transaction, or shared-lock
+userdb, credential, system-unit, boot-policy, fixed executable, proc evidence,
+transaction, or shared-lock
 surfaces. The process then verifies
 the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration

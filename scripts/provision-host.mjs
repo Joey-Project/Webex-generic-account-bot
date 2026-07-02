@@ -250,6 +250,17 @@ const BOOT_POLICY_EXECUTABLES = new Set([
   'systemd-sysusers',
   'systemd-tmpfiles',
 ]);
+const FIXED_HOST_EXECUTABLE_PATHS = Object.freeze([
+  '/usr/bin/flock',
+  '/usr/bin/getent',
+  '/usr/bin/getfacl',
+  '/usr/bin/lsns',
+  '/usr/bin/node',
+  '/usr/bin/systemctl',
+  '/usr/bin/systemd-creds',
+  '/usr/bin/systemd-sysusers',
+  '/usr/bin/systemd-tmpfiles',
+]);
 const SYSTEMD_SHELL_EXECUTABLES = new Set([
   'ash',
   'bash',
@@ -325,7 +336,9 @@ const SYSTEMD_IMPLICIT_SERVICE_ACTIVATOR_SUFFIXES = Object.freeze([
 const TRUSTED_MANAGED_MOUNT_ANCESTORS = new Set([
   '/',
   '/etc',
+  '/proc',
   '/run',
+  '/usr',
   '/var',
   '/var/lib',
 ]);
@@ -769,6 +782,7 @@ export async function provisionHost(options, dependencies = {}) {
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
     throw new Error('host provisioning requires root, including dry-run');
   }
+  await deps.verifyPidNamespace();
   await deps.verifyMountNamespace('inspection');
   const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
     ?? ((runtimeInspected) => assertManagedRuntimeAncestorsTraversable(
@@ -778,6 +792,7 @@ export async function provisionHost(options, dependencies = {}) {
         fsApi: deps.fsApi,
         targetUid: deps.targetUid,
         targetGid: deps.targetGid,
+        verifyNoExtendedPosixAcl: deps.verifyNoExtendedPosixAcl,
       },
     ));
   const verifyManagedRuntimeState = dependencies.verifyManagedRuntimeState
@@ -817,6 +832,7 @@ export async function provisionHost(options, dependencies = {}) {
       identityBefore,
     );
     assertNoUnexpectedManagedMounts(
+      plan,
       recoveryInspected,
       await deps.readMountInfo(),
     );
@@ -864,7 +880,7 @@ export async function provisionHost(options, dependencies = {}) {
     inspected,
     identityBefore,
   );
-  assertNoUnexpectedManagedMounts(inspected, await deps.readMountInfo());
+  assertNoUnexpectedManagedMounts(plan, inspected, await deps.readMountInfo());
   await verifyRuntimeAncestors(inspected);
   const canRecoverManagerCache = (options.apply || options.recoveryPreflight)
     && inspected.artifacts.every(({ changed }) => !changed);
@@ -892,8 +908,19 @@ export async function provisionHost(options, dependencies = {}) {
   });
   const safetyRollbackTransaction = transactionFromInspected(inspected);
   try {
+    const mountsBeforeSysusers = assertNoUnexpectedManagedMounts(
+      plan,
+      inspected,
+      await deps.readMountInfo(),
+    );
     await deps.verifyMountNamespace('systemd-sysusers');
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
+    const mountsAfterSysusers = assertNoUnexpectedManagedMounts(
+      plan,
+      inspected,
+      await deps.readMountInfo(),
+    );
+    assertProtectedMountSnapshotUnchanged(mountsBeforeSysusers, mountsAfterSysusers);
     const identityAfter = await deps.readIdentitySnapshot();
     validateIdentityPolicy(identityAfter, { requireAccounts: true });
     auditBootPolicyCatalogs(
@@ -902,19 +929,38 @@ export async function provisionHost(options, dependencies = {}) {
       identityAfter,
       { requireManagedPolicy: true },
     );
-    assertNoUnexpectedManagedMounts(inspected, await deps.readMountInfo());
+    const mountsBeforeTmpfiles = assertNoUnexpectedManagedMounts(
+      plan,
+      inspected,
+      await deps.readMountInfo(),
+    );
     await deps.verifyMountNamespace('systemd-tmpfiles');
     commands.push(await deps.runCommand('/usr/bin/systemd-tmpfiles', [
       '--create',
       ...plan.tmpfiles,
     ]));
+    const mountsAfterTmpfiles = assertNoUnexpectedManagedMounts(
+      plan,
+      inspected,
+      await deps.readMountInfo(),
+    );
+    assertProtectedMountSnapshotUnchanged(mountsBeforeTmpfiles, mountsAfterTmpfiles);
     await verifyManagedRuntimeState(inspected, identityAfter);
     await deps.verifyProvisionLockConverged();
     await deps.verifyMountNamespace('daemon-reload-final');
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
+    const identityFinal = await deps.readIdentitySnapshot();
+    validateIdentityPolicy(identityFinal, { requireAccounts: true });
+    auditBootPolicyCatalogs(
+      await deps.readBootPolicyCatalogs(),
+      inspected,
+      identityFinal,
+      { requireManagedPolicy: true },
+    );
+    assertNoUnexpectedManagedMounts(plan, inspected, await deps.readMountInfo());
     try {
-      const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
+      const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityFinal);
       assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
     } catch (error) {
       await rollbackPolicyAfterSafetyFailure(
@@ -1711,6 +1757,32 @@ export async function readBoundedProcFile(file, maxBytes, fsApi) {
     return buffer.subarray(0, totalBytesRead).toString('utf8');
   } finally {
     await handle.close();
+  }
+}
+
+export async function assertInitialPidNamespace(
+  runCommand = runFixedCommand,
+  processApi = process,
+  fsApi = fs,
+) {
+  const [managerName, managerCgroup] = await Promise.all([
+    readBoundedProcFile('/proc/1/comm', 64, fsApi),
+    readBoundedProcFile('/proc/1/cgroup', 4096, fsApi),
+  ]);
+  if (managerName !== 'systemd\n' || managerCgroup !== '0::/init.scope\n') {
+    throw new Error('host provisioner is not running under the host systemd manager');
+  }
+  const result = await runCommand('/usr/bin/lsns', [
+    '--noheadings',
+    '--output',
+    'PNS',
+    '--type',
+    'pid',
+    '--task',
+    String(processApi.pid),
+  ]);
+  if (result.code !== 0 || result.stderr !== '' || String(result.stdout).trim() !== '0') {
+    throw new Error('host provisioner is not in the initial PID namespace');
   }
 }
 
@@ -2630,6 +2702,7 @@ export async function assertManagedRuntimeAncestorsTraversable(
     fsApi = fs,
     targetUid = 0,
     targetGid = 0,
+    verifyNoExtendedPosixAcl = assertNoExtendedPosixAcl,
   } = {},
 ) {
   const entries = managedTmpfilesEntries(plan, inspected);
@@ -2651,6 +2724,19 @@ export async function assertManagedRuntimeAncestorsTraversable(
     assertTrustedDirectory(ancestor, stat, targetUid, targetGid);
     if (((stat.mode & 0o7777) & 0o001) === 0) {
       throw new Error(`managed runtime ancestor is not traversable: ${ancestor}`);
+    }
+    await verifyNoExtendedPosixAcl(ancestor);
+    const after = await fsApi.lstat(ancestor);
+    if (
+      !sameFileIdentity(stat, after)
+      || !after.isDirectory()
+      || after.isSymbolicLink()
+      || after.uid !== targetUid
+      || after.gid !== targetGid
+      || ((after.mode & 0o7777) & 0o022) !== 0
+      || ((after.mode & 0o7777) & 0o001) === 0
+    ) {
+      throw new Error(`managed runtime ancestor changed during ACL inspection: ${ancestor}`);
     }
   }
   for (const entry of entries) {
@@ -2687,6 +2773,7 @@ export async function verifyManagedTmpfilesState(
     fsApi,
     targetUid,
     targetGid,
+    verifyNoExtendedPosixAcl,
   });
   for (const entry of managedTmpfilesEntries(plan, inspected, identitySnapshot)) {
     let stat;
@@ -3069,12 +3156,8 @@ function normaliseBootPolicyPath(policyPath) {
   return `/${components.join('/')}`;
 }
 
-function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
-  const managedPaths = new Set(inspected.artifacts
-    .filter(({ kind }) => kind === 'tmpfiles')
-    .flatMap(({ source }) => policyCatalogLines(source.contents))
-    .map((line) => parseSystemdFields(line)[1])
-    .map(normaliseBootPolicyPath));
+function assertNoUnexpectedManagedMounts(plan, inspected, mountInfo) {
+  const protectedPaths = protectedHostMountPaths(plan, inspected);
   const mounts = parseMountInfo(mountInfo);
   const mountIdentityCounts = new Map();
   const mountPointCounts = new Map();
@@ -3083,14 +3166,17 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
     mountIdentityCounts.set(identity, (mountIdentityCounts.get(identity) ?? 0) + 1);
     mountPointCounts.set(mountPoint, (mountPointCounts.get(mountPoint) ?? 0) + 1);
   }
-  for (const { device, root, mountPoint } of mounts) {
-    for (const managedPath of managedPaths) {
-      if (mountPoint === managedPath || mountPoint.startsWith(`${managedPath}/`)) {
-        throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
+  const relevantMounts = [];
+  for (const { device, root, mountPoint, raw } of mounts) {
+    for (const protectedPath of protectedPaths) {
+      if (!systemdPathsOverlap(mountPoint, protectedPath)) continue;
+      relevantMounts.push(raw);
+      if (mountPoint === protectedPath || mountPoint.startsWith(`${protectedPath}/`)) {
+        throw new Error(`unexpected mount overlaps protected host path: ${mountPoint}`);
       }
       const mountIsAncestor = mountPoint === '/'
-        ? managedPath.startsWith('/')
-        : managedPath.startsWith(`${mountPoint}/`);
+        ? protectedPath.startsWith('/')
+        : protectedPath.startsWith(`${mountPoint}/`);
       if (!mountIsAncestor) continue;
       const uniqueFilesystemRoot = mountIdentityCounts.get(`${device}\0${root}`) === 1;
       const uniqueMountPoint = mountPointCounts.get(mountPoint) === 1;
@@ -3100,8 +3186,31 @@ function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
         && uniqueFilesystemRoot
         && uniqueMountPoint
       ) continue;
-      throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
+      throw new Error(`unexpected mount overlaps protected host path: ${mountPoint}`);
     }
+  }
+  return Object.freeze([...new Set(relevantMounts)].sort());
+}
+
+function protectedHostMountPaths(plan, inspected) {
+  const managedPaths = inspected.artifacts
+    .filter(({ kind }) => kind === 'tmpfiles')
+    .flatMap(({ source }) => policyCatalogLines(source.contents))
+    .map((line) => parseSystemdFields(line)[1])
+    .map(normaliseBootPolicyPath);
+  return new Set([
+    ...protectedSystemdMountPaths(),
+    ...managedPaths,
+    ...plan.artifacts.flatMap(({ source, target, targetPath }) => [source, target, targetPath]),
+    plan.transactionFile,
+    process.execPath,
+    fileURLToPath(import.meta.url),
+  ].map((candidate) => path.resolve(candidate)));
+}
+
+function assertProtectedMountSnapshotUnchanged(before, after) {
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    throw new Error('protected host mount snapshot changed during command execution');
   }
 }
 
@@ -3137,6 +3246,7 @@ function parseMountInfo(mountInfo) {
       device,
       root: path.posix.normalize(root),
       mountPoint: path.posix.normalize(mountPoint),
+      raw: line,
     });
   });
   if (mounts.filter(({ mountPoint }) => mountPoint === '/').length !== 1) {
@@ -3895,6 +4005,21 @@ function systemdPolicyMountsProtectedDirectory(value, unitNames) {
       ));
     });
   }
+  if (directive === 'What') {
+    return fields.some((field) => {
+      if (hasUnresolvedSystemdSpecifier(field)) return true;
+      if (!path.posix.isAbsolute(field)) return false;
+      const sourcePath = normaliseBootPolicyPath(field);
+      return protectedSystemdMountPaths().some((protectedPath) => (
+        systemdPathsOverlap(sourcePath, protectedPath)
+      ));
+    });
+  }
+  if (directive === 'Options') {
+    return fields.some((field) => (
+      field.split(',').some((option) => ['bind', 'rbind'].includes(option.trim()))
+    ));
+  }
   if (!['Alias', 'Also'].includes(directive)) return false;
   return fields.some((field) => (
     systemdPathUnitOverlapsProtectedDirectory(field)
@@ -3938,7 +4063,16 @@ function protectedSystemdMountPaths() {
     ...Object.values(BOOT_POLICY_DIRECTORIES).flat(),
     ...CREDENTIAL_STORE_DIRECTORIES,
     ...BOOT_POLICY_CREDENTIAL_PATHS,
+    ...FIXED_HOST_EXECUTABLE_PATHS,
+    '/proc/1/cgroup',
+    '/proc/1/comm',
+    '/proc/1/ns/mnt',
+    '/proc/locks',
+    '/proc/self/mountinfo',
+    '/proc/self/ns/mnt',
+    '/run/systemd/private',
     TRANSACTION_PATH,
+    PROVISION_LOCK_PATH,
     PROVISION_LOCK_PARENT,
   ])];
 }
@@ -4621,9 +4755,10 @@ async function runFixedCommand(command, args, allowedExitCodes = [0]) {
 function provisionDependencies(dependencies) {
   const runCommand = dependencies.runCommand ?? runFixedCommand;
   const fsApi = dependencies.fsApi ?? fs;
+  const processApi = dependencies.processApi ?? process;
   return {
     fsApi,
-    processApi: dependencies.processApi ?? process,
+    processApi,
     randomUUID: dependencies.randomUUID ?? randomUUID,
     requireRoot: dependencies.requireRoot ?? true,
     allowTestRoot: dependencies.allowTestRoot ?? false,
@@ -4645,6 +4780,8 @@ function provisionDependencies(dependencies) {
       )),
     verifyMountNamespace: dependencies.verifyMountNamespace
       ?? (() => assertSameMountNamespace(fsApi)),
+    verifyPidNamespace: dependencies.verifyPidNamespace
+      ?? (() => assertInitialPidNamespace(runCommand, processApi, fsApi)),
     verifyNoExtendedPosixAcl: dependencies.verifyNoExtendedPosixAcl
       ?? ((file) => assertNoExtendedPosixAcl(file, runCommand)),
     readUnitStates: dependencies.readUnitStates

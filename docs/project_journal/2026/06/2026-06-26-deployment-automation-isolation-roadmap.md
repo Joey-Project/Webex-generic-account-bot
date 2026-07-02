@@ -235,11 +235,14 @@ superseded_by:
   tmpfiles policy search directory, traversal-preserving ancestor metadata,
   recursive parent handling, pre-apply unmanaged-ancestor and managed-target
   checks, post-tmpfiles exact managed path type/mode/UID/GID convergence with
-  extended POSIX ACL rejection, root-owned stable source metadata for every
+  extended POSIX ACL rejection on both targets and unmanaged ancestors,
+  root-owned stable source metadata for every
   effective catalogue file, pre-command rejection of non-regular boot-policy
   `.conf` entries except stable root-owned `/dev/null` masks, persistent mount
-  protection for identity, userdb, credential, unit, boot-policy, transaction,
-  and lock surfaces, and
+  protection for identity, userdb, credential, unit, boot-policy, fixed-command,
+  proc-evidence, transaction, and lock surfaces, rejection of external bind
+  aliases and protected `What=` sources, an initial-PID-namespace host-systemd
+  gate, stable mount snapshots around sysusers/tmpfiles, and
   pre-allocation rejection of unmaterialised external numeric UID, primary-GID,
   and group-GID claims,
   trusted re-exec paths plus a complete transaction-aware read-only host

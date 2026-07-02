@@ -15,6 +15,7 @@ import {
 import {
   ARTIFACTS,
   MANAGED_UNITS,
+  assertInitialPidNamespace,
   assertManagedRuntimeAncestorsTraversable,
   assertNoExtendedPosixAcl,
   assertSameMountNamespace,
@@ -139,6 +140,42 @@ describe('guarded host provisioner policy', () => {
     await assert.rejects(
       assertSameMountNamespace(namespaceFs(42)),
       /not in PID 1 mount namespace/,
+    );
+  });
+
+  it('requires the initial PID namespace through the fixed lsns probe', async () => {
+    const calls = [];
+    const hostProcFs = boundedProcFileSystem(new Map([
+      ['/proc/1/comm', 'systemd\n'],
+      ['/proc/1/cgroup', '0::/init.scope\n'],
+    ]));
+    const runCommand = async (command, args) => {
+      calls.push([command, args]);
+      return { code: 0, stdout: '0\n', stderr: '' };
+    };
+    await assertInitialPidNamespace(runCommand, { pid: 1234 }, hostProcFs);
+    assert.deepEqual(calls, [[
+      '/usr/bin/lsns',
+      ['--noheadings', '--output', 'PNS', '--type', 'pid', '--task', '1234'],
+    ]]);
+    await assert.rejects(
+      assertInitialPidNamespace(
+        async () => ({ code: 0, stdout: '4026531836\n', stderr: '' }),
+        { pid: 2 },
+        hostProcFs,
+      ),
+      /not in the initial PID namespace/,
+    );
+    await assert.rejects(
+      assertInitialPidNamespace(
+        runCommand,
+        { pid: 2 },
+        boundedProcFileSystem(new Map([
+          ['/proc/1/comm', 'bwrap\n'],
+          ['/proc/1/cgroup', '0::/\n'],
+        ])),
+      ),
+      /not running under the host systemd manager/,
     );
   });
 
@@ -779,6 +816,7 @@ describe('guarded host provisioner policy', () => {
         fsApi: fs,
         targetUid: UID,
         targetGid: GID,
+        verifyNoExtendedPosixAcl: async () => {},
       }),
       /managed runtime ancestor is not traversable/,
     );
@@ -806,7 +844,24 @@ describe('guarded host provisioner policy', () => {
         fsApi: { lstat: async () => trustedDirectory },
         targetUid: UID,
         targetGid: GID,
+        verifyNoExtendedPosixAcl: async () => {},
       },
+    );
+
+    await assert.rejects(
+      assertManagedRuntimeAncestorsTraversable(
+        fixture.plan,
+        allowlistInspection,
+        {
+          fsApi: { lstat: async () => trustedDirectory },
+          targetUid: UID,
+          targetGid: GID,
+          verifyNoExtendedPosixAcl: async (candidate) => {
+            throw new Error(`managed runtime path has an extended POSIX ACL: ${candidate}`);
+          },
+        },
+      ),
+      /managed runtime path has an extended POSIX ACL/,
     );
 
     const hardLinkTarget = `${root}/var/lib/webex-example.lock`;
@@ -834,6 +889,7 @@ describe('guarded host provisioner policy', () => {
         },
         targetUid: UID,
         targetGid: GID,
+        verifyNoExtendedPosixAcl: async () => {},
       }),
       /managed runtime path is not safe to mutate/,
     );
@@ -898,7 +954,7 @@ describe('guarded host provisioner policy', () => {
         verifyNoExtendedPosixAcl: async (candidate) => aclChecks.push(candidate),
       },
     );
-    assert.deepEqual(aclChecks, [target]);
+    assert.deepEqual(aclChecks, [root, `${root}/run`, target]);
     await assert.rejects(
       verifyManagedTmpfilesState(
         plan,
@@ -924,8 +980,10 @@ describe('guarded host provisioner policy', () => {
           fsApi,
           targetUid: 0,
           targetGid: 0,
-          verifyNoExtendedPosixAcl: async () => {
-            records.set(target, directoryStat(1002, 2003, 0o700));
+          verifyNoExtendedPosixAcl: async (candidate) => {
+            if (candidate === target) {
+              records.set(target, directoryStat(1002, 2003, 0o700));
+            }
           },
         },
       ),
@@ -1089,6 +1147,8 @@ describe('guarded host provisioner execution', () => {
     const fixture = await provisionFixture(context);
     for (const [root, mountPoint, device, expectedError] of [
       ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
+      ['/spoofed-shadow', '/etc/shadow'],
+      ['/spoofed-command', '/usr/bin/getfacl'],
       ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
       ['/redirected-var-lib', '/var/lib'],
       ['/', '/etc'],
@@ -1104,7 +1164,7 @@ describe('guarded host provisioner execution', () => {
             mountInfoSequence: [mountInfoWith(root, mountPoint, device)],
           }),
         ),
-        expectedError ?? /unexpected mount overlaps managed tmpfiles path/,
+        expectedError ?? /unexpected mount overlaps protected host path/,
       );
       assert.deepEqual(commands, []);
     }
@@ -1125,7 +1185,7 @@ describe('guarded host provisioner execution', () => {
 
     await assert.rejects(
       provisionHost({ apply: false }, dependencies),
-      /unexpected mount overlaps managed tmpfiles path/,
+      /unexpected mount overlaps protected host path/,
     );
     await assert.rejects(
       readBoundedProcFile(
@@ -1162,6 +1222,33 @@ describe('guarded host provisioner execution', () => {
       );
       assert.deepEqual(commands, []);
     }
+  });
+
+  it('rejects protected mount snapshot drift across tmpfiles execution', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    const changedRunMount = SAFE_MOUNT_INFO.replace('2 1 0:2', '2 1 0:22');
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          mountInfoSequence: [
+            SAFE_MOUNT_INFO,
+            SAFE_MOUNT_INFO,
+            SAFE_MOUNT_INFO,
+            SAFE_MOUNT_INFO,
+            changedRunMount,
+          ],
+        }),
+      ),
+      /protected host mount snapshot changed during command execution/,
+    );
+    assert.deepEqual(commands.slice(0, 2), [
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+    ]);
   });
 
   it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
@@ -1794,6 +1881,37 @@ describe('guarded host provisioner execution', () => {
     assert.equal(recovered.changed_artifact_count, 0);
     assert.deepEqual(recoveredCommands, [
       ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+  });
+
+  it('rechecks host identity after the final manager reload', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    const unsafeIdentity = expectedIdentitySnapshot({
+      shadowDatabase: expectedShadowDatabase().replace(
+        `${shadowRecord('webex-generic-account-bot')}\n`,
+        `${shadowRecord('webex-generic-account-bot', '$6$usable')}\n`,
+      ),
+    });
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          identitySequence: [
+            emptyIdentitySnapshot(),
+            expectedIdentitySnapshot(),
+            unsafeIdentity,
+          ],
+        }),
+      ),
+      /host policy files are installed but convergence failed.*managed user shadow password is not locked/,
+    );
+    assert.deepEqual(commands, [
       ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
       ['/usr/bin/systemctl', ['daemon-reload']],
@@ -2503,6 +2621,18 @@ describe('guarded host provisioner execution', () => {
       [
         'etc-sysusers.d.mount',
         '[Mount]\nWhere=/etc/sysusers.d\nBefore=systemd-sysusers.service\n',
+      ],
+      [
+        'srv-etc.mount',
+        '[Mount]\nWhat=/etc\nWhere=/srv/etc\n',
+      ],
+      [
+        'srv-cache.mount',
+        '[Mount]\nWhat=/srv/cache\nWhere=/srv/cache-copy\nOptions=bind\n',
+      ],
+      [
+        'usr-bin-getfacl.mount',
+        '[Mount]\nWhat=/srv/getfacl\nWhere=/usr/bin/getfacl\n',
       ],
       [
         'external-mount-alias.service',
@@ -4856,6 +4986,7 @@ async function provisionFixture(context) {
       bootPolicySequence = null,
       mountInfoSequence = null,
       verifyProvisionLockConverged = async () => {},
+      verifyPidNamespace = async () => {},
       verifyMountNamespace = async () => {},
       verifyRuntimeAncestors = async () => {},
       verifyManagedRuntimeState = async () => {},
@@ -4896,6 +5027,7 @@ async function provisionFixture(context) {
         readMountInfo: async () => mountInfos[
           Math.min(mountInfoIndex++, mountInfos.length - 1)
         ],
+        verifyPidNamespace,
         verifyMountNamespace,
         readUnitStates: async () => stateSequence[
           Math.min(stateIndex++, stateSequence.length - 1)
@@ -5217,6 +5349,32 @@ function shortReadFileSystem(contents, maxChunkBytes) {
         async read(buffer, offset, length, position) {
           assert.equal(position, null);
           const bytesRead = Math.min(maxChunkBytes, length, payload.length - cursor);
+          if (bytesRead > 0) {
+            payload.copy(buffer, offset, cursor, cursor + bytesRead);
+            cursor += bytesRead;
+          }
+          return { bytesRead, buffer };
+        },
+        close: async () => {},
+      };
+    },
+  };
+}
+
+function boundedProcFileSystem(contentsByPath) {
+  return {
+    async open(file, flags) {
+      assert.equal(
+        flags,
+        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+      );
+      const payload = Buffer.from(contentsByPath.get(file) ?? '');
+      let cursor = 0;
+      return {
+        stat: async () => ({ isFile: () => true }),
+        async read(buffer, offset, length, position) {
+          assert.equal(position, null);
+          const bytesRead = Math.min(length, payload.length - cursor);
           if (bytesRead > 0) {
             payload.copy(buffer, offset, cursor, cursor + bytesRead);
             cursor += bytesRead;

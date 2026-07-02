@@ -160,15 +160,16 @@
   type/symlink/hardlink
   metadata, cleanup, replacement, and recursive rules, allocation ranges and
   unmaterialised external numeric UID/primary-GID/group-GID claims,
-  with pre-apply unmanaged-ancestor and managed-target checks and post-tmpfiles exact
-  managed path type/mode/UID/GID convergence,
+  with pre-apply unmanaged-ancestor mode and extended-ACL checks, managed-target
+  checks, and post-tmpfiles exact managed path type/mode/UID/GID/ACL convergence,
   normalised glob and trailing-slash paths including legacy `/var/run` alias
   globs and exact compatibility-link text,
   source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
-  trusted re-exec paths and a complete transaction-aware read-only host
-  preflight validated before first-run lock convergence, followed by repeated
-  checks under the held lock,
+  trusted re-exec paths, an initial-PID-namespace host-systemd/cgroup gate, and
+  a complete transaction-aware read-only host preflight validated before
+  first-run lock convergence, followed by protected mount snapshots around
+  sysusers/tmpfiles and repeated identity/policy checks under the held lock,
   managed-name-free stale candidates that remain recoverable through systemd
   policy scanning, fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full
