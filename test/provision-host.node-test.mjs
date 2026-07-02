@@ -2060,6 +2060,48 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    const splitEnvUnit = '/etc/systemd/system/external-env-split.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external-env-split.service' }]]]),
+          {
+            filesByPath: new Map([[
+              splitEnvUnit,
+              Buffer.from(
+                '[Service]\nExecStart=/usr/bin/env "--split-string=systemd-sysusers /etc/rogue.conf"\n',
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy reinterprets command arguments/,
+    );
+
+    for (const command of ['set-credential', 'set-credential-encrypted']) {
+      const credentialUnit = `/etc/systemd/system/external-${command}.service`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name: `external-${command}.service` }]]]),
+            {
+              filesByPath: new Map([[
+                credentialUnit,
+                Buffer.from(
+                  `[Service]\nExecStart=/usr/bin/systemctl ${command} passwd.plaintext-password.root=secret\n`,
+                ),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd policy injects a host policy credential/,
+      );
+    }
+
     for (const [name, policy, activatorPolicy] of [
       [
         'external-shell.service',
@@ -2077,6 +2119,11 @@ describe('guarded host provisioner execution', () => {
         'external-shell@.service',
         "[Service]\nExecStart=/usr/bin/mk%i -c 'echo safe'\n",
         '[Unit]\nWants=external-shell@sh.service\n',
+      ],
+      [
+        'external-env-shell@.service',
+        "[Service]\nExecStart=/usr/bin/env pw%i -c 'echo safe'\n",
+        '[Unit]\nWants=external-env-shell@sh.service\n',
       ],
     ]) {
       const shellUnit = `/etc/systemd/system/${name}`;

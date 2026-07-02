@@ -135,7 +135,8 @@
   implicit service suffixes, or glob targets, while shell `Exec*` directives
   including the `|` prefix, unresolved executable specifiers, and standard
   shell-family names require direct or single-hop same-name package-vendor
-  provenance,
+  provenance, reject `env` split-string argv reinterpretation and protected
+  `systemctl set-credential{,-encrypted}` assignments,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

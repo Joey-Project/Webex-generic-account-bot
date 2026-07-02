@@ -3237,6 +3237,9 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     ) {
       throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
     }
+    if (systemdPolicyReinterpretsCommandArguments(candidate)) {
+      throw new Error(`external systemd policy reinterprets command arguments: ${source}`);
+    }
     if (
       systemdPolicyInvokesShell(candidate)
       && !isExpectedVendorSystemdUnitSource(
@@ -3247,6 +3250,9 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       )
     ) {
       throw new Error(`external systemd policy invokes a shell: ${source}`);
+    }
+    if (systemdPolicyInjectsSystemCredential(candidate)) {
+      throw new Error(`external systemd policy injects a host policy credential: ${source}`);
     }
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
@@ -3269,13 +3275,9 @@ function assertSystemdPolicyDoesNotReferenceManaged(
 }
 
 function systemdPolicyInvokesBootPolicyTool(value) {
-  const separator = value.indexOf('=');
-  if (separator <= 0) return false;
-  const directive = value.slice(0, separator).trim();
-  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
-  const fields = parseSystemdFields(value.slice(separator + 1));
-  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
-  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
+  const command = parseSystemdExecCommand(value);
+  if (!command) return false;
+  const { names, tokens } = command;
   if (names.some((name) => (
     BOOT_POLICY_EXECUTABLES.has(name)
     || systemdSpecifierFieldCouldMatch(name, [...BOOT_POLICY_EXECUTABLES])
@@ -3291,26 +3293,16 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 }
 
 function systemdPolicyInvokesManagedUnitControl(value) {
-  const separator = value.indexOf('=');
-  if (separator <= 0) return false;
-  const directive = value.slice(0, separator).trim();
-  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
-  const fields = parseSystemdFields(value.slice(separator + 1));
-  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
-  const invokesSystemctl = tokens.some((token) => {
-    const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
-    return name === 'systemctl'
-      || systemdSpecifierFieldCouldMatch(name, ['systemctl']);
-  });
-  return invokesSystemctl && tokens.some(systemctlUnitFieldCouldMatch);
+  const command = parseSystemdExecCommand(value);
+  return command !== null
+    && systemdExecInvokes(command, 'systemctl')
+    && command.tokens.some(systemctlUnitFieldCouldMatch);
 }
 
 function systemdPolicyInvokesShell(value) {
-  const separator = value.indexOf('=');
-  if (separator <= 0) return false;
-  const directive = value.slice(0, separator).trim();
-  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
-  const fields = parseSystemdFields(value.slice(separator + 1));
+  const command = parseSystemdExecCommand(value);
+  if (!command) return false;
+  const { fields, tokens } = command;
   const executable = fields[0] ?? '';
   const prefixes = executable.match(/^[-@:+!|]+/)?.[0] ?? '';
   const executableName = path.basename(executable.replace(/^[-@:+!|]+/, ''));
@@ -3319,12 +3311,63 @@ function systemdPolicyInvokesShell(value) {
     || hasUnresolvedSystemdSpecifier(executableName)
     || shellExecutableName(executableName)
   ) return true;
-  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
   return tokens.some((token) => {
     const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
     return shellExecutableName(name)
-      || systemdSpecifierFieldCouldMatch(name, [...SYSTEMD_SHELL_EXECUTABLES]);
+      || systemdSpecifierFieldCouldMatch(
+        name,
+        [...SYSTEMD_SHELL_EXECUTABLES],
+        { includeShellFamilies: true },
+      );
   });
+}
+
+function systemdPolicyReinterpretsCommandArguments(value) {
+  const command = parseSystemdExecCommand(value);
+  return command !== null
+    && systemdExecInvokes(command, 'env')
+    && command.tokens.some((token) => (
+      token === '-S'
+      || /^-S.+/.test(token)
+      || token === '--split-string'
+      || token.startsWith('--split-string=')
+    ));
+}
+
+function systemdPolicyInjectsSystemCredential(value) {
+  const command = parseSystemdExecCommand(value);
+  if (
+    command === null
+    || !systemdExecInvokes(command, 'systemctl')
+    || !command.tokens.some((token) => (
+      token === 'set-credential'
+      || token === 'set-credential-encrypted'
+    ))
+  ) return false;
+  return command.tokens.some((token) => {
+    const separator = token.indexOf('=');
+    if (separator <= 0) return false;
+    const credential = token.slice(0, separator);
+    return credential.includes('%') || credentialNameCanInjectHostPolicy(credential);
+  });
+}
+
+function parseSystemdExecCommand(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return null;
+  const directive = value.slice(0, separator).trim();
+  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return null;
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
+  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
+  return Object.freeze({ fields, tokens, names });
+}
+
+function systemdExecInvokes(command, executable) {
+  return command.names.some((name) => (
+    name === executable
+    || systemdSpecifierFieldCouldMatch(name, [executable])
+  ));
 }
 
 function shellExecutableName(name) {
@@ -3558,7 +3601,10 @@ function unresolvedSpecifierCouldReferenceManagedUnit(value) {
 function systemdSpecifierFieldCouldMatch(
   field,
   candidates,
-  { includeLauncherInstances = false } = {},
+  {
+    includeLauncherInstances = false,
+    includeShellFamilies = false,
+  } = {},
 ) {
   let pattern = '';
   let hasUnresolvedSpecifier = false;
@@ -3586,6 +3632,10 @@ function systemdSpecifierFieldCouldMatch(
     || (
       includeLauncherInstances
       && systemdTokenPatternsIntersect(tokens, launcherReferenceTokens())
+    )
+    || (
+      includeShellFamilies
+      && systemdTokenPatternsIntersect(tokens, shellFamilyReferenceTokens())
     );
 }
 
@@ -3595,6 +3645,14 @@ function launcherReferenceTokens() {
     { characterClass: 'launcher-instance', repeat: false },
     { characterClass: 'launcher-instance', repeat: true },
     ...[...'.service'].map((literal) => ({ literal, repeat: false })),
+  ];
+}
+
+function shellFamilyReferenceTokens() {
+  return [
+    { characterClass: 'shell-name', repeat: true },
+    { literal: 's', repeat: false },
+    { literal: 'h', repeat: false },
   ];
 }
 
@@ -3632,7 +3690,9 @@ function systemdTokenCharactersIntersect(left, right) {
 
 function systemdTokenAllows(token, character) {
   if (/[\s/]/.test(character)) return false;
-  return token.characterClass !== 'launcher-instance' || character !== '@';
+  if (token.characterClass === 'launcher-instance') return character !== '@';
+  if (token.characterClass === 'shell-name') return /[A-Za-z0-9_.+-]/.test(character);
+  return true;
 }
 
 function unitNameClaimsManagedIdentity(unitName) {
