@@ -16,6 +16,7 @@ import {
   ARTIFACTS,
   MANAGED_UNITS,
   assertCanonicalVarRunLink,
+  assertIdentityLockHeld,
   assertInitialPidNamespace,
   assertManagedRuntimeAncestorsTraversable,
   assertNoExtendedPosixAcl,
@@ -621,6 +622,79 @@ describe('guarded host provisioner policy', () => {
     assert.match(readme, /sudoers rule must name that absolute launcher path/);
     assert.match(readme, /must use\n`NOSETENV` with the normal `env_reset` policy/);
     assert.match(readme, /granting `SETENV`.*dynamic-loader variables/s);
+  });
+
+  it('verifies the inherited identity lock without reopening its path', async () => {
+    const lockStat = Object.freeze({
+      uid: 0,
+      gid: 0,
+      mode: 0o100600,
+      nlink: 1,
+      dev: 0x2a,
+      ino: 654,
+      size: 0,
+      mtimeMs: 1,
+      ctimeMs: 1,
+      isFile: () => true,
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+    });
+    const directoryStat = Object.freeze({
+      uid: 0,
+      gid: 0,
+      mode: 0o40755,
+      isFile: () => false,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    const procFs = boundedProcFileSystem(new Map([
+      ['/proc/self/mountinfo', SAFE_MOUNT_INFO],
+      ['/proc/locks', '8: POSIX ADVISORY WRITE 321 00:2a:654 0 EOF\n'],
+    ]));
+    const opened = [];
+    const fsApi = {
+      ...procFs,
+      lstat: async (candidate) => (
+        candidate === '/etc/.pwd.lock' ? lockStat : directoryStat
+      ),
+      readdir: async (candidate) => {
+        assert.equal(candidate, '/proc/self/fd');
+        return ['0', '1', '2', '9'];
+      },
+      stat: async (candidate) => {
+        assert.equal(candidate, '/proc/self/fd/9');
+        return lockStat;
+      },
+      open: async (candidate, flags) => {
+        opened.push(candidate);
+        return procFs.open(candidate, flags);
+      },
+    };
+    let fstatCalls = 0;
+
+    await assertIdentityLockHeld({
+      fsApi,
+      processApi: {
+        pid: 321,
+        env: {
+          WEBEX_HOST_IDENTITY_LOCK_FD: '9',
+          WEBEX_HOST_IDENTITY_LOCK_PID: '321',
+        },
+      },
+      statFd: async (fd) => {
+        assert.equal(fd, 9);
+        fstatCalls += 1;
+        return lockStat;
+      },
+    });
+
+    assert.equal(fstatCalls, 2);
+    assert.deepEqual(opened, [
+      '/proc/self/mountinfo',
+      '/proc/locks',
+      '/proc/self/mountinfo',
+    ]);
+    assert.equal(opened.includes('/etc/.pwd.lock'), false);
   });
 
   it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {

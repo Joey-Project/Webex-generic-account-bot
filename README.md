@@ -468,7 +468,11 @@ identity-lock helper acquires glibc's system password-database lock, identifies
 its unique descriptor, clears only that descriptor's `CLOEXEC` flag, and then
 executes the fixed FD-bound Node recovery in place. The same PID therefore
 holds the password-database lock while repeating the complete read-only
-recovery preflight and applying each rename.
+recovery preflight and applying each rename. The helper passes the retained
+descriptor number through its fixed clean environment; Node verifies it with
+`fstat` and `/proc/locks` without reopening `/etc/.pwd.lock`, because closing
+any second descriptor for that inode would release all process-associated
+POSIX record locks.
 The locked provisioner identifies exactly one descriptor for the shared host
 deployment `flock` and passes that same open-file-description to the native
 helper. The helper validates and retains it for the entire recovery, and binds

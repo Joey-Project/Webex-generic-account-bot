@@ -2,7 +2,7 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, fstat } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -10,9 +10,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const fstatAsync = promisify(fstat);
 const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
 const IDENTITY_RECOVERY_CHILD_ENV = 'WEBEX_HOST_IDENTITY_RECOVERY_CHILD';
+const IDENTITY_LOCK_FD_ENV = 'WEBEX_HOST_IDENTITY_LOCK_FD';
 const IDENTITY_LOCK_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PID';
 const IDENTITY_LOCK_PARENT_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PARENT_PID';
 const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
@@ -1414,45 +1416,66 @@ export async function findOpenFileDescriptor(
   return matches[0];
 }
 
-async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {}) {
+export async function assertIdentityLockHeld({
+  fsApi = fs,
+  processApi = process,
+  statFd = fstatAsync,
+} = {}) {
   const lockPid = processApi.env?.[IDENTITY_LOCK_PID_ENV];
   if (!/^[1-9][0-9]*$/.test(lockPid ?? '') || String(processApi.pid) !== lockPid) {
     throw new Error('identity recovery process is not the identity lock holder');
   }
-  await assertTrustedDirectoryChain('/', path.dirname(IDENTITY_LOCK_PATH), 0, 0, fsApi);
-  const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
-    new Set([IDENTITY_LOCK_PATH]),
-    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
-  );
-  const lock = await fsApi.open(
-    IDENTITY_LOCK_PATH,
-    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
-  );
-  let stat;
-  try {
-    stat = await lock.stat();
-    if (
-      !stat.isFile()
-      || stat.isSymbolicLink()
-      || stat.nlink !== 1
-      || stat.uid !== 0
-      || stat.gid !== 0
-      || ((stat.mode & 0o7777) & 0o077) !== 0
-    ) {
-      throw new Error('system identity database lock file is not trusted');
-    }
-  } finally {
-    await lock.close();
+  const rawLockFd = processApi.env?.[IDENTITY_LOCK_FD_ENV];
+  const lockFd = Number(rawLockFd);
+  if (
+    !/^[1-9][0-9]*$/.test(rawLockFd ?? '')
+    || !Number.isSafeInteger(lockFd)
+    || lockFd < 3
+    || String(lockFd) !== rawLockFd
+  ) {
+    throw new Error('identity recovery lock descriptor is invalid');
   }
-  const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
+  await assertTrustedDirectoryChain('/', path.dirname(IDENTITY_LOCK_PATH), 0, 0, fsApi);
+  const mountsBeforeInspection = assertNoUnexpectedMountsForPaths(
     new Set([IDENTITY_LOCK_PATH]),
     await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
   );
-  assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
+  const pathStat = await fsApi.lstat(IDENTITY_LOCK_PATH);
+  const stat = await statFd(lockFd);
+  if (
+    !pathStat.isFile()
+    || pathStat.isSymbolicLink()
+    || !stat.isFile()
+    || stat.isSymbolicLink()
+    || pathStat.nlink !== 1
+    || stat.nlink !== 1
+    || pathStat.uid !== 0
+    || stat.uid !== 0
+    || pathStat.gid !== 0
+    || stat.gid !== 0
+    || ((pathStat.mode & 0o7777) & 0o077) !== 0
+    || ((stat.mode & 0o7777) & 0o077) !== 0
+    || !sameFileIdentity(pathStat, stat)
+  ) {
+    throw new Error('system identity database lock file is not trusted');
+  }
+  if (await findOpenFileDescriptor(stat, { fsApi }) !== lockFd) {
+    throw new Error('identity recovery lock descriptor does not match the inherited lock');
+  }
   const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fsApi);
   if (!hasIdentityLock(procLocks, lockPid, stat)) {
     throw new Error('identity recovery process does not hold the system identity lock');
   }
+  const pathAfter = await fsApi.lstat(IDENTITY_LOCK_PATH);
+  const statAfter = await statFd(lockFd);
+  if (!sameFileIdentity(pathStat, pathAfter) || !sameFileIdentity(stat, statAfter)) {
+    throw new Error('system identity database lock file changed during inspection');
+  }
+  const mountsAfterInspection = assertNoUnexpectedMountsForPaths(
+    new Set([IDENTITY_LOCK_PATH]),
+    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+  );
+  assertProtectedMountSnapshotUnchanged(mountsBeforeInspection, mountsAfterInspection);
 }
 
 function linuxDeviceNumbers(device) {

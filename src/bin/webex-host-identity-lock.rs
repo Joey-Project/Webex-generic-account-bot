@@ -25,6 +25,8 @@ const DEPLOYMENT_LOCK_PATH: &str = "/run/webex-config-deploy/deploy-config.lock"
 #[cfg(target_os = "linux")]
 const PARENT_PID_ENV: &str = "WEBEX_HOST_IDENTITY_LOCK_PARENT_PID";
 #[cfg(target_os = "linux")]
+const IDENTITY_LOCK_FD_ENV: &str = "WEBEX_HOST_IDENTITY_LOCK_FD";
+#[cfg(target_os = "linux")]
 const IDENTITY_LOCK_PATH: &str = "/etc/.pwd.lock";
 #[cfg(target_os = "linux")]
 const MAX_AUDITED_FDS: usize = 1024;
@@ -46,7 +48,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "linux")]
 struct PasswordDatabaseLock {
-    _fd: RawFd,
+    fd: RawFd,
 }
 
 #[cfg(target_os = "linux")]
@@ -106,7 +108,7 @@ impl PasswordDatabaseLock {
                 .context("failed to acquire the system identity database lock");
         }
         match retain_lock_descriptor_across_exec(Path::new(IDENTITY_LOCK_PATH), 0, 0) {
-            Ok(fd) => Ok(Self { _fd: fd }),
+            Ok(fd) => Ok(Self { fd }),
             Err(error) => {
                 unsafe {
                     ulckpwdf();
@@ -254,7 +256,7 @@ fn run() -> Result<i32> {
     let expected_parent = expected_parent_pid()?;
     arm_parent_death_signal(expected_parent)?;
     let _deployment_lock = DeploymentLock::acquire()?;
-    let _lock = PasswordDatabaseLock::acquire()?;
+    let identity_lock = PasswordDatabaseLock::acquire()?;
     let lock_holder_pid = unsafe { libc::getpid() };
     let mut command = Command::new(NODE_FD_PATH);
     command
@@ -274,6 +276,7 @@ fn run() -> Result<i32> {
         .env("WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS", "1")
         .env("WEBEX_HOST_PROVISION_SOURCE_ROOT", SOURCE_ROOT)
         .env("WEBEX_HOST_IDENTITY_RECOVERY_CHILD", "1")
+        .env(IDENTITY_LOCK_FD_ENV, identity_lock.fd.to_string())
         .env("WEBEX_HOST_IDENTITY_LOCK_PID", lock_holder_pid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -339,7 +342,16 @@ mod tests {
     const NODE_LOCK_VERIFIER: &str = concat!(
         "const fs = require('node:fs'); ",
         "const { spawnSync } = require('node:child_process'); ",
-        "fs.fstatSync(Number(process.env.WEBEX_TEST_IDENTITY_LOCK_EXEC_FD)); ",
+        "const fd = Number(process.env.WEBEX_TEST_IDENTITY_LOCK_EXEC_FD); ",
+        "const path = process.env.WEBEX_TEST_IDENTITY_LOCK_EXEC_PATH; ",
+        "const inherited = fs.fstatSync(fd); ",
+        "const named = fs.lstatSync(path); ",
+        "if (inherited.dev !== named.dev || inherited.ino !== named.ino) process.exit(31); ",
+        "const matches = fs.readdirSync('/proc/self/fd').filter((entry) => { ",
+        "try { const stat = fs.statSync('/proc/self/fd/' + entry); ",
+        "return stat.dev === inherited.dev && stat.ino === inherited.ino; ",
+        "} catch { return false; } }); ",
+        "if (matches.length !== 1 || Number(matches[0]) !== fd) process.exit(32); ",
         "const env = { ...process.env, WEBEX_TEST_IDENTITY_LOCK_EXEC_STAGE: 'contend' }; ",
         "const result = spawnSync(process.env.WEBEX_TEST_IDENTITY_LOCK_TEST_EXE, ",
         "['--exact', 'tests::password_lock_descriptor_survives_exec', '--nocapture'], ",
@@ -352,6 +364,7 @@ mod tests {
         assert_eq!(NODE_FD_PATH, "/proc/self/fd/3");
         assert_eq!(NODE_FD, 3);
         assert_eq!(DEPLOYMENT_LOCK_FD, 6);
+        assert_eq!(IDENTITY_LOCK_FD_ENV, "WEBEX_HOST_IDENTITY_LOCK_FD");
         assert_eq!(
             SOURCE_ROOT,
             "/opt/webex-generic-account-bot/code/deploy/systemd"
