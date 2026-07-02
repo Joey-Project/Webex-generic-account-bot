@@ -200,7 +200,9 @@ superseded_by:
   tool execution from external or linked helper units after unit-name executable
   and argument specifier expansion, including unresolved template instances,
   plus external `systemctl` commands with specifier-reachable managed-unit
-  targets and launcher-instance reference rejection, fixed-path scanning for
+  targets, implicit service suffixes, or glob targets, shell `Exec*` directives
+  restricted to direct or single-hop same-name package-vendor provenance, and
+  launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

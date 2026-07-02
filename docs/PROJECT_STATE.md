@@ -132,6 +132,8 @@
   external or linked helper units after concrete or unresolved template
   unit-name executable and argument specifier expansion, and reject external
   `systemctl` commands with specifier-reachable managed-unit targets,
+  implicit service suffixes, or glob targets, while shell `Exec*` directives
+  require direct or single-hop same-name package-vendor provenance,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

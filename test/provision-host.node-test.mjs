@@ -2028,6 +2028,8 @@ describe('guarded host provisioner execution', () => {
     for (const [instance, target] of [
       ['generic-account-bot', 'webex-%i.service'],
       ['smoke', 'webex-codex-launcher@%I.service'],
+      ['literal', 'webex-codex-activation-renew'],
+      ['glob', 'webex-*'],
     ]) {
       const template = '/etc/systemd/system/external@.service';
       const activator = '/etc/systemd/system/external-trigger.service';
@@ -2057,6 +2059,26 @@ describe('guarded host provisioner execution', () => {
         /external systemd policy references a managed unit/,
       );
     }
+
+    const shellUnit = '/etc/systemd/system/external-shell.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external-shell.service' }]]]),
+          {
+            filesByPath: new Map([[
+              shellUnit,
+              Buffer.from(
+                "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemd-\"sysusers\" /etc/rogue.conf'\n",
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy invokes a shell/,
+    );
 
     const helperWants = '/etc/systemd/system/external.target.wants';
     const helperLink = `${helperWants}/external-helper.service`;
@@ -2112,6 +2134,7 @@ describe('guarded host provisioner execution', () => {
               { name: 'systemd-tmpfiles-setup.service' },
               { name: 'systemd-pcrfs@.service' },
               { name: 'user@.service' },
+              { name: 'vendor-shell.service' },
               {
                 name: 'sysinit.target.wants',
                 isFile: () => false,
@@ -2168,6 +2191,10 @@ describe('guarded host provisioner execution', () => {
                   'Slice=user-%i.slice',
                   '',
                 ].join('\n')),
+              ],
+              [
+                '/usr/lib/systemd/system/vendor-shell.service',
+                Buffer.from("[Service]\nExecStart=/bin/sh -c 'echo safe'\n"),
               ],
             ]),
             symlinksByPath: new Map([[

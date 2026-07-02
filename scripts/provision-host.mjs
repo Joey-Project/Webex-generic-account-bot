@@ -229,6 +229,17 @@ const BOOT_POLICY_EXECUTABLES = new Set([
   'systemd-sysusers',
   'systemd-tmpfiles',
 ]);
+const SYSTEMD_SHELL_EXECUTABLES = new Set([
+  'bash',
+  'busybox',
+  'csh',
+  'dash',
+  'fish',
+  'ksh',
+  'sh',
+  'tcsh',
+  'zsh',
+]);
 
 class PolicySafetyRollbackError extends Error {}
 
@@ -3222,6 +3233,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
     }
     if (
+      systemdPolicyInvokesShell(candidate)
+      && !isExpectedVendorSystemdUnitSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
+      throw new Error(`external systemd policy invokes a shell: ${source}`);
+    }
+    if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
@@ -3275,13 +3297,67 @@ function systemdPolicyInvokesManagedUnitControl(value) {
     return name === 'systemctl'
       || systemdSpecifierFieldCouldMatch(name, ['systemctl']);
   });
-  return invokesSystemctl && tokens.some((token) => (
-    systemdSpecifierFieldCouldMatch(
-      token,
-      MANAGED_UNITS,
-      { includeLauncherInstances: true },
-    )
-  ));
+  return invokesSystemctl && tokens.some(systemctlUnitFieldCouldMatch);
+}
+
+function systemdPolicyInvokesShell(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
+  return tokens.some((token) => {
+    const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
+    return SYSTEMD_SHELL_EXECUTABLES.has(name)
+      || systemdSpecifierFieldCouldMatch(name, [...SYSTEMD_SHELL_EXECUTABLES]);
+  });
+}
+
+function systemctlUnitFieldCouldMatch(field) {
+  return [field, `${field}.service`].some((candidate) => {
+    const tokens = systemdUnitPatternTokens(candidate);
+    const pattern = tokens.map((token) => {
+      if (token.literal !== undefined) return escapeRegExp(token.literal);
+      return token.repeat ? '[^\\s/]*' : '[^\\s/]';
+    }).join('');
+    const reference = new RegExp(`^${pattern}$`);
+    return MANAGED_UNITS.some((unit) => reference.test(unit))
+      || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
+  });
+}
+
+function systemdUnitPatternTokens(field) {
+  const tokens = [];
+  for (let offset = 0; offset < field.length; offset += 1) {
+    const character = field[offset];
+    if (character === '%' && field[offset + 1] === '%') {
+      tokens.push({ literal: '%', repeat: false });
+      offset += 1;
+      continue;
+    }
+    if (character === '%') {
+      tokens.push({ characterClass: 'unit', repeat: true });
+      if (offset + 1 < field.length) offset += 1;
+      continue;
+    }
+    if (character === '*') {
+      tokens.push({ characterClass: 'unit', repeat: true });
+      continue;
+    }
+    if (character === '?') {
+      tokens.push({ characterClass: 'unit', repeat: false });
+      continue;
+    }
+    if (character === '[') {
+      const end = field.indexOf(']', offset + 1);
+      tokens.push({ characterClass: 'unit', repeat: false });
+      if (end >= 0) offset = end;
+      continue;
+    }
+    tokens.push({ literal: character, repeat: false });
+  }
+  return tokens;
 }
 
 function systemdPolicyInjectsBootPolicyCredential(
@@ -3414,6 +3490,24 @@ function isExpectedVendorBootPolicyConsumerSource(
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
   if (!BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit)) return false;
+  return isExpectedVendorSystemdUnitSource(
+    source,
+    unitNames,
+    logicalSource,
+    symlinkDepth,
+  );
+}
+
+function isExpectedVendorSystemdUnitSource(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
+  const directory = path.dirname(source);
+  if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
+  const unit = path.basename(source);
+  if (!SYSTEMD_UNIT_NAME_PATTERN.test(unit)) return false;
   if (!systemdUnitNamesEqual(unitNames, unit)) return false;
   const directVendorFile = symlinkDepth === 0 && logicalSource === source;
   const directDependencyLink = (
