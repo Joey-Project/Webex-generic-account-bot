@@ -324,6 +324,10 @@ The systemd `|` shell prefix, unresolved executable specifiers, and standard
 shell-family executable names are all treated as shell execution.
 `env -S`/`--split-string` argv reinterpretation is rejected, and `systemctl`
 may not set protected plaintext or encrypted system credentials.
+Non-vendor `Exec*` environment expansion is rejected instead of attempting
+incomplete cross-directive data-flow analysis. The runtime system-credential
+directory `/run/credentials/@system` is protected from external tmpfiles paths
+and symlink targets.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.

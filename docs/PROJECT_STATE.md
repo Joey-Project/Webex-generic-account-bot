@@ -136,7 +136,8 @@
   including the `|` prefix, unresolved executable specifiers, and standard
   shell-family names require direct or single-hop same-name package-vendor
   provenance, reject `env` split-string argv reinterpretation and protected
-  `systemctl set-credential{,-encrypted}` assignments,
+  `systemctl set-credential{,-encrypted}` assignments, non-vendor `Exec*`
+  environment expansion, and tmpfiles access to `/run/credentials/@system`,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

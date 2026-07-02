@@ -204,7 +204,8 @@ superseded_by:
   including the `|` prefix, unresolved executable specifiers, and standard
   shell-family names restricted to direct or single-hop same-name package-vendor
   provenance, `env` split-string argv reinterpretation and protected `systemctl`
-  credential assignments rejected, and
+  credential assignments rejected, non-vendor `Exec*` environment expansion
+  refused, `/run/credentials/@system` protected from tmpfiles, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency
   directories across all managed units plus

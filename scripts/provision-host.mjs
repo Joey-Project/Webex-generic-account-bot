@@ -47,6 +47,7 @@ const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
 const SYSTEMD_UNIT_NAME_PATTERN =
   /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
+const SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY = '/run/credentials/@system';
 const SYSTEMD_DYNAMIC_USER_PROVIDER = 'io.systemd.DynamicUser';
 const SYSTEMD_MANAGER_UNIT_PATHS = Object.freeze([
   '/etc/systemd/system.control',
@@ -2305,6 +2306,7 @@ export function auditBootPolicyCatalogs(
     ...IDENTITY_POLICY_PATHS,
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
+    SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
     ...SYSTEMD_PROTECTED_UNIT_PATHS,
     ...Object.values(BOOT_POLICY_DIRECTORIES).flat(),
     ...BOOT_POLICY_CREDENTIAL_PATHS,
@@ -3241,6 +3243,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy reinterprets command arguments: ${source}`);
     }
     if (
+      systemdPolicyUsesEnvironmentExpansion(candidate)
+      && !isExpectedVendorSystemdUnitSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
+      throw new Error(`external systemd policy uses environment expansion: ${source}`);
+    }
+    if (
       systemdPolicyInvokesShell(candidate)
       && !isExpectedVendorSystemdUnitSource(
         source,
@@ -3327,11 +3340,14 @@ function systemdPolicyReinterpretsCommandArguments(value) {
   return command !== null
     && systemdExecInvokes(command, 'env')
     && command.tokens.some((token) => (
-      token === '-S'
-      || /^-S.+/.test(token)
-      || token === '--split-string'
-      || token.startsWith('--split-string=')
+      /^-[^-]*S/.test(token)
+      || token.startsWith('--split')
     ));
+}
+
+function systemdPolicyUsesEnvironmentExpansion(value) {
+  const command = parseSystemdExecCommand(value);
+  return command !== null && command.fields.some((field) => field.includes('$'));
 }
 
 function systemdPolicyInjectsSystemCredential(value) {

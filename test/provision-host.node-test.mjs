@@ -895,7 +895,9 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
       ['tmpfiles', 'f /etc/credstore/userdb.user.injected 0600 root root - {}'],
       ['tmpfiles', 'f /run/credstore/* 0600 root root - payload'],
+      ['tmpfiles', 'f /run/credentials/@system/sysusers.extra 0600 root root - payload'],
       ['tmpfiles', 'd+ /run/credstore 0700 root root -'],
+      ['tmpfiles', 'L+ /dev/host-creds - - - - /run/credentials/@system'],
       ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
       ['tmpfiles', 'L /tmp/untrusted - - - - %t/systemd/userdb'],
       ['tmpfiles', 'f+ /var/run/systemd/system/external.service 0644 root root - payload'],
@@ -2061,23 +2063,50 @@ describe('guarded host provisioner execution', () => {
     }
 
     const splitEnvUnit = '/etc/systemd/system/external-env-split.service';
+    for (const option of [
+      '"--split-string=/usr/bin/echo safe"',
+      '"--split-s=/usr/bin/echo safe"',
+      '"-iS /usr/bin/echo safe"',
+    ]) {
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name: 'external-env-split.service' }]]]),
+            {
+              filesByPath: new Map([[
+                splitEnvUnit,
+                Buffer.from(`[Service]\nExecStart=/usr/bin/env ${option}\n`),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd policy reinterprets command arguments/,
+      );
+    }
+
+    const environmentUnit = '/etc/systemd/system/external-environment.service';
     await assert.rejects(
       readSystemUnitStates(
         MANAGED_UNITS,
         async () => ({ stdout: '', stderr: '', code: 0 }),
         systemdUnitPathFs(
-          new Map([['/etc/systemd/system', [{ name: 'external-env-split.service' }]]]),
+          new Map([['/etc/systemd/system', [{ name: 'external-environment.service' }]]]),
           {
             filesByPath: new Map([[
-              splitEnvUnit,
-              Buffer.from(
-                '[Service]\nExecStart=/usr/bin/env "--split-string=systemd-sysusers /etc/rogue.conf"\n',
-              ),
+              environmentUnit,
+              Buffer.from([
+                '[Service]',
+                'Environment=HELPER=/usr/bin/systemd-sysusers',
+                'ExecStart=/usr/bin/env ${HELPER} /etc/rogue.conf',
+                '',
+              ].join('\n')),
             ]]),
           },
         ),
       ),
-      /external systemd policy reinterprets command arguments/,
+      /external systemd policy uses environment expansion/,
     );
 
     for (const command of ['set-credential', 'set-credential-encrypted']) {
