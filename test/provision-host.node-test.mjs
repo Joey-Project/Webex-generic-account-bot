@@ -16,6 +16,7 @@ import {
   ARTIFACTS,
   MANAGED_UNITS,
   assertManagedRuntimeAncestorsTraversable,
+  assertNoExtendedPosixAcl,
   assertSameMountNamespace,
   buildLockedApplyCommand,
   buildProvisionPlan,
@@ -875,16 +876,87 @@ describe('guarded host provisioner policy', () => {
         plan,
         inspected,
         expectedIdentitySnapshot(),
-        { fsApi, targetUid: 0, targetGid: 0 },
+        {
+          fsApi,
+          targetUid: 0,
+          targetGid: 0,
+          verifyNoExtendedPosixAcl: async () => {},
+        },
       ),
       /managed runtime path metadata is not converged/,
     );
     records.set(target, directoryStat(1002, 2003, 0o750));
+    const aclChecks = [];
     await verifyManagedTmpfilesState(
       plan,
       inspected,
       expectedIdentitySnapshot(),
-      { fsApi, targetUid: 0, targetGid: 0 },
+      {
+        fsApi,
+        targetUid: 0,
+        targetGid: 0,
+        verifyNoExtendedPosixAcl: async (candidate) => aclChecks.push(candidate),
+      },
+    );
+    assert.deepEqual(aclChecks, [target]);
+    await assert.rejects(
+      verifyManagedTmpfilesState(
+        plan,
+        inspected,
+        expectedIdentitySnapshot(),
+        {
+          fsApi,
+          targetUid: 0,
+          targetGid: 0,
+          verifyNoExtendedPosixAcl: async () => {
+            throw new Error(`managed runtime path has an extended POSIX ACL: ${target}`);
+          },
+        },
+      ),
+      /managed runtime path has an extended POSIX ACL/,
+    );
+    await assert.rejects(
+      verifyManagedTmpfilesState(
+        plan,
+        inspected,
+        expectedIdentitySnapshot(),
+        {
+          fsApi,
+          targetUid: 0,
+          targetGid: 0,
+          verifyNoExtendedPosixAcl: async () => {
+            records.set(target, directoryStat(1002, 2003, 0o700));
+          },
+        },
+      ),
+      /managed runtime path changed during ACL inspection/,
+    );
+  });
+
+  it('uses a fixed read-only getfacl command for runtime ACL convergence', async () => {
+    const calls = [];
+    await assertNoExtendedPosixAcl('/run/webex-example', async (command, args) => {
+      calls.push([command, args]);
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    assert.deepEqual(calls, [[
+      '/usr/bin/getfacl',
+      [
+        '--absolute-names',
+        '--numeric',
+        '--omit-header',
+        '--skip-base',
+        '--physical',
+        '--',
+        '/run/webex-example',
+      ],
+    ]]);
+    await assert.rejects(
+      assertNoExtendedPosixAcl(
+        '/run/webex-example',
+        async () => ({ code: 0, stdout: 'user:1000:rwx\n', stderr: '' }),
+      ),
+      /managed runtime path has an extended POSIX ACL/,
     );
   });
 });
@@ -1015,12 +1087,12 @@ describe('guarded host provisioner execution', () => {
 
   it('rejects unexpected mounts overlapping managed tmpfiles paths', async (context) => {
     const fixture = await provisionFixture(context);
-    for (const [root, mountPoint, device] of [
+    for (const [root, mountPoint, device, expectedError] of [
       ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
       ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
       ['/redirected-var-lib', '/var/lib'],
       ['/', '/etc'],
-      ['/', '/', '0:1'],
+      ['/', '/', '0:1', /mountinfo must contain exactly one root mount/],
       ['/', '/var/lib/webex-generic-account-bot/state/nested'],
     ]) {
       const commands = [];
@@ -1032,7 +1104,7 @@ describe('guarded host provisioner execution', () => {
             mountInfoSequence: [mountInfoWith(root, mountPoint, device)],
           }),
         ),
-        /unexpected mount overlaps managed tmpfiles path/,
+        expectedError ?? /unexpected mount overlaps managed tmpfiles path/,
       );
       assert.deepEqual(commands, []);
     }
@@ -1063,6 +1135,33 @@ describe('guarded host provisioner execution', () => {
       ),
       /proc file is too large/,
     );
+    await assert.rejects(
+      readBoundedProcFile('/proc/self/mountinfo', 128, {
+        open: async () => ({
+          stat: async () => ({ isFile: () => false }),
+          close: async () => {},
+        }),
+      }),
+      /proc file metadata is not trusted/,
+    );
+  });
+
+  it('requires a single root mount in the proc mount snapshot', async (context) => {
+    const fixture = await provisionFixture(context);
+    for (const mountInfo of [
+      '',
+      `${SAFE_MOUNT_INFO}4 0 0:4 / / rw - tmpfs tmpfs rw\n`,
+    ]) {
+      const commands = [];
+      await assert.rejects(
+        provisionHost(
+          { apply: false },
+          fixture.dependencies({ commands, mountInfoSequence: [mountInfo] }),
+        ),
+        /mountinfo must contain exactly one root mount/,
+      );
+      assert.deepEqual(commands, []);
+    }
   });
 
   it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
@@ -1086,6 +1185,14 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'L /var/run - - - - ../run/child/..'],
       ['tmpfiles', 'L /var/run/external - - - - ../etc/passwd'],
       ['tmpfiles', 'L /var/lib/innocent - - - - ../run/../etc/passwd'],
+      [
+        'tmpfiles',
+        'C /tmp/leak 0644 root root - /pivot /../var/lib/webex-headless-access/access-token',
+      ],
+      [
+        'tmpfiles',
+        'L /tmp/leak - - - - /pivot /../var/lib/webex-headless-access/access-token',
+      ],
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
@@ -1309,6 +1416,34 @@ describe('guarded host provisioner execution', () => {
       );
       assert.equal(commandCalls, 0, label);
     }
+
+    const injectedPolicy = '/run/tmpfiles.d/injected.conf';
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemBootPolicyCatalogs(
+        async () => {
+          commandCalls += 1;
+          throw new Error('boot policy command reached');
+        },
+        systemdUnitPathFs(
+          new Map([['/run/tmpfiles.d', [{ name: 'injected.conf' }]]]),
+          {
+            filesByPath: sourceFiles,
+            specialStatsByPath: new Map([[injectedPolicy, Object.freeze({
+              uid: 0,
+              gid: 0,
+              mode: 0o010644,
+              nlink: 1,
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => false,
+            })]]),
+          },
+        ),
+      ),
+      /boot policy search entry is not trusted: \/run\/tmpfiles\.d\/injected\.conf/,
+    );
+    assert.equal(commandCalls, 0);
 
     for (const [kind, result] of [
       ['sysusers', { stdout: '', stderr: '', code: 0 }],
@@ -2364,6 +2499,10 @@ describe('guarded host provisioner execution', () => {
       [
         'external-protected.mount',
         '[Mount]\nWhere=/var/lib/webex-generic-account-bot/state\n',
+      ],
+      [
+        'etc-sysusers.d.mount',
+        '[Mount]\nWhere=/etc/sysusers.d\nBefore=systemd-sysusers.service\n',
       ],
       [
         'external-mount-alias.service',
@@ -5068,9 +5207,13 @@ function shortReadFileSystem(contents, maxChunkBytes) {
   return {
     async open(file, flags) {
       assert.equal(file, '/proc/self/mountinfo');
-      assert.equal(flags, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      assert.equal(
+        flags,
+        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+      );
       let cursor = 0;
       return {
+        stat: async () => ({ isFile: () => true }),
         async read(buffer, offset, length, position) {
           assert.equal(position, null);
           const bytesRead = Math.min(maxChunkBytes, length, payload.length - cursor);
@@ -5095,6 +5238,7 @@ function systemdUnitPathFs(
     fileModesByPath = new Map(),
     directoryModesByPath = new Map(),
     missingPaths = new Set(),
+    specialStatsByPath = new Map(),
     symlinksByPath = new Map(),
   } = {},
 ) {
@@ -5153,6 +5297,7 @@ function systemdUnitPathFs(
       if (missingPaths.has(candidate)) {
         throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       }
+      if (specialStatsByPath.has(candidate)) return specialStatsByPath.get(candidate);
       if (filesByPath.has(candidate)) {
         return fileStat(filesByPath.get(candidate), fileModesByPath.get(candidate));
       }

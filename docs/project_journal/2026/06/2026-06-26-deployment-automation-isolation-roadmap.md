@@ -210,8 +210,8 @@ superseded_by:
   path-qualified and unscoped mutating `systemctl` operations and non-regular
   boot-policy consumer overrides rejected, `/var/run` rewritten before path
   normalisation, path-based unit-file aliases, option-interleaved credentials,
-  later-command shell prefixes, unbounded mountinfo reads, and duplicate-root
-  or stacked-root managed-path mounts refused, plus opaque `systemctl edit`
+  later-command shell prefixes, blocking or non-regular mountinfo reads, and
+  missing, duplicate, or stacked-root managed-path mounts refused, plus opaque `systemctl edit`
   replacement, full-path executable specifiers, path-generating systemctl
   specifiers, `--marked` abbreviations, equivalent `/var/run` paths, and
   implicit timer/path/socket service activation,
@@ -224,7 +224,7 @@ superseded_by:
   sysusers/tmpfiles catalogue requirements, and semantic boot-policy auditing
   with C-escape, normalised specifier/glob-prefix and trailing slash,
   including glob access through the legacy `/var/run` alias and exact
-  compatibility-link text, and copy-source
+  compatibility-link text, and complete copy-source and symlink argument fields,
   paths, source-associated managed-policy upgrades, pre-mutation managed-target
   type/symlink/hardlink checks, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
@@ -234,8 +234,12 @@ superseded_by:
   system-unit load paths, installed policy targets, and every sysusers and
   tmpfiles policy search directory, traversal-preserving ancestor metadata,
   recursive parent handling, pre-apply unmanaged-ancestor and managed-target
-  checks, post-tmpfiles exact managed path type/mode/UID/GID convergence,
-  root-owned stable source metadata for every effective catalogue file, and
+  checks, post-tmpfiles exact managed path type/mode/UID/GID convergence with
+  extended POSIX ACL rejection, root-owned stable source metadata for every
+  effective catalogue file, pre-command rejection of non-regular boot-policy
+  `.conf` entries except stable root-owned `/dev/null` masks, persistent mount
+  protection for identity, userdb, credential, unit, boot-policy, transaction,
+  and lock surfaces, and
   pre-allocation rejection of unmaterialised external numeric UID, primary-GID,
   and group-GID claims,
   trusted re-exec paths plus a complete transaction-aware read-only host

@@ -789,6 +789,7 @@ export async function provisionHost(options, dependencies = {}) {
         fsApi: deps.fsApi,
         targetUid: deps.targetUid,
         targetGid: deps.targetGid,
+        verifyNoExtendedPosixAcl: deps.verifyNoExtendedPosixAcl,
       },
     ));
 
@@ -1687,8 +1688,13 @@ async function readTrustedSensitiveIdentityFile(file, allowedGids, allowedModes,
 }
 
 export async function readBoundedProcFile(file, maxBytes, fsApi) {
-  const handle = await fsApi.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`proc file metadata is not trusted: ${file}`);
     const buffer = Buffer.alloc(maxBytes + 1);
     let totalBytesRead = 0;
     while (totalBytesRead < buffer.length) {
@@ -2387,6 +2393,59 @@ async function assertTrustedBootPolicySearchDirectories(fsApi) {
       throw error;
     }
     await assertTrustedDirectoryChain('/', directory, 0, 0, fsApi);
+    const entries = await readTrustedDirectoryEntries(
+      directory,
+      MAX_SCANNED_DIRECTORY_ENTRIES,
+      fsApi,
+    );
+    for (const entry of entries) {
+      if (!entry.name.endsWith('.conf')) continue;
+      if (path.basename(entry.name) !== entry.name || ['.', '..'].includes(entry.name)) {
+        throw new Error(`boot policy search entry is not trusted: ${entry.name}`);
+      }
+      await assertTrustedBootPolicySearchEntry(path.join(directory, entry.name), fsApi);
+    }
+  }
+}
+
+async function assertTrustedBootPolicySearchEntry(file, fsApi) {
+  const before = await fsApi.lstat(file);
+  if (before.isSymbolicLink()) {
+    const target = await fsApi.readlink(file);
+    const after = await fsApi.lstat(file);
+    if (
+      target !== '/dev/null'
+      || before.uid !== 0
+      || before.gid !== 0
+      || !sameFileIdentity(before, after)
+    ) {
+      throw new Error(`boot policy search entry is not trusted: ${file}`);
+    }
+    return;
+  }
+  if (!before.isFile()) {
+    throw new Error(`boot policy search entry is not trusted: ${file}`);
+  }
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const opened = await handle.stat();
+    assertTrustedFileMetadata(file, opened, 0, 0, null);
+    if (opened.size < 0 || opened.size > MAX_POLICY_FILE_BYTES) {
+      throw new Error(`policy file size is invalid: ${file}`);
+    }
+    const contents = await handle.readFile();
+    if (contents.length !== opened.size) {
+      throw new Error(`policy file size is invalid: ${file}`);
+    }
+    const after = await handle.stat();
+    if (!sameFileIdentity(opened, after)) {
+      throw new Error(`policy file changed while reading: ${file}`);
+    }
+  } finally {
+    await handle.close();
   }
 }
 
@@ -2621,6 +2680,7 @@ export async function verifyManagedTmpfilesState(
     fsApi = fs,
     targetUid = 0,
     targetGid = 0,
+    verifyNoExtendedPosixAcl = assertNoExtendedPosixAcl,
   } = {},
 ) {
   await assertManagedRuntimeAncestorsTraversable(plan, inspected, {
@@ -2649,6 +2709,38 @@ export async function verifyManagedTmpfilesState(
     ) {
       throw new Error(`managed runtime path metadata is not converged: ${entry.target}`);
     }
+    await verifyNoExtendedPosixAcl(entry.target);
+    const after = await fsApi.lstat(entry.target);
+    const afterCorrectType = entry.type === 'd' ? after.isDirectory() : after.isFile();
+    if (
+      !sameFileIdentity(stat, after)
+      || !afterCorrectType
+      || after.isSymbolicLink()
+      || (entry.type === 'f' && after.nlink !== 1)
+      || after.uid !== entry.uid
+      || after.gid !== entry.gid
+      || (after.mode & 0o7777) !== entry.mode
+    ) {
+      throw new Error(`managed runtime path changed during ACL inspection: ${entry.target}`);
+    }
+  }
+}
+
+export async function assertNoExtendedPosixAcl(file, runCommand = runFixedCommand) {
+  const result = await runCommand('/usr/bin/getfacl', [
+    '--absolute-names',
+    '--numeric',
+    '--omit-header',
+    '--skip-base',
+    '--physical',
+    '--',
+    file,
+  ]);
+  if (result.code !== 0 || result.stderr !== '') {
+    throw new Error(`managed runtime POSIX ACL inspection failed: ${file}`);
+  }
+  if (result.stdout !== '') {
+    throw new Error(`managed runtime path has an extended POSIX ACL: ${file}`);
   }
 }
 
@@ -2833,7 +2925,7 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   }
   const credentialStorePolicy = tmpfilesCredentialStorePathTouchesManagedSurface(fields);
   if (credentialStorePolicy !== null) return credentialStorePolicy;
-  const argument = fields[6];
+  const argument = fields.length > 6 ? fields.slice(6).join(' ') : undefined;
   if (type === 'L' && policyPath === '/var/run' && argument !== undefined) {
     if (['../run', '/run'].includes(argument)) return false;
   }
@@ -3026,7 +3118,7 @@ function parseMountInfo(mountInfo) {
   if (lines.length > MAX_MOUNTINFO_ENTRIES) {
     throw new Error('mountinfo has too many entries');
   }
-  return lines.map((line) => {
+  const mounts = lines.map((line) => {
     const fields = line.split(' ');
     const separator = fields.indexOf('-');
     if (separator < 6 || fields.length < separator + 4) {
@@ -3047,6 +3139,10 @@ function parseMountInfo(mountInfo) {
       mountPoint: path.posix.normalize(mountPoint),
     });
   });
+  if (mounts.filter(({ mountPoint }) => mountPoint === '/').length !== 1) {
+    throw new Error('mountinfo must contain exactly one root mount');
+  }
+  return mounts;
 }
 
 function decodeMountInfoPath(value) {
@@ -3794,7 +3890,7 @@ function systemdPolicyMountsProtectedDirectory(value, unitNames) {
     return fields.some((field) => {
       if (hasUnresolvedSystemdSpecifier(field) || !path.posix.isAbsolute(field)) return true;
       const mountedPath = normaliseBootPolicyPath(field);
-      return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+      return protectedSystemdMountPaths().some((protectedPath) => (
         systemdPathsOverlap(mountedPath, protectedPath)
       ));
     });
@@ -3815,13 +3911,13 @@ function systemdPathUnitOverlapsProtectedDirectory(unitName) {
     : normaliseBootPolicyPath(
       `/${decodeSystemdEscapesForAudit(match[1].replaceAll('-', '/'))}`,
     );
-  return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+  return protectedSystemdMountPaths().some((protectedPath) => (
     systemdPathsOverlap(mountedPath, protectedPath)
   ));
 }
 
 function protectedSystemdPathUnitNames() {
-  return SYSTEMD_PROTECTED_DIRECTORY_PATHS.flatMap((protectedPath) => {
+  return protectedSystemdMountPaths().flatMap((protectedPath) => {
     const stem = protectedPath
       .slice(1)
       .split('/')
@@ -3829,6 +3925,22 @@ function protectedSystemdPathUnitNames() {
       .join('-');
     return [`${stem}.mount`, `${stem}.automount`];
   });
+}
+
+function protectedSystemdMountPaths() {
+  return [...new Set([
+    ...SYSTEMD_PROTECTED_DIRECTORY_PATHS,
+    ...IDENTITY_POLICY_PATHS,
+    ...STATIC_USERDB_DIRECTORIES,
+    SYSTEMD_USERDB_DIRECTORY,
+    SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
+    ...SYSTEMD_PROTECTED_UNIT_PATHS,
+    ...Object.values(BOOT_POLICY_DIRECTORIES).flat(),
+    ...CREDENTIAL_STORE_DIRECTORIES,
+    ...BOOT_POLICY_CREDENTIAL_PATHS,
+    TRANSACTION_PATH,
+    PROVISION_LOCK_PARENT,
+  ])];
 }
 
 function systemdPathsOverlap(left, right) {
@@ -4533,6 +4645,8 @@ function provisionDependencies(dependencies) {
       )),
     verifyMountNamespace: dependencies.verifyMountNamespace
       ?? (() => assertSameMountNamespace(fsApi)),
+    verifyNoExtendedPosixAcl: dependencies.verifyNoExtendedPosixAcl
+      ?? ((file) => assertNoExtendedPosixAcl(file, runCommand)),
     readUnitStates: dependencies.readUnitStates
       ?? ((units, identitySnapshot) => readSystemUnitStates(
         units,

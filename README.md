@@ -232,7 +232,9 @@ without creating files or directories. Before tmpfiles can mutate host state,
 existing managed targets must already have the expected object type, must not be
 symlinks, and managed files must have a single link. Apply rechecks those ancestors after
 tmpfiles and verifies every managed directory and lock file has its exact type,
-mode, and resolved UID/GID before the transaction can complete.
+mode, resolved UID/GID, and no extended POSIX ACL before the transaction can
+complete. ACL convergence uses the fixed read-only `/usr/bin/getfacl`
+entrypoint, which must be installed on the host.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
 launcher template units. It rejects unloaded policy and dependency directories
@@ -289,7 +291,8 @@ specifier/glob-prefix, lexical path and trailing-slash normalisation after the
 legacy `/var/run` alias is rewritten to `/run`, including glob-capable access,
 copy-source, path-derived-ID,
 owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
-metadata, and recursive-parent semantics. External
+metadata, recursive-parent semantics, and the complete remainder of copy and
+symlink argument fields rather than only their first word. External
 sysusers allocation-range directives are rejected. Before managed account
 allocation, external numeric UID, primary-GID, and group-GID claims within the
 managed local range must already be materialised in the complete identity
@@ -350,7 +353,10 @@ incomplete cross-directive data-flow analysis, including unescaped unit
 specifiers that can generate a `$` marker only after template instantiation.
 Every existing sysusers and
 tmpfiles search directory is validated before and after catalogue collection,
-even when the directory contributes no active file. The runtime system-credential
+even when the directory contributes no active file. Before a catalogue command
+runs, each `.conf` entry is opened non-blocking and must be a bounded,
+root-owned regular file or a stable root-owned `/dev/null` mask; FIFOs, devices,
+directories, and other links fail closed. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths
 and symlink targets.
 The legacy compatibility rule accepts only the exact `/var/run` link text
@@ -367,12 +373,16 @@ lock. The provisioner opens and compares its own and PID 1's mount namespace
 identities before inspection and immediately before every mutation path,
 including fd-backed writes and metadata changes.
 Dry-run, recovery, and apply loop through short reads while collecting and
-parsing bounded `/proc/self/mountinfo` data;
+parsing bounded `/proc/self/mountinfo` data through a non-blocking regular-file
+handle. The snapshot must contain exactly one root mount;
 managed tmpfiles targets, descendants, and non-standard redirected ancestors
 must not be mount points before any tmpfiles mutation. Standard ancestor mount
 points must have a unique filesystem device/root identity so filesystem-root
 bind mounts cannot masquerade as ordinary mounts; the root mount itself must
-also have a unique mountpoint and device/root identity. The process then verifies
+also have a unique mountpoint and device/root identity. Persistent mount and
+automount policy is rejected when it overlaps runtime, identity database,
+userdb, credential, system-unit, boot-policy, transaction, or shared-lock
+surfaces. The process then verifies
 the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a
