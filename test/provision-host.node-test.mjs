@@ -689,6 +689,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
       ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
+      ['tmpfiles', 'L /tmp/untrusted - - - - %t/systemd/userdb'],
       ['tmpfiles', 'f+ /var/run/systemd/system/external.service 0644 root root - payload'],
       ['tmpfiles', 'R /var/run/systemd/system/* - - - -'],
       ['tmpfiles', 'L+ /var/run/userdb/untrusted - - - - /tmp/provider'],
@@ -1387,6 +1388,10 @@ describe('guarded host provisioner execution', () => {
       ['external-host-identity.service', '[Service]\nUser=%H\n'],
       ['external-host-unit.service', '[Unit]\nWants=%H.service\n'],
       [
+        'external-composed@.service',
+        '[Unit]\nWants=webex-codex-%i@prod.service\n',
+      ],
+      [
         'external-empty-specifier.service',
         '[Unit]\nWants=webex-codex-activation-renew%W.service\n',
       ],
@@ -1759,6 +1764,35 @@ describe('guarded host provisioner execution', () => {
             }]],
           ]),
           { symlinksByPath: new Map([[managedLink, '../webex-generic-account-bot.service']]) },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    const escapedWantsDirectory =
+      '/etc/systemd/system/external.target.wants';
+    const escapedLauncherInstance =
+      'webex-codex-launcher@foo\\x20bar.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [escapedWantsDirectory, [{ name: escapedLauncherInstance }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              path.join(escapedWantsDirectory, escapedLauncherInstance),
+              Buffer.from(''),
+            ]]),
+          },
         ),
       ),
       /external systemd policy references a managed unit/,

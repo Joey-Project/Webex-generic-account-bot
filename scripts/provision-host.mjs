@@ -43,7 +43,6 @@ const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
-const SYMBOLIC_LAUNCHER_INSTANCE = 'webex-codex-launcher@instance.service';
 const SYSTEMD_UNIT_NAME_PATTERN =
   /\.(?:automount|device|mount|path|scope|service|slice|socket|swap|target|timer)$/;
 const SYSTEMD_USERDB_DIRECTORY = '/run/systemd/userdb';
@@ -2166,6 +2165,7 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
       || pathFieldTouchesProtected(argument, false, protectedPaths);
   }
   if (type.startsWith('L')) {
+    if (argument.includes('%')) return true;
     const resolvedTarget = argument.startsWith('/')
       ? argument
       : path.posix.resolve(path.posix.dirname(policyPath), argument);
@@ -2599,7 +2599,8 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   managedIds = new Set(),
   logicalSource = source,
 ) {
-  const decoded = decodeSystemdEscapesForAudit(String(value));
+  const raw = String(value);
+  const decoded = decodeSystemdEscapesForAudit(raw);
   if (systemdPolicyInjectsBootPolicyCredential(
     decoded,
     source,
@@ -2608,9 +2609,14 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   )) {
     throw new Error(`external systemd policy injects a boot policy credential: ${source}`);
   }
+  const representations = new Set([raw, decoded]);
   const expanded = new Set(unitNames.size === 0
-    ? [decoded]
-    : [...unitNames].map((unitName) => expandSystemdUnitNameSpecifiers(decoded, unitName)));
+    ? representations
+    : [...representations].flatMap((representation) => (
+      [...unitNames].map((unitName) => (
+        expandSystemdUnitNameSpecifiers(representation, unitName)
+      ))
+    )));
   for (const candidate of expanded) {
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
@@ -2717,31 +2723,81 @@ function unresolvedSpecifierCouldReferenceManagedUnit(value) {
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
   if (!SYSTEMD_UNIT_REFERENCE_DIRECTIVES.has(directive)) return false;
-  const managedUnits = [...MANAGED_UNITS, SYMBOLIC_LAUNCHER_INSTANCE];
   return parseSystemdFields(value.slice(separator + 1))
-    .some((field) => systemdSpecifierFieldCouldMatch(field, managedUnits));
+    .some((field) => systemdSpecifierFieldCouldMatch(field, MANAGED_UNITS));
 }
 
 function systemdSpecifierFieldCouldMatch(field, candidates) {
   let pattern = '';
   let hasUnresolvedSpecifier = false;
+  const tokens = [];
   for (let offset = 0; offset < field.length; offset += 1) {
     if (field[offset] !== '%') {
       pattern += escapeRegExp(field[offset]);
+      tokens.push({ literal: field[offset], repeat: false });
       continue;
     }
     if (field[offset + 1] === '%') {
       pattern += escapeRegExp('%');
+      tokens.push({ literal: '%', repeat: false });
       offset += 1;
       continue;
     }
     hasUnresolvedSpecifier = true;
     pattern += '[^\\s/]*';
+    tokens.push({ characterClass: 'unit', repeat: true });
     if (offset + 1 < field.length) offset += 1;
   }
   if (!hasUnresolvedSpecifier) return false;
   const reference = new RegExp(`^${pattern}$`);
-  return candidates.some((candidate) => reference.test(candidate));
+  return candidates.some((candidate) => reference.test(candidate))
+    || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
+}
+
+function launcherReferenceTokens() {
+  return [
+    ...[...'webex-codex-launcher@'].map((literal) => ({ literal, repeat: false })),
+    { characterClass: 'launcher-instance', repeat: false },
+    { characterClass: 'launcher-instance', repeat: true },
+    ...[...'.service'].map((literal) => ({ literal, repeat: false })),
+  ];
+}
+
+function systemdTokenPatternsIntersect(left, right) {
+  const pending = [[0, 0]];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const [leftOffset, rightOffset] = pending.pop();
+    const state = `${leftOffset}:${rightOffset}`;
+    if (visited.has(state)) continue;
+    visited.add(state);
+    if (leftOffset === left.length && rightOffset === right.length) return true;
+    const leftToken = left[leftOffset];
+    const rightToken = right[rightOffset];
+    if (leftToken?.repeat) pending.push([leftOffset + 1, rightOffset]);
+    if (rightToken?.repeat) pending.push([leftOffset, rightOffset + 1]);
+    if (leftToken && rightToken && systemdTokenCharactersIntersect(leftToken, rightToken)) {
+      pending.push([
+        leftToken.repeat ? leftOffset : leftOffset + 1,
+        rightToken.repeat ? rightOffset : rightOffset + 1,
+      ]);
+    }
+  }
+  return false;
+}
+
+function systemdTokenCharactersIntersect(left, right) {
+  if (left.literal !== undefined && right.literal !== undefined) {
+    return left.literal === right.literal;
+  }
+  if (left.literal !== undefined) return systemdTokenAllows(right, left.literal);
+  if (right.literal !== undefined) return systemdTokenAllows(left, right.literal);
+  return true;
+}
+
+function systemdTokenAllows(token, character) {
+  if (/[\s/]/.test(character)) return false;
+  return token.characterClass !== 'launcher-instance' || character !== '@';
 }
 
 function unitNameClaimsManagedIdentity(unitName) {

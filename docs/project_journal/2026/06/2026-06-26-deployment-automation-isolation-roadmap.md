@@ -176,8 +176,9 @@ superseded_by:
   symbolic shared dash-prefix drop-ins preserved across physical-file symlinks,
   named/implicit-DynamicUser assignments, unresolved dynamic identity
   specifiers outside the physical-file/logical-owner-bound vendor user-manager
-  assignment plus symbolic managed-unit reachability checks for all unresolved
-  dynamic unit-reference specifiers, pre-allocation
+  assignment plus language-intersection managed-unit and launcher reachability
+  checks for all unresolved dynamic unit-reference specifiers, including raw
+  escaped and decoded policy names, pre-allocation
   rejection of static-range numeric identities,
   boot-policy credential injection with exact/trailing-glob/glob-rename-prefix-aware
   selectors, fail-closed complex wildcard handling, and
@@ -192,7 +193,8 @@ superseded_by:
   compatibility-link text, and copy-source
   paths, source-associated managed-policy upgrades, path-derived-ID,
   allocation-range rejection, owner modifiers, numeric
-  identities, ACL principals, and symlink targets, protected root, identity
+  identities, ACL principals, and fail-closed specifier-bearing symlink targets,
+  protected root, identity
   databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
   system-unit load paths, and installed
   policy targets, traversal-preserving ancestor metadata, recursive parent
