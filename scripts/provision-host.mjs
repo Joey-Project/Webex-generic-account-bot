@@ -1263,11 +1263,11 @@ export async function executeIdentityRecovery({
       child.once('error', reject);
       child.once('exit', (code, signal) => {
         if (signal) {
-          reject(new Error(`identity recovery supervisor terminated by signal ${signal}`));
+          reject(new Error(`identity recovery process terminated by signal ${signal}`));
           return;
         }
         if (code !== 0) {
-          reject(new Error(`identity recovery supervisor failed with exit code ${code ?? 1}`));
+          reject(new Error(`identity recovery process failed with exit code ${code ?? 1}`));
           return;
         }
         resolve();
@@ -1286,13 +1286,13 @@ export async function runIdentityRecoveryChild({
   const deps = provisionDependencies(dependencies);
   const plan = dependencies.plan ?? buildProvisionPlan();
   if (!allowTestInvocation && process.env[IDENTITY_RECOVERY_CHILD_ENV] !== '1') {
-    throw new Error('identity recovery child invocation is not authorised');
+    throw new Error('identity recovery process invocation is not authorised');
   }
   if (plan.targetRoot !== '/' && !deps.allowTestRoot) {
     throw new Error('non-production target roots are test-only');
   }
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
-    throw new Error('identity recovery child requires root');
+    throw new Error('identity recovery process requires root');
   }
   await deps.verifyIdentityLock();
   await deps.verifyPidNamespace();
@@ -1416,8 +1416,8 @@ export async function findOpenFileDescriptor(
 
 async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {}) {
   const lockPid = processApi.env?.[IDENTITY_LOCK_PID_ENV];
-  if (!/^[1-9][0-9]*$/.test(lockPid ?? '') || String(processApi.ppid) !== lockPid) {
-    throw new Error('identity recovery child is not supervised by the lock holder');
+  if (!/^[1-9][0-9]*$/.test(lockPid ?? '') || String(processApi.pid) !== lockPid) {
+    throw new Error('identity recovery process is not the identity lock holder');
   }
   await assertTrustedDirectoryChain('/', path.dirname(IDENTITY_LOCK_PATH), 0, 0, fsApi);
   const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
@@ -1435,6 +1435,8 @@ async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {})
       !stat.isFile()
       || stat.isSymbolicLink()
       || stat.nlink !== 1
+      || stat.uid !== 0
+      || stat.gid !== 0
       || ((stat.mode & 0o7777) & 0o077) !== 0
     ) {
       throw new Error('system identity database lock file is not trusted');
@@ -1449,7 +1451,7 @@ async function assertIdentityLockHeld({ fsApi = fs, processApi = process } = {})
   assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
   const procLocks = await readBoundedProcFile('/proc/locks', MAX_PROC_LOCKS_BYTES, fsApi);
   if (!hasIdentityLock(procLocks, lockPid, stat)) {
-    throw new Error('identity recovery supervisor does not hold the system identity lock');
+    throw new Error('identity recovery process does not hold the system identity lock');
   }
 }
 

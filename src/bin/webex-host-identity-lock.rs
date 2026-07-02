@@ -23,6 +23,10 @@ const DEPLOYMENT_LOCK_PATH: &str = "/run/webex-config-deploy/deploy-config.lock"
 #[cfg(target_os = "linux")]
 const PARENT_PID_ENV: &str = "WEBEX_HOST_IDENTITY_LOCK_PARENT_PID";
 #[cfg(target_os = "linux")]
+const IDENTITY_LOCK_PATH: &str = "/etc/.pwd.lock";
+#[cfg(target_os = "linux")]
+const MAX_AUDITED_FDS: usize = 1024;
+#[cfg(target_os = "linux")]
 const IDENTITY_RECOVERY_BOOTSTRAP: &str = concat!(
     "const { readFileSync } = await import(\"node:fs\"); ",
     "const source = readFileSync(5).toString(\"base64\"); ",
@@ -37,7 +41,9 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
-struct PasswordDatabaseLock;
+struct PasswordDatabaseLock {
+    _fd: RawFd,
+}
 
 #[cfg(target_os = "linux")]
 struct DeploymentLock {
@@ -95,8 +101,75 @@ impl PasswordDatabaseLock {
             return Err(std::io::Error::last_os_error())
                 .context("failed to acquire the system identity database lock");
         }
-        Ok(Self)
+        match retain_lock_descriptor_across_exec(Path::new(IDENTITY_LOCK_PATH), 0, 0) {
+            Ok(fd) => Ok(Self { _fd: fd }),
+            Err(error) => {
+                unsafe {
+                    ulckpwdf();
+                }
+                Err(error).context("failed to retain the system identity database lock")
+            }
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn retain_lock_descriptor_across_exec(
+    path: &Path,
+    required_uid: u32,
+    required_gid: u32,
+) -> Result<RawFd> {
+    let expected = fs::symlink_metadata(path).context("failed to inspect the lock path")?;
+    if !expected.is_file()
+        || expected.file_type().is_symlink()
+        || expected.uid() != required_uid
+        || expected.gid() != required_gid
+        || expected.nlink() != 1
+        || (expected.mode() & 0o077) != 0
+    {
+        return Err(anyhow!("lock path metadata is not trusted"));
+    }
+    let entries = fs::read_dir("/proc/self/fd").context("failed to inspect process descriptors")?;
+    let mut matches = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_AUDITED_FDS {
+            return Err(anyhow!(
+                "process file descriptor table exceeds the audit limit"
+            ));
+        }
+        let entry = entry.context("failed to inspect a process descriptor")?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<RawFd>().ok())
+        else {
+            continue;
+        };
+        if fd < 3 {
+            continue;
+        }
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("failed to inspect a process descriptor"),
+        };
+        if metadata.dev() == expected.dev() && metadata.ino() == expected.ino() {
+            matches.push(fd);
+        }
+    }
+    let [fd] = matches.as_slice() else {
+        return Err(anyhow!("identity lock descriptor is missing or ambiguous"));
+    };
+    let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect identity lock descriptor flags");
+    }
+    if unsafe { libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to retain identity lock descriptor across exec");
+    }
+    Ok(*fd)
 }
 
 #[cfg(target_os = "linux")]
@@ -123,16 +196,16 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn run() -> Result<i32> {
     if env::args_os().len() != 1 {
-        return Err(anyhow!("identity lock supervisor accepts no arguments"));
+        return Err(anyhow!("identity recovery helper accepts no arguments"));
     }
     if unsafe { libc::geteuid() } != 0 {
-        return Err(anyhow!("identity lock supervisor requires root"));
+        return Err(anyhow!("identity recovery helper requires root"));
     }
     let expected_parent = expected_parent_pid()?;
     arm_parent_death_signal(expected_parent)?;
     let _deployment_lock = DeploymentLock::acquire()?;
     let _lock = PasswordDatabaseLock::acquire()?;
-    let supervisor_pid = unsafe { libc::getpid() };
+    let lock_holder_pid = unsafe { libc::getpid() };
     let mut command = Command::new(NODE_FD_PATH);
     command
         .arg0("/usr/bin/node")
@@ -151,31 +224,12 @@ fn run() -> Result<i32> {
         .env("WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS", "1")
         .env("WEBEX_HOST_PROVISION_SOURCE_ROOT", SOURCE_ROOT)
         .env("WEBEX_HOST_IDENTITY_RECOVERY_CHILD", "1")
-        .env("WEBEX_HOST_IDENTITY_LOCK_PID", supervisor_pid.to_string())
+        .env("WEBEX_HOST_IDENTITY_LOCK_PID", lock_holder_pid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // SAFETY: pre_exec performs only async-signal-safe libc calls and creates
-    // no allocations. The parent PID check closes the parent-death race.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != supervisor_pid {
-                return Err(std::io::Error::other(
-                    "identity lock supervisor exited before child setup",
-                ));
-            }
-            Ok(())
-        });
-    }
-    let status = command
-        .status()
-        .context("failed to start the identity recovery child")?;
-    status
-        .code()
-        .ok_or_else(|| anyhow!("identity recovery child terminated by signal"))
+    let error = command.exec();
+    Err(error).context("failed to exec the identity recovery process")
 }
 
 #[cfg(target_os = "linux")]
@@ -200,7 +254,7 @@ fn arm_parent_death_signal(expected_parent: libc::pid_t) -> Result<()> {
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to bind the identity lock supervisor to its parent");
+                .context("failed to bind the identity recovery process to its parent");
         }
         if libc::getppid() != expected_parent {
             return Err(anyhow!(
@@ -213,7 +267,7 @@ fn arm_parent_death_signal(expected_parent: libc::pid_t) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("identity lock supervisor requires Linux");
+    eprintln!("identity recovery process requires Linux");
     std::process::exit(1);
 }
 
@@ -222,11 +276,25 @@ mod tests {
     use super::*;
     use std::{
         fs::OpenOptions,
-        os::unix::fs::OpenOptionsExt,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
         sync::atomic::{AtomicU64, Ordering},
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const EXEC_LOCK_STAGE_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_STAGE";
+    const EXEC_LOCK_PATH_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_PATH";
+    const EXEC_LOCK_FD_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_FD";
+    const EXEC_LOCK_TEST_EXE_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_TEST_EXE";
+    const NODE_LOCK_VERIFIER: &str = concat!(
+        "const fs = require('node:fs'); ",
+        "const { spawnSync } = require('node:child_process'); ",
+        "fs.fstatSync(Number(process.env.WEBEX_TEST_IDENTITY_LOCK_EXEC_FD)); ",
+        "const env = { ...process.env, WEBEX_TEST_IDENTITY_LOCK_EXEC_STAGE: 'contend' }; ",
+        "const result = spawnSync(process.env.WEBEX_TEST_IDENTITY_LOCK_TEST_EXE, ",
+        "['--exact', 'tests::password_lock_descriptor_survives_exec', '--nocapture'], ",
+        "{ env, stdio: 'inherit' }); ",
+        "process.exit(result.status ?? 1);"
+    );
 
     #[test]
     fn child_contract_is_fixed_and_fd_bound() {
@@ -291,6 +359,34 @@ mod tests {
     }
 
     #[test]
+    fn password_lock_descriptor_survives_exec() {
+        if let Ok(stage) = env::var(EXEC_LOCK_STAGE_ENV) {
+            run_exec_lock_stage(&stage);
+            return;
+        }
+        let path = env::temp_dir().join(format!(
+            "webex-password-lock-exec-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::write(&path, []).expect("create exec lock test file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set exec lock test mode");
+        let status = Command::new(env::current_exe().expect("resolve test executable"))
+            .args([
+                "--exact",
+                "tests::password_lock_descriptor_survives_exec",
+                "--nocapture",
+            ])
+            .env(EXEC_LOCK_STAGE_ENV, "acquire")
+            .env(EXEC_LOCK_PATH_ENV, &path)
+            .status()
+            .expect("start exec lock test process");
+        assert!(status.success(), "exec lock test process failed: {status}");
+        fs::remove_file(path).expect("remove exec lock test file");
+    }
+
+    #[test]
     fn parent_death_signal_rejects_the_wrong_parent() {
         let wrong_parent = unsafe { libc::getppid() }.saturating_add(1);
         let error = arm_parent_death_signal(wrong_parent).expect_err("reject wrong parent");
@@ -304,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_death_signal_kills_an_orphaned_supervisor() {
+    fn parent_death_signal_kills_an_orphaned_recovery_process() {
         let ready = create_pipe();
         let worker_pid = create_pipe();
         let release = create_pipe();
@@ -374,6 +470,59 @@ mod tests {
         assert_ne!(descriptor.revents & libc::POLLIN, 0);
         close_fd(pidfd);
         close_fd(worker_pid[0]);
+    }
+
+    fn run_exec_lock_stage(stage: &str) {
+        let path = std::path::PathBuf::from(
+            env::var_os(EXEC_LOCK_PATH_ENV).expect("exec lock path is present"),
+        );
+        match stage {
+            "acquire" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("open exec lock test file");
+                assert_eq!(set_posix_write_lock(file.as_raw_fd()), 0);
+                let fd =
+                    retain_lock_descriptor_across_exec(&path, unsafe { libc::geteuid() }, unsafe {
+                        libc::getegid()
+                    })
+                    .expect("retain POSIX lock descriptor");
+                assert_eq!(fd, file.as_raw_fd());
+                let mut command = Command::new("node");
+                command
+                    .args(["-e", NODE_LOCK_VERIFIER])
+                    .env(EXEC_LOCK_PATH_ENV, &path)
+                    .env(EXEC_LOCK_FD_ENV, fd.to_string())
+                    .env(
+                        EXEC_LOCK_TEST_EXE_ENV,
+                        env::current_exe().expect("resolve test executable"),
+                    );
+                let error = command.exec();
+                panic!("failed to exec Node lock verifier: {error}");
+            }
+            "contend" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .expect("open competing lock descriptor");
+                assert_eq!(set_posix_write_lock(file.as_raw_fd()), -1);
+                assert!(matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EACCES) | Some(libc::EAGAIN)
+                ));
+            }
+            _ => panic!("unexpected exec lock stage: {stage}"),
+        }
+    }
+
+    fn set_posix_write_lock(fd: RawFd) -> libc::c_int {
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) }
     }
 
     fn create_pipe() -> [RawFd; 2] {

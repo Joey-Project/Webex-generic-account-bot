@@ -220,7 +220,7 @@ binaries, rendered config, and the activation-owned
 `webex-generic-account-bot.service.d/10-codex-launcher.conf` drop-in.
 Apply also requires root-owned, non-writable ancestors and files for both the
 Node executable, provisioner script, and fixed
-`/opt/webex-generic-account-bot/bin/webex-host-identity-lock` supervisor; do not
+`/opt/webex-generic-account-bot/bin/webex-host-identity-lock` helper; do not
 run this root workflow through a user-managed Node installation or checkout.
 
 Both modes require root so the complete files-backed `shadow` and `gshadow`
@@ -464,15 +464,18 @@ order with atomic renames and directory fsyncs, then reruns sysusers and
 requires the complete strict identity contract. A recovery interrupted during
 those reverse renames converges on the next apply; a missing, modified, or stale
 backup fails closed instead of overwriting administrator changes. The native
-identity-lock supervisor holds glibc's system password-database lock while a
-fixed FD-bound recovery child repeats the complete read-only recovery preflight.
+identity-lock helper acquires glibc's system password-database lock, identifies
+its unique descriptor, clears only that descriptor's `CLOEXEC` flag, and then
+executes the fixed FD-bound Node recovery in place. The same PID therefore
+holds the password-database lock while repeating the complete read-only
+recovery preflight and applying each rename.
 The locked provisioner identifies exactly one descriptor for the shared host
 deployment `flock` and passes that same open-file-description to the native
-supervisor. The supervisor validates and retains it for the entire recovery,
-and binds both itself and its recovery child to their expected parent with
-`PR_SET_PDEATHSIG` plus PPID race checks. An outer provisioner crash therefore
+helper. The helper validates and retains it for the entire recovery, and binds
+the same exec-preserved process to its expected parent with `PR_SET_PDEATHSIG`
+plus a PPID race check. An outer provisioner crash therefore
 cannot orphan identity mutation after releasing the shared deployment lock.
-That child copies verified backup contents into fixed private candidates and
+That process copies verified backup contents into fixed private candidates and
 atomically installs those candidates, preserving the standard `*-` backups.
 Legacy version 1 and 2 journals do not bind identity-file digests, so a partial
 identity commit under either legacy format fails closed and requires explicit

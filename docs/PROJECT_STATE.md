@@ -173,8 +173,9 @@
   first-run lock convergence, followed by protected mount snapshots around
   sysusers/tmpfiles and repeated identity/policy/runtime-ownership checks under
   the held lock, including explicit inheritance of that deployment-lock
-  open-file-description into the native identity supervisor and parent-death
-  binding for both supervisor and recovery child,
+  open-file-description into the native identity helper, exec preservation of
+  the glibc password-lock descriptor so the mutating PID owns the lock, and
+  parent-death binding across that exec,
   managed-name-free stale candidates that remain recoverable through systemd
   policy scanning, fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full
@@ -185,8 +186,9 @@
   failures force the current installation journal's old set, reload, and
   dormant revalidation, complete-desired version 3 recovery admits only locked
   passwd/shadow or group/gshadow counterpart interruptions before rerunning
-  sysusers, with glibc password-database locking, a supervised FD-bound recovery
-  child, preserved standard backups, and private atomic recovery candidates.
+  sysusers, with glibc password-database locking held by the same FD-bound
+  recovery process across exec, preserved standard backups, and private atomic
+  recovery candidates.
   Legacy journals with partial identity commits require manual repair. A
   versioned marker preserves bounded version 3 recovery after a
   forced-old safety rollback while unmarked old/mixed transactions stay strict,

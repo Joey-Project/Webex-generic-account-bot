@@ -263,8 +263,8 @@ superseded_by:
   journal retained after installation rollback and through final manager convergence,
   current-installation forced-old reload and dormant revalidation after final
   manager safety failures, narrowly bounded version 3 credential-counterpart
-  recovery before rerunning sysusers under glibc password-database locking and
-  a supervised FD-bound child, with private atomic candidates that preserve the
+  recovery before rerunning sysusers under a glibc password-database lock held
+  across exec by the same FD-bound mutating process, with private atomic candidates that preserve the
   standard backups. Legacy partial identity commits require manual repair. A
   versioned marker preserves only version 3 recovery after forced-old safety
   rollback while unmarked old/mixed
@@ -300,13 +300,13 @@ superseded_by:
 - Add a default-dry-run, explicit-apply provisioner with a fixed artifact
   allowlist, atomic root-owned installation, sysusers/tmpfiles application,
   manager reload, and post-install verification.
-- Add the fixed-purpose `webex-host-identity-lock` native supervisor so
+- Add the fixed-purpose `webex-host-identity-lock` native helper so
   version 3 identity recovery shares systemd-sysusers' glibc-compatible account
   database lock without exposing a general root command wrapper. Pass and
   retain the exact shared deployment-lock open-file-description across this
-  supervisor boundary, and bind the supervisor and child to expected-parent
-  death so an outer crash cannot orphan identity mutation without the global
-  lock.
+  helper boundary, retain the password-lock descriptor while execing the fixed
+  Node recovery in the same PID, and bind that process to expected-parent death
+  so an outer crash cannot orphan identity mutation without either lock.
 - Before installation, reject pre-existing static bot membership in every
   launcher, input, config-pull, or config-deploy group because systemd extends
   user-database groups even after an empty `SupplementaryGroups=` assignment.
