@@ -3151,17 +3151,6 @@ function assertSystemdPolicyDoesNotReferenceManaged(
 ) {
   const raw = String(value);
   const decoded = decodeSystemdEscapesForAudit(raw);
-  if (
-    systemdPolicyInvokesBootPolicyTool(decoded)
-    && !isExpectedVendorBootPolicyConsumerSource(
-      source,
-      unitNames,
-      logicalSource,
-      symlinkDepth,
-    )
-  ) {
-    throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
-  }
   if (systemdPolicyInjectsBootPolicyCredential(
     decoded,
     source,
@@ -3180,6 +3169,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       ))
     )));
   for (const candidate of expanded) {
+    if (
+      systemdPolicyInvokesBootPolicyTool(candidate)
+      && !isExpectedVendorBootPolicyConsumerSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
+      throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
+    }
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
@@ -3206,7 +3206,7 @@ function systemdPolicyInvokesBootPolicyTool(value) {
   if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
   const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
-  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!]+/, '')));
+  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
   if (names.some((name) => BOOT_POLICY_EXECUTABLES.has(name))) return true;
   return names.includes('systemd-userdbd') && tokens.includes('--load-credentials');
 }

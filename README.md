@@ -309,7 +309,7 @@ cannot bypass the merged policy audit. Consumer masks, dangling links, and
 non-regular symlink targets are rejected before terminal-link handling can skip
 the vendor provenance check. External unit execution directives may not invoke
 `systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
-including through linked helper units.
+including through linked helper units or unit-name specifier expansion.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.

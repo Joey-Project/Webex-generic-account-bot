@@ -197,7 +197,8 @@ superseded_by:
   plus exact/shared drop-ins and consumer-owned dependency directories before
   their commands can bypass merged catalogue auditing, and rejects masks,
   dangling links, non-regular consumer symlink targets, and direct boot-policy
-  tool execution from external or linked helper units, plus
+  tool execution from external or linked helper units after unit-name specifier
+  expansion, plus
   launcher-instance reference rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact

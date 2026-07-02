@@ -1918,6 +1918,34 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const [name, policy] of [
+      [
+        'external-tmpfiles.service',
+        '[Service]\nExecStart=|/usr/bin/systemd-%j --create /etc/rogue.conf\n',
+      ],
+      [
+        'external-sysusers.service',
+        '[Service]\nExecStart=/usr/bin/systemd-%j /etc/rogue.conf\n',
+      ],
+      [
+        'external-userdb.service',
+        '[Service]\nExecStart=/usr/lib/systemd/systemd-%jd --load-credentials\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy invokes a boot policy tool/,
+      );
+    }
+
     const helperWants = '/etc/systemd/system/external.target.wants';
     const helperLink = `${helperWants}/external-helper.service`;
     const helperTarget = '/usr/lib/systemd/system/external-helper.service';
