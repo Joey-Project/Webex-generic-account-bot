@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
+const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
 
 const inheritedSourceRoot = process.env[SOURCE_ROOT_ENV];
 if (inheritedSourceRoot && process.env[PRIVATE_MOUNT_NAMESPACE_ENV] !== '1') {
@@ -44,7 +45,7 @@ const MAX_MOUNTINFO_BYTES = 8 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES = 16_384;
 const MAX_MANAGED_ID = 59_999;
 const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
-const TRANSACTION_VERSION = 2;
+const TRANSACTION_VERSION = 3;
 const TRANSACTION_PATH =
   '/etc/systemd/system/.webex-host-provision.transaction.json';
 const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
@@ -191,6 +192,12 @@ const IDENTITY_POLICY_PATHS = Object.freeze([
   '/etc/shadow',
   '/etc/group',
   '/etc/gshadow',
+]);
+const IDENTITY_DATABASE_COMMIT_ORDER = Object.freeze([
+  '/etc/group',
+  '/etc/gshadow',
+  '/etc/passwd',
+  '/etc/shadow',
 ]);
 const BOOT_POLICY_CREDENTIAL_NAMES = Object.freeze([
   'sysusers.extra',
@@ -517,8 +524,8 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: node scripts/provision-host.mjs [--dry-run] [--json]',
-    '       node scripts/provision-host.mjs --apply [--json]',
+    'Usage: /opt/webex-generic-account-bot/code/scripts/provision-host [--dry-run] [--json]',
+    '       /opt/webex-generic-account-bot/code/scripts/provision-host --apply [--json]',
     '',
     'Dry-run is the default. The production source and target paths are fixed.',
   ].join('\n');
@@ -838,7 +845,19 @@ export async function provisionHost(options, dependencies = {}) {
     const transactionInspection = await inspectPolicyTransactionRecovery(transaction, plan, deps);
     identityBefore = await deps.readIdentitySnapshot();
     if (transactionInspection.resumeDesiredState || transaction.identityRecoveryRequired) {
-      identityRecoveryRequired = validateIdentityPolicyForTransactionRecovery(identityBefore);
+      try {
+        validateIdentityPolicy(identityBefore);
+      } catch {
+        await deps.recoverIdentityDatabases(transaction, identityBefore, {
+          apply: !options.recoveryPreflight,
+        });
+        identityRecoveryRequired = true;
+        if (!options.recoveryPreflight) {
+          identityBefore = await deps.readIdentitySnapshot();
+          validateIdentityPolicy(identityBefore);
+          identityRecoveryRequired = false;
+        }
+      }
     } else {
       validateIdentityPolicy(identityBefore);
     }
@@ -919,12 +938,16 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
+  const identityFilesBefore = await deps.readIdentityFileState(identityBefore);
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps, {
     identityRecoveryRequired,
+    identityFiles: identityFilesBefore,
   });
-  const safetyRollbackTransaction = transactionFromInspected(inspected);
+  const safetyRollbackTransaction = transactionFromInspected(inspected, {
+    identityFiles: identityFilesBefore,
+  });
   try {
     const mountsBeforeSysusers = assertNoUnexpectedManagedMounts(
       plan,
@@ -1008,11 +1031,6 @@ export async function provisionHost(options, dependencies = {}) {
     );
   }
   return provisionReport('applied', plan, inspected, commands, installed);
-}
-
-function validateIdentityPolicyForTransactionRecovery(snapshot) {
-  validateIdentityPolicy(snapshot);
-  return false;
 }
 
 export async function runCli({
@@ -1123,7 +1141,7 @@ export async function executeLockedApply(argv, {
     const command = buildLockedApplyCommand({
       argv,
       nodePath: '/proc/self/fd/4',
-      scriptPath: '/proc/self/fd/5',
+      scriptPath: FD_REEXEC_SCRIPT_PATH,
       unsharePath: '/proc/self/fd/3',
     });
     return await new Promise((resolve, reject) => {
@@ -1330,12 +1348,18 @@ async function installPolicySetAtomically(
   inspected,
   plan,
   deps,
-  { identityRecoveryRequired = false } = {},
+  { identityRecoveryRequired = false, identityFiles } = {},
 ) {
   const changed = inspected.artifacts.filter(({ changed }) => changed);
   const staged = [];
-  const rollbackTransaction = transactionFromInspected(inspected, { identityRecoveryRequired });
-  await writeProvisionTransaction(inspected, plan, deps, { identityRecoveryRequired });
+  const rollbackTransaction = transactionFromInspected(inspected, {
+    identityRecoveryRequired,
+    identityFiles,
+  });
+  await writeProvisionTransaction(inspected, plan, deps, {
+    identityRecoveryRequired,
+    identityFiles,
+  });
   if (changed.length === 0) return [];
   try {
     for (const artifact of changed) {
@@ -1377,11 +1401,15 @@ async function installPolicySetAtomically(
 
 function transactionFromInspected(
   inspected,
-  { identityRecoveryRequired = false } = {},
+  { identityRecoveryRequired = false, identityFiles } = {},
 ) {
+  if (!Array.isArray(identityFiles)) {
+    throw new Error('identity recovery metadata is unavailable');
+  }
   return Object.freeze({
     version: TRANSACTION_VERSION,
     identityRecoveryRequired,
+    identityFiles: Object.freeze(identityFiles.map((entry) => Object.freeze({ ...entry }))),
     artifacts: Object.freeze(inspected.artifacts.map((artifact) => Object.freeze({
       target: artifact.target,
       desiredSha256: artifact.source.sha256,
@@ -1777,6 +1805,229 @@ async function readTrustedSensitiveIdentityFile(file, allowedGids, allowedModes,
   }
 }
 
+export async function restoreInterruptedIdentityDatabases(
+  transaction,
+  snapshot,
+  {
+    apply = false,
+    fsApi = fs,
+    targetRoot = '/',
+    verifyMountNamespace = () => assertSameMountNamespace(fsApi),
+    readMountInfo = () => readBoundedProcFile(
+      '/proc/self/mountinfo',
+      MAX_MOUNTINFO_BYTES,
+      fsApi,
+    ),
+  } = {},
+) {
+  if (!Array.isArray(transaction.identityFiles)) {
+    throw new Error('identity recovery metadata is unavailable');
+  }
+  const currentFiles = new Map();
+  const originalFiles = new Map();
+  const changed = [];
+  const protectedPaths = new Set(transaction.identityFiles.flatMap((entry) => {
+    const target = rootedPath(targetRoot, entry.path);
+    return [target, `${target}-`];
+  }));
+  const mountsBeforeRecovery = assertNoUnexpectedMountsForPaths(
+    protectedPaths,
+    await readMountInfo(),
+  );
+  for (const expected of transaction.identityFiles) {
+    const target = rootedPath(targetRoot, expected.path);
+    const current = await readTrustedIdentityRecoveryFile(target, expected, fsApi);
+    currentFiles.set(expected.path, current);
+    if (current.sha256 === expected.sha256) {
+      originalFiles.set(expected.path, current);
+      continue;
+    }
+    const backup = await readTrustedIdentityRecoveryFile(`${target}-`, expected, fsApi);
+    if (backup.sha256 !== expected.sha256) {
+      throw new Error(`identity recovery backup digest mismatch: ${expected.path}`);
+    }
+    assertUnmanagedIdentityRecordsUnchanged(
+      current.contents,
+      backup.contents,
+      expected.path,
+    );
+    originalFiles.set(expected.path, backup);
+    changed.push(Object.freeze({ expected, target, current, backup }));
+  }
+
+  validateIdentityPolicy(identitySnapshotFromFiles(originalFiles));
+  validateIdentityPolicyForDesiredRecovery(identitySnapshotFromFiles(
+    currentFiles,
+    snapshot.effectiveGroups,
+  ));
+  if (!apply) return;
+
+  for (const entry of [...changed].reverse()) {
+    const current = await readTrustedIdentityRecoveryFile(
+      entry.target,
+      entry.expected,
+      fsApi,
+    );
+    const backup = await readTrustedIdentityRecoveryFile(
+      `${entry.target}-`,
+      entry.expected,
+      fsApi,
+    );
+    if (
+      !sameFileIdentity(current.stat, entry.current.stat)
+      || current.sha256 !== entry.current.sha256
+      || !sameFileIdentity(backup.stat, entry.backup.stat)
+      || backup.sha256 !== entry.expected.sha256
+    ) {
+      throw new Error(`identity database changed during recovery: ${entry.expected.path}`);
+    }
+    await verifyMountNamespace('identity-recovery-rename');
+    await fsApi.rename(`${entry.target}-`, entry.target);
+    await syncDirectory(path.dirname(entry.target), fsApi);
+  }
+
+  for (const expected of transaction.identityFiles) {
+    const restored = await readTrustedIdentityRecoveryFile(
+      rootedPath(targetRoot, expected.path),
+      expected,
+      fsApi,
+    );
+    if (restored.sha256 !== expected.sha256) {
+      throw new Error(`identity database recovery failed: ${expected.path}`);
+    }
+  }
+  const mountsAfterRecovery = assertNoUnexpectedMountsForPaths(
+    protectedPaths,
+    await readMountInfo(),
+  );
+  assertProtectedMountSnapshotUnchanged(mountsBeforeRecovery, mountsAfterRecovery);
+}
+
+async function readTrustedIdentityRecoveryFile(file, expected, fsApi) {
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.nlink !== 1
+      || before.uid !== expected.uid
+      || before.gid !== expected.gid
+      || (before.mode & 0o7777) !== expected.mode
+      || before.size < 0
+      || before.size > MAX_IDENTITY_FILE_BYTES
+    ) {
+      throw new Error(`identity recovery file metadata is not trusted: ${file}`);
+    }
+    const contents = await handle.readFile();
+    if (contents.length !== before.size) {
+      throw new Error(`identity recovery file size is invalid: ${file}`);
+    }
+    const after = await handle.stat();
+    if (!sameFileIdentity(before, after)) {
+      throw new Error(`identity recovery file changed while reading: ${file}`);
+    }
+    return Object.freeze({
+      contents,
+      sha256: createHash('sha256').update(contents).digest('hex'),
+      stat: before,
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
+function identitySnapshotFromFiles(files, effectiveGroups = null) {
+  const texts = Object.fromEntries([...files].map(([file, record]) => (
+    [file, record.contents.toString('utf8')]
+  )));
+  let effective = effectiveGroups;
+  if (effective === null) {
+    const basic = parseIdentityDatabases(texts['/etc/passwd'], texts['/etc/group']);
+    effective = Object.fromEntries(Object.values(MANAGED_USERS)
+      .filter((user) => basic.users.has(user))
+      .map((user) => {
+        const record = basic.users.get(user);
+        return [user, [
+          record.gid,
+          ...[...basic.groups.values()]
+            .filter((group) => group.members.includes(user))
+            .map((group) => group.gid),
+        ]];
+      }));
+  } else if (effective instanceof Map) {
+    effective = Object.fromEntries(
+      [...effective].map(([user, gids]) => [user, [...gids]]),
+    );
+  }
+  return parseIdentityDatabases(
+    texts['/etc/passwd'],
+    texts['/etc/group'],
+    effective,
+    texts['/etc/gshadow'],
+    texts['/etc/shadow'],
+  );
+}
+
+function assertUnmanagedIdentityRecordsUnchanged(current, original, file) {
+  const managed = new Set([
+    ...Object.values(MANAGED_USERS),
+    ...Object.values(MANAGED_GROUPS),
+  ]);
+  const unmanaged = (contents) => contents.toString('utf8').split('\n')
+    .filter((line) => !managed.has(line.split(':', 1)[0]))
+    .join('\n');
+  if (unmanaged(current) !== unmanaged(original)) {
+    throw new Error(`unmanaged identity records changed during recovery: ${file}`);
+  }
+}
+
+function validateIdentityPolicyForDesiredRecovery(snapshot) {
+  const shadowUsers = new Map(snapshot.shadowUsers);
+  const shadowGroups = new Map(snapshot.shadowGroups);
+  for (const userName of Object.values(MANAGED_USERS)) {
+    const user = snapshot.users.get(userName);
+    const shadowUser = shadowUsers.get(userName);
+    if (user?.password === 'x' && !shadowUser) {
+      shadowUsers.set(userName, Object.freeze({ name: userName, password: '!' }));
+    } else if (!user && shadowUser) {
+      if (!/^[!*]+$/.test(shadowUser.password)) {
+        throw new Error(`managed user shadow password is not locked: ${userName}`);
+      }
+      shadowUsers.delete(userName);
+    }
+  }
+  for (const groupName of Object.values(MANAGED_GROUPS)) {
+    const group = snapshot.groups.get(groupName);
+    const shadowGroup = shadowGroups.get(groupName);
+    if (group?.password === 'x' && !shadowGroup) {
+      shadowGroups.set(groupName, Object.freeze({
+        name: groupName,
+        password: '!',
+        administrators: Object.freeze([]),
+        members: Object.freeze([]),
+      }));
+    } else if (!group && shadowGroup) {
+      if (
+        !/^[!*]+$/.test(shadowGroup.password)
+        || shadowGroup.administrators.length !== 0
+        || shadowGroup.members.length !== 0
+      ) {
+        throw new Error(`managed group shadow credential is not recoverable: ${groupName}`);
+      }
+      shadowGroups.delete(groupName);
+    }
+  }
+  validateIdentityPolicy(Object.freeze({
+    ...snapshot,
+    shadowUsers,
+    shadowGroups,
+  }));
+}
+
 export async function readBoundedProcFile(file, maxBytes, fsApi) {
   const handle = await fsApi.open(
     file,
@@ -2105,17 +2356,20 @@ async function readProvisionTransaction(plan, deps) {
 }
 
 function parseProvisionTransaction(value, plan) {
-  const legacy = value?.version === 1;
-  const expectedKeys = legacy
+  const legacyV1 = value?.version === 1;
+  const legacyV2 = value?.version === 2;
+  const expectedKeys = legacyV1
     ? 'artifacts,version'
-    : 'artifacts,identity_recovery_required,version';
+    : legacyV2
+      ? 'artifacts,identity_recovery_required,version'
+      : 'artifacts,identity_files,identity_recovery_required,version';
   if (
     !value
     || typeof value !== 'object'
     || Array.isArray(value)
-    || (!legacy && value.version !== TRANSACTION_VERSION)
+    || (!legacyV1 && !legacyV2 && value.version !== TRANSACTION_VERSION)
     || Object.keys(value).sort().join(',') !== expectedKeys
-    || (!legacy && typeof value.identity_recovery_required !== 'boolean')
+    || (!legacyV1 && typeof value.identity_recovery_required !== 'boolean')
     || !Array.isArray(value.artifacts)
     || value.artifacts.length !== plan.artifacts.length
   ) {
@@ -2166,9 +2420,46 @@ function parseProvisionTransaction(value, plan) {
       existing: Object.freeze({ contents }),
     });
   });
+  let identityFiles = null;
+  if (!legacyV1 && !legacyV2) {
+    if (
+      !Array.isArray(value.identity_files)
+      || value.identity_files.length !== IDENTITY_DATABASE_COMMIT_ORDER.length
+    ) {
+      throw new Error('host policy transaction identity snapshot is invalid');
+    }
+    identityFiles = value.identity_files.map((entry, index) => {
+      if (
+        !entry
+        || typeof entry !== 'object'
+        || Array.isArray(entry)
+        || Object.keys(entry).sort().join(',') !== 'gid,mode,path,sha256,uid'
+        || entry.path !== IDENTITY_DATABASE_COMMIT_ORDER[index]
+        || typeof entry.sha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(entry.sha256)
+        || !Number.isSafeInteger(entry.uid)
+        || entry.uid < 0
+        || !Number.isSafeInteger(entry.gid)
+        || entry.gid < 0
+        || !Number.isSafeInteger(entry.mode)
+        || entry.mode < 0
+        || entry.mode > 0o7777
+      ) {
+        throw new Error('host policy transaction identity snapshot is invalid');
+      }
+      return Object.freeze({
+        path: entry.path,
+        sha256: entry.sha256,
+        uid: entry.uid,
+        gid: entry.gid,
+        mode: entry.mode,
+      });
+    });
+  }
   return Object.freeze({
     version: TRANSACTION_VERSION,
-    identityRecoveryRequired: legacy ? false : value.identity_recovery_required,
+    identityRecoveryRequired: legacyV1 ? false : value.identity_recovery_required,
+    identityFiles: identityFiles && Object.freeze(identityFiles),
     artifacts: Object.freeze(artifacts),
   });
 }
@@ -2177,10 +2468,10 @@ async function writeProvisionTransaction(
   inspected,
   plan,
   deps,
-  { identityRecoveryRequired = false } = {},
+  { identityRecoveryRequired = false, identityFiles } = {},
 ) {
   await writeProvisionTransactionRecord(
-    transactionFromInspected(inspected, { identityRecoveryRequired }),
+    transactionFromInspected(inspected, { identityRecoveryRequired, identityFiles }),
     plan,
     deps,
   );
@@ -2192,9 +2483,19 @@ async function writeProvisionTransactionRecord(
   deps,
   identityRecoveryRequired = transaction.identityRecoveryRequired,
 ) {
+  if (!transaction.identityFiles) {
+    throw new Error('host policy transaction lacks identity recovery metadata');
+  }
   const value = {
     version: TRANSACTION_VERSION,
     identity_recovery_required: identityRecoveryRequired,
+    identity_files: transaction.identityFiles.map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      uid: entry.uid,
+      gid: entry.gid,
+      mode: entry.mode,
+    })),
     artifacts: transaction.artifacts.map((artifact) => ({
       target: artifact.target,
       desired_sha256: artifact.desiredSha256,
@@ -2583,13 +2884,32 @@ export async function readSystemIdentitySnapshot(fsApi = fs, runCommand = runFix
         .map((groupRecord) => groupRecord.gid),
     ];
   }
-  return parseIdentityDatabases(
+  const snapshot = parseIdentityDatabases(
     passwdText,
     groupText,
     effectiveGroups,
     gshadowText,
     shadowText,
   );
+  const records = new Map([
+    ['/etc/group', group],
+    ['/etc/gshadow', gshadow],
+    ['/etc/passwd', passwd],
+    ['/etc/shadow', shadow],
+  ]);
+  return Object.freeze({
+    ...snapshot,
+    identityFiles: Object.freeze(IDENTITY_DATABASE_COMMIT_ORDER.map((file) => {
+      const record = records.get(file);
+      return Object.freeze({
+        path: file,
+        sha256: createHash('sha256').update(record.contents).digest('hex'),
+        uid: record.stat.uid,
+        gid: record.stat.gid,
+        mode: record.stat.mode & 0o7777,
+      });
+    })),
+  });
 }
 
 export async function readSystemBootPolicyCatalogs(
@@ -2810,6 +3130,7 @@ export function auditBootPolicyCatalogs(
     ...inspected.artifacts.map((artifact) => artifact.targetPath),
     ...inspected.artifacts.map((artifact) => artifact.sourcePath).filter(Boolean),
     ...IDENTITY_POLICY_PATHS,
+    ...IDENTITY_DATABASE_COMMIT_ORDER.map((file) => `${file}-`),
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
     SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
@@ -4003,7 +4324,7 @@ async function assertSystemdMountPathsResolveOutsideProtectedSurface(
 }
 
 async function resolveExistingSystemdPath(value, fsApi) {
-  let components = normaliseBootPolicyPath(value).split('/').filter(Boolean);
+  let components = normaliseExistingFilesystemPath(value).split('/').filter(Boolean);
   let current = '/';
   const visited = new Set();
   assertTrustedDirectory('/', await fsApi.lstat('/'), 0, 0);
@@ -4015,7 +4336,7 @@ async function resolveExistingSystemdPath(value, fsApi) {
       before = await fsApi.lstat(candidate);
     } catch (error) {
       if (error?.code === 'ENOENT') {
-        return normaliseBootPolicyPath(path.posix.join(candidate, ...components));
+        return normaliseExistingFilesystemPath(path.posix.join(candidate, ...components));
       }
       throw error;
     }
@@ -4036,12 +4357,16 @@ async function resolveExistingSystemdPath(value, fsApi) {
       throw new Error(`systemd mount path symlink changed while reading: ${candidate}`);
     }
     const resolvedTarget = path.posix.isAbsolute(target)
-      ? normaliseBootPolicyPath(target)
-      : normaliseBootPolicyPath(path.posix.join(path.posix.dirname(candidate), target));
+      ? normaliseExistingFilesystemPath(target)
+      : normaliseExistingFilesystemPath(path.posix.join(path.posix.dirname(candidate), target));
     components = [...resolvedTarget.split('/').filter(Boolean), ...components];
     current = '/';
   }
-  return normaliseBootPolicyPath(current);
+  return normaliseExistingFilesystemPath(current);
+}
+
+function normaliseExistingFilesystemPath(value) {
+  return path.posix.normalize(value);
 }
 
 function assertSystemdPolicyDoesNotReferenceManaged(
@@ -4365,6 +4690,7 @@ function protectedSystemdMountPaths() {
   return [...new Set([
     ...SYSTEMD_PROTECTED_DIRECTORY_PATHS,
     ...IDENTITY_POLICY_PATHS,
+    ...IDENTITY_DATABASE_COMMIT_ORDER.map((file) => `${file}-`),
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
     SYSTEMD_SYSTEM_CREDENTIAL_DIRECTORY,
@@ -5126,6 +5452,14 @@ function provisionDependencies(dependencies) {
   const runCommand = dependencies.runCommand ?? runFixedCommand;
   const fsApi = dependencies.fsApi ?? fs;
   const processApi = dependencies.processApi ?? process;
+  const verifyMountNamespace = dependencies.verifyMountNamespace
+    ?? (() => assertSameMountNamespace(fsApi));
+  const readMountInfo = dependencies.readMountInfo
+    ?? (() => readBoundedProcFile(
+      '/proc/self/mountinfo',
+      MAX_MOUNTINFO_BYTES,
+      fsApi,
+    ));
   return {
     fsApi,
     processApi,
@@ -5142,14 +5476,22 @@ function provisionDependencies(dependencies) {
     runCommand,
     readIdentitySnapshot: dependencies.readIdentitySnapshot
       ?? (() => readSystemIdentitySnapshot(fsApi, runCommand)),
+    readIdentityFileState: dependencies.readIdentityFileState
+      ?? ((snapshot) => {
+        if (!Array.isArray(snapshot.identityFiles)) {
+          throw new Error('identity recovery metadata is unavailable');
+        }
+        return snapshot.identityFiles;
+      }),
+    recoverIdentityDatabases: dependencies.recoverIdentityDatabases
+      ?? ((transaction, snapshot, options) => restoreInterruptedIdentityDatabases(
+        transaction,
+        snapshot,
+        { ...options, fsApi, verifyMountNamespace, readMountInfo },
+      )),
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
       ?? (() => readSystemBootPolicyCatalogs(runCommand, fsApi)),
-    readMountInfo: dependencies.readMountInfo
-      ?? (() => readBoundedProcFile(
-        '/proc/self/mountinfo',
-        MAX_MOUNTINFO_BYTES,
-        fsApi,
-      )),
+    readMountInfo,
     readManagerMountInfo: dependencies.readManagerMountInfo
       ?? (() => readBoundedProcFile(
         '/proc/1/mountinfo',
@@ -5162,8 +5504,7 @@ function provisionDependencies(dependencies) {
         targetUid: dependencies.targetUid ?? 0,
         targetGid: dependencies.targetGid ?? 0,
       })),
-    verifyMountNamespace: dependencies.verifyMountNamespace
-      ?? (() => assertSameMountNamespace(fsApi)),
+    verifyMountNamespace,
     verifyPidNamespace: dependencies.verifyPidNamespace
       ?? (() => assertInitialPidNamespace(runCommand, processApi, fsApi)),
     verifyNoExtendedPosixAcl: dependencies.verifyNoExtendedPosixAcl
@@ -5284,7 +5625,18 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+const invokedDirectly = process.argv[1]
+  && (
+    import.meta.url === pathToFileURL(process.argv[1]).href
+    || (
+      process.argv[1] === FD_REEXEC_SCRIPT_PATH
+      && process.env[PROVISION_LOCK_ENV] === '1'
+      && process.env[PRIVATE_MOUNT_NAMESPACE_ENV] === '1'
+      && inheritedSourceRoot
+    )
+  );
+
+if (invokedDirectly) {
   runCli()
     .then((code) => {
       process.exitCode = code;

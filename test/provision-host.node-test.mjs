@@ -31,6 +31,7 @@ import {
   readSystemIdentitySnapshot,
   readSystemBootPolicyCatalogs,
   readSystemUnitStates as readSystemUnitStatesImpl,
+  restoreInterruptedIdentityDatabases,
   runFixedCommand,
   runCli,
   validateIdentityPolicy,
@@ -413,6 +414,71 @@ describe('guarded host provisioner policy', () => {
       '/proc/self/fd/5',
       '--apply',
     ]);
+
+    const provisionScript = fileURLToPath(
+      new URL('../scripts/provision-host.mjs', import.meta.url),
+    );
+    const scriptHandle = await fs.open(provisionScript, fsConstants.O_RDONLY);
+    try {
+      const result = spawnSync(
+        process.execPath,
+        ['/proc/self/fd/5', '--help'],
+        {
+          env: {
+            PATH: '/usr/bin:/bin',
+            LANG: 'C.UTF-8',
+            LC_ALL: 'C.UTF-8',
+            WEBEX_HOST_PROVISION_LOCKED: '1',
+            WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS: '1',
+            WEBEX_HOST_PROVISION_SOURCE_ROOT: REPO_SYSTEMD_ROOT,
+          },
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', scriptHandle.fd],
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /Dry-run is the default/);
+      assert.equal(result.stderr, '');
+    } finally {
+      await scriptHandle.close();
+    }
+
+    const launcherPath = fileURLToPath(new URL('../scripts/provision-host', import.meta.url));
+    const launcher = await fs.readFile(launcherPath, 'utf8');
+    assert.equal((await fs.stat(launcherPath)).mode & 0o777, 0o755);
+    assert.equal(launcher, [
+      '#!/usr/bin/env -S -i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 /usr/bin/node',
+      '',
+      "import process from 'node:process';",
+      '',
+      "import { runCli } from './provision-host.mjs';",
+      '',
+      'runCli()',
+      '  .then((code) => {',
+      '    process.exitCode = code;',
+      '  })',
+      '  .catch((error) => {',
+      '    process.stderr.write(`${error.message}\\n`);',
+      '    process.exitCode = 1;',
+      '  });',
+      '',
+    ].join('\n'));
+    const cleanLaunch = spawnSync(
+      '/usr/bin/env',
+      [
+        '-S',
+        `-i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ${process.execPath}`,
+        launcherPath,
+        '--help',
+      ],
+      {
+        env: { NODE_OPTIONS: '--definitely-invalid' },
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(cleanLaunch.status, 0, cleanLaunch.stderr);
+    assert.match(cleanLaunch.stdout, /Dry-run is the default/);
+    assert.equal(cleanLaunch.stderr, '');
   });
 
   it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {
@@ -917,6 +983,137 @@ describe('guarded host provisioner policy', () => {
         emptySystemdIdentityLookup(),
       ),
       /identity file metadata is not trusted: \/etc\/shadow/,
+    );
+  });
+
+  it('restores an interrupted sysusers commit from transaction-bound backups', async (context) => {
+    const targetRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-identity-recovery-'));
+    context.after(async () => fs.rm(targetRoot, { recursive: true, force: true }));
+    const original = new Map([
+      ['/etc/group', Buffer.from(`${groupRecord('shadow', 42)}\n`)],
+      ['/etc/gshadow', Buffer.from('shadow:!::\n')],
+      ['/etc/passwd', Buffer.alloc(0)],
+      ['/etc/shadow', Buffer.alloc(0)],
+    ]);
+    const modes = new Map([
+      ['/etc/group', 0o644],
+      ['/etc/gshadow', 0o600],
+      ['/etc/passwd', 0o644],
+      ['/etc/shadow', 0o600],
+    ]);
+    const committed = new Map([
+      ['/etc/group', Buffer.from(expectedGroupDatabase())],
+      ['/etc/gshadow', Buffer.from(expectedGshadowDatabase())],
+      ['/etc/passwd', Buffer.from([
+        passwdRecord('webex-generic-account-bot', 1001, 2001),
+        passwdRecord('webex-config-deploy', 1002, 2002),
+        '',
+      ].join('\n'))],
+      ['/etc/shadow', Buffer.from(expectedShadowDatabase())],
+    ]);
+    const identityFiles = [...modes].map(([file, mode]) => Object.freeze({
+      path: file,
+      sha256: createHash('sha256').update(original.get(file)).digest('hex'),
+      uid: UID,
+      gid: GID,
+      mode,
+    }));
+    const transaction = Object.freeze({ identityFiles: Object.freeze(identityFiles) });
+    const phaseRoots = [];
+    for (let committedCount = 1; committedCount < 4; committedCount += 1) {
+      const phaseRoot = path.join(targetRoot, `phase-${committedCount}`);
+      phaseRoots.push(phaseRoot);
+      await fs.mkdir(path.join(phaseRoot, 'etc'), { recursive: true, mode: 0o755 });
+      const current = new Map();
+      for (const [index, file] of [
+        '/etc/group',
+        '/etc/gshadow',
+        '/etc/passwd',
+        '/etc/shadow',
+      ].entries()) {
+        const contents = index < committedCount ? committed.get(file) : original.get(file);
+        current.set(file, contents);
+        const target = path.join(phaseRoot, file.slice(1));
+        const mode = modes.get(file);
+        await fs.writeFile(target, contents, { mode });
+        await fs.chmod(target, mode);
+        await fs.writeFile(`${target}-`, original.get(file), { mode });
+        await fs.chmod(`${target}-`, mode);
+      }
+      const effectiveGroups = committedCount >= 3
+        ? {
+          'webex-generic-account-bot': [2001],
+          'webex-config-deploy': [2002],
+        }
+        : {};
+      const snapshot = parseIdentityDatabases(
+        current.get('/etc/passwd').toString('utf8'),
+        current.get('/etc/group').toString('utf8'),
+        effectiveGroups,
+        current.get('/etc/gshadow').toString('utf8'),
+        current.get('/etc/shadow').toString('utf8'),
+      );
+      const options = {
+        fsApi: fs,
+        targetRoot: phaseRoot,
+        verifyMountNamespace: async () => {},
+        readMountInfo: async () => SAFE_MOUNT_INFO,
+      };
+      await restoreInterruptedIdentityDatabases(transaction, snapshot, options);
+      assert.deepEqual(
+        await fs.readFile(path.join(phaseRoot, 'etc/group')),
+        current.get('/etc/group'),
+      );
+      if (committedCount === 3) {
+        let renames = 0;
+        const interruptedFs = new Proxy(fs, {
+          get(target, property) {
+            if (property !== 'rename') return target[property];
+            return async (...args) => {
+              renames += 1;
+              if (renames === 2) throw new Error('injected identity recovery interruption');
+              return target.rename(...args);
+            };
+          },
+        });
+        await assert.rejects(
+          restoreInterruptedIdentityDatabases(transaction, snapshot, {
+            ...options,
+            apply: true,
+            fsApi: interruptedFs,
+          }),
+          /injected identity recovery interruption/,
+        );
+      }
+      await restoreInterruptedIdentityDatabases(transaction, snapshot, {
+        ...options,
+        apply: true,
+      });
+      for (const [file, contents] of original) {
+        assert.deepEqual(await fs.readFile(path.join(phaseRoot, file.slice(1))), contents);
+      }
+    }
+
+    const driftRoot = phaseRoots[0];
+    const driftGroup = path.join(driftRoot, 'etc/group');
+    await fs.writeFile(
+      driftGroup,
+      Buffer.concat([committed.get('/etc/group'), Buffer.from('external:x:3000:\n')]),
+      { mode: 0o644 },
+    );
+    await fs.writeFile(`${driftGroup}-`, original.get('/etc/group'), { mode: 0o644 });
+    await assert.rejects(
+      restoreInterruptedIdentityDatabases(
+        transaction,
+        parseIdentityDatabases('', committed.get('/etc/group').toString('utf8')),
+        {
+          fsApi: fs,
+          targetRoot: driftRoot,
+          verifyMountNamespace: async () => {},
+          readMountInfo: async () => SAFE_MOUNT_INFO,
+        },
+      ),
+      /unmanaged identity records changed during recovery/,
     );
   });
 
@@ -2896,6 +3093,25 @@ describe('guarded host provisioner execution', () => {
       /policy directory is not trusted: \/srv\/user/,
     );
 
+    const redirectedVarRunMount = '/etc/systemd/system/external-var-run.mount';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external-var-run.mount' }]]]),
+          {
+            filesByPath: new Map([[
+              redirectedVarRunMount,
+              Buffer.from('[Mount]\nWhat=tmpfs\nWhere=/var/run/bin\n'),
+            ]]),
+            symlinksByPath: new Map([['/var/run', '/usr']]),
+          },
+        ),
+      ),
+      /external systemd policy mounts a protected directory/,
+    );
+
     const protectedMountWants = '/etc/systemd/system/external.target.wants';
     const protectedMountName = 'run-webex\\x2dcodex\\x2dcanary.mount';
     const protectedMountLink = `${protectedMountWants}/${protectedMountName}`;
@@ -4792,7 +5008,11 @@ describe('guarded host provisioner execution', () => {
       /injected sysusers partial commit/,
     );
 
-    const partialIdentity = recoverableSysusersPartialIdentitySnapshot();
+    const partialIdentity = expectedIdentitySnapshot({ shadowDatabase: '' });
+    const recoveryModes = [];
+    const recoverIdentityDatabases = async (_transaction, _snapshot, options) => {
+      recoveryModes.push(options.apply);
+    };
     await assert.rejects(
       provisionHost(
         { apply: false, recoveryPreflight: true },
@@ -4810,6 +5030,7 @@ describe('guarded host provisioner execution', () => {
       fixture.dependencies({
         commands: preflightCommands,
         identitySequence: [partialIdentity],
+        recoverIdentityDatabases,
       }),
     );
     assert.equal(preflight.mode, 'dry-run');
@@ -4821,11 +5042,17 @@ describe('guarded host provisioner execution', () => {
       fixture.dependencies({
         applied: true,
         commands,
-        identitySequence: [partialIdentity, expectedIdentitySnapshot()],
+        identitySequence: [
+          partialIdentity,
+          emptyIdentitySnapshot(),
+          expectedIdentitySnapshot(),
+        ],
+        recoverIdentityDatabases,
       }),
     );
 
     assert.equal(report.mode, 'applied');
+    assert.deepEqual(recoveryModes, [false, true]);
     assert.deepEqual(report.installed_artifacts, []);
     assert.deepEqual(commands, [
       ['/usr/bin/systemctl', ['daemon-reload']],
@@ -4948,7 +5175,7 @@ describe('guarded host provisioner execution', () => {
       /injected newer policy install interruption/,
     );
     const interrupted = JSON.parse(await fs.readFile(fixture.plan.transactionFile, 'utf8'));
-    assert.equal(interrupted.version, 2);
+    assert.equal(interrupted.version, 3);
     assert.equal(interrupted.identity_recovery_required, false);
 
     const preflight = await provisionHost(
@@ -5229,6 +5456,10 @@ async function provisionFixture(context) {
       managerMountInfoSequence = null,
       verifyProvisionLockConverged = async () => {},
       verifyManagerInstalledArtifacts = async () => {},
+      readIdentityFileState = async () => testIdentityFileState(),
+      recoverIdentityDatabases = async (_transaction, snapshot) => {
+        validateIdentityPolicy(snapshot);
+      },
       verifyPidNamespace = async () => {},
       verifyMountNamespace = async () => {},
       verifyRuntimeAncestors = async () => {},
@@ -5276,6 +5507,8 @@ async function provisionFixture(context) {
           Math.min(managerMountInfoIndex++, managerMountInfos.length - 1)
         ],
         verifyManagerInstalledArtifacts,
+        readIdentityFileState,
+        recoverIdentityDatabases,
         verifyPidNamespace,
         verifyMountNamespace,
         readUnitStates: async () => stateSequence[
@@ -5362,6 +5595,21 @@ async function writeRecoveryTransaction(fixture, selected, desired, existing) {
 
 function emptyIdentitySnapshot() {
   return parseIdentityDatabases('', '');
+}
+
+function testIdentityFileState() {
+  return [
+    ['/etc/group', 0o644],
+    ['/etc/gshadow', 0o640],
+    ['/etc/passwd', 0o644],
+    ['/etc/shadow', 0o640],
+  ].map(([file, mode], index) => Object.freeze({
+    path: file,
+    sha256: String(index + 1).repeat(64),
+    uid: 0,
+    gid: file.includes('shadow') ? 42 : 0,
+    mode,
+  }));
 }
 
 function recoverableSysusersPartialIdentitySnapshot() {

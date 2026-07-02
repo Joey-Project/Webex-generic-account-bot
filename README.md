@@ -197,9 +197,17 @@ the separately hardened launcher and immutable transient runtime.
 Guarded host policy provisioning is dry-run by default:
 
 ```bash
-sudo /usr/bin/node scripts/provision-host.mjs --dry-run
-sudo /usr/bin/node scripts/provision-host.mjs --apply
+sudo -- /opt/webex-generic-account-bot/code/scripts/provision-host --dry-run
+sudo -- /opt/webex-generic-account-bot/code/scripts/provision-host --apply
 ```
+
+The launcher path and the complete `/opt/webex-generic-account-bot/code`
+ancestor chain must already be installed as `root:root` and must not be group-
+or world-writable. Any sudoers rule must name that absolute launcher path, not
+`node`, a relative repository path, or a wildcard command. The launcher clears
+the inherited environment before starting the fixed system Node and script, so
+`NODE_OPTIONS`, a caller-controlled `PATH`, and the caller's working directory
+cannot select root-loaded code.
 
 The production CLI has no source, target, or root override. It reads a fixed
 allowlist of four sysusers files, six tmpfiles files, and five systemd units
@@ -377,10 +385,12 @@ symlink in component order. Pattern paths containing parent traversal fail
 closed. Lexically
 equivalent link text remains rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
-The trusted Node and provisioner entrypoints and a complete transaction-aware,
-read-only host preflight are verified before first-run lock metadata can be
-created or converged. The re-executed process repeats the host checks under the
-lock. Apply executes the verified `flock`, `unshare`, and Node inodes through
+The fixed root-owned launcher clears the inherited environment before loading
+the system Node and absolute provisioner path. The provisioner then verifies
+the trusted Node and script entrypoints and a complete transaction-aware,
+read-only host preflight before first-run lock metadata can be created or
+converged. The re-executed process repeats the host checks under the lock. Apply
+executes the verified `flock`, `unshare`, Node, and provisioner inodes through
 inherited file descriptors, then runs inside `unshare --mount --propagation
 private`; the private namespace must differ from PID 1 and expose no shared,
 master, propagate-from, or unbindable records. Host mount changes therefore
@@ -437,17 +447,19 @@ Recovery first proves identity, unit, source, merged boot-policy, system
 credential, and credential-store trust against the current partial state. After
 restoring the old set and reloading the manager, the journal remains until the
 same common preflight accepts the recovered state.
-When every target already matches the complete desired transaction, recovery
-also accepts only a narrowly bounded sysusers interruption: a managed
-passwd/shadow or group/gshadow counterpart may be missing or orphaned only when
-the observed credential is locked and every structural identity check still
-passes. The outer preflight remains read-only, then the locked apply reruns
-sysusers and requires the complete strict identity contract before continuing.
-If manager safety rollback restores the old policy while such a partial commit
-still exists, the provisioner first persists an explicit versioned identity
-recovery marker; old or mixed target sets without that marker remain strict.
-The marker is carried into any replacement policy transaction until sysusers
-has restored and strictly validated the complete identity state.
+Version 3 transactions bind the digest, UID, GID, and mode of `/etc/group`,
+`/etc/gshadow`, `/etc/passwd`, and `/etc/shadow` before sysusers runs. When every
+policy target already matches the complete desired transaction, recovery also
+accepts only a narrowly bounded sysusers interruption: a managed passwd/shadow
+or group/gshadow counterpart may be missing or orphaned only when the observed
+credential is locked and every structural identity check still passes. The
+outer preflight remains read-only and verifies that systemd's corresponding
+`*-` backups exactly match the transaction and that no unmanaged identity
+record changed. The locked apply restores changed databases in reverse commit
+order with atomic renames and directory fsyncs, then reruns sysusers and
+requires the complete strict identity contract. A recovery interrupted during
+those reverse renames converges on the next apply; a missing, modified, or stale
+backup fails closed instead of overwriting administrator changes.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.
