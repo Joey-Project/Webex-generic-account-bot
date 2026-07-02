@@ -15,6 +15,7 @@ import {
   ARTIFACTS,
   MANAGED_UNITS,
   assertManagedRuntimeAncestorsTraversable,
+  assertSameMountNamespace,
   buildLockedApplyCommand,
   buildProvisionPlan,
   ensureProvisionLockFile,
@@ -117,6 +118,26 @@ describe('guarded host provisioner policy', () => {
     assert.throws(() => parseArgs(['--apply', '--dry-run']), /cannot be combined/);
     assert.throws(() => parseArgs(['--dry-run', '--apply']), /cannot be combined/);
     assert.throws(() => parseArgs(['--apply', '--apply']), /only once/);
+  });
+
+  it('requires the provisioner to share PID 1 mount namespace identity', async () => {
+    const namespaceFs = (managerInode) => ({
+      async open(file, flags) {
+        assert.equal(flags, fsConstants.O_RDONLY);
+        return {
+          stat: async () => ({
+            dev: 7,
+            ino: file === '/proc/self/ns/mnt' ? 41 : managerInode,
+          }),
+          close: async () => {},
+        };
+      },
+    });
+    await assert.doesNotReject(assertSameMountNamespace(namespaceFs(41)));
+    await assert.rejects(
+      assertSameMountNamespace(namespaceFs(42)),
+      /not in PID 1 mount namespace/,
+    );
   });
 
   it('wraps the complete apply in the fixed exclusive flock command', async () => {
@@ -872,6 +893,30 @@ describe('guarded host provisioner execution', () => {
     assert.equal(report.mode, 'dry-run');
     assert.equal(report.artifact_count, 15);
     assert.equal(report.changed_artifact_count, 15);
+    assert.deepEqual(commands, []);
+    await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
+  });
+
+  it('rechecks mount namespace identity immediately before apply mutation', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    let namespaceChecks = 0;
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          commands,
+          verifyMountNamespace: async () => {
+            namespaceChecks += 1;
+            if (namespaceChecks === 2) {
+              throw new Error('host provisioner is not in PID 1 mount namespace');
+            }
+          },
+        }),
+      ),
+      /not in PID 1 mount namespace/,
+    );
+    assert.equal(namespaceChecks, 2);
     assert.deepEqual(commands, []);
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
   });
@@ -2195,6 +2240,72 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const [name, policy] of [
+      [
+        'run-webex\\x2dcodex\\x2dcanary.mount',
+        '[Mount]\nWhat=tmpfs\n',
+      ],
+      [
+        'var-lib-webex\\x2dcodex\\x2druntime\\x2dinputs.automount',
+        '[Automount]\nTimeoutIdleSec=60\n',
+      ],
+      [
+        'external-protected.mount',
+        '[Mount]\nWhere=/var/lib/webex-generic-account-bot/state\n',
+      ],
+      [
+        'external-mount-alias.service',
+        '[Install]\nAlias=run-webex\\\\x2dconfig\\\\x2ddeploy.mount\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy mounts a protected directory/,
+        name,
+      );
+    }
+
+    const protectedMountWants = '/etc/systemd/system/external.target.wants';
+    const protectedMountName = 'run-webex\\x2dcodex\\x2dcanary.mount';
+    const protectedMountLink = `${protectedMountWants}/${protectedMountName}`;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [protectedMountWants, [{
+              name: protectedMountName,
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            symlinksByPath: new Map([[
+              protectedMountLink,
+              '/usr/lib/systemd/system/external-protected.mount',
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy mounts a protected directory/,
+    );
+
     for (const [index, command] of [
       'systemctl --preset-mode=enable-only preset-all',
       'systemctl daemon-reload',
@@ -2337,8 +2448,12 @@ describe('guarded host provisioner execution', () => {
         'set-credential-template',
         'set-credenti%ial sysusers.extra /tmp/sysusers.extra',
       ],
+      [
+        'set-credential-name-template',
+        'set-credential userdb.us%i.webex-generic-account-bot /tmp/userdb.json',
+      ],
     ]) {
-      const unitName = name === 'set-credential-template'
+      const unitName = name.includes('template')
         ? 'external@.service'
         : `external-${name}.service`;
       const credentialUnit = `/etc/systemd/system/${unitName}`;
@@ -2585,6 +2700,44 @@ describe('guarded host provisioner execution', () => {
       /systemctl reached after vendor credential import audit/,
     );
     assert.equal(vendorImportCommandCalls, 2);
+
+    const intermediatePolicyLink = '/usr/lib/systemd/system/link';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/usr/lib/systemd/system', [{
+              name: 'sysinit.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [sysinitWants, [{
+              name: 'systemd-sysusers.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              '/usr/lib/systemd/system/systemd-sysusers.service',
+              Buffer.from('[Service]\nImportCredential=sysusers.*\n'),
+            ]]),
+            symlinksByPath: new Map([
+              [
+                linkedSysusers,
+                '/usr/lib/systemd/system/link/../systemd-sysusers.service',
+              ],
+              [intermediatePolicyLink, '/opt/untrusted/systemd'],
+            ]),
+          },
+        ),
+      ),
+      /systemd policy symlink target has unsafe parent traversal/,
+    );
 
     const unresolvedDependencyTemplate =
       '/etc/systemd/system/external-dependency@.service';
@@ -4434,6 +4587,7 @@ async function provisionFixture(context) {
       bootPolicySequence = null,
       mountInfoSequence = null,
       verifyProvisionLockConverged = async () => {},
+      verifyMountNamespace = async () => {},
       verifyRuntimeAncestors = async () => {},
       verifyManagedRuntimeState = async () => {},
     } = {}) {
@@ -4473,6 +4627,7 @@ async function provisionFixture(context) {
         readMountInfo: async () => mountInfos[
           Math.min(mountInfoIndex++, mountInfos.length - 1)
         ],
+        verifyMountNamespace,
         readUnitStates: async () => stateSequence[
           Math.min(stateIndex++, stateSequence.length - 1)
         ],

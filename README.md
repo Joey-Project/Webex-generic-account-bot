@@ -313,7 +313,9 @@ are rejected so explicit out-of-catalogue command arguments or helper units
 cannot bypass the merged policy audit. Consumer masks, dangling links,
 non-regular symlink targets, directories, and other non-regular consumer
 overrides are rejected before terminal handling can skip the vendor provenance
-check. External unit execution directives may not invoke
+check. Relative dependency links may traverse trusted leading parent
+components, but a parent traversal after entering a child component is rejected
+before lexical normalisation can hide an intermediate symlink. External unit execution directives may not invoke
 `systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
 or use `systemctl` with a literal, path-qualified, or specifier-reachable managed
 unit target. Unit-file mutations with path arguments are rejected because an
@@ -338,8 +340,11 @@ executable names, are all treated as shell execution.
 `env -S`/`--split-string` argv reinterpretation, including every accepted GNU
 long-option abbreviation and specifier-generated option, is rejected. `systemctl` may not set protected
 plaintext or encrypted system credentials through inline, path,
-option-interleaved, or specifier-expanded arguments. Non-vendor units also cannot claim protected
+option-interleaved, or specifier-expanded arguments; unresolved credential-name
+arguments fail closed. Non-vendor units also cannot claim protected
 Webex paths through systemd-managed directory source or alias directives.
+Path-derived `.mount` and `.automount` names, `Where=`, install aliases, and
+dependency links also cannot mount over a protected Webex path on a later boot.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis. Every existing sysusers and
 tmpfiles search directory is validated before and after catalogue collection,
@@ -354,7 +359,9 @@ The same host-wide `flock` used by config deployment serialises the complete app
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
-lock. Dry-run, recovery, and apply loop through short reads while collecting and
+lock. The provisioner opens and compares its own and PID 1's mount namespace
+identities before inspection and immediately before every mutation path.
+Dry-run, recovery, and apply loop through short reads while collecting and
 parsing bounded `/proc/self/mountinfo` data;
 managed tmpfiles targets, descendants, and non-standard redirected ancestors
 must not be mount points before any tmpfiles mutation. Standard ancestor mount

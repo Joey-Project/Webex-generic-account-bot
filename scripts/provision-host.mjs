@@ -769,6 +769,7 @@ export async function provisionHost(options, dependencies = {}) {
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
     throw new Error('host provisioning requires root, including dry-run');
   }
+  await deps.verifyMountNamespace();
   const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
     ?? ((runtimeInspected) => assertManagedRuntimeAncestorsTraversable(
       plan,
@@ -826,6 +827,7 @@ export async function provisionHost(options, dependencies = {}) {
     if (options.recoveryPreflight) {
       return provisionReport('dry-run', plan, recoveryInspected, commands);
     }
+    await deps.verifyMountNamespace();
     recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
@@ -873,6 +875,7 @@ export async function provisionHost(options, dependencies = {}) {
     if (options.recoveryPreflight) {
       return provisionReport('dry-run', plan, inspected, commands);
     }
+    await deps.verifyMountNamespace();
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
@@ -881,6 +884,7 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
+  await deps.verifyMountNamespace();
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps, {
@@ -1667,6 +1671,28 @@ export async function readBoundedProcFile(file, maxBytes, fsApi) {
     return buffer.subarray(0, totalBytesRead).toString('utf8');
   } finally {
     await handle.close();
+  }
+}
+
+export async function assertSameMountNamespace(fsApi = fs) {
+  const readNamespaceIdentity = async (file) => {
+    const handle = await fsApi.open(file, fsConstants.O_RDONLY);
+    try {
+      const stat = await handle.stat();
+      return Object.freeze({ dev: stat.dev, ino: stat.ino });
+    } finally {
+      await handle.close();
+    }
+  };
+  const [selfNamespace, managerNamespace] = await Promise.all([
+    readNamespaceIdentity('/proc/self/ns/mnt'),
+    readNamespaceIdentity('/proc/1/ns/mnt'),
+  ]);
+  if (
+    selfNamespace.dev !== managerNamespace.dev
+    || selfNamespace.ino !== managerNamespace.ino
+  ) {
+    throw new Error('host provisioner is not in PID 1 mount namespace');
   }
 }
 
@@ -3343,6 +3369,7 @@ async function auditSystemdPolicySymlink(
     logicalSource,
     visited.size,
   );
+  assertSystemdPolicySymlinkTraversalSafe(candidate, target);
   let resolved = path.resolve(path.dirname(candidate), target);
   if (resolved === '/dev/null') {
     assertBootPolicySystemdConsumerSymlinkTarget(unitNames, logicalSource);
@@ -3387,6 +3414,20 @@ async function auditSystemdPolicySymlink(
     logicalSource,
     visited.size,
   );
+}
+
+function assertSystemdPolicySymlinkTraversalSafe(candidate, target) {
+  let enteredDescendant = path.isAbsolute(target);
+  for (const component of String(target).split('/')) {
+    if (component === '' || component === '.') continue;
+    if (component === '..') {
+      if (enteredDescendant) {
+        throw new Error(`systemd policy symlink target has unsafe parent traversal: ${candidate}`);
+      }
+      continue;
+    }
+    enteredDescendant = true;
+  }
 }
 
 async function auditSystemdPolicyFile(
@@ -3488,6 +3529,9 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       )
     ) {
       throw new Error(`external systemd policy claims a protected directory: ${source}`);
+    }
+    if (systemdPolicyMountsProtectedDirectory(candidate, unitNames)) {
+      throw new Error(`external systemd policy mounts a protected directory: ${source}`);
     }
     if (
       systemdPolicyInvokesShell(candidate)
@@ -3662,8 +3706,57 @@ function systemdPolicyClaimsProtectedDirectory(value) {
   });
 }
 
+function systemdPolicyMountsProtectedDirectory(value, unitNames) {
+  if ([...unitNames].some(systemdPathUnitOverlapsProtectedDirectory)) return true;
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  if (directive === 'Where') {
+    return fields.some((field) => {
+      if (hasUnresolvedSystemdSpecifier(field) || !path.posix.isAbsolute(field)) return true;
+      const mountedPath = normaliseBootPolicyPath(field);
+      return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+        systemdPathsOverlap(mountedPath, protectedPath)
+      ));
+    });
+  }
+  if (!['Alias', 'Also'].includes(directive)) return false;
+  return fields.some((field) => (
+    systemdPathUnitOverlapsProtectedDirectory(field)
+    || systemdSpecifierFieldCouldMatch(field, protectedSystemdPathUnitNames())
+  ));
+}
+
+function systemdPathUnitOverlapsProtectedDirectory(unitName) {
+  const basename = path.posix.basename(unitName);
+  const match = basename.match(/^(.*)\.(?:automount|mount)$/);
+  if (!match) return false;
+  const mountedPath = match[1] === '-'
+    ? '/'
+    : normaliseBootPolicyPath(
+      `/${decodeSystemdEscapesForAudit(match[1].replaceAll('-', '/'))}`,
+    );
+  return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+    systemdPathsOverlap(mountedPath, protectedPath)
+  ));
+}
+
+function protectedSystemdPathUnitNames() {
+  return SYSTEMD_PROTECTED_DIRECTORY_PATHS.flatMap((protectedPath) => {
+    const stem = protectedPath
+      .slice(1)
+      .split('/')
+      .map((component) => component.replaceAll('-', '\\x2d'))
+      .join('-');
+    return [`${stem}.mount`, `${stem}.automount`];
+  });
+}
+
 function systemdPathsOverlap(left, right) {
   return left === right
+    || left === '/'
+    || right === '/'
     || left.startsWith(`${right}/`)
     || right.startsWith(`${left}/`);
 }
@@ -3684,7 +3777,8 @@ function systemdPolicyInjectsSystemCredential(value) {
     const credential = token.slice(0, token.indexOf('=') < 0
       ? token.length
       : token.indexOf('='));
-    return credentialNameCanInjectHostPolicy(credential)
+    return hasUnresolvedSystemdSpecifier(credential)
+      || credentialNameCanInjectHostPolicy(credential)
       || systemdSpecifierFieldCouldMatch(credential, [
         ...BOOT_POLICY_CREDENTIAL_NAMES,
         ...BOOT_POLICY_CREDENTIAL_PREFIXES.map((prefix) => `${prefix}root`),
@@ -4359,6 +4453,8 @@ function provisionDependencies(dependencies) {
         MAX_MOUNTINFO_BYTES,
         fsApi,
       )),
+    verifyMountNamespace: dependencies.verifyMountNamespace
+      ?? (() => assertSameMountNamespace(fsApi)),
     readUnitStates: dependencies.readUnitStates
       ?? ((units, identitySnapshot) => readSystemUnitStates(
         units,
