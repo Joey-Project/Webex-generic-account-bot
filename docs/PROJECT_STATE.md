@@ -112,7 +112,7 @@
   symbolic managed-unit reachability checks for unresolved dynamic specifiers
   in unit-reference directives, pre-allocation rejection
   of static-range numeric identities, and boot-policy credential injection
-  rejection with exact/trailing-glob/rename-aware selectors and fail-closed
+  rejection with exact/trailing-glob/glob-rename-prefix-aware selectors and fail-closed
   complex wildcard handling, physical-file/logical-owner vendor
   binding, and system-credential and credential-store absence checks,
   assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy

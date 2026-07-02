@@ -2647,18 +2647,25 @@ function importCredentialSelectorTargetsBootPolicy(selector) {
   ) return true;
   const components = selector.split(':');
   if (components.length > 2) return true;
-  return components.some((pattern) => {
-    const wildcardOffset = pattern.indexOf('*');
-    if (wildcardOffset >= 0 && (
-      wildcardOffset !== pattern.length - 1
-      || pattern.lastIndexOf('*') !== wildcardOffset
-    )) return true;
-    return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
-      wildcardOffset < 0
-        ? pattern === name
-        : name.startsWith(pattern.slice(0, -1))
-    ));
-  });
+  const [sourcePattern, renamePrefix] = components;
+  if (sourcePattern === '') return true;
+  const wildcardOffset = sourcePattern.indexOf('*');
+  if (wildcardOffset >= 0 && (
+    wildcardOffset !== sourcePattern.length - 1
+    || sourcePattern.lastIndexOf('*') !== wildcardOffset
+  )) return true;
+  if (BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
+    wildcardOffset < 0
+      ? sourcePattern === name
+      : name.startsWith(sourcePattern.slice(0, -1))
+  ))) return true;
+  if (renamePrefix === undefined) return false;
+  if (renamePrefix.includes('*')) return true;
+  return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
+    wildcardOffset < 0
+      ? renamePrefix === name
+      : name.startsWith(renamePrefix)
+  ));
 }
 
 function isExpectedVendorBootPolicyCredentialImport(
@@ -2710,7 +2717,7 @@ function systemdSpecifierFieldCouldMatch(field, candidates) {
       continue;
     }
     hasUnresolvedSpecifier = true;
-    pattern += '[^\\s/]+';
+    pattern += '[^\\s/]*';
     if (offset + 1 < field.length) offset += 1;
   }
   if (!hasUnresolvedSpecifier) return false;

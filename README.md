@@ -250,7 +250,7 @@ in unit-reference directives are symbolically checked against every managed
 unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
 range before allocation. Direct boot-policy credential injection is rejected;
 credential import selectors are evaluated across exact, trailing-glob, and
-rename forms, while complex wildcard forms are rejected fail closed, and
+glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
 exact physical-file/logical-owner pair after the current system credential set
 and all plaintext and encrypted credential stores prove that `sysusers.extra`

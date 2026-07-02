@@ -1382,6 +1382,10 @@ describe('guarded host provisioner execution', () => {
     for (const [name, policy] of [
       ['external-host-identity.service', '[Service]\nUser=%H\n'],
       ['external-host-unit.service', '[Unit]\nWants=%H.service\n'],
+      [
+        'external-empty-specifier.service',
+        '[Unit]\nWants=webex-codex-activation-renew%W.service\n',
+      ],
     ]) {
       const target = `/etc/systemd/system/${name}`;
       await assert.rejects(
@@ -1403,6 +1407,8 @@ describe('guarded host provisioner execution', () => {
     for (const policy of [
       'LoadCredential=sysusers.extra:/root/policy',
       'ImportCredential=payload:sysusers.extra',
+      'ImportCredential=payload.*:sysusers.',
+      'ImportCredential=payload.*:tmpfiles.',
       'ImportCredential=sysusers.?xtra',
       'ImportCredential=sysusers.[e]xtra',
       'ImportCredential=sysusers.[[:alpha:]]xtra',

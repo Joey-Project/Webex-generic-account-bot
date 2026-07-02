@@ -178,7 +178,7 @@ superseded_by:
   assignment plus symbolic managed-unit reachability checks for all unresolved
   dynamic unit-reference specifiers, pre-allocation
   rejection of static-range numeric identities,
-  boot-policy credential injection with exact/trailing-glob/rename-aware
+  boot-policy credential injection with exact/trailing-glob/glob-rename-prefix-aware
   selectors, fail-closed complex wildcard handling, and
   physical-file/logical-owner vendor binding plus current system and
   credential-store inputs, and launcher-instance
