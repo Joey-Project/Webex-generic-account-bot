@@ -101,8 +101,9 @@
   locked-user/group-credential, and shadow-grant
   checks, bounded dormant-unit preflight, device-bound kernel lock verification
   shared with config deployment, exact loaded-fragment, no-drop-in,
-  no-stale-manager, no-external-activator, exact PID 1 `UnitPath`, and strict
-  systemctl exit/output/diagnostic/load-state checks, bounded policy-path
+  no-stale-manager, no-external-activator, profile-exact PID 1 `UnitPath` with
+  one-for-one disk scanning, and strict portable systemctl
+  exit/output/diagnostic/load-state checks, bounded policy-path
   scanning for every managed unit, launcher instance, type drop-in, and
   dash-prefix drop-in with usr-merge handling, direct disk scanning of external
   units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
@@ -142,7 +143,10 @@
   root-owned policy installation whose rollback journal distinguishes partial
   rollback from complete-desired convergence resume and remains through manager
   convergence without unsafe post-unlink rollback, while final manager safety
-  failures force the recorded old set, reload, and dormant revalidation, explicit
+  failures force the current installation journal's old set, reload, and
+  dormant revalidation, complete-desired recovery admits only locked
+  passwd/shadow or group/gshadow counterpart interruptions before rerunning
+  sysusers, and stale-cache outer preflight remains read-only, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before Configuration Space pinning and activation.
 

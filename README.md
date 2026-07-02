@@ -230,9 +230,10 @@ rejects active, enabled, or masked managed units, including instantiated
 launcher template units. It rejects unloaded policy and dependency directories
 for every fixed managed unit, template or instance launcher overrides, and
 systemd type-level or dash-prefix drop-ins from every fixed systemd system-unit
-load path. PID 1 must report the exact reviewed `UnitPath`; custom or reordered
-manager search paths fail closed before any state is accepted. It accepts only
-the exact root-owned `/lib -> usr/lib` compatibility
+load path. PID 1 must report the exact reviewed usr-merged or split-usr
+`UnitPath`, and the disk audit scans that same profile one-for-one; custom or
+reordered manager search paths fail closed before any state is accepted. An
+usr-merged host must expose the exact root-owned `/lib -> usr/lib` compatibility
 link and requires every loaded managed unit to use the fixed
 `/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
 no external reverse activator. Every `is-active`, `is-enabled`, and metadata
@@ -322,6 +323,12 @@ Recovery first proves identity, unit, source, merged boot-policy, system
 credential, and credential-store trust against the current partial state. After
 restoring the old set and reloading the manager, the journal remains until the
 same common preflight accepts the recovered state.
+When every target already matches the complete desired transaction, recovery
+also accepts only a narrowly bounded sysusers interruption: a managed
+passwd/shadow or group/gshadow counterpart may be missing or orphaned only when
+the observed credential is locked and every structural identity check still
+passes. The outer preflight remains read-only, then the locked apply reruns
+sysusers and requires the complete strict identity contract before continuing.
 The journal remains durable through sysusers/tmpfiles convergence, manager
 reload, and final unit verification; it is removed only after all of those
 steps succeed.
@@ -348,7 +355,12 @@ fails closed on the stale cache. In contrast, a final manager safety validation
 failure after reload forces the transaction back to the recorded old policy
 set, reloads the manager, rechecks dormant state, and clears the journal only
 after that rollback is proven safe. The same forced-old path protects a resumed
-complete desired transaction that fails its first post-reload safety check.
+complete desired transaction that fails its first post-reload safety check. If
+an older transaction is restored and a newer source revision is installed in
+the same apply, safety rollback uses the new installation journal rather than
+the stale startup snapshot. The pre-lock read-only preflight may recognise an
+unchanged complete desired set with stale manager cache as apply-recoverable,
+but only the later locked apply may run `daemon-reload`.
 
 The deployment entrypoint lives in this bot repository, not in the config
 repository checkout. It treats the config checkout as data, builds fixed argv

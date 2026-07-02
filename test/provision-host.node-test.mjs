@@ -51,6 +51,10 @@ const SYSTEMD_MANAGER_UNIT_PATH = [
   '/usr/lib/systemd/system',
   '/run/systemd/generator.late',
 ].join(' ');
+const SPLIT_USR_SYSTEMD_MANAGER_UNIT_PATH = SYSTEMD_MANAGER_UNIT_PATH.replace(
+  '/usr/lib/systemd/system',
+  '/lib/systemd/system',
+);
 
 function readSystemUnitStates(units, runCommand, fsApi, identitySnapshot = null) {
   return readSystemUnitStatesImpl(
@@ -65,7 +69,7 @@ function readSystemUnitStates(units, runCommand, fsApi, identitySnapshot = null)
       }
       if (args[0] === 'is-enabled' && result.code === 0) {
         if (result.stdout === 'disabled\n') return { ...result, code: 1 };
-        if (result.stdout === 'not-found\n') return { ...result, code: 4 };
+        if (result.stdout === 'not-found\n') return { ...result, code: 1 };
       }
       return result;
     },
@@ -1173,6 +1177,17 @@ describe('guarded host provisioner execution', () => {
       ),
       /managed unit requires daemon-reload/,
     );
+    const preflightCommands = [];
+    const preflight = await provisionHost(
+      { apply: false, recoveryPreflight: true },
+      fixture.dependencies({
+        commands: preflightCommands,
+        identitySequence: [expectedIdentitySnapshot()],
+        unitStateSequence: [staleManagerStates],
+      }),
+    );
+    assert.equal(preflight.mode, 'dry-run');
+    assert.deepEqual(preflightCommands, []);
     const recoveredCommands = [];
     const recovered = await provisionHost(
       { apply: true },
@@ -2021,6 +2036,31 @@ describe('guarded host provisioner execution', () => {
       /systemctl listing reached after candidate audit/,
     );
     assert.equal(listingCalls, 2);
+
+    const splitStates = await readSystemUnitStatesImpl(
+      MANAGED_UNITS,
+      async (_command, args) => {
+        if (args.join('\0') === 'show\0--property=UnitPath\0--value') {
+          return {
+            stdout: `${SPLIT_USR_SYSTEMD_MANAGER_UNIT_PATH}\n`,
+            stderr: '',
+            code: 0,
+          };
+        }
+        if (args[0] === 'list-units' || args[0] === 'list-unit-files') {
+          return { stdout: '', stderr: '', code: 0 };
+        }
+        if (args[0] === 'is-active') {
+          return { stdout: 'inactive\n', stderr: '', code: 3 };
+        }
+        if (args[0] === 'is-enabled') {
+          return { stdout: 'not-found\n', stderr: '', code: 1 };
+        }
+        return { stdout: systemdUnitMetadata('not-found'), stderr: '', code: 0 };
+      },
+      systemdUnitPathFs(new Map(), { usrMerged: false }),
+    );
+    assert.equal(splitStates.size, MANAGED_UNITS.length);
   });
 
   it('rejects malformed or load-inconsistent systemctl state queries', async () => {
@@ -2179,6 +2219,63 @@ describe('guarded host provisioner execution', () => {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
+  it('uses the current install transaction after recovering an older revision', async (context) => {
+    const fixture = await provisionFixture(context);
+    const unitArtifact = fixture.plan.artifacts.find(({ kind }) => kind === 'unit');
+    const oldPolicy = Buffer.from('[Unit]\nDescription=old policy\n');
+    const interruptedPolicy = Buffer.from('[Unit]\nDescription=interrupted policy\n');
+    const currentPolicy = Buffer.from('[Unit]\nDescription=current policy\n');
+    await writeRecoveryTransaction(
+      fixture,
+      unitArtifact,
+      interruptedPolicy,
+      oldPolicy,
+    );
+    await fs.writeFile(unitArtifact.source, currentPolicy, { mode: 0o644 });
+    await fs.chmod(unitArtifact.source, 0o644);
+
+    const before = unitStates({
+      load: 'not-found',
+      active: 'inactive',
+      enabled: 'not-found',
+    });
+    const unsafe = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    unsafe.set(MANAGED_UNITS[0], {
+      ...unsafe.get(MANAGED_UNITS[0]),
+      fragment: '/run/systemd/system/webex-generic-account-bot.service',
+    });
+    const commands = [];
+
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          unitStateSequence: [before, before, before, unsafe, before],
+        }),
+      ),
+      /host policy safety validation failed and the old policy set was restored/,
+    );
+    assert.equal(await fs.readFile(unitArtifact.target, 'utf8'), oldPolicy.toString('utf8'));
+    for (const artifact of fixture.plan.artifacts) {
+      if (artifact.target === unitArtifact.target) continue;
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
   });
 
   it('rolls back the complete policy set when an atomic rename fails', async (context) => {
@@ -2885,6 +2982,68 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
+  it('retries sysusers after a recoverable credential-database partial commit', async (context) => {
+    const fixture = await provisionFixture(context);
+    const failedInstall = fixture.dependencies({ applied: true });
+    failedInstall.runCommand = async () => {
+      throw new Error('injected sysusers partial commit');
+    };
+    await assert.rejects(
+      provisionHost({ apply: true }, failedInstall),
+      /injected sysusers partial commit/,
+    );
+
+    const partialIdentity = expectedIdentitySnapshot({
+      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+      gshadowDatabase: expectedGshadowDatabase().replace(
+        'webex-config-pull:!::\n',
+        '',
+      ),
+    });
+    await assert.rejects(
+      provisionHost(
+        { apply: false, recoveryPreflight: true },
+        fixture.dependencies({
+          identitySequence: [expectedIdentitySnapshot({
+            configPullMembers: ['unexpected-user'],
+            shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+          })],
+        }),
+      ),
+      /managed group has static members: webex-config-pull/,
+    );
+    const preflightCommands = [];
+    const preflight = await provisionHost(
+      { apply: false, recoveryPreflight: true },
+      fixture.dependencies({
+        commands: preflightCommands,
+        identitySequence: [partialIdentity],
+      }),
+    );
+    assert.equal(preflight.mode, 'dry-run');
+    assert.deepEqual(preflightCommands, []);
+
+    const commands = [];
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        applied: true,
+        commands,
+        identitySequence: [partialIdentity, expectedIdentitySnapshot()],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    assert.deepEqual(report.installed_artifacts, []);
+    assert.deepEqual(commands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
   it('does not reload systemd until the held lock metadata has converged', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
@@ -3312,7 +3471,7 @@ function asyncDirectory(entries) {
 function systemdUnitPathFs(
   entriesByDirectory = new Map(),
   {
-    usrMerged = false,
+    usrMerged = true,
     usrMergeTarget = 'usr/lib',
     filesByPath = new Map(),
     fileModesByPath = new Map(),

@@ -62,10 +62,9 @@ const SYSTEMD_MANAGER_UNIT_PATHS = Object.freeze([
   '/usr/lib/systemd/system',
   '/run/systemd/generator.late',
 ]);
-const SYSTEMD_SYSTEM_UNIT_LOAD_PATHS = Object.freeze([
-  ...SYSTEMD_MANAGER_UNIT_PATHS.slice(0, -1),
+const SYSTEMD_PROTECTED_UNIT_PATHS = Object.freeze([
+  ...SYSTEMD_MANAGER_UNIT_PATHS,
   '/lib/systemd/system',
-  SYSTEMD_MANAGER_UNIT_PATHS.at(-1),
 ]);
 const STATIC_USERDB_DIRECTORIES = Object.freeze([
   '/etc/userdb',
@@ -607,8 +606,13 @@ export async function provisionHost(options, dependencies = {}) {
   let identityBefore = null;
   let recoveryState = null;
   if (transaction) {
+    const transactionInspection = await inspectPolicyTransactionRecovery(transaction, plan, deps);
     identityBefore = await deps.readIdentitySnapshot();
-    validateIdentityPolicy(identityBefore);
+    if (transactionInspection.resumeDesiredState) {
+      validateIdentityPolicyForDesiredRecovery(identityBefore);
+    } else {
+      validateIdentityPolicy(identityBefore);
+    }
     const recoveryUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     const recoveryInspected = await inspectArtifacts(plan, deps);
     auditBootPolicyCatalogs(
@@ -621,7 +625,6 @@ export async function provisionHost(options, dependencies = {}) {
       allowDaemonReloadRequired: true,
     });
     if (options.recoveryPreflight) {
-      await inspectPolicyTransactionRecovery(transaction, plan, deps);
       return provisionReport('dry-run', plan, recoveryInspected, commands);
     }
     recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
@@ -658,13 +661,16 @@ export async function provisionHost(options, dependencies = {}) {
     inspected,
     identityBefore,
   );
-  const canRecoverManagerCache = options.apply
+  const canRecoverManagerCache = (options.apply || options.recoveryPreflight)
     && inspected.artifacts.every(({ changed }) => !changed);
   assertUnitsDormant(unitStatesBefore, plan, {
     requireLoaded: false,
     allowDaemonReloadRequired: canRecoverManagerCache,
   });
   if (unitStatesNeedDaemonReload(unitStatesBefore)) {
+    if (options.recoveryPreflight) {
+      return provisionReport('dry-run', plan, inspected, commands);
+    }
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     const reloadedUnitStates = await deps.readUnitStates(MANAGED_UNITS, identityBefore);
     assertUnitsDormant(reloadedUnitStates, plan, { requireLoaded: true });
@@ -684,10 +690,12 @@ export async function provisionHost(options, dependencies = {}) {
     return provisionReport('dry-run', plan, inspected, commands);
   }
 
-  const safetyRollbackTransaction = transaction ?? transactionFromInspected(inspected);
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
+  const safetyRollbackTransaction = installed.length > 0
+    ? transactionFromInspected(inspected)
+    : transaction;
   try {
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
     const identityAfter = await deps.readIdentitySnapshot();
@@ -732,6 +740,49 @@ export async function provisionHost(options, dependencies = {}) {
     );
   }
   return provisionReport('applied', plan, inspected, commands, installed);
+}
+
+function validateIdentityPolicyForDesiredRecovery(snapshot) {
+  const shadowUsers = new Map(snapshot.shadowUsers);
+  const shadowGroups = new Map(snapshot.shadowGroups);
+  for (const userName of Object.values(MANAGED_USERS)) {
+    const user = snapshot.users.get(userName);
+    const shadowUser = shadowUsers.get(userName);
+    if (user?.password === 'x' && !shadowUser) {
+      shadowUsers.set(userName, Object.freeze({ name: userName, password: '!' }));
+    } else if (!user && shadowUser) {
+      if (!/^[!*]+$/.test(shadowUser.password)) {
+        throw new Error(`managed user shadow password is not locked: ${userName}`);
+      }
+      shadowUsers.delete(userName);
+    }
+  }
+  for (const groupName of Object.values(MANAGED_GROUPS)) {
+    const group = snapshot.groups.get(groupName);
+    const shadowGroup = shadowGroups.get(groupName);
+    if (group?.password === 'x' && !shadowGroup) {
+      shadowGroups.set(groupName, Object.freeze({
+        name: groupName,
+        password: '!',
+        administrators: Object.freeze([]),
+        members: Object.freeze([]),
+      }));
+    } else if (!group && shadowGroup) {
+      if (
+        !/^[!*]+$/.test(shadowGroup.password)
+        || shadowGroup.administrators.length !== 0
+        || shadowGroup.members.length !== 0
+      ) {
+        throw new Error(`managed group shadow credential is not recoverable: ${groupName}`);
+      }
+      shadowGroups.delete(groupName);
+    }
+  }
+  validateIdentityPolicy(Object.freeze({
+    ...snapshot,
+    shadowUsers,
+    shadowGroups,
+  }));
 }
 
 export async function runCli({
@@ -2098,7 +2149,7 @@ export function auditBootPolicyCatalogs(
     ...IDENTITY_POLICY_PATHS,
     ...STATIC_USERDB_DIRECTORIES,
     SYSTEMD_USERDB_DIRECTORY,
-    ...SYSTEMD_SYSTEM_UNIT_LOAD_PATHS,
+    ...SYSTEMD_PROTECTED_UNIT_PATHS,
     ...BOOT_POLICY_CREDENTIAL_PATHS,
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
@@ -2465,8 +2516,13 @@ export async function readSystemUnitStates(
   fsApi = fs,
   identitySnapshot = null,
 ) {
-  await assertNoUnexpectedManagedUnitPolicy(fsApi, managedIdentityIds(identitySnapshot));
-  await assertSystemdManagerUnitPath(runCommand);
+  const unitPaths = await reviewedSystemdManagerUnitPaths(fsApi);
+  await assertNoUnexpectedManagedUnitPolicy(
+    fsApi,
+    managedIdentityIds(identitySnapshot),
+    unitPaths,
+  );
+  await assertSystemdManagerUnitPath(runCommand, unitPaths);
   const [loadedInstances, installedInstances] = await Promise.all([
     runCommand('/usr/bin/systemctl', [
       'list-units',
@@ -2531,13 +2587,20 @@ export async function readSystemUnitStates(
   return states;
 }
 
-async function assertSystemdManagerUnitPath(runCommand) {
+async function reviewedSystemdManagerUnitPaths(fsApi) {
+  if (await isUsrMergedLib(fsApi)) return SYSTEMD_MANAGER_UNIT_PATHS;
+  return Object.freeze(SYSTEMD_MANAGER_UNIT_PATHS.map((directory) => (
+    directory === '/usr/lib/systemd/system' ? '/lib/systemd/system' : directory
+  )));
+}
+
+async function assertSystemdManagerUnitPath(runCommand, unitPaths) {
   const result = await runCommand('/usr/bin/systemctl', [
     'show',
     '--property=UnitPath',
     '--value',
   ]);
-  const expected = `${SYSTEMD_MANAGER_UNIT_PATHS.join(' ')}\n`;
+  const expected = `${unitPaths.join(' ')}\n`;
   if (result.code !== 0 || result.stderr !== '' || result.stdout !== expected) {
     throw new Error('systemd manager unit path is not the reviewed fixed path');
   }
@@ -2571,9 +2634,9 @@ function assertSystemctlStateMatchesLoadState(
 ) {
   if (loadState === 'not-found') {
     if (
-      activeResult.code !== 4
+      ![3, 4].includes(activeResult.code)
       || activeState !== 'inactive'
-      || enabledResult.code !== 4
+      || ![1, 4].includes(enabledResult.code)
       || enabledState !== 'not-found'
     ) {
       throw new Error(`managed unit query state disagrees with load state: ${unit}`);
@@ -2615,10 +2678,9 @@ function assertSystemctlStateMatchesLoadState(
   }
 }
 
-async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds) {
+async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds, unitPaths) {
   const budget = { entries: 0, files: 0, bytes: 0 };
-  for (const directory of SYSTEMD_SYSTEM_UNIT_LOAD_PATHS) {
-    if (directory === '/lib/systemd/system' && await isUsrMergedLib(fsApi)) continue;
+  for (const directory of unitPaths) {
     const entries = await readTrustedDirectoryEntries(
       directory,
       Math.min(
