@@ -3016,6 +3016,7 @@ async function auditSystemdPolicySymlink(
     unitNames,
     managedIds,
     logicalSource,
+    visited.size,
   );
   let resolved = path.resolve(path.dirname(candidate), target);
   if (resolved === '/dev/null') return;
@@ -3052,6 +3053,7 @@ async function auditSystemdPolicySymlink(
     mergeSystemdUnitNames(unitNames, path.basename(resolved)),
     managedIds,
     logicalSource,
+    visited.size,
   );
 }
 
@@ -3062,6 +3064,7 @@ async function auditSystemdPolicyFile(
   unitNames,
   managedIds,
   logicalSource,
+  symlinkDepth = 0,
 ) {
   budget.files += 1;
   if (budget.files > MAX_SYSTEMD_POLICY_FILES) {
@@ -3079,6 +3082,7 @@ async function auditSystemdPolicyFile(
       unitNames,
       managedIds,
       logicalSource,
+      symlinkDepth,
     );
   }
 }
@@ -3089,6 +3093,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
   unitNames = new Set(),
   managedIds = new Set(),
   logicalSource = source,
+  symlinkDepth = 0,
 ) {
   const raw = String(value);
   const decoded = decodeSystemdEscapesForAudit(raw);
@@ -3097,6 +3102,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     source,
     unitNames,
     logicalSource,
+    symlinkDepth,
   )) {
     throw new Error(`external systemd policy injects a host policy credential: ${source}`);
   }
@@ -3133,6 +3139,7 @@ function systemdPolicyInjectsBootPolicyCredential(
   source,
   unitNames,
   logicalSource,
+  symlinkDepth,
 ) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
@@ -3143,6 +3150,7 @@ function systemdPolicyInjectsBootPolicyCredential(
     value.trim(),
     unitNames,
     logicalSource,
+    symlinkDepth,
   )) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
   if (directive === 'ImportCredential') {
@@ -3195,11 +3203,19 @@ function isExpectedVendorBootPolicyCredentialImport(
   line,
   unitNames,
   logicalSource,
+  symlinkDepth,
 ) {
   const directory = path.dirname(source);
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
-  if (path.basename(logicalSource) !== unit) return false;
+  const directVendorFile = symlinkDepth === 0 && logicalSource === source;
+  const directDependencyLink = (
+    symlinkDepth === 1
+    && path.basename(logicalSource) === unit
+    && /\.(?:wants|requires|upholds)$/.test(path.basename(path.dirname(logicalSource)))
+    && SYSTEMD_PROTECTED_UNIT_PATHS.includes(path.dirname(path.dirname(logicalSource)))
+  );
+  if (!directVendorFile && !directDependencyLink) return false;
   return (
     unit === 'systemd-sysusers.service'
     && systemdUnitNamesEqual(unitNames, unit)

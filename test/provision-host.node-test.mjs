@@ -1883,6 +1883,12 @@ describe('guarded host provisioner execution', () => {
         /external systemd policy injects a host policy credential/,
       ],
       [
+        'systemd-sysusers.service',
+        '/usr/lib/systemd/system/systemd-sysusers.service',
+        '[Service]\nImportCredential=sysusers.*\n',
+        /external systemd policy injects a host policy credential/,
+      ],
+      [
         'external-userdb.service',
         '/usr/lib/systemd/system/systemd-userdb-load-credentials.service',
         '[Service]\nImportCredential=userdb.user.*\n',
@@ -1910,6 +1916,43 @@ describe('guarded host provisioner execution', () => {
         expected,
       );
     }
+
+    const externalWants = '/etc/systemd/system/external.target.wants';
+    const chainedSysusers = `${externalWants}/systemd-sysusers.service`;
+    const intermediateSysusers = '/opt/systemd/systemd-sysusers.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: 'external.target.wants',
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [externalWants, [{
+              name: 'systemd-sysusers.service',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              '/usr/lib/systemd/system/systemd-sysusers.service',
+              Buffer.from('[Service]\nImportCredential=sysusers.*\n'),
+            ]]),
+            symlinksByPath: new Map([
+              [chainedSysusers, intermediateSysusers],
+              [intermediateSysusers, '/usr/lib/systemd/system/systemd-sysusers.service'],
+            ]),
+          },
+        ),
+      ),
+      /external systemd policy injects a host policy credential/,
+    );
 
     const fakeVendorUnit =
       '/usr/lib/systemd/system/systemd-tmpfiles-unreviewed.service';

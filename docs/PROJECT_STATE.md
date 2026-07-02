@@ -124,7 +124,8 @@
   `passwd.shell.*` rejection, plus systemd 258 `userdb.user.*` and
   `userdb.group.*` plus `userdb.transient.*` prefix rejection across credential
   and tmpfiles channels, exact physical/logical vendor import exceptions that
-  accept same-name dependency links but reject renamed aliases,
+  accept direct single-hop same-name dependency links but reject top-level,
+  multi-hop, and renamed aliases,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

@@ -272,10 +272,10 @@ materialise static records under `/etc/userdb`, together with their
 selectors are evaluated across exact, trailing-glob, and
 glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
-exact physical-file/logical-owner pair and exact upstream selector. Same-name
-vendor dependency links are accepted, while renamed aliases remain outside the
-exception. The current system credential set and all plaintext and encrypted
-credential stores must prove that `sysusers.extra`
+exact physical-file/logical-owner pair and exact upstream selector. Direct,
+single-hop same-name vendor dependency links are accepted, while top-level,
+multi-hop, and renamed aliases remain outside the exception. The current system
+credential set and all plaintext and encrypted credential stores must prove that `sysusers.extra`
 and `tmpfiles.extra` plus all passwd and userdb credential prefixes are absent. Tmpfiles
 may perform only tightly bounded root-owned maintenance on credential-store
 root directories; child paths, globs, and modified operation types are
