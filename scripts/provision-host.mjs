@@ -30,6 +30,8 @@ const MAX_SYSTEMD_POLICY_TREE_ENTRIES = 32_768;
 const MAX_SYSTEMD_POLICY_FILES = 8192;
 const MAX_SYSTEMD_POLICY_BYTES = 64 * 1024 * 1024;
 const MAX_CREDENTIAL_STORE_ENTRIES = 1024;
+const MAX_MOUNTINFO_BYTES = 8 * 1024 * 1024;
+const MAX_MOUNTINFO_ENTRIES = 16_384;
 const MAX_MANAGED_ID = 59_999;
 const MAX_IDENTITY_FILE_BYTES = 8 * 1024 * 1024;
 const TRANSACTION_VERSION = 2;
@@ -263,6 +265,41 @@ const SYSTEMD_SHELL_EXECUTABLES = new Set([
   'sh',
   'tcsh',
   'zsh',
+]);
+const SYSTEMCTL_UNSCOPED_MUTATION_VERBS = new Set([
+  'cancel',
+  'daemon-reexec',
+  'daemon-reload',
+  'default',
+  'emergency',
+  'exit',
+  'halt',
+  'hibernate',
+  'hybrid-sleep',
+  'import-environment',
+  'kexec',
+  'log-level',
+  'log-target',
+  'poweroff',
+  'preset-all',
+  'reboot',
+  'rescue',
+  'reset-failed',
+  'service-watchdogs',
+  'set-default',
+  'set-environment',
+  'soft-reboot',
+  'suspend',
+  'suspend-then-hibernate',
+  'switch-root',
+  'unset-environment',
+]);
+const TRUSTED_MANAGED_MOUNT_ANCESTORS = new Set([
+  '/',
+  '/etc',
+  '/run',
+  '/var',
+  '/var/lib',
 ]);
 
 class PolicySafetyRollbackError extends Error {}
@@ -737,6 +774,10 @@ export async function provisionHost(options, dependencies = {}) {
       recoveryInspected,
       identityBefore,
     );
+    assertNoUnexpectedManagedMounts(
+      recoveryInspected,
+      await deps.readMountInfo(),
+    );
     await verifyRuntimeAncestors(recoveryInspected);
     assertUnitsDormant(recoveryUnitStates, plan, {
       requireLoaded: false,
@@ -780,6 +821,7 @@ export async function provisionHost(options, dependencies = {}) {
     inspected,
     identityBefore,
   );
+  assertNoUnexpectedManagedMounts(inspected, await deps.readMountInfo());
   await verifyRuntimeAncestors(inspected);
   const canRecoverManagerCache = (options.apply || options.recoveryPreflight)
     && inspected.artifacts.every(({ changed }) => !changed);
@@ -815,6 +857,7 @@ export async function provisionHost(options, dependencies = {}) {
       identityAfter,
       { requireManagedPolicy: true },
     );
+    assertNoUnexpectedManagedMounts(inspected, await deps.readMountInfo());
     commands.push(await deps.runCommand('/usr/bin/systemd-tmpfiles', [
       '--create',
       ...plan.tmpfiles,
@@ -2762,11 +2805,75 @@ function pathFieldTouchesProtected(policyPath, ancestorPolicyIsSafe, protectedPa
 }
 
 function normaliseBootPolicyPath(policyPath) {
-  let normalised = path.posix.normalize(policyPath);
+  const runtimePath = policyPath === '/var/run'
+    ? '/run'
+    : policyPath.startsWith('/var/run/')
+      ? `/run/${policyPath.slice('/var/run/'.length)}`
+      : policyPath;
+  let normalised = path.posix.normalize(runtimePath);
   if (normalised.length > 1) normalised = normalised.replace(/\/+$/, '');
-  if (normalised === '/var/run') return '/run';
-  if (normalised.startsWith('/var/run/')) return `/run/${normalised.slice('/var/run/'.length)}`;
   return normalised;
+}
+
+function assertNoUnexpectedManagedMounts(inspected, mountInfo) {
+  const managedPaths = new Set(inspected.artifacts
+    .filter(({ kind }) => kind === 'tmpfiles')
+    .flatMap(({ source }) => policyCatalogLines(source.contents))
+    .map((line) => parseSystemdFields(line)[1])
+    .map(normaliseBootPolicyPath));
+  for (const { root, mountPoint } of parseMountInfo(mountInfo)) {
+    for (const managedPath of managedPaths) {
+      if (mountPoint === managedPath || mountPoint.startsWith(`${managedPath}/`)) {
+        throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
+      }
+      const mountIsAncestor = mountPoint === '/'
+        ? managedPath.startsWith('/')
+        : managedPath.startsWith(`${mountPoint}/`);
+      if (!mountIsAncestor) continue;
+      if (TRUSTED_MANAGED_MOUNT_ANCESTORS.has(mountPoint) && root === '/') continue;
+      throw new Error(`unexpected mount overlaps managed tmpfiles path: ${mountPoint}`);
+    }
+  }
+}
+
+function parseMountInfo(mountInfo) {
+  const contents = Buffer.isBuffer(mountInfo)
+    ? mountInfo
+    : Buffer.from(String(mountInfo), 'utf8');
+  if (contents.length > MAX_MOUNTINFO_BYTES) {
+    throw new Error('mountinfo exceeds the safety limit');
+  }
+  const text = contents.toString('utf8');
+  if (text.includes('\uFFFD')) throw new Error('mountinfo is not valid UTF-8');
+  const lines = text.split('\n').filter((line) => line !== '');
+  if (lines.length > MAX_MOUNTINFO_ENTRIES) {
+    throw new Error('mountinfo has too many entries');
+  }
+  return lines.map((line) => {
+    const fields = line.split(' ');
+    const separator = fields.indexOf('-');
+    if (separator < 6 || fields.length < separator + 4) {
+      throw new Error('mountinfo entry is malformed');
+    }
+    const root = decodeMountInfoPath(fields[3]);
+    const mountPoint = decodeMountInfoPath(fields[4]);
+    if (!path.posix.isAbsolute(root) || !path.posix.isAbsolute(mountPoint)) {
+      throw new Error('mountinfo path is not absolute');
+    }
+    return Object.freeze({
+      root: path.posix.normalize(root),
+      mountPoint: path.posix.normalize(mountPoint),
+    });
+  });
+}
+
+function decodeMountInfoPath(value) {
+  if (/\\(?![0-7]{3})/.test(value)) {
+    throw new Error('mountinfo path escape is malformed');
+  }
+  return value.replace(/\\([0-7]{3})/g, (_match, encoded) => (
+    String.fromCodePoint(Number.parseInt(encoded, 8))
+  ));
 }
 
 function tmpfilesAncestorPolicyIsSafe(fields) {
@@ -3064,6 +3171,9 @@ async function auditSystemdPolicyEntry(
 ) {
   const candidate = path.join(directory, entry.name);
   const unitNames = systemdPolicyUnitNames(directory, entry.name);
+  const bootPolicyConsumer = [...unitNames].some((unit) => (
+    BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit)
+  ));
   assertSystemdPolicyDoesNotReferenceManaged(entry.name, candidate, unitNames, managedIds);
   const unitFile = SYSTEMD_UNIT_NAME_PATTERN.test(entry.name);
   const policyDirectory = /\.(?:d|wants|requires|upholds)$/.test(entry.name);
@@ -3084,6 +3194,9 @@ async function auditSystemdPolicyEntry(
   if (stat.isFile()) {
     await auditSystemdPolicyFile(candidate, budget, fsApi, unitNames, managedIds, candidate);
     return;
+  }
+  if (bootPolicyConsumer) {
+    throw new Error(`boot policy systemd consumer is not trusted: ${candidate}`);
   }
   if (!stat.isDirectory()) return;
   if (!/\.(?:d|wants|requires|upholds)$/.test(entry.name)) return;
@@ -3338,7 +3451,18 @@ function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
   return command !== null
     && systemdExecInvokes(command, 'systemctl')
-    && command.tokens.some(systemctlUnitFieldCouldMatch);
+    && (
+      command.tokens.some(systemctlUnitFieldCouldMatch)
+      || command.tokens.some((token) => (
+        SYSTEMCTL_UNSCOPED_MUTATION_VERBS.has(token)
+        || systemdSpecifierFieldCouldMatch(
+          token,
+          [...SYSTEMCTL_UNSCOPED_MUTATION_VERBS],
+        )
+        || token === '--marked'
+        || systemdSpecifierFieldCouldMatch(token, ['--marked'])
+      ))
+    );
 }
 
 function systemdPolicyInvokesShell(value) {
@@ -3459,16 +3583,19 @@ function shellExecutableName(name) {
 }
 
 function systemctlUnitFieldCouldMatch(field) {
-  return [field, `${field}.service`].some((candidate) => {
-    const tokens = systemdUnitPatternTokens(candidate);
-    const pattern = tokens.map((token) => {
-      if (token.literal !== undefined) return escapeRegExp(token.literal);
-      return token.repeat ? '[^\\s/]*' : '[^\\s/]';
-    }).join('');
-    const reference = new RegExp(`^${pattern}$`);
-    return MANAGED_UNITS.some((unit) => reference.test(unit))
-      || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
-  });
+  const basename = path.posix.basename(field);
+  return [...new Set([field, basename])]
+    .flatMap((candidate) => [candidate, `${candidate}.service`])
+    .some((candidate) => {
+      const tokens = systemdUnitPatternTokens(candidate);
+      const pattern = tokens.map((token) => {
+        if (token.literal !== undefined) return escapeRegExp(token.literal);
+        return token.repeat ? '[^\\s/]*' : '[^\\s/]';
+      }).join('');
+      const reference = new RegExp(`^${pattern}$`);
+      return MANAGED_UNITS.some((unit) => reference.test(unit))
+        || systemdTokenPatternsIntersect(tokens, launcherReferenceTokens());
+    });
 }
 
 function systemdUnitPatternTokens(field) {
@@ -4050,8 +4177,9 @@ async function runFixedCommand(command, args, allowedExitCodes = [0]) {
 
 function provisionDependencies(dependencies) {
   const runCommand = dependencies.runCommand ?? runFixedCommand;
+  const fsApi = dependencies.fsApi ?? fs;
   return {
-    fsApi: dependencies.fsApi ?? fs,
+    fsApi,
     processApi: dependencies.processApi ?? process,
     randomUUID: dependencies.randomUUID ?? randomUUID,
     requireRoot: dependencies.requireRoot ?? true,
@@ -4063,14 +4191,16 @@ function provisionDependencies(dependencies) {
     targetGid: dependencies.targetGid ?? 0,
     runCommand,
     readIdentitySnapshot: dependencies.readIdentitySnapshot
-      ?? (() => readSystemIdentitySnapshot(dependencies.fsApi ?? fs, runCommand)),
+      ?? (() => readSystemIdentitySnapshot(fsApi, runCommand)),
     readBootPolicyCatalogs: dependencies.readBootPolicyCatalogs
-      ?? (() => readSystemBootPolicyCatalogs(runCommand, dependencies.fsApi ?? fs)),
+      ?? (() => readSystemBootPolicyCatalogs(runCommand, fsApi)),
+    readMountInfo: dependencies.readMountInfo
+      ?? (() => fsApi.readFile('/proc/self/mountinfo')),
     readUnitStates: dependencies.readUnitStates
       ?? ((units, identitySnapshot) => readSystemUnitStates(
         units,
         runCommand,
-        dependencies.fsApi ?? fs,
+        fsApi,
         identitySnapshot,
       )),
     verifyProvisionLockConverged: dependencies.verifyProvisionLockConverged

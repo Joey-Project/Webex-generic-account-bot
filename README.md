@@ -285,8 +285,9 @@ rejected. The merged systemd sysusers and tmpfiles
 catalogue commands must return code zero, empty diagnostics, and non-empty
 source-associated output. Their catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
-specifier/glob-prefix, lexical path and trailing-slash normalisation including
-glob-capable access through the legacy `/var/run` alias, copy-source, path-derived-ID,
+specifier/glob-prefix, lexical path and trailing-slash normalisation after the
+legacy `/var/run` alias is rewritten to `/run`, including glob-capable access,
+copy-source, path-derived-ID,
 owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
 metadata, and recursive-parent semantics. External
 sysusers allocation-range directives are rejected. Before managed account
@@ -309,13 +310,16 @@ The sysusers, userdb credential loader, and tmpfiles consumer services must
 also remain direct vendor fragments or single-hop same-name dependency links.
 Overrides, exact or shared drop-ins, and consumer-owned dependency directories
 are rejected so explicit out-of-catalogue command arguments or helper units
-cannot bypass the merged policy audit. Consumer masks, dangling links, and
-non-regular symlink targets are rejected before terminal-link handling can skip
-the vendor provenance check. External unit execution directives may not invoke
+cannot bypass the merged policy audit. Consumer masks, dangling links,
+non-regular symlink targets, directories, and other non-regular consumer
+overrides are rejected before terminal handling can skip the vendor provenance
+check. External unit execution directives may not invoke
 `systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
-or use `systemctl` with a literal or specifier-reachable managed unit target,
-including through linked helper units, unit-name specifier expansion, or
-unresolved template-instance executable and argument specifiers.
+or use `systemctl` with a literal, path-qualified, or specifier-reachable managed
+unit target. Unscoped mutating commands such as `preset-all`, manager reloads,
+and `--marked` operations are also rejected, including through linked helper
+units, unit-name specifier expansion, or unresolved template-instance
+executable and argument specifiers.
 Administrator, runtime, generator, and local-vendor `Exec*` directives may not
 invoke a shell. Shell execution is accepted only from a direct package-owned
 vendor unit or its single-hop same-name dependency link; direct boot-policy
@@ -337,7 +341,9 @@ The same host-wide `flock` used by config deployment serialises the complete app
 The trusted Node and provisioner entrypoints and a complete transaction-aware,
 read-only host preflight are verified before first-run lock metadata can be
 created or converged. The re-executed process repeats the host checks under the
-lock and then verifies
+lock. Dry-run, recovery, and apply parse bounded `/proc/self/mountinfo` data;
+managed tmpfiles targets, descendants, and non-standard redirected ancestors
+must not be mount points before any tmpfiles mutation. The process then verifies
 the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a

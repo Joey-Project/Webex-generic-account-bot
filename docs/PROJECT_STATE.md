@@ -139,7 +139,10 @@
   protected `systemctl set-credential{,-encrypted}` inline, path, or
   specifier-expanded assignment, non-vendor `Exec*` environment expansion and
   systemd-managed directory source or alias claims over protected Webex paths,
-  and tmpfiles access to `/run/credentials/@system`,
+  path-qualified and unscoped mutating `systemctl` operations, non-regular
+  boot-policy consumer overrides, and tmpfiles access to
+  `/run/credentials/@system`; rewrite `/var/run` before path normalisation and
+  reject unexpected mounts overlapping managed tmpfiles paths,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

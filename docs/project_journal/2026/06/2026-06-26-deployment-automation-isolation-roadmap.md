@@ -207,6 +207,9 @@ superseded_by:
   `systemctl` inline, path, or specifier-expanded credential assignment
   rejected, non-vendor `Exec*` environment expansion and systemd-managed
   directory source or alias claims over protected Webex paths refused,
+  path-qualified and unscoped mutating `systemctl` operations and non-regular
+  boot-policy consumer overrides rejected, `/var/run` rewritten before path
+  normalisation, unexpected managed-path mounts refused,
   `/run/credentials/@system` protected from tmpfiles, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency

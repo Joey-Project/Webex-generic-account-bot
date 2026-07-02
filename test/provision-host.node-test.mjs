@@ -57,6 +57,12 @@ const SPLIT_USR_SYSTEMD_MANAGER_UNIT_PATH = SYSTEMD_MANAGER_UNIT_PATH.replace(
   '/usr/lib/systemd/system',
   '/lib/systemd/system',
 );
+const SAFE_MOUNT_INFO = [
+  '1 0 0:1 / / rw - overlay overlay rw',
+  '2 1 0:2 / /run rw - tmpfs tmpfs rw',
+  '3 1 8:1 / /var/lib rw - ext4 /dev/root rw',
+  '',
+].join('\n');
 
 function readSystemUnitStates(units, runCommand, fsApi, identitySnapshot = null) {
   return readSystemUnitStatesImpl(
@@ -869,6 +875,29 @@ describe('guarded host provisioner execution', () => {
     await assert.rejects(fs.stat(path.join(fixture.targetRoot, 'etc')), { code: 'ENOENT' });
   });
 
+  it('rejects unexpected mounts overlapping managed tmpfiles paths', async (context) => {
+    const fixture = await provisionFixture(context);
+    for (const [root, mountPoint] of [
+      ['/etc/shadow', '/run/webex-config-deploy/deploy-config.lock'],
+      ['/sensitive-state', '/var/lib/webex-generic-account-bot'],
+      ['/redirected-var-lib', '/var/lib'],
+      ['/', '/var/lib/webex-generic-account-bot/state/nested'],
+    ]) {
+      const commands = [];
+      await assert.rejects(
+        provisionHost(
+          { apply: false },
+          fixture.dependencies({
+            commands,
+            mountInfoSequence: [mountInfoWith(root, mountPoint)],
+          }),
+        ),
+        /unexpected mount overlaps managed tmpfiles path/,
+      );
+      assert.deepEqual(commands, []);
+    }
+  });
+
   it('rejects unmanaged boot policy that can cross the Webex boundary', async (context) => {
     for (const [kind, policy] of [
       ['sysusers', 'm webex-generic-account-bot sudo'],
@@ -892,6 +921,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f /tmp/untrusted 0600 1001 root -'],
       ['tmpfiles', 'f /tmp/untrusted 0600 root :02001 -'],
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
+      ['tmpfiles', 'f+ /var/run/../etc/passwd 0600 root root - replacement'],
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
       ['tmpfiles', 'f /etc/credstore/userdb.user.injected 0600 root root - {}'],
       ['tmpfiles', 'f /run/credstore/* 0600 root root - payload'],
@@ -1885,6 +1915,20 @@ describe('guarded host provisioner execution', () => {
       /boot policy systemd consumer is not trusted/,
     );
 
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(new Map([['/etc/systemd/system', [{
+          name: 'systemd-sysusers.service',
+          isFile: () => false,
+          isDirectory: () => true,
+          isSymbolicLink: () => false,
+        }]]])),
+      ),
+      /boot policy systemd consumer is not trusted/,
+    );
+
     for (const directoryName of [
       'service.d',
       'systemd-.service.d',
@@ -2029,6 +2073,7 @@ describe('guarded host provisioner execution', () => {
 
     for (const [instance, target] of [
       ['generic-account-bot', 'webex-%i.service'],
+      ['generic-account-bot', '/etc/systemd/system/webex-%i.service'],
       ['smoke', 'webex-codex-launcher@%I.service'],
       ['literal', 'webex-codex-activation-renew'],
       ['glob', 'webex-*'],
@@ -2055,6 +2100,31 @@ describe('guarded host provisioner execution', () => {
                   Buffer.from(`[Unit]\nWants=external@${instance}.service\n`),
                 ],
               ]),
+            },
+          ),
+        ),
+        /external systemd policy references a managed unit/,
+      );
+    }
+
+    for (const command of [
+      'systemctl --preset-mode=enable-only preset-all',
+      'systemctl daemon-reload',
+      'systemctl --marked reload-or-restart',
+    ]) {
+      const name = `external-global-systemctl-${command.length}.service`;
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
+                Buffer.from(`[Service]\nExecStart=/usr/bin/${command}\n`),
+              ]]),
             },
           ),
         ),
@@ -4162,6 +4232,10 @@ describe('guarded host provisioner execution', () => {
   });
 });
 
+function mountInfoWith(root, mountPoint) {
+  return `${SAFE_MOUNT_INFO}4 1 8:1 ${root} ${mountPoint} rw - ext4 /dev/root rw\n`;
+}
+
 async function provisionFixture(context) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-host-provision-test-'));
   context.after(async () => fs.rm(root, { recursive: true, force: true }));
@@ -4198,6 +4272,7 @@ async function provisionFixture(context) {
       identitySequence = null,
       unitStateSequence = null,
       bootPolicySequence = null,
+      mountInfoSequence = null,
       verifyProvisionLockConverged = async () => {},
       verifyRuntimeAncestors = async () => {},
       verifyManagedRuntimeState = async () => {},
@@ -4214,8 +4289,10 @@ async function provisionFixture(context) {
       let identityIndex = 0;
       let stateIndex = 0;
       let bootPolicyIndex = 0;
+      let mountInfoIndex = 0;
       let uuid = 0;
       const bootPolicies = bootPolicySequence ?? [bootPolicyCatalogs];
+      const mountInfos = mountInfoSequence ?? [SAFE_MOUNT_INFO];
       return {
         plan,
         fsApi,
@@ -4232,6 +4309,9 @@ async function provisionFixture(context) {
         ],
         readBootPolicyCatalogs: async () => bootPolicies[
           Math.min(bootPolicyIndex++, bootPolicies.length - 1)
+        ],
+        readMountInfo: async () => mountInfos[
+          Math.min(mountInfoIndex++, mountInfos.length - 1)
         ],
         readUnitStates: async () => stateSequence[
           Math.min(stateIndex++, stateSequence.length - 1)
