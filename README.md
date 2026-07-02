@@ -400,7 +400,9 @@ private`; the private namespace must differ from PID 1 and expose no shared,
 master, propagate-from, or unbindable records. Host mount changes therefore
 cannot enter the mutation namespace. The provisioner still checks its mount
 namespace identity immediately before every mutation path, including fd-backed
-writes and metadata changes. Every other fixed host command is opened through a
+writes and metadata changes. Each Node bootstrap opens `/proc/self/fd/5` as an
+independent source descriptor so the inherited script OFD remains positioned at
+zero for a later identity-recovery exec. Every other fixed host command is opened through a
 stable root-owned executable handle, bracketed by command-path mount snapshots,
 and executed through `/proc/self/fd`.
 Dry-run, recovery, and apply loop through short reads while collecting and

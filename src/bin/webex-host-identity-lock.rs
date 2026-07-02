@@ -35,7 +35,7 @@ const FILE_CAPABILITY_XATTR: &[u8] = b"security.capability\0";
 #[cfg(target_os = "linux")]
 const IDENTITY_RECOVERY_BOOTSTRAP: &str = concat!(
     "const { readFileSync } = await import(\"node:fs\"); ",
-    "const source = readFileSync(5).toString(\"base64\"); ",
+    "const source = readFileSync(\"/proc/self/fd/5\").toString(\"base64\"); ",
     "const { runIdentityRecoveryChild } = await import(\"data:text/javascript;base64,\" + source); ",
     "process.exitCode = await runIdentityRecoveryChild();"
 );
@@ -369,7 +369,7 @@ mod tests {
             SOURCE_ROOT,
             "/opt/webex-generic-account-bot/code/deploy/systemd"
         );
-        assert!(IDENTITY_RECOVERY_BOOTSTRAP.contains("readFileSync(5)"));
+        assert!(IDENTITY_RECOVERY_BOOTSTRAP.contains("readFileSync(\"/proc/self/fd/5\")"));
         assert!(IDENTITY_RECOVERY_BOOTSTRAP.contains("runIdentityRecoveryChild"));
         assert!(!IDENTITY_RECOVERY_BOOTSTRAP.contains("runCli"));
     }

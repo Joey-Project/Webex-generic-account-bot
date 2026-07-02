@@ -20,7 +20,7 @@ const IDENTITY_LOCK_PARENT_PID_ENV = 'WEBEX_HOST_IDENTITY_LOCK_PARENT_PID';
 const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
 const FD_REEXEC_BOOTSTRAP = [
   'const { readFileSync } = await import("node:fs");',
-  'const source = readFileSync(5).toString("base64");',
+  'const source = readFileSync("/proc/self/fd/5").toString("base64");',
   'const { runCli } = await import("data:text/javascript;base64," + source);',
   'process.exitCode = await runCli({ argv: process.argv.slice(1) });',
 ].join(' ');

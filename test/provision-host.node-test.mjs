@@ -264,7 +264,7 @@ describe('guarded host provisioner policy', () => {
   it('wraps the complete apply in the fixed exclusive flock command', async () => {
     const fdBootstrap = [
       'const { readFileSync } = await import("node:fs");',
-      'const source = readFileSync(5).toString("base64");',
+      'const source = readFileSync("/proc/self/fd/5").toString("base64");',
       'const { runCli } = await import("data:text/javascript;base64," + source);',
       'process.exitCode = await runCli({ argv: process.argv.slice(1) });',
     ].join(' ');
@@ -550,32 +550,43 @@ describe('guarded host provisioner policy', () => {
     );
     const scriptHandle = await fs.open(provisionScript, fsConstants.O_RDONLY);
     try {
-      const result = spawnSync(
-        process.execPath,
-        [
-          '--input-type=module',
-          '--eval',
-          fdBootstrap,
-          '--',
-          '--help',
-        ],
-        {
-          env: {
-            PATH: '/usr/bin:/bin',
-            LANG: 'C.UTF-8',
-            LC_ALL: 'C.UTF-8',
-            WEBEX_HOST_PROVISION_LOCKED: '1',
-            WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS: '1',
-            WEBEX_HOST_PROVISION_SOURCE_ROOT: REPO_SYSTEMD_ROOT,
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '--eval',
+            fdBootstrap,
+            '--',
+            '--help',
+          ],
+          {
+            env: {
+              PATH: '/usr/bin:/bin',
+              LANG: 'C.UTF-8',
+              LC_ALL: 'C.UTF-8',
+              WEBEX_HOST_PROVISION_LOCKED: '1',
+              WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS: '1',
+              WEBEX_HOST_PROVISION_SOURCE_ROOT: REPO_SYSTEMD_ROOT,
+            },
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', scriptHandle.fd],
           },
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', scriptHandle.fd],
-        },
+        );
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /Dry-run is the default/);
+        assert.equal(result.stderr, '');
+      }
+      const offsetProbe = Buffer.alloc(2);
+      const { bytesRead } = await scriptHandle.read(
+        offsetProbe,
+        0,
+        offsetProbe.length,
+        null,
       );
-      assert.equal(result.error, undefined);
-      assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /Dry-run is the default/);
-      assert.equal(result.stderr, '');
+      assert.equal(bytesRead, 2);
+      assert.equal(offsetProbe.toString('utf8'), '#!');
     } finally {
       await scriptHandle.close();
     }
