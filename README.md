@@ -322,8 +322,11 @@ vendor unit or its single-hop same-name dependency link; direct boot-policy
 tools and managed-unit control remain forbidden even in those vendor sources.
 The systemd `|` shell prefix, unresolved executable specifiers, and standard
 shell-family executable names are all treated as shell execution.
-`env -S`/`--split-string` argv reinterpretation is rejected, and `systemctl`
-may not set protected plaintext or encrypted system credentials.
+`env -S`/`--split-string` argv reinterpretation, including every accepted GNU
+long-option abbreviation, is rejected. `systemctl` may not set protected
+plaintext or encrypted system credentials through inline, path, or
+specifier-expanded arguments. Non-vendor units also cannot claim protected
+Webex paths through systemd-managed directory source or alias directives.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths

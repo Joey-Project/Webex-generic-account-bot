@@ -135,9 +135,11 @@
   implicit service suffixes, or glob targets, while shell `Exec*` directives
   including the `|` prefix, unresolved executable specifiers, and standard
   shell-family names require direct or single-hop same-name package-vendor
-  provenance, reject `env` split-string argv reinterpretation and protected
-  `systemctl set-credential{,-encrypted}` assignments, non-vendor `Exec*`
-  environment expansion, and tmpfiles access to `/run/credentials/@system`,
+  provenance, reject every accepted `env` split-string abbreviation and
+  protected `systemctl set-credential{,-encrypted}` inline, path, or
+  specifier-expanded assignment, non-vendor `Exec*` environment expansion and
+  systemd-managed directory source or alias claims over protected Webex paths,
+  and tmpfiles access to `/run/credentials/@system`,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements

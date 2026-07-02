@@ -2066,6 +2066,8 @@ describe('guarded host provisioner execution', () => {
     for (const option of [
       '"--split-string=/usr/bin/echo safe"',
       '"--split-s=/usr/bin/echo safe"',
+      '"--s=/usr/bin/echo safe"',
+      '"--spl=/usr/bin/echo safe"',
       '"-iS /usr/bin/echo safe"',
     ]) {
       await assert.rejects(
@@ -2109,25 +2111,81 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy uses environment expansion/,
     );
 
-    for (const command of ['set-credential', 'set-credential-encrypted']) {
-      const credentialUnit = `/etc/systemd/system/external-${command}.service`;
+    for (const [name, commandLine] of [
+      [
+        'set-credential-inline',
+        'set-credential passwd.plaintext-password.root=secret',
+      ],
+      [
+        'set-credential-path',
+        'set-credential sysusers.extra /tmp/sysusers.extra',
+      ],
+      [
+        'set-credential-encrypted-path',
+        'set-credential-encrypted tmpfiles.extra /tmp/tmpfiles.extra',
+      ],
+      [
+        'set-credential-template',
+        'set-credenti%ial sysusers.extra /tmp/sysusers.extra',
+      ],
+    ]) {
+      const unitName = name === 'set-credential-template'
+        ? 'external@.service'
+        : `external-${name}.service`;
+      const credentialUnit = `/etc/systemd/system/${unitName}`;
       await assert.rejects(
         readSystemUnitStates(
           MANAGED_UNITS,
           async () => ({ stdout: '', stderr: '', code: 0 }),
           systemdUnitPathFs(
-            new Map([['/etc/systemd/system', [{ name: `external-${command}.service` }]]]),
+            new Map([['/etc/systemd/system', [{ name: unitName }]]]),
             {
               filesByPath: new Map([[
                 credentialUnit,
                 Buffer.from(
-                  `[Service]\nExecStart=/usr/bin/systemctl ${command} passwd.plaintext-password.root=secret\n`,
+                  `[Service]\nExecStart=/usr/bin/systemctl ${commandLine}\n`,
                 ),
               ]]),
             },
           ),
         ),
         /external systemd policy injects a host policy credential/,
+      );
+    }
+
+    for (const [name, policy] of [
+      [
+        'external-state.service',
+        '[Service]\nStateDirectory=webex-headless-access\n',
+      ],
+      [
+        'external-state-alias.service',
+        '[Service]\nStateDirectory=external:webex-headless-access\n',
+      ],
+      [
+        'external-runtime.service',
+        '[Service]\nRuntimeDirectory=webex-config-deploy\n',
+      ],
+      [
+        'external-config.service',
+        '[Service]\nConfigurationDirectory=webex-generic-account-bot\n',
+      ],
+      [
+        'external-state@.service',
+        '[Service]\nStateDirectory=%i\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy claims a protected directory/,
       );
     }
 

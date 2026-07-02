@@ -203,9 +203,11 @@ superseded_by:
   targets, implicit service suffixes, or glob targets, shell `Exec*` directives
   including the `|` prefix, unresolved executable specifiers, and standard
   shell-family names restricted to direct or single-hop same-name package-vendor
-  provenance, `env` split-string argv reinterpretation and protected `systemctl`
-  credential assignments rejected, non-vendor `Exec*` environment expansion
-  refused, `/run/credentials/@system` protected from tmpfiles, and
+  provenance, every accepted `env` split-string abbreviation and protected
+  `systemctl` inline, path, or specifier-expanded credential assignment
+  rejected, non-vendor `Exec*` environment expansion and systemd-managed
+  directory source or alias claims over protected Webex paths refused,
+  `/run/credentials/@system` protected from tmpfiles, and
   launcher-instance reference rejection, fixed-path scanning for
   unloaded policy and dependency
   directories across all managed units plus

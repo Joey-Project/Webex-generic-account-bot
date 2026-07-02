@@ -67,6 +67,24 @@ const SYSTEMD_PROTECTED_UNIT_PATHS = Object.freeze([
   ...SYSTEMD_MANAGER_UNIT_PATHS,
   '/lib/systemd/system',
 ]);
+const SYSTEMD_MANAGED_DIRECTORY_ROOTS = new Map([
+  ['CacheDirectory', '/var/cache'],
+  ['ConfigurationDirectory', '/etc'],
+  ['LogsDirectory', '/var/log'],
+  ['RuntimeDirectory', '/run'],
+  ['StateDirectory', '/var/lib'],
+]);
+const SYSTEMD_PROTECTED_DIRECTORY_PATHS = Object.freeze([
+  '/etc/webex-generic-account-bot',
+  '/run/webex-codex-activation',
+  '/run/webex-codex-canary',
+  '/run/webex-codex-launcher',
+  '/run/webex-config-deploy',
+  '/run/webex-config-pull',
+  '/var/lib/webex-codex-runtime-inputs',
+  '/var/lib/webex-generic-account-bot',
+  '/var/lib/webex-headless-access',
+]);
 const STATIC_USERDB_DIRECTORIES = Object.freeze([
   '/etc/userdb',
   '/run/userdb',
@@ -3254,6 +3272,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy uses environment expansion: ${source}`);
     }
     if (
+      systemdPolicyClaimsProtectedDirectory(candidate)
+      && !isExpectedVendorSystemdUnitSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
+      throw new Error(`external systemd policy claims a protected directory: ${source}`);
+    }
+    if (
       systemdPolicyInvokesShell(candidate)
       && !isExpectedVendorSystemdUnitSource(
         source,
@@ -3339,10 +3368,13 @@ function systemdPolicyReinterpretsCommandArguments(value) {
   const command = parseSystemdExecCommand(value);
   return command !== null
     && systemdExecInvokes(command, 'env')
-    && command.tokens.some((token) => (
-      /^-[^-]*S/.test(token)
-      || token.startsWith('--split')
-    ));
+    && command.tokens.some((token) => {
+      if (/^-[^-]*S/.test(token)) return true;
+      const longOption = token.slice(0, token.indexOf('=') < 0
+        ? token.length
+        : token.indexOf('='));
+      return longOption.length > 2 && '--split-string'.startsWith(longOption);
+    });
 }
 
 function systemdPolicyUsesEnvironmentExpansion(value) {
@@ -3350,22 +3382,56 @@ function systemdPolicyUsesEnvironmentExpansion(value) {
   return command !== null && command.fields.some((field) => field.includes('$'));
 }
 
+function systemdPolicyClaimsProtectedDirectory(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  const root = SYSTEMD_MANAGED_DIRECTORY_ROOTS.get(directive);
+  if (!root) return false;
+  return parseSystemdFields(value.slice(separator + 1)).some((field) => {
+    const [sourceName, destinationName] = field.split(':', 2);
+    return [sourceName, destinationName].some((directoryName) => {
+      if (!directoryName) return false;
+      if (hasUnresolvedSystemdSpecifier(directoryName)) return true;
+      const claimedPath = path.resolve(root, directoryName);
+      return SYSTEMD_PROTECTED_DIRECTORY_PATHS.some((protectedPath) => (
+        systemdPathsOverlap(claimedPath, protectedPath)
+      ));
+    });
+  });
+}
+
+function systemdPathsOverlap(left, right) {
+  return left === right
+    || left.startsWith(`${right}/`)
+    || right.startsWith(`${left}/`);
+}
+
 function systemdPolicyInjectsSystemCredential(value) {
   const command = parseSystemdExecCommand(value);
-  if (
-    command === null
-    || !systemdExecInvokes(command, 'systemctl')
-    || !command.tokens.some((token) => (
-      token === 'set-credential'
-      || token === 'set-credential-encrypted'
-    ))
-  ) return false;
-  return command.tokens.some((token) => {
-    const separator = token.indexOf('=');
-    if (separator <= 0) return false;
-    const credential = token.slice(0, separator);
-    return credential.includes('%') || credentialNameCanInjectHostPolicy(credential);
-  });
+  if (command === null || !systemdExecInvokes(command, 'systemctl')) return false;
+  const verbOffset = command.tokens.findIndex((token) => (
+    token === 'set-credential'
+    || token === 'set-credential-encrypted'
+    || systemdSpecifierFieldCouldMatch(
+      token,
+      ['set-credential', 'set-credential-encrypted'],
+    )
+  ));
+  if (verbOffset < 0) return false;
+  const credentialToken = command.tokens
+    .slice(verbOffset + 1)
+    .find((token) => token !== '--' && !token.startsWith('-'));
+  if (!credentialToken) return false;
+  const credential = credentialToken.slice(0, credentialToken.indexOf('=') < 0
+    ? credentialToken.length
+    : credentialToken.indexOf('='));
+  return credential.includes('%')
+    || credentialNameCanInjectHostPolicy(credential)
+    || systemdSpecifierFieldCouldMatch(credential, [
+      ...BOOT_POLICY_CREDENTIAL_NAMES,
+      ...BOOT_POLICY_CREDENTIAL_PREFIXES.map((prefix) => `${prefix}root`),
+    ]);
 }
 
 function parseSystemdExecCommand(value) {
