@@ -13,6 +13,12 @@ const execFileAsync = promisify(execFile);
 const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
 const FD_REEXEC_SCRIPT_PATH = '/proc/self/fd/5';
+const FD_REEXEC_BOOTSTRAP = [
+  'const { readFileSync } = await import("node:fs");',
+  'const source = readFileSync(5).toString("base64");',
+  'const { runCli } = await import("data:text/javascript;base64," + source);',
+  'process.exitCode = await runCli({ argv: process.argv.slice(1) });',
+].join(' ');
 
 const inheritedSourceRoot = process.env[SOURCE_ROOT_ENV];
 if (inheritedSourceRoot && process.env[PRIVATE_MOUNT_NAMESPACE_ENV] !== '1') {
@@ -22,6 +28,9 @@ if (inheritedSourceRoot && !path.isAbsolute(inheritedSourceRoot)) {
   throw new Error('inherited host provision source root is not absolute');
 }
 
+const PROVISION_SCRIPT_PATH = inheritedSourceRoot
+  ? FD_REEXEC_SCRIPT_PATH
+  : fileURLToPath(import.meta.url);
 const SYSTEMD_SOURCE_ROOT = inheritedSourceRoot
   ? path.resolve(inheritedSourceRoot)
   : fileURLToPath(new URL('../deploy/systemd/', import.meta.url));
@@ -809,6 +818,7 @@ export async function provisionHost(options, dependencies = {}) {
   }
   await deps.verifyPidNamespace();
   await deps.verifyMountNamespace('inspection');
+  await deps.verifyLegacyPaths();
   const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
     ?? ((runtimeInspected) => assertManagedRuntimeAncestorsTraversable(
       plan,
@@ -1069,7 +1079,6 @@ export async function runCli({
 export function buildLockedApplyCommand({
   argv,
   nodePath = process.execPath,
-  scriptPath = fileURLToPath(import.meta.url),
   unsharePath = '/usr/bin/unshare',
 } = {}) {
   if (!Array.isArray(argv) || !argv.includes('--apply')) {
@@ -1090,7 +1099,10 @@ export function buildLockedApplyCommand({
       'private',
       '--',
       nodePath,
-      scriptPath,
+      '--input-type=module',
+      '--eval',
+      FD_REEXEC_BOOTSTRAP,
+      '--',
       ...argv,
     ]),
   });
@@ -1114,7 +1126,7 @@ export function hasProvisionLock(locksText, pid, stat) {
 export async function executeLockedApply(argv, {
   fsApi = fs,
   nodePath = process.execPath,
-  scriptPath = fileURLToPath(import.meta.url),
+  scriptPath = PROVISION_SCRIPT_PATH,
   verifyReexecFile = assertTrustedReexecFile,
   preflightHost = () => provisionHost({
     apply: false,
@@ -1141,7 +1153,6 @@ export async function executeLockedApply(argv, {
     const command = buildLockedApplyCommand({
       argv,
       nodePath: '/proc/self/fd/4',
-      scriptPath: FD_REEXEC_SCRIPT_PATH,
       unsharePath: '/proc/self/fd/3',
     });
     return await new Promise((resolve, reject) => {
@@ -1820,21 +1831,22 @@ export async function restoreInterruptedIdentityDatabases(
     ),
   } = {},
 ) {
-  if (!Array.isArray(transaction.identityFiles)) {
-    throw new Error('identity recovery metadata is unavailable');
-  }
   const currentFiles = new Map();
   const originalFiles = new Map();
   const changed = [];
-  const protectedPaths = new Set(transaction.identityFiles.flatMap((entry) => {
-    const target = rootedPath(targetRoot, entry.path);
+  const protectedPaths = new Set(IDENTITY_DATABASE_COMMIT_ORDER.flatMap((file) => {
+    const target = rootedPath(targetRoot, file);
     return [target, `${target}-`];
   }));
   const mountsBeforeRecovery = assertNoUnexpectedMountsForPaths(
     protectedPaths,
     await readMountInfo(),
   );
-  for (const expected of transaction.identityFiles) {
+  const identityFiles = Array.isArray(transaction.identityFiles)
+    ? transaction.identityFiles
+    : await inferLegacyIdentityRecoveryFiles(snapshot, { fsApi, targetRoot });
+  assertIdentityRecoveryFileSet(identityFiles);
+  for (const expected of identityFiles) {
     const target = rootedPath(targetRoot, expected.path);
     const current = await readTrustedIdentityRecoveryFile(target, expected, fsApi);
     currentFiles.set(expected.path, current);
@@ -1886,7 +1898,7 @@ export async function restoreInterruptedIdentityDatabases(
     await syncDirectory(path.dirname(entry.target), fsApi);
   }
 
-  for (const expected of transaction.identityFiles) {
+  for (const expected of identityFiles) {
     const restored = await readTrustedIdentityRecoveryFile(
       rootedPath(targetRoot, expected.path),
       expected,
@@ -1901,6 +1913,54 @@ export async function restoreInterruptedIdentityDatabases(
     await readMountInfo(),
   );
   assertProtectedMountSnapshotUnchanged(mountsBeforeRecovery, mountsAfterRecovery);
+}
+
+async function inferLegacyIdentityRecoveryFiles(snapshot, { fsApi, targetRoot }) {
+  if (!Array.isArray(snapshot.identityFiles)) {
+    throw new Error('legacy identity recovery metadata is unavailable');
+  }
+  const inferred = [];
+  for (const recorded of snapshot.identityFiles) {
+    const target = rootedPath(targetRoot, recorded.path);
+    const current = await readTrustedIdentityRecoveryFile(target, recorded, fsApi);
+    if (current.sha256 !== recorded.sha256) {
+      throw new Error(`identity snapshot changed before legacy recovery: ${recorded.path}`);
+    }
+    let backup = null;
+    try {
+      backup = await readTrustedIdentityRecoveryFile(`${target}-`, recorded, fsApi);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    inferred.push(Object.freeze({
+      path: recorded.path,
+      sha256: backup?.sha256 ?? current.sha256,
+      uid: recorded.uid,
+      gid: recorded.gid,
+      mode: recorded.mode,
+    }));
+  }
+  return Object.freeze(inferred);
+}
+
+function assertIdentityRecoveryFileSet(identityFiles) {
+  if (
+    identityFiles.length !== IDENTITY_DATABASE_COMMIT_ORDER.length
+    || identityFiles.some((entry, index) => (
+      entry.path !== IDENTITY_DATABASE_COMMIT_ORDER[index]
+      || typeof entry.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(entry.sha256)
+      || !Number.isSafeInteger(entry.uid)
+      || entry.uid < 0
+      || !Number.isSafeInteger(entry.gid)
+      || entry.gid < 0
+      || !Number.isSafeInteger(entry.mode)
+      || entry.mode < 0
+      || entry.mode > 0o7777
+    ))
+  ) {
+    throw new Error('identity recovery metadata is invalid');
+  }
 }
 
 async function readTrustedIdentityRecoveryFile(file, expected, fsApi) {
@@ -1973,10 +2033,11 @@ function identitySnapshotFromFiles(files, effectiveGroups = null) {
 }
 
 function assertUnmanagedIdentityRecordsUnchanged(current, original, file) {
-  const managed = new Set([
-    ...Object.values(MANAGED_USERS),
-    ...Object.values(MANAGED_GROUPS),
-  ]);
+  const managed = new Set(
+    ['/etc/passwd', '/etc/shadow'].includes(file)
+      ? Object.values(MANAGED_USERS)
+      : Object.values(MANAGED_GROUPS),
+  );
   const unmanaged = (contents) => contents.toString('utf8').split('\n')
     .filter((line) => !managed.has(line.split(':', 1)[0]))
     .join('\n');
@@ -2149,6 +2210,29 @@ export async function assertSameMountNamespace(
     }
     assertMountPropagationIsPrivate(await readMountInfo());
   }
+}
+
+export async function assertCanonicalVarRunLink(fsApi = fs) {
+  assertTrustedDirectory('/var', await fsApi.lstat('/var'), 0, 0);
+  const before = await fsApi.lstat('/var/run');
+  if (
+    !before.isSymbolicLink()
+    || before.uid !== 0
+    || before.gid !== 0
+    || before.nlink !== 1
+  ) {
+    throw new Error('/var/run is not the canonical root-owned symlink');
+  }
+  const target = await fsApi.readlink('/var/run');
+  const after = await fsApi.lstat('/var/run');
+  if (
+    !after.isSymbolicLink()
+    || !sameFileIdentity(before, after)
+    || !['../run', '/run'].includes(target)
+  ) {
+    throw new Error('/var/run is not the canonical symlink to /run');
+  }
+  assertTrustedDirectory('/run', await fsApi.lstat('/run'), 0, 0);
 }
 
 function assertMountPropagationIsPrivate(mountInfo) {
@@ -3139,7 +3223,7 @@ export function auditBootPolicyCatalogs(
     ...BOOT_POLICY_CREDENTIAL_PATHS,
     ...FIXED_HOST_EXECUTABLE_PATHS,
     process.execPath,
-    fileURLToPath(import.meta.url),
+    PROVISION_SCRIPT_PATH,
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
   ]);
@@ -3746,7 +3830,7 @@ function protectedHostMountPaths(plan, inspected) {
     ...plan.artifacts.flatMap(({ source, target, targetPath }) => [source, target, targetPath]),
     plan.transactionFile,
     process.execPath,
-    fileURLToPath(import.meta.url),
+    PROVISION_SCRIPT_PATH,
   ].map((candidate) => path.resolve(candidate)));
 }
 
@@ -4710,6 +4794,7 @@ function protectedSystemdMountPaths() {
     '/proc/self/ns/mnt',
     '/proc/self/ns/user',
     '/run/systemd/private',
+    '/var/run',
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
     PROVISION_LOCK_PARENT,
@@ -5507,6 +5592,8 @@ function provisionDependencies(dependencies) {
     verifyMountNamespace,
     verifyPidNamespace: dependencies.verifyPidNamespace
       ?? (() => assertInitialPidNamespace(runCommand, processApi, fsApi)),
+    verifyLegacyPaths: dependencies.verifyLegacyPaths
+      ?? (() => assertCanonicalVarRunLink(fsApi)),
     verifyNoExtendedPosixAcl: dependencies.verifyNoExtendedPosixAcl
       ?? ((file) => assertNoExtendedPosixAcl(file, runCommand)),
     readUnitStates: dependencies.readUnitStates
@@ -5626,15 +5713,7 @@ function escapeRegExp(value) {
 }
 
 const invokedDirectly = process.argv[1]
-  && (
-    import.meta.url === pathToFileURL(process.argv[1]).href
-    || (
-      process.argv[1] === FD_REEXEC_SCRIPT_PATH
-      && process.env[PROVISION_LOCK_ENV] === '1'
-      && process.env[PRIVATE_MOUNT_NAMESPACE_ENV] === '1'
-      && inheritedSourceRoot
-    )
-  );
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedDirectly) {
   runCli()

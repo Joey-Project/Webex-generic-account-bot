@@ -15,6 +15,7 @@ import {
 import {
   ARTIFACTS,
   MANAGED_UNITS,
+  assertCanonicalVarRunLink,
   assertInitialPidNamespace,
   assertManagedRuntimeAncestorsTraversable,
   assertNoExtendedPosixAcl,
@@ -164,6 +165,28 @@ describe('guarded host provisioner policy', () => {
     );
   });
 
+  it('requires the canonical root-owned /var/run compatibility link', async () => {
+    await assertCanonicalVarRunLink(systemdUnitPathFs(
+      new Map(),
+      { symlinksByPath: new Map([['/var/run', '../run']]) },
+    ));
+    await assertCanonicalVarRunLink(systemdUnitPathFs(
+      new Map(),
+      { symlinksByPath: new Map([['/var/run', '/run']]) },
+    ));
+    await assert.rejects(
+      assertCanonicalVarRunLink(systemdUnitPathFs(
+        new Map(),
+        { symlinksByPath: new Map([['/var/run', '/etc']]) },
+      )),
+      /not the canonical symlink to \/run/,
+    );
+    await assert.rejects(
+      assertCanonicalVarRunLink(systemdUnitPathFs()),
+      /not the canonical root-owned symlink/,
+    );
+  });
+
   it('requires the initial PID namespace through the fixed lsns probe', async () => {
     const calls = [];
     const hostProcContents = new Map([
@@ -234,10 +257,15 @@ describe('guarded host provisioner policy', () => {
   });
 
   it('wraps the complete apply in the fixed exclusive flock command', async () => {
+    const fdBootstrap = [
+      'const { readFileSync } = await import("node:fs");',
+      'const source = readFileSync(5).toString("base64");',
+      'const { runCli } = await import("data:text/javascript;base64," + source);',
+      'process.exitCode = await runCli({ argv: process.argv.slice(1) });',
+    ].join(' ');
     const command = buildLockedApplyCommand({
       argv: ['--apply', '--json'],
       nodePath: '/trusted/node',
-      scriptPath: '/trusted/provision-host.mjs',
     });
     assert.deepEqual(command, {
       command: '/usr/bin/flock',
@@ -254,7 +282,10 @@ describe('guarded host provisioner policy', () => {
         'private',
         '--',
         '/trusted/node',
-        '/trusted/provision-host.mjs',
+        '--input-type=module',
+        '--eval',
+        fdBootstrap,
+        '--',
         '--apply',
         '--json',
       ],
@@ -404,14 +435,17 @@ describe('guarded host provisioner policy', () => {
     assert.equal(spawned.options.argv0, '/usr/bin/flock');
     assert.deepEqual(spawned.options.stdio.slice(3), [32, 33, 34]);
     assert.equal(spawned.options.env.WEBEX_HOST_PROVISION_SOURCE_ROOT, '/deploy/systemd');
-    assert.deepEqual(spawned.args.slice(6, 14), [
+    assert.deepEqual(spawned.args.slice(6, 17), [
       '/proc/self/fd/3',
       '--mount',
       '--propagation',
       'private',
       '--',
       '/proc/self/fd/4',
-      '/proc/self/fd/5',
+      '--input-type=module',
+      '--eval',
+      fdBootstrap,
+      '--',
       '--apply',
     ]);
 
@@ -422,7 +456,13 @@ describe('guarded host provisioner policy', () => {
     try {
       const result = spawnSync(
         process.execPath,
-        ['/proc/self/fd/5', '--help'],
+        [
+          '--input-type=module',
+          '--eval',
+          fdBootstrap,
+          '--',
+          '--help',
+        ],
         {
           env: {
             PATH: '/usr/bin:/bin',
@@ -436,6 +476,7 @@ describe('guarded host provisioner policy', () => {
           stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', scriptHandle.fd],
         },
       );
+      assert.equal(result.error, undefined);
       assert.equal(result.status, 0, result.stderr);
       assert.match(result.stdout, /Dry-run is the default/);
       assert.equal(result.stderr, '');
@@ -449,11 +490,10 @@ describe('guarded host provisioner policy', () => {
     assert.equal(launcher, [
       '#!/usr/bin/env -S -i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 /usr/bin/node',
       '',
-      "import process from 'node:process';",
+      "const process = require('node:process');",
       '',
-      "import { runCli } from './provision-host.mjs';",
-      '',
-      'runCli()',
+      "import('./provision-host.mjs')",
+      '  .then(({ runCli }) => runCli())',
       '  .then((code) => {',
       '    process.exitCode = code;',
       '  })',
@@ -479,6 +519,13 @@ describe('guarded host provisioner policy', () => {
     assert.equal(cleanLaunch.status, 0, cleanLaunch.stderr);
     assert.match(cleanLaunch.stdout, /Dry-run is the default/);
     assert.equal(cleanLaunch.stderr, '');
+    const readme = await fs.readFile(
+      fileURLToPath(new URL('../README.md', import.meta.url)),
+      'utf8',
+    );
+    assert.match(readme, /sudoers rule must name that absolute launcher path/);
+    assert.match(readme, /must use\n`NOSETENV` with the normal `env_reset` policy/);
+    assert.match(readme, /granting `SETENV`.*dynamic-loader variables/s);
   });
 
   it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {
@@ -1059,6 +1106,33 @@ describe('guarded host provisioner policy', () => {
         verifyMountNamespace: async () => {},
         readMountInfo: async () => SAFE_MOUNT_INFO,
       };
+      if (committedCount === 1) {
+        const legacySnapshot = Object.freeze({
+          ...snapshot,
+          identityFiles: Object.freeze(identityFiles.map((entry) => Object.freeze({
+            ...entry,
+            sha256: createHash('sha256').update(current.get(entry.path)).digest('hex'),
+          }))),
+        });
+        const legacyTransaction = Object.freeze({ identityFiles: null });
+        await restoreInterruptedIdentityDatabases(
+          legacyTransaction,
+          legacySnapshot,
+          options,
+        );
+        await restoreInterruptedIdentityDatabases(
+          legacyTransaction,
+          legacySnapshot,
+          { ...options, apply: true },
+        );
+        for (const [file, mode] of modes) {
+          const target = path.join(phaseRoot, file.slice(1));
+          await fs.writeFile(target, current.get(file), { mode });
+          await fs.chmod(target, mode);
+          await fs.writeFile(`${target}-`, original.get(file), { mode });
+          await fs.chmod(`${target}-`, mode);
+        }
+      }
       await restoreInterruptedIdentityDatabases(transaction, snapshot, options);
       assert.deepEqual(
         await fs.readFile(path.join(phaseRoot, 'etc/group')),
@@ -1114,6 +1188,30 @@ describe('guarded host provisioner policy', () => {
         },
       ),
       /unmanaged identity records changed during recovery/,
+    );
+
+    const passwdDriftRoot = phaseRoots[1];
+    const driftPasswd = path.join(passwdDriftRoot, 'etc/passwd');
+    const groupNamedUser = Buffer.from(
+      `${passwdRecord('webex-config-pull', 3000, 42)}\n`,
+    );
+    await fs.writeFile(driftPasswd, groupNamedUser, { mode: 0o644 });
+    await fs.writeFile(`${driftPasswd}-`, original.get('/etc/passwd'), { mode: 0o644 });
+    await assert.rejects(
+      restoreInterruptedIdentityDatabases(
+        transaction,
+        parseIdentityDatabases(
+          groupNamedUser.toString('utf8'),
+          original.get('/etc/group').toString('utf8'),
+        ),
+        {
+          fsApi: fs,
+          targetRoot: passwdDriftRoot,
+          verifyMountNamespace: async () => {},
+          readMountInfo: async () => SAFE_MOUNT_INFO,
+        },
+      ),
+      /unmanaged identity records changed during recovery: \/etc\/passwd/,
     );
   });
 
@@ -5460,6 +5558,7 @@ async function provisionFixture(context) {
       recoverIdentityDatabases = async (_transaction, snapshot) => {
         validateIdentityPolicy(snapshot);
       },
+      verifyLegacyPaths = async () => {},
       verifyPidNamespace = async () => {},
       verifyMountNamespace = async () => {},
       verifyRuntimeAncestors = async () => {},
@@ -5509,6 +5608,7 @@ async function provisionFixture(context) {
         verifyManagerInstalledArtifacts,
         readIdentityFileState,
         recoverIdentityDatabases,
+        verifyLegacyPaths,
         verifyPidNamespace,
         verifyMountNamespace,
         readUnitStates: async () => stateSequence[

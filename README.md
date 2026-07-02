@@ -204,10 +204,13 @@ sudo -- /opt/webex-generic-account-bot/code/scripts/provision-host --apply
 The launcher path and the complete `/opt/webex-generic-account-bot/code`
 ancestor chain must already be installed as `root:root` and must not be group-
 or world-writable. Any sudoers rule must name that absolute launcher path, not
-`node`, a relative repository path, or a wildcard command. The launcher clears
-the inherited environment before starting the fixed system Node and script, so
-`NODE_OPTIONS`, a caller-controlled `PATH`, and the caller's working directory
-cannot select root-loaded code.
+`node`, a relative repository path, or a wildcard command. That rule must use
+`NOSETENV` with the normal `env_reset` policy; granting `SETENV` or permitting
+command-line environment assignments would let dynamic-loader variables act
+before the launcher can clear them. The launcher clears the remaining inherited
+environment before starting the fixed system Node and script, so `NODE_OPTIONS`,
+a caller-controlled `PATH`, and the caller's working directory cannot select
+root-loaded code.
 
 The production CLI has no source, target, or root override. It reads a fixed
 allowlist of four sysusers files, six tmpfiles files, and five systemd units
