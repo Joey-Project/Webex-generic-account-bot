@@ -14,6 +14,7 @@ import {
 import {
   ARTIFACTS,
   MANAGED_UNITS,
+  assertManagedRuntimeAncestorsTraversable,
   buildLockedApplyCommand,
   buildProvisionPlan,
   ensureProvisionLockFile,
@@ -29,6 +30,7 @@ import {
   validateIdentityPolicy,
   validateNsswitchPolicy,
   validateProvisionLockMetadata,
+  verifyManagedTmpfilesState,
 } from '../scripts/provision-host.mjs';
 
 const REPO_SYSTEMD_ROOT = fileURLToPath(
@@ -713,6 +715,80 @@ describe('guarded host provisioner policy', () => {
       /identity file metadata is not trusted: \/etc\/shadow/,
     );
   });
+
+  it('rejects restrictive unmanaged runtime ancestors before mutation', async (context) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-runtime-ancestor-test-'));
+    context.after(async () => fs.rm(root, { recursive: true, force: true }));
+    await fs.chmod(root, 0o755);
+    await fs.mkdir(path.join(root, 'var'), { mode: 0o755 });
+    await fs.mkdir(path.join(root, 'var/lib'), { mode: 0o700 });
+    const plan = { targetRoot: root };
+    const inspected = {
+      artifacts: [{
+        kind: 'tmpfiles',
+        source: { contents: Buffer.from('d /var/lib/webex-example 0755 root root -\n') },
+      }],
+    };
+
+    await assert.rejects(
+      assertManagedRuntimeAncestorsTraversable(plan, inspected, {
+        fsApi: fs,
+        targetUid: UID,
+        targetGid: GID,
+      }),
+      /managed runtime ancestor is not traversable/,
+    );
+  });
+
+  it('verifies exact managed tmpfiles ownership and mode after creation', async () => {
+    const root = '/test-root';
+    const plan = { targetRoot: root };
+    const target = `${root}/run/webex-example`;
+    const inspected = {
+      artifacts: [{
+        kind: 'tmpfiles',
+        source: {
+          contents: Buffer.from(
+            'd /run/webex-example 0750 webex-config-deploy webex-config-pull -\n',
+          ),
+        },
+      }],
+    };
+    const directoryStat = (uid, gid, mode) => Object.freeze({
+      uid,
+      gid,
+      mode: 0o40000 | mode,
+      isDirectory: () => true,
+      isFile: () => false,
+      isSymbolicLink: () => false,
+    });
+    const records = new Map([
+      [root, directoryStat(0, 0, 0o755)],
+      [`${root}/run`, directoryStat(0, 0, 0o755)],
+      [target, directoryStat(1002, 2003, 0o700)],
+    ]);
+    const fsApi = {
+      lstat: async (candidate) => records.get(candidate)
+        ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' })),
+    };
+
+    await assert.rejects(
+      verifyManagedTmpfilesState(
+        plan,
+        inspected,
+        expectedIdentitySnapshot(),
+        { fsApi, targetUid: 0, targetGid: 0 },
+      ),
+      /managed runtime path metadata is not converged/,
+    );
+    records.set(target, directoryStat(1002, 2003, 0o750));
+    await verifyManagedTmpfilesState(
+      plan,
+      inspected,
+      expectedIdentitySnapshot(),
+      { fsApi, targetUid: 0, targetGid: 0 },
+    );
+  });
 });
 
 describe('guarded host provisioner execution', () => {
@@ -940,6 +1016,8 @@ describe('guarded host provisioner execution', () => {
       'passwd.hashed-password.webex-generic-account-bot',
       'passwd.plaintext-password.webex-config-deploy',
       'passwd.shell.webex-generic-account-bot',
+      'userdb.transient.user.webex-generic-account-bot',
+      'userdb.transient.group.webex-codex-launch',
       'userdb.user.webex-generic-account-bot',
       'userdb.group.webex-codex-launch',
     ]) {
@@ -968,6 +1046,8 @@ describe('guarded host provisioner execution', () => {
       'passwd.hashed-password.webex-generic-account-bot',
       'passwd.plaintext-password.webex-config-deploy',
       'passwd.shell.webex-generic-account-bot',
+      'userdb.transient.user.injected',
+      'userdb.transient.group.injected',
       'userdb.user.injected',
       'userdb.group.injected',
     ]) {
@@ -1618,6 +1698,7 @@ describe('guarded host provisioner execution', () => {
       'ImportCredential=payload.*:tmpfiles.',
       'ImportCredential=userdb.user.*',
       'ImportCredential=payload.*:userdb.group.',
+      'ImportCredential=userdb.transient.user.*',
       'ImportCredential=sysusers.?xtra',
       'ImportCredential=sysusers.[e]xtra',
       'ImportCredential=sysusers.[[:alpha:]]xtra',
@@ -1660,6 +1741,7 @@ describe('guarded host provisioner execution', () => {
           new Map([
             ['/usr/lib/systemd/system', [
               { name: 'systemd-sysusers.service' },
+              { name: 'systemd-userdb-load-credentials.service' },
               { name: 'systemd-tmpfiles-setup.service' },
               { name: 'systemd-pcrfs@.service' },
               { name: 'user@.service' },
@@ -1669,7 +1751,25 @@ describe('guarded host provisioner execution', () => {
             filesByPath: new Map([
               [
                 '/usr/lib/systemd/system/systemd-sysusers.service',
-                Buffer.from('[Service]\nImportCredential=sysusers.*\n'),
+                Buffer.from([
+                  '[Service]',
+                  'ImportCredential=passwd.hashed-password.root',
+                  'ImportCredential=passwd.plaintext-password.root',
+                  'ImportCredential=passwd.shell.root',
+                  'ImportCredential=sysusers.*',
+                  '',
+                ].join('\n')),
+              ],
+              [
+                '/usr/lib/systemd/system/systemd-userdb-load-credentials.service',
+                Buffer.from([
+                  '[Service]',
+                  'ImportCredential=userdb.user.*',
+                  'ImportCredential=userdb.group.*',
+                  'ImportCredential=userdb.transient.user.*',
+                  'ImportCredential=userdb.transient.group.*',
+                  '',
+                ].join('\n')),
               ],
               [
                 '/usr/lib/systemd/system/systemd-tmpfiles-setup.service',
@@ -1731,6 +1831,12 @@ describe('guarded host provisioner execution', () => {
         'external-sysusers.service',
         '/usr/lib/systemd/system/systemd-sysusers.service',
         '[Service]\nImportCredential=sysusers.*\n',
+        /external systemd policy injects a host policy credential/,
+      ],
+      [
+        'external-userdb.service',
+        '/usr/lib/systemd/system/systemd-userdb-load-credentials.service',
+        '[Service]\nImportCredential=userdb.user.*\n',
         /external systemd policy injects a host policy credential/,
       ],
     ]) {
@@ -2570,13 +2676,20 @@ describe('guarded host provisioner execution', () => {
     await writeNullTransaction(fixture);
     const transactionBefore = await fs.readFile(fixture.plan.transactionFile);
     const commands = [];
+    let runtimePreflights = 0;
 
     const report = await provisionHost(
       { apply: false, recoveryPreflight: true },
-      fixture.dependencies({ commands }),
+      fixture.dependencies({
+        commands,
+        verifyRuntimeAncestors: async () => {
+          runtimePreflights += 1;
+        },
+      }),
     );
 
     assert.equal(report.mode, 'dry-run');
+    assert.equal(runtimePreflights, 1);
     assert.deepEqual(commands, []);
     assert.deepEqual(
       await fs.readFile(fixture.plan.transactionFile),
@@ -3299,12 +3412,20 @@ describe('guarded host provisioner execution', () => {
   it('does not reload systemd until the held lock metadata has converged', async (context) => {
     const fixture = await provisionFixture(context);
     const commands = [];
+    let runtimeVerified = false;
     await assert.rejects(
       provisionHost(
         { apply: true },
         fixture.dependencies({
           commands,
           applied: true,
+          verifyManagedRuntimeState: async () => {
+            assert.deepEqual(commands.at(-1), [
+              '/usr/bin/systemd-tmpfiles',
+              ['--create', ...fixture.plan.tmpfiles],
+            ]);
+            runtimeVerified = true;
+          },
           verifyProvisionLockConverged: async () => {
             throw new Error('held lock metadata is still transitional');
           },
@@ -3316,6 +3437,7 @@ describe('guarded host provisioner execution', () => {
       ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
     ]);
+    assert.equal(runtimeVerified, true);
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
@@ -3385,6 +3507,8 @@ async function provisionFixture(context) {
       unitStateSequence = null,
       bootPolicySequence = null,
       verifyProvisionLockConverged = async () => {},
+      verifyRuntimeAncestors = async () => {},
+      verifyManagedRuntimeState = async () => {},
     } = {}) {
       const identities = identitySequence ?? (applied
         ? [emptyIdentitySnapshot(), expectedIdentitySnapshot()]
@@ -3421,6 +3545,8 @@ async function provisionFixture(context) {
           Math.min(stateIndex++, stateSequence.length - 1)
         ],
         verifyProvisionLockConverged,
+        verifyRuntimeAncestors,
+        verifyManagedRuntimeState,
         runCommand: async (command, args) => {
           commands.push([command, [...args]]);
           return { command, args: [...args], code: 0, stdout: '', stderr: '' };

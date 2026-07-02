@@ -187,8 +187,10 @@ superseded_by:
   wildcard handling, physical-file/logical-owner vendor binding, current
   system and credential-store inputs, `passwd.hashed-password.*`,
   `passwd.plaintext-password.*`, and `passwd.shell.*` rejection, and systemd
-  258 `userdb.user.*` and `userdb.group.*` rejection across system credentials,
-  credential stores, tmpfiles, and unit credential directives, plus launcher-instance reference
+  258 `userdb.user.*`, `userdb.group.*`, and `userdb.transient.*` rejection
+  across system credentials, credential stores,
+  tmpfiles, and unit credential directives, with exact physical/logical vendor
+  import exceptions, plus launcher-instance reference
   rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
@@ -204,7 +206,8 @@ superseded_by:
   databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
   system-unit load paths, and installed
   policy targets, traversal-preserving ancestor metadata, recursive parent
-  handling, and root-owned stable source
+  handling, pre-apply unmanaged-ancestor traversal checks, post-tmpfiles exact
+  managed path type/mode/UID/GID convergence, and root-owned stable source
   metadata for every effective catalogue file,
   trusted re-exec paths plus a complete transaction-aware read-only host
   preflight checked before first-run lock convergence, with the checks repeated

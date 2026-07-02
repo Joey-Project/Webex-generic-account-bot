@@ -169,6 +169,8 @@ const BOOT_POLICY_CREDENTIAL_PREFIXES = Object.freeze([
   'passwd.hashed-password.',
   'passwd.plaintext-password.',
   'passwd.shell.',
+  'userdb.transient.user.',
+  'userdb.transient.group.',
   'userdb.user.',
   'userdb.group.',
 ]);
@@ -197,6 +199,18 @@ const VENDOR_TMPFILES_CREDENTIAL_UNITS = new Set([
   'systemd-tmpfiles-setup-dev-early.service',
   'systemd-tmpfiles-setup-dev.service',
   'systemd-tmpfiles-setup.service',
+]);
+const VENDOR_SYSUSERS_CREDENTIAL_IMPORTS = new Set([
+  'ImportCredential=passwd.hashed-password.root',
+  'ImportCredential=passwd.plaintext-password.root',
+  'ImportCredential=passwd.shell.root',
+  'ImportCredential=sysusers.*',
+]);
+const VENDOR_USERDB_CREDENTIAL_IMPORTS = new Set([
+  'ImportCredential=userdb.user.*',
+  'ImportCredential=userdb.group.*',
+  'ImportCredential=userdb.transient.user.*',
+  'ImportCredential=userdb.transient.group.*',
 ]);
 
 class PolicySafetyRollbackError extends Error {}
@@ -621,6 +635,27 @@ export async function provisionHost(options, dependencies = {}) {
   if (deps.requireRoot && deps.processApi.geteuid?.() !== 0) {
     throw new Error('host provisioning requires root, including dry-run');
   }
+  const verifyRuntimeAncestors = dependencies.verifyRuntimeAncestors
+    ?? ((runtimeInspected) => assertManagedRuntimeAncestorsTraversable(
+      plan,
+      runtimeInspected,
+      {
+        fsApi: deps.fsApi,
+        targetUid: deps.targetUid,
+        targetGid: deps.targetGid,
+      },
+    ));
+  const verifyManagedRuntimeState = dependencies.verifyManagedRuntimeState
+    ?? ((runtimeInspected, snapshot) => verifyManagedTmpfilesState(
+      plan,
+      runtimeInspected,
+      snapshot,
+      {
+        fsApi: deps.fsApi,
+        targetUid: deps.targetUid,
+        targetGid: deps.targetGid,
+      },
+    ));
 
   const transaction = await readProvisionTransaction(plan, deps);
   if (transaction && !options.apply && !options.recoveryPreflight) {
@@ -641,6 +676,7 @@ export async function provisionHost(options, dependencies = {}) {
       recoveryInspected,
       identityBefore,
     );
+    await verifyRuntimeAncestors(recoveryInspected);
     assertUnitsDormant(recoveryUnitStates, plan, {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
@@ -683,6 +719,7 @@ export async function provisionHost(options, dependencies = {}) {
     inspected,
     identityBefore,
   );
+  await verifyRuntimeAncestors(inspected);
   const canRecoverManagerCache = (options.apply || options.recoveryPreflight)
     && inspected.artifacts.every(({ changed }) => !changed);
   assertUnitsDormant(unitStatesBefore, plan, {
@@ -719,6 +756,7 @@ export async function provisionHost(options, dependencies = {}) {
       '--create',
       ...plan.tmpfiles,
     ]));
+    await verifyManagedRuntimeState(inspected, identityAfter);
     await deps.verifyProvisionLockConverged();
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
     await verifyInstalledArtifacts(inspected, deps);
@@ -2229,6 +2267,128 @@ export function auditBootPolicyCatalogs(
   }
 }
 
+export async function assertManagedRuntimeAncestorsTraversable(
+  plan,
+  inspected,
+  {
+    fsApi = fs,
+    targetUid = 0,
+    targetGid = 0,
+  } = {},
+) {
+  const entries = managedTmpfilesEntries(plan, inspected);
+  const managedTargets = new Set(entries.map(({ target }) => target));
+  const ancestors = new Set(entries.flatMap(({ target }) => (
+    pathComponentsWithin(plan.targetRoot, path.dirname(target))
+  )));
+  for (const ancestor of [...ancestors].sort()) {
+    if (managedTargets.has(ancestor)) continue;
+    let stat;
+    try {
+      stat = await fsApi.lstat(ancestor);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        throw new Error(`managed runtime ancestor is missing: ${ancestor}`);
+      }
+      throw error;
+    }
+    assertTrustedDirectory(ancestor, stat, targetUid, targetGid);
+    if (((stat.mode & 0o7777) & 0o001) === 0) {
+      throw new Error(`managed runtime ancestor is not traversable: ${ancestor}`);
+    }
+  }
+}
+
+export async function verifyManagedTmpfilesState(
+  plan,
+  inspected,
+  identitySnapshot,
+  {
+    fsApi = fs,
+    targetUid = 0,
+    targetGid = 0,
+  } = {},
+) {
+  await assertManagedRuntimeAncestorsTraversable(plan, inspected, {
+    fsApi,
+    targetUid,
+    targetGid,
+  });
+  for (const entry of managedTmpfilesEntries(plan, inspected, identitySnapshot)) {
+    let stat;
+    try {
+      stat = await fsApi.lstat(entry.target);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        throw new Error(`managed runtime path is missing: ${entry.target}`);
+      }
+      throw error;
+    }
+    const correctType = entry.type === 'd' ? stat.isDirectory() : stat.isFile();
+    if (
+      !correctType
+      || stat.isSymbolicLink()
+      || (entry.type === 'f' && stat.nlink !== 1)
+      || stat.uid !== entry.uid
+      || stat.gid !== entry.gid
+      || (stat.mode & 0o7777) !== entry.mode
+    ) {
+      throw new Error(`managed runtime path metadata is not converged: ${entry.target}`);
+    }
+  }
+}
+
+function managedTmpfilesEntries(plan, inspected, identitySnapshot = null) {
+  const entries = new Map();
+  for (const artifact of inspected.artifacts.filter(({ kind }) => kind === 'tmpfiles')) {
+    for (const line of policyCatalogLines(artifact.source.contents)) {
+      const fields = parseSystemdFields(line);
+      if (fields.length !== 6) {
+        throw new Error(`managed tmpfiles policy line is malformed: ${line}`);
+      }
+      const [type, rawPath, rawMode, user, group, age] = fields;
+      const policyPath = normaliseBootPolicyPath(rawPath);
+      if (
+        !['d', 'f'].includes(type)
+        || age !== '-'
+        || !path.posix.isAbsolute(rawPath)
+        || policyPath !== rawPath
+        || !/^[0-7]{3,4}$/.test(rawMode)
+      ) {
+        throw new Error(`managed tmpfiles policy line is unsupported: ${line}`);
+      }
+      const target = rootedPath(plan.targetRoot, policyPath);
+      const entry = {
+        type,
+        target,
+        mode: Number.parseInt(rawMode, 8),
+        user,
+        group,
+      };
+      if (identitySnapshot) {
+        entry.uid = resolveTmpfilesIdentity(user, 'user', identitySnapshot);
+        entry.gid = resolveTmpfilesIdentity(group, 'group', identitySnapshot);
+      }
+      const existing = entries.get(target);
+      const signature = JSON.stringify([type, entry.mode, user, group]);
+      if (existing && existing.signature !== signature) {
+        throw new Error(`managed tmpfiles path has conflicting policy: ${policyPath}`);
+      }
+      entries.set(target, Object.freeze({ ...entry, signature }));
+    }
+  }
+  return Object.freeze([...entries.values()]);
+}
+
+function resolveTmpfilesIdentity(name, kind, identitySnapshot) {
+  if (name === 'root' || name === '0') return 0;
+  const record = kind === 'user'
+    ? identitySnapshot.users.get(name)
+    : identitySnapshot.groups.get(name);
+  if (!record) throw new Error(`managed tmpfiles ${kind} is missing: ${name}`);
+  return kind === 'user' ? record.uid : record.gid;
+}
+
 function policyCatalogLines(contents) {
   return policyCatalogEntries(contents).map(({ line }) => line);
 }
@@ -2992,7 +3152,11 @@ function isExpectedVendorBootPolicyCredentialImport(
   return (
     unit === 'systemd-sysusers.service'
     && systemdUnitNamesEqual(unitNames, unit)
-    && line === 'ImportCredential=sysusers.*'
+    && VENDOR_SYSUSERS_CREDENTIAL_IMPORTS.has(line)
+  ) || (
+    unit === 'systemd-userdb-load-credentials.service'
+    && systemdUnitNamesEqual(unitNames, unit)
+    && VENDOR_USERDB_CREDENTIAL_IMPORTS.has(line)
   ) || (
     VENDOR_TMPFILES_CREDENTIAL_UNITS.has(unit)
     && systemdUnitNamesEqual(unitNames, unit)

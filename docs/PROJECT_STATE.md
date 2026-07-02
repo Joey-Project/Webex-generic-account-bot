@@ -122,7 +122,8 @@
   binding, system-credential and credential-store absence checks,
   `passwd.hashed-password.*`, `passwd.plaintext-password.*`, and
   `passwd.shell.*` rejection, plus systemd 258 `userdb.user.*` and
-  `userdb.group.*` prefix rejection across credential and tmpfiles channels,
+  `userdb.group.*` plus `userdb.transient.*` prefix rejection across credential
+  and tmpfiles channels, exact physical/logical vendor import exceptions,
   plus launcher-instance reference rejection. Semantic
   merged boot sysusers/tmpfiles policy with code-zero, diagnostic-free,
   non-empty source catalogue requirements
@@ -132,6 +133,8 @@
   numeric-identity, ACL-principal, fail-closed specifier-bearing symlink-target,
   traversal-restricting ancestor
   metadata, cleanup, replacement, and recursive rules, allocation ranges,
+  with pre-apply unmanaged-ancestor traversal checks and post-tmpfiles exact
+  managed path type/mode/UID/GID convergence,
   normalised glob and trailing-slash paths including legacy `/var/run` alias
   globs and exact compatibility-link text,
   source-associated managed-policy upgrades, and copy sources while

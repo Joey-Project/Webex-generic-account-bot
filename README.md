@@ -224,7 +224,11 @@ systemd user database may expose only its root-owned `DynamicUser` provider,
 static userdb records are rejected, fixed `getent -s systemd` lookups must show
 every managed user and group name unclaimed, and managed UIDs/GIDs must remain
 below the dynamic allocation range.
-It also validates dormant unit state without creating files or directories.
+It also validates dormant unit state and requires every unmanaged ancestor of
+the managed tmpfiles paths to be root-owned, non-writable, and traversable
+without creating files or directories. Apply rechecks those ancestors after
+tmpfiles and verifies every managed directory and lock file has its exact type,
+mode, and resolved UID/GID before the transaction can complete.
 Apply additionally requires root and
 rejects active, enabled, or masked managed units, including instantiated
 launcher template units. It rejects unloaded policy and dependency directories
@@ -261,11 +265,13 @@ range before allocation. Direct host-policy credential injection is rejected,
 including `passwd.hashed-password.*`, `passwd.plaintext-password.*`, and
 `passwd.shell.*` credentials that could make managed accounts login-capable,
 plus systemd 258 `userdb.user.*` and `userdb.group.*` credentials that could
-materialise static records under `/etc/userdb`; credential import
+materialise static records under `/etc/userdb`, together with their
+`userdb.transient.*` forms; credential import
 selectors are evaluated across exact, trailing-glob, and
 glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
-exact physical-file/logical-owner pair after the current system credential set
+exact physical-file/logical-owner pair and exact upstream selector after the
+current system credential set
 and all plaintext and encrypted credential stores prove that `sysusers.extra`
 and `tmpfiles.extra` plus all passwd and userdb credential prefixes are absent. Tmpfiles
 may perform only tightly bounded root-owned maintenance on credential-store
