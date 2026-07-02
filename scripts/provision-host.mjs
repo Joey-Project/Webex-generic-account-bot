@@ -334,6 +334,7 @@ const SYSTEMCTL_UNSCOPED_MUTATION_VERBS = new Set([
   'hibernate',
   'hybrid-sleep',
   'import-environment',
+  'isolate',
   'kexec',
   'log-level',
   'log-target',
@@ -368,6 +369,10 @@ const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
 const SYSTEMCTL_MARKED_OPTION_PREFIXES = Object.freeze(Array.from(
   { length: '--marked'.length - 2 },
   (_, index) => '--marked'.slice(0, index + 3),
+));
+const SYSTEMCTL_JOB_MODE_OPTION_PREFIXES = Object.freeze(Array.from(
+  { length: '--job-mode'.length - 2 },
+  (_, index) => '--job-mode'.slice(0, index + 3),
 ));
 const ENV_SPLIT_STRING_OPTION_PREFIXES = Object.freeze(Array.from(
   { length: '--split-string'.length - 2 },
@@ -4941,6 +4946,7 @@ function systemdPolicyInvokesManagedUnitControl(value) {
           [...SYSTEMCTL_UNSCOPED_MUTATION_VERBS],
         )
         || systemctlOptionCouldBeMarked(token)
+        || systemctlOptionCouldSelectJobMode(token)
       ))
   );
 }
@@ -4951,6 +4957,14 @@ function systemctlOptionCouldBeMarked(token) {
     : token.indexOf('='));
   return SYSTEMCTL_MARKED_OPTION_PREFIXES.includes(option)
     || systemdSpecifierFieldCouldMatch(option, SYSTEMCTL_MARKED_OPTION_PREFIXES);
+}
+
+function systemctlOptionCouldSelectJobMode(token) {
+  const option = token.slice(0, token.indexOf('=') < 0
+    ? token.length
+    : token.indexOf('='));
+  return SYSTEMCTL_JOB_MODE_OPTION_PREFIXES.includes(option)
+    || systemdSpecifierFieldCouldMatch(option, SYSTEMCTL_JOB_MODE_OPTION_PREFIXES);
 }
 
 function systemdPolicyInvokesShell(value) {

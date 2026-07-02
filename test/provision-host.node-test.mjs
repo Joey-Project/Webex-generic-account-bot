@@ -3474,6 +3474,8 @@ describe('guarded host provisioner execution', () => {
     for (const [index, command] of [
       'systemctl --preset-mode=enable-only preset-all',
       'systemctl daemon-reload',
+      'systemctl isolate rescue.target',
+      'systemctl --job-mode=isolate start rescue.target',
       'systemctl --marked reload-or-restart',
       'systemctl --mark reload-or-restart',
       'systemctl enable /opt/benign.service',
