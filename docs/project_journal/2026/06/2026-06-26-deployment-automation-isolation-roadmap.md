@@ -204,7 +204,8 @@ superseded_by:
   metadata for every effective catalogue file,
   trusted re-exec paths plus a complete transaction-aware read-only host
   preflight checked before first-run lock convergence, with the checks repeated
-  under the held lock, bounded
+  under the held lock, bounded managed-name-free stale candidates that remain
+  recoverable through systemd policy scanning, and
   post-preflight stale candidate collection with
   all-before-any validation and unit
   discovery, complete recovery-before-write identity, unit, source,

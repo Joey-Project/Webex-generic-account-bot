@@ -300,6 +300,8 @@ that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,
 trusted stale candidates left by an interrupted prior run, including a
 root-owned candidate whose initial mode was narrowed by umask before chmod. The
+candidate name uses a dedicated managed-name-free prefix so an interrupted unit
+write remains recoverable without resembling external systemd policy. The
 shared lock applies the same bounded interrupted-creation recovery before
 converging exact metadata. Stale candidates are collected and fully validated
 only after the host trust preflight; no candidate is removed until the complete

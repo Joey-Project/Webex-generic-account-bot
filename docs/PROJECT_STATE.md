@@ -134,7 +134,8 @@
   trusted re-exec paths and a complete transaction-aware read-only host
   preflight validated before first-run lock convergence, followed by repeated
   checks under the held lock,
-  fail-closed crash recovery bracketed by complete preflight checks, with
+  managed-name-free stale candidates that remain recoverable through systemd
+  policy scanning, fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full
   target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional
   root-owned policy installation whose rollback journal distinguishes partial

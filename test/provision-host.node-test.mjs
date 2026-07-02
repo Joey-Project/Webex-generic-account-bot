@@ -36,6 +36,7 @@ const REPO_SYSTEMD_ROOT = fileURLToPath(
 );
 const UID = process.getuid();
 const GID = process.getgid();
+const PROVISION_CANDIDATE_PREFIX = '.webex-host-policy.provision-';
 
 describe('guarded host provisioner policy', () => {
   it('pins the complete non-secret allowlist and excludes activation permission', () => {
@@ -956,21 +957,29 @@ describe('guarded host provisioner execution', () => {
     const artifact = fixture.plan.artifacts[0];
     const candidate = path.join(
       path.dirname(artifact.target),
-      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000099.tmp`,
+      `${PROVISION_CANDIDATE_PREFIX}00000000-0000-4000-8000-000000000099.tmp`,
     );
     await fs.mkdir(path.dirname(candidate), { recursive: true, mode: 0o755 });
     await fs.writeFile(candidate, 'interrupted candidate\n', { mode: 0o600 });
     await fs.chmod(candidate, 0o600);
     const umaskCandidate = path.join(
       path.dirname(artifact.target),
-      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000098.tmp`,
+      `${PROVISION_CANDIDATE_PREFIX}00000000-0000-4000-8000-000000000098.tmp`,
     );
     await fs.writeFile(umaskCandidate, 'interrupted before chmod\n', { mode: 0o600 });
     await fs.chmod(umaskCandidate, 0o000);
+    const unitArtifact = fixture.plan.artifacts.find(({ kind }) => kind === 'unit');
+    const unitCandidate = path.join(
+      path.dirname(unitArtifact.target),
+      `${PROVISION_CANDIDATE_PREFIX}00000000-0000-4000-8000-000000000097.tmp`,
+    );
+    await fs.mkdir(path.dirname(unitCandidate), { recursive: true, mode: 0o755 });
+    await fs.writeFile(unitCandidate, 'interrupted unit candidate\n', { mode: 0o600 });
 
     await provisionHost({ apply: false }, fixture.dependencies());
     assert.equal(await fs.readFile(candidate, 'utf8'), 'interrupted candidate\n');
     assert.equal((await fs.stat(umaskCandidate)).mode & 0o777, 0o000);
+    assert.equal(await fs.readFile(unitCandidate, 'utf8'), 'interrupted unit candidate\n');
 
     await provisionHost(
       { apply: true },
@@ -978,7 +987,12 @@ describe('guarded host provisioner execution', () => {
     );
     await assert.rejects(fs.stat(candidate), { code: 'ENOENT' });
     await assert.rejects(fs.stat(umaskCandidate), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(unitCandidate), { code: 'ENOENT' });
     assert.equal(await fs.readFile(artifact.target, 'utf8'), await fs.readFile(artifact.source, 'utf8'));
+    assert.equal(
+      await fs.readFile(unitArtifact.target, 'utf8'),
+      await fs.readFile(unitArtifact.source, 'utf8'),
+    );
   });
 
   it('bounds total directory entries before stale-candidate inspection', async (context) => {
@@ -1015,7 +1029,7 @@ describe('guarded host provisioner execution', () => {
     const fixture = await provisionFixture(context);
     const artifact = fixture.plan.artifacts[0];
     const directory = path.dirname(artifact.target);
-    const prefix = `.${path.basename(artifact.target)}.provision-`;
+    const prefix = PROVISION_CANDIDATE_PREFIX;
     const validName = `${prefix}00000000-0000-4000-8000-000000000099.tmp`;
     const malformedName = `${prefix}not-a-uuid.tmp`;
     const valid = path.join(directory, validName);
@@ -1147,7 +1161,7 @@ describe('guarded host provisioner execution', () => {
     const artifact = fixture.plan.artifacts[0];
     const candidate = path.join(
       path.dirname(artifact.target),
-      `.${path.basename(artifact.target)}.provision-00000000-0000-4000-8000-000000000099.tmp`,
+      `${PROVISION_CANDIDATE_PREFIX}00000000-0000-4000-8000-000000000099.tmp`,
     );
     await fs.mkdir(path.dirname(candidate), { recursive: true, mode: 0o755 });
     await fs.writeFile(candidate, 'preserved before preflight\n', { mode: 0o600 });
@@ -2390,7 +2404,7 @@ describe('guarded host provisioner execution', () => {
     await writeRecoveryTransaction(fixture, artifact, desired, existing);
     const candidatePrefix = path.join(
       path.dirname(artifact.target),
-      `.${path.basename(artifact.target)}.provision-`,
+      PROVISION_CANDIDATE_PREFIX,
     );
     let injected = false;
     const fsApi = new Proxy(fs, {

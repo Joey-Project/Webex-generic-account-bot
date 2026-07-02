@@ -41,6 +41,7 @@ const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const PROVISION_CANDIDATE_PREFIX = '.webex-host-policy.provision-';
 const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const LAUNCHER_REFERENCE_PATTERN = /webex-codex-launcher@[^@/\s]*\.service/;
 const SYSTEMD_UNIT_NAME_PATTERN =
@@ -897,18 +898,12 @@ async function ensureTargetDirectories(plan, deps) {
 
 async function cleanupStaleCandidates(plan, deps) {
   const targets = [...plan.artifacts.map(({ target }) => target), plan.transactionFile];
-  const targetsByDirectory = new Map();
-  for (const target of targets) {
-    const directory = path.dirname(target);
-    const prefixes = targetsByDirectory.get(directory) ?? [];
-    prefixes.push(`.${path.basename(target)}.provision-`);
-    targetsByDirectory.set(directory, prefixes);
-  }
+  const targetDirectories = new Set(targets.map((target) => path.dirname(target)));
 
   let candidateCount = 0;
   let scannedEntryCount = 0;
   const candidates = [];
-  for (const [directory, prefixes] of targetsByDirectory) {
+  for (const directory of targetDirectories) {
     await assertTrustedExistingAncestors(
       plan.targetRoot,
       directory,
@@ -929,13 +924,12 @@ async function cleanupStaleCandidates(plan, deps) {
         if (scannedEntryCount > MAX_SCANNED_DIRECTORY_ENTRIES) {
           throw new Error('too many policy directory entries');
         }
-        const prefix = prefixes.find((value) => entry.name.startsWith(value));
-        if (!prefix) continue;
+        if (!entry.name.startsWith(PROVISION_CANDIDATE_PREFIX)) continue;
         candidateCount += 1;
         if (candidateCount > MAX_STALE_CANDIDATES) {
           throw new Error('too many stale policy candidates');
         }
-        const suffix = entry.name.slice(prefix.length);
+        const suffix = entry.name.slice(PROVISION_CANDIDATE_PREFIX.length);
         if (!new RegExp(`^${CANDIDATE_UUID_PATTERN}\\.tmp$`).test(suffix)) {
           throw new Error(`stale policy candidate name is malformed: ${entry.name}`);
         }
@@ -1052,7 +1046,7 @@ async function writeCandidate(target, contents, deps) {
 async function writeCandidateWithMode(target, contents, mode, deps) {
   const temporary = path.join(
     path.dirname(target),
-    `.${path.basename(target)}.provision-${deps.randomUUID()}.tmp`,
+    `${PROVISION_CANDIDATE_PREFIX}${deps.randomUUID()}.tmp`,
   );
   let handle;
   try {
