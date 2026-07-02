@@ -213,8 +213,8 @@ superseded_by:
   identities, ACL principals, and fail-closed specifier-bearing symlink targets,
   protected root, identity
   databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
-  system-unit load paths, and installed
-  policy targets, traversal-preserving ancestor metadata, recursive parent
+  system-unit load paths, installed policy targets, and every sysusers and
+  tmpfiles policy search directory, traversal-preserving ancestor metadata, recursive parent
   handling, pre-apply unmanaged-ancestor and managed-target checks, post-tmpfiles exact
   managed path type/mode/UID/GID convergence, and root-owned stable source
   metadata for every effective catalogue file,

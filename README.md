@@ -293,8 +293,9 @@ sysusers allocation-range directives are rejected. Every effective catalogue sou
 must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
 the local identity databases and NSS policy, every static and runtime systemd
 userdb path, every fixed systemd system-unit
-load path, every installed policy target, the transaction journal, and the
-shared lock are protected from external tmpfiles policy; ancestor maintenance must preserve
+load path, every installed policy target, the transaction journal, the shared
+lock, and every sysusers and tmpfiles policy search directory are protected
+from external tmpfiles policy; ancestor maintenance must preserve
 traversal for the managed accounts. Only the reviewed Webex lines may affect
 managed identities, IDs, or paths, which keeps the identity and filesystem
 boundary durable across reboot. Catalogue source markers bind each active line

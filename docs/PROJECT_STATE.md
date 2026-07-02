@@ -136,7 +136,8 @@
   non-empty source catalogue requirements
   auditing that protects root, runtime, identity databases, NSS policy, and
   static/runtime systemd userdb paths,
-  systemd system-unit load paths, and installed policy paths from owner-modifier,
+  systemd system-unit load paths, installed policy paths, and every sysusers and
+  tmpfiles policy search directory from owner-modifier,
   numeric-identity, ACL-principal, fail-closed specifier-bearing symlink-target,
   traversal-restricting ancestor and pre-mutation managed-target
   type/symlink/hardlink
