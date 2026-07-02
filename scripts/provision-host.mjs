@@ -529,7 +529,6 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
       throw new Error(`managed user has an orphan shadow credential: ${user}`);
     }
   }
-
   for (const groupName of controlledGroups) {
     const group = snapshot.groups.get(groupName);
     const shadowGroup = snapshot.shadowGroups.get(groupName);
@@ -559,6 +558,14 @@ export function validateIdentityPolicy(snapshot, { requireAccounts = false } = {
     for (const user of primaryUsers) {
       if (!allowed.has(user)) {
         throw new Error(`managed group is a static primary group for ${user}: ${groupName}`);
+      }
+    }
+  }
+  for (const group of snapshot.groups.values()) {
+    if (controlledGroups.includes(group.name)) continue;
+    for (const user of Object.values(MANAGED_USERS)) {
+      if (group.members.includes(user)) {
+        throw new Error(`managed user has static group privileges: ${user} (${group.name})`);
       }
     }
   }
@@ -680,9 +687,7 @@ export async function provisionHost(options, dependencies = {}) {
   await cleanupStaleCandidates(plan, deps);
   await ensureTargetDirectories(plan, deps);
   const installed = await installPolicySetAtomically(inspected, plan, deps);
-  const safetyRollbackTransaction = installed.length > 0
-    ? transactionFromInspected(inspected)
-    : transaction;
+  const safetyRollbackTransaction = transactionFromInspected(inspected);
   try {
     commands.push(await deps.runCommand('/usr/bin/systemd-sysusers', plan.sysusers));
     const identityAfter = await deps.readIdentitySnapshot();
@@ -704,22 +709,17 @@ export async function provisionHost(options, dependencies = {}) {
       const unitStatesAfter = await deps.readUnitStates(MANAGED_UNITS, identityAfter);
       assertUnitsDormant(unitStatesAfter, plan, { requireLoaded: true });
     } catch (error) {
-      if (installed.length > 0 || recoveryState === 'desired') {
-        await rollbackPolicyAfterSafetyFailure(
-          error,
-          safetyRollbackTransaction,
-          plan,
-          deps,
-          commands,
-          identityAfter,
-          false,
-        );
-      }
-      throw error;
+      await rollbackPolicyAfterSafetyFailure(
+        error,
+        safetyRollbackTransaction,
+        plan,
+        deps,
+        commands,
+        identityAfter,
+        false,
+      );
     }
-    if (installed.length > 0 || recoveryState === 'desired') {
-      await removeProvisionTransaction(plan, deps);
-    }
+    await removeProvisionTransaction(plan, deps);
   } catch (error) {
     if (error instanceof PolicySafetyRollbackError) throw error;
     throw new Error(
@@ -1054,10 +1054,10 @@ async function cleanupStaleCandidates(plan, deps) {
 
 async function installPolicySetAtomically(inspected, plan, deps) {
   const changed = inspected.artifacts.filter(({ changed }) => changed);
-  if (changed.length === 0) return [];
   const staged = [];
   const rollbackTransaction = transactionFromInspected(inspected);
   await writeProvisionTransaction(inspected, plan, deps);
+  if (changed.length === 0) return [];
   try {
     for (const artifact of changed) {
       const temporary = await writeCandidate(

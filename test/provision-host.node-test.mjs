@@ -434,6 +434,13 @@ describe('guarded host provisioner policy', () => {
     );
     const clean = expectedIdentitySnapshot();
     validateIdentityPolicy(clean, { requireAccounts: true });
+    assert.throws(
+      () => validateIdentityPolicy(parseIdentityDatabases(
+        '',
+        `${groupRecord('external-operators', 27, ['webex-config-deploy'])}\n`,
+      )),
+      /managed user has static group privileges: webex-config-deploy \(external-operators\)/,
+    );
 
     assert.throws(
       () => validateIdentityPolicy(expectedIdentitySnapshot({
@@ -3148,6 +3155,130 @@ describe('guarded host provisioner execution', () => {
 
     assert.equal(report.mode, 'applied');
     assert.deepEqual(retryCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
+  it('journals a zero-policy-change sysusers partial commit for recovery', async (context) => {
+    const fixture = await provisionFixture(context);
+    for (const artifact of fixture.plan.artifacts) {
+      await fs.mkdir(path.dirname(artifact.target), { recursive: true, mode: 0o755 });
+      await fs.copyFile(artifact.source, artifact.target);
+      await fs.chmod(artifact.target, 0o644);
+    }
+    const loaded = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    const failedCommands = [];
+    const failedInstall = fixture.dependencies({
+      commands: failedCommands,
+      identitySequence: [emptyIdentitySnapshot()],
+      unitStateSequence: [loaded],
+    });
+    failedInstall.runCommand = async (command, args) => {
+      failedCommands.push([command, [...args]]);
+      throw new Error('injected zero-change sysusers partial commit');
+    };
+
+    await assert.rejects(
+      provisionHost({ apply: true }, failedInstall),
+      /injected zero-change sysusers partial commit/,
+    );
+    assert.deepEqual(failedCommands, [
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+    ]);
+    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+
+    const partialIdentity = expectedIdentitySnapshot({
+      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
+      gshadowDatabase: expectedGshadowDatabase().replace(
+        'webex-config-pull:!::\n',
+        '',
+      ),
+    });
+    const retryCommands = [];
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        commands: retryCommands,
+        identitySequence: [partialIdentity, expectedIdentitySnapshot()],
+        unitStateSequence: [loaded, loaded, loaded, loaded],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    assert.deepEqual(report.installed_artifacts, []);
+    assert.deepEqual(retryCommands, [
+      ['/usr/bin/systemctl', ['daemon-reload']],
+      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
+      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
+      ['/usr/bin/systemctl', ['daemon-reload']],
+    ]);
+    await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
+  });
+
+  it('clears an old recovery transaction after the source policy is reverted', async (context) => {
+    const fixture = await provisionFixture(context);
+    const selected = fixture.plan.artifacts.find(({ kind }) => kind === 'unit');
+    const interrupted = Buffer.from('[Unit]\nDescription=interrupted policy\n');
+    const snapshots = new Map();
+    for (const artifact of fixture.plan.artifacts) {
+      const contents = await fs.readFile(artifact.source);
+      snapshots.set(artifact.target, contents);
+      await fs.mkdir(path.dirname(artifact.target), { recursive: true, mode: 0o755 });
+      await fs.copyFile(artifact.source, artifact.target);
+      await fs.chmod(artifact.target, 0o644);
+    }
+    await fs.mkdir(path.dirname(fixture.plan.transactionFile), {
+      recursive: true,
+      mode: 0o755,
+    });
+    const transaction = {
+      version: 1,
+      artifacts: fixture.plan.artifacts.map((artifact) => {
+        const existing = snapshots.get(artifact.target);
+        const desired = artifact.target === selected.target ? interrupted : existing;
+        return {
+          target: artifact.target,
+          desired_sha256: createHash('sha256').update(desired).digest('hex'),
+          existing: {
+            contents_base64: existing.toString('base64'),
+            sha256: createHash('sha256').update(existing).digest('hex'),
+          },
+        };
+      }),
+    };
+    await fs.writeFile(
+      fixture.plan.transactionFile,
+      `${JSON.stringify(transaction)}\n`,
+      { mode: 0o600 },
+    );
+    await fs.chmod(fixture.plan.transactionFile, 0o600);
+    const loaded = unitStates({
+      load: 'loaded',
+      active: 'inactive',
+      enabled: 'disabled',
+    }, fixture.plan);
+    const commands = [];
+
+    const report = await provisionHost(
+      { apply: true },
+      fixture.dependencies({
+        applied: true,
+        commands,
+        unitStateSequence: [loaded, loaded, loaded, loaded],
+      }),
+    );
+
+    assert.equal(report.mode, 'applied');
+    assert.deepEqual(report.installed_artifacts, []);
+    assert.deepEqual(commands, [
       ['/usr/bin/systemctl', ['daemon-reload']],
       ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
       ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
