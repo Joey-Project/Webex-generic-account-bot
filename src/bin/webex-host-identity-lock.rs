@@ -15,6 +15,8 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(target_os = "linux")]
 const NODE_FD_PATH: &str = "/proc/self/fd/3";
 #[cfg(target_os = "linux")]
+const NODE_FD: RawFd = 3;
+#[cfg(target_os = "linux")]
 const SOURCE_ROOT: &str = "/opt/webex-generic-account-bot/code/deploy/systemd";
 #[cfg(target_os = "linux")]
 const DEPLOYMENT_LOCK_FD: RawFd = 6;
@@ -26,6 +28,8 @@ const PARENT_PID_ENV: &str = "WEBEX_HOST_IDENTITY_LOCK_PARENT_PID";
 const IDENTITY_LOCK_PATH: &str = "/etc/.pwd.lock";
 #[cfg(target_os = "linux")]
 const MAX_AUDITED_FDS: usize = 1024;
+#[cfg(target_os = "linux")]
+const FILE_CAPABILITY_XATTR: &[u8] = b"security.capability\0";
 #[cfg(target_os = "linux")]
 const IDENTITY_RECOVERY_BOOTSTRAP: &str = concat!(
     "const { readFileSync } = await import(\"node:fs\"); ",
@@ -173,6 +177,52 @@ fn retain_lock_descriptor_across_exec(
 }
 
 #[cfg(target_os = "linux")]
+fn assert_no_file_capabilities(fd: RawFd) -> Result<()> {
+    assert_xattr_absent(
+        fd,
+        FILE_CAPABILITY_XATTR,
+        "Node executable has file capabilities that would clear the parent-death signal",
+        "failed to inspect Node executable file capabilities",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assert_xattr_absent(
+    fd: RawFd,
+    name: &[u8],
+    present_error: &str,
+    inspect_error: &str,
+) -> Result<()> {
+    if name.last() != Some(&0) || name[..name.len() - 1].contains(&0) {
+        return Err(anyhow!("invalid extended attribute name"));
+    }
+    // SAFETY: the name is a validated NUL-terminated byte string, fd is the
+    // inspected executable, and a null value pointer requests only the size.
+    let size = unsafe { libc::fgetxattr(fd, name.as_ptr().cast(), std::ptr::null_mut(), 0) };
+    let error = (size < 0).then(|| std::io::Error::last_os_error().raw_os_error());
+    assert_xattr_probe_absent(size, error.flatten(), present_error, inspect_error)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_xattr_probe_absent(
+    size: libc::ssize_t,
+    error: Option<libc::c_int>,
+    present_error: &str,
+    inspect_error: &str,
+) -> Result<()> {
+    if size >= 0 {
+        return Err(anyhow!(present_error.to_owned()));
+    }
+    if error == Some(libc::ENODATA) {
+        return Ok(());
+    }
+    Err(std::io::Error::from_raw_os_error(
+        error.unwrap_or(libc::EIO),
+    ))
+    .context(inspect_error.to_owned())
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for PasswordDatabaseLock {
     fn drop(&mut self) {
         // SAFETY: this guard exists only after a successful lckpwdf call.
@@ -228,6 +278,7 @@ fn run() -> Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    assert_no_file_capabilities(NODE_FD)?;
     let error = command.exec();
     Err(error).context("failed to exec the identity recovery process")
 }
@@ -299,6 +350,7 @@ mod tests {
     #[test]
     fn child_contract_is_fixed_and_fd_bound() {
         assert_eq!(NODE_FD_PATH, "/proc/self/fd/3");
+        assert_eq!(NODE_FD, 3);
         assert_eq!(DEPLOYMENT_LOCK_FD, 6);
         assert_eq!(
             SOURCE_ROOT,
@@ -307,6 +359,35 @@ mod tests {
         assert!(IDENTITY_RECOVERY_BOOTSTRAP.contains("readFileSync(5)"));
         assert!(IDENTITY_RECOVERY_BOOTSTRAP.contains("runIdentityRecoveryChild"));
         assert!(!IDENTITY_RECOVERY_BOOTSTRAP.contains("runCli"));
+    }
+
+    #[test]
+    fn node_exec_rejects_file_capability_transitions() {
+        let executable = File::open(env::current_exe().expect("resolve test executable"))
+            .expect("open test executable");
+        assert_no_file_capabilities(executable.as_raw_fd())
+            .expect("ordinary test executable has no file capabilities");
+
+        let present = assert_xattr_probe_absent(
+            20,
+            None,
+            "test executable capability is present",
+            "failed to inspect test executable capability",
+        )
+        .expect_err("reject present executable capability");
+        assert!(present.to_string().contains("capability is present"));
+        let unreadable = assert_xattr_probe_absent(
+            -1,
+            Some(libc::EIO),
+            "test executable capability is present",
+            "failed to inspect test executable capability",
+        )
+        .expect_err("fail closed when capability state cannot be inspected");
+        assert!(
+            unreadable
+                .to_string()
+                .contains("failed to inspect test executable capability")
+        );
     }
 
     #[test]

@@ -473,8 +473,10 @@ The locked provisioner identifies exactly one descriptor for the shared host
 deployment `flock` and passes that same open-file-description to the native
 helper. The helper validates and retains it for the entire recovery, and binds
 the same exec-preserved process to its expected parent with `PR_SET_PDEATHSIG`
-plus a PPID race check. An outer provisioner crash therefore
-cannot orphan identity mutation after releasing the shared deployment lock.
+plus a PPID race check. Immediately before exec, it rejects a
+`security.capability` attribute on the inherited Node descriptor because a
+privileged-file exec would clear the parent-death signal. An outer provisioner
+crash therefore cannot orphan identity mutation after releasing the shared deployment lock.
 That process copies verified backup contents into fixed private candidates and
 atomically installs those candidates, preserving the standard `*-` backups.
 Legacy version 1 and 2 journals do not bind identity-file digests, so a partial
