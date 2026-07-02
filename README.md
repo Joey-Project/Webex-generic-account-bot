@@ -194,6 +194,145 @@ trusted Jenkins helper runs under Node/V8. Prompt-controlled Codex tools do not
 inherit that broad base-service boundary after activation: they execute through
 the separately hardened launcher and immutable transient runtime.
 
+Guarded host policy provisioning is dry-run by default:
+
+```bash
+sudo /usr/bin/node scripts/provision-host.mjs --dry-run
+sudo /usr/bin/node scripts/provision-host.mjs --apply
+```
+
+The production CLI has no source, target, or root override. It reads a fixed
+allowlist of four sysusers files, six tmpfiles files, and five systemd units
+from the root-owned repository deployment tree, then installs them as
+`root:root` mode `0644` files under `/etc`. The allowlist excludes secrets,
+binaries, rendered config, and the activation-owned
+`webex-generic-account-bot.service.d/10-codex-launcher.conf` drop-in.
+Apply also requires root-owned, non-writable ancestors and files for both the
+Node executable and provisioner script; do not run this root workflow through
+a user-managed Node installation or checkout.
+
+Both modes require root so the complete files-backed `shadow` and `gshadow`
+databases can be checked without exposing them in output. Dry-run reads
+`/etc/passwd`, `/etc/shadow`, `/etc/group`, and `/etc/gshadow` through stable
+no-follow handles with fixed root-owned metadata, then validates source and
+target ancestor metadata, existing policy files, the exact non-login account
+metadata, locked managed-user and managed-group credentials, all shadow-group
+grants, NSS group state, and an exact local-only NSS policy for passwd, shadow,
+group, gshadow, and optional initgroups data.
+Static identities are enumerated explicitly from the `files` database. The
+systemd user database may expose only its root-owned `DynamicUser` provider,
+static userdb records are rejected, fixed `getent -s systemd` lookups must show
+every managed user and group name unclaimed, and managed UIDs/GIDs must remain
+below the dynamic allocation range.
+It also validates dormant unit state without creating files or directories.
+Apply additionally requires root and
+rejects active, enabled, or masked managed units, including instantiated
+launcher template units. It rejects unloaded policy and dependency directories
+for every fixed managed unit, template or instance launcher overrides, and
+systemd type-level or dash-prefix drop-ins from every fixed systemd system-unit
+load path. It accepts only the exact root-owned `/lib -> usr/lib` compatibility
+link and requires every loaded managed unit to use the fixed
+`/etc/systemd/system` fragment with no drop-ins, no pending daemon reload, and
+no external reverse activator. Enabled external unit dependency graphs are
+not inferred from a potentially stale manager cache: every trusted system unit
+load path is scanned directly for external unit, drop-in, alias, and dependency
+symlink references to managed units, including C-escaped references, launcher
+instances, and the contents of trusted linked unit files. A dangling external
+alias is accepted only when its link text is clean and its target parent remains
+root-owned and non-writable. Unit-name specifiers are expanded against each
+external fragment, alias, and drop-in owner before matching, directory entries
+are classified from `lstat` rather than optional `d_type` metadata, and external
+type-level and dash-prefix drop-ins keep unit-name specifiers symbolic because
+their eventual owner is not a single concrete unit, including across linked
+physical policy files. External
+policy may not assign a managed user or group by name or implicit DynamicUser
+unit name, unresolved dynamic specifiers are forbidden in identity directives
+except for the exact vendor `user@.service` user-manager assignment when both
+the physical file and logical unit owner match. Unresolved dynamic specifiers
+in unit-reference directives are symbolically checked against every managed
+unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
+range before allocation. Direct boot-policy credential injection is rejected;
+credential import selectors are evaluated across exact, trailing-glob, and
+glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
+the standard vendor `ImportCredential=` consumers remain allowed only for an
+exact physical-file/logical-owner pair after the current system credential set
+and all plaintext and encrypted credential stores prove that `sysusers.extra`
+and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
+catalogues are audited before mutation and again after
+account allocation using systemd field, quoting, continuation, C-escape,
+specifier/glob-prefix, lexical path and trailing-slash normalisation including
+glob-capable access through the legacy `/var/run` alias, copy-source, path-derived-ID,
+owner modifiers, numeric identities, ACL principals, symlink targets, ancestor
+metadata, and recursive-parent semantics. External
+sysusers allocation-range directives are rejected. Every effective catalogue source and its ancestors
+must also be root-owned, non-writable, no-follow, and stable. Runtime paths,
+the local identity databases and NSS policy, every static and runtime systemd
+userdb path, every fixed systemd system-unit
+load path, every installed policy target, the transaction journal, and the
+shared lock are protected from external tmpfiles policy; ancestor maintenance must preserve
+traversal for the managed accounts. Only the reviewed Webex lines may affect
+managed identities, IDs, or paths, which keeps the identity and filesystem
+boundary durable across reboot. Catalogue source markers bind each active line
+to its policy file, allowing a trusted installed managed version to be replaced
+by the reviewed desired version without accepting the same line from an
+unmanaged source.
+The legacy compatibility rule accepts only the exact `/var/run` link text
+`../run` or `/run`; lexically equivalent paths are rejected.
+The same host-wide `flock` used by config deployment serialises the complete apply.
+The trusted Node and provisioner entrypoints are verified before first-run lock
+metadata can be created or converged, and the re-executed process then verifies
+the kernel lock PID, device, and inode instead
+of trusting its environment. An interrupted first-run lock metadata migration
+is accepted only in a root-owned, non-writable half-migrated state, including a
+safe mode narrowed to any value by the caller's umask before the first metadata
+update, or in the unique safe group-owned mode left when tmpfiles completes
+`chown` before `chmod`. A rerun first converges that directory to the exact
+bootstrap or deployed mode.
+Apply must then prove
+that tmpfiles converged the same held inode to deployed metadata. Apply streams
+a bounded number of directory entries and removes only bounded, exact-name,
+trusted stale candidates left by an interrupted prior run, including a
+root-owned candidate whose initial mode was narrowed by umask before chmod. The
+shared lock applies the same bounded interrupted-creation recovery before
+converging exact metadata. Stale candidates are collected and fully validated
+only after the host trust preflight; no candidate is removed until the complete
+bounded candidate set is accepted. It installs the complete
+policy file set transactionally,
+applies only the fixed sysusers and tmpfiles files, reloads the manager, and
+verifies hashes, ownership, modes, account separation, load state, and that no
+unit became active or enabled. It never starts or enables a unit. A policy-file
+transaction failure restores the old file set and retains the journal until a
+later apply reloads the manager and accepts the common preflight. Each file replacement is atomic,
+and a root-only transaction journal
+under `/etc/systemd/system` makes an interrupted multi-file commit recoverable.
+Recovery first proves identity, unit, source, merged boot-policy, system
+credential, and credential-store trust against the current partial state. After
+restoring the old set and reloading the manager, the journal remains until the
+same common preflight accepts the recovered state.
+The journal remains durable through sysusers/tmpfiles convergence, manager
+reload, and final unit verification; it is removed only after all of those
+steps succeed.
+Rollback and recovery classify every managed target, accept only the recorded
+old or desired digest, and fail closed on an administrator-modified third
+state. Recovery fsyncs every target directory before removing the journal,
+including targets that already match their recorded old state, and then
+re-verifies the complete old target set before clearing recovery state. A
+startup recovery keeps the journal while immediately reloading systemd and
+rechecking dormant unit state, so later validation failures cannot leave a
+half-committed unit cached by the manager. Dry-run reports recovery required,
+and the next apply first proves every managed unit and discovered instance
+dormant, then restores a partial commit to the old set before reapplying. A
+journal whose complete target set already matches the desired digests resumes
+sysusers/tmpfiles and manager convergence without restoring old policy. Once a desired policy set
+is fully installed and verified, a journal unlink durability failure no longer
+starts a second rollback; it leaves that complete desired set for a convergent
+rerun. A later sysusers, tmpfiles, or reload failure leaves the complete
+reviewed file set installed and reports a convergence error so the same command
+can be rerun after correction. If that leaves the complete desired file set on
+disk with `NeedDaemonReload=yes`, only an explicit apply may reload the manager,
+revalidate the complete dormant policy, and resume convergence; dry-run still
+fails closed on the stale cache.
+
 The deployment entrypoint lives in this bot repository, not in the config
 repository checkout. It treats the config checkout as data, builds fixed argv
 calls for `git`, the bot repo's trusted `scripts/config-policy/validate-config.sh`,

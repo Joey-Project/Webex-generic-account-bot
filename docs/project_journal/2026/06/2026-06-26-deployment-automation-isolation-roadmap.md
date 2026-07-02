@@ -161,7 +161,59 @@ superseded_by:
   stable unprivileged bot identity, fixed service, and root-managed versus
   bot-writable filesystem contract. It grants no launcher, input, or
   config-worker group and does not install secrets, assets, units, or the
-  activation drop-in. PR 4d2 owns the guarded dry-run/apply provisioner.
+  activation drop-in. PR 4d2 adds the guarded dry-run/apply provisioner with a
+  fixed non-secret allowlist, stable no-follow reads of complete
+  passwd/shadow/group/gshadow databases, a DynamicUser-only systemd userdb boundary,
+  fixed managed-name vacancy lookups, identity-drift, locked-user/group-credential,
+  and cross-group shadow-grant checks,
+  dormant-unit
+  preflight, transactional policy-file installation, device-bound kernel lock
+  verification shared with config deployment, exact loaded-fragment and
+  no-drop-in, no-stale-manager, and no-external-reverse-activator checks,
+  direct next-boot disk inspection of external units, drop-ins, aliases,
+  dependency symlinks, linked policy contents, trusted dangling-alias parents,
+  `d_type`-independent file classification, unit-name specifier expansion with
+  symbolic shared dash-prefix drop-ins preserved across physical-file symlinks,
+  named/implicit-DynamicUser assignments, unresolved dynamic identity
+  specifiers outside the physical-file/logical-owner-bound vendor user-manager
+  assignment plus language-intersection managed-unit and launcher reachability
+  checks for all unresolved dynamic unit-reference specifiers, including raw
+  escaped and decoded policy names, pre-allocation
+  rejection of static-range numeric identities,
+  boot-policy credential injection with exact/trailing-glob/glob-rename-prefix-aware
+  selectors, fail-closed complex wildcard handling, and
+  physical-file/logical-owner vendor binding plus current system and
+  credential-store inputs, and launcher-instance
+  references, fixed-path scanning for unloaded policy and dependency
+  directories across all managed units plus
+  template, instance, type-level, and dash-prefix overrides, with exact
+  usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
+  auditing with C-escape, normalised specifier/glob-prefix and trailing slash,
+  including glob access through the legacy `/var/run` alias and exact
+  compatibility-link text, and copy-source
+  paths, source-associated managed-policy upgrades, path-derived-ID,
+  allocation-range rejection, owner modifiers, numeric
+  identities, ACL principals, and fail-closed specifier-bearing symlink targets,
+  protected root, identity
+  databases and NSS policy, static/runtime systemd userdb paths, fixed systemd
+  system-unit load paths, and installed
+  policy targets, traversal-preserving ancestor metadata, recursive parent
+  handling, and root-owned stable source
+  metadata for every effective catalogue file,
+  trusted re-exec paths checked before first-run lock convergence, bounded
+  post-preflight stale candidate collection with
+  all-before-any validation and unit
+  discovery, complete recovery-before-write identity, unit, source,
+  boot-policy, and credential checks, immediate recovery-time manager reload,
+  delayed journal removal until the recovered state passes common preflight,
+  explicit complete-target stale-cache convergence recovery,
+  fail-closed recovery with full target-directory durability, partial-commit
+  rollback versus complete-desired convergence-resume classification, and a
+  journal retained after installation rollback and through final manager convergence,
+  non-rollback journal-unlink failure handling, umask-safe interrupted candidate
+  and first-run lock recovery including the group-owned pre-chmod directory
+  state, and post-reload verification. Real host apply remains an
+  explicit operational gate.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
@@ -192,6 +244,39 @@ superseded_by:
   launcher, input, config-pull, or config-deploy group because systemd extends
   user-database groups even after an empty `SupplementaryGroups=` assignment.
   Also reject worker membership in the bot group or any bot-secret group.
+- Install the complete root-owned policy file set transactionally with atomic
+  per-file replacement. If a later
+  commit is interrupted, recover the old set from a fixed root-only journal
+  before reapplying, but reject any target that matches neither the recorded
+  old nor desired digest. Apply the same all-target digest gate before rollback.
+  Require exact local-only passwd/shadow/group/gshadow NSS policies, enumerate static identities from
+  `files`, reject static systemd userdb records and managed IDs in the
+  DynamicUser range, require locked files-backed shadow and gshadow credentials
+  for every managed account and privilege group, and permit only the trusted
+  DynamicUser provider.
+  Fsync every target directory and re-verify the complete old target set before
+  clearing a recovery journal. Keep that journal while immediately reloading
+  systemd after startup recovery, and prove every managed unit and discovered
+  instance dormant before and after recovery mutates policy. Do not begin a
+  second rollback after a fully installed desired set reaches journal unlink but
+  its directory fsync fails. Serialise the full apply with
+  a PID/device/inode-bound kernel lock shared with config deployment, validate
+  every re-exec path ancestor, stream a bounded scan that removes only trusted
+  stale candidates, and bound and reject active launcher template instances as
+  well as active template units. Allow only a root-owned, non-writable
+  half-migrated first-run lock state, including safe umask-narrowed modes and
+  the group-owned pre-chmod directory state, then
+  require tmpfiles to converge and revalidate the held
+  inode before success. Require each loaded unit and instance to use the fixed
+  managed fragment without any
+  drop-ins, and reject unloaded unit overrides, drop-ins, wants, requires, and upholds
+  for every managed unit and launcher instance from every fixed systemd
+  system-unit load path while
+  accepting only the exact root-owned `/lib -> usr/lib` compatibility link. If
+  a later sysusers, tmpfiles, manager-reload, or
+  post-verification step fails, retain that complete set and fail with an
+  explicit convergent-rerun requirement; do not claim rollback of users or
+  directories already created by systemd.
 - Never copy secrets, install the activation-owned bot drop-in, enable the bot,
   or run the real reboot challenge as an implicit side effect.
 

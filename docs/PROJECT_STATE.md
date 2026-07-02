@@ -94,9 +94,50 @@
 - Host deployment discovery found that the repository had privileged launcher,
   activation, and worker units but no base bot unit or reproducible host
   provisioner. The base contract now defines the unprivileged bot identity,
-  fixed service, and root-managed versus bot-writable filesystem layout. A
-  guarded installer remains the next slice before Configuration Space pinning
-  and real host activation.
+  fixed service, and root-managed versus bot-writable filesystem layout. The
+  guarded provisioner now has a fixed non-secret allowlist, stable no-follow
+  reads of the complete passwd/shadow/group/gshadow identity databases, a DynamicUser-only systemd
+  userdb boundary with fixed managed-name vacancy lookups, identity-drift,
+  locked-user/group-credential, and shadow-grant
+  checks, bounded dormant-unit preflight, device-bound kernel lock verification
+  shared with config deployment, exact loaded-fragment, no-drop-in,
+  no-stale-manager, and no-external-activator checks, bounded policy-path
+  scanning for every managed unit, launcher instance, type drop-in, and
+  dash-prefix drop-in with usr-merge handling, direct disk scanning of external
+  units, drop-ins, aliases, dependency symlinks, linked policy contents, trusted
+  dangling-alias parents, `d_type`-independent entry classification, unit-name
+  specifier expansion with symbolic shared dash-prefix drop-ins preserved
+  across physical-file symlinks,
+  named/implicit-DynamicUser identities, unresolved
+  dynamic-specifier rejection in identity directives with only the exact
+  physical-file/logical-owner vendor user-manager identity assignment permitted,
+  language-intersection managed-unit and launcher reachability checks for
+  unresolved dynamic specifiers in unit-reference directives, with both raw
+  escaped and decoded names audited, pre-allocation rejection
+  of static-range numeric identities, and boot-policy credential injection
+  rejection with exact/trailing-glob/glob-rename-prefix-aware selectors and fail-closed
+  complex wildcard handling, physical-file/logical-owner vendor
+  binding, and system-credential and credential-store absence checks,
+  assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
+  auditing that protects root, runtime, identity databases, NSS policy, and
+  static/runtime systemd userdb paths,
+  systemd system-unit load paths, and installed policy paths from owner-modifier,
+  numeric-identity, ACL-principal, fail-closed specifier-bearing symlink-target,
+  traversal-restricting ancestor
+  metadata, cleanup, replacement, and recursive rules, allocation ranges,
+  normalised glob and trailing-slash paths including legacy `/var/run` alias
+  globs and exact compatibility-link text,
+  source-associated managed-policy upgrades, and copy sources while
+  validating every catalogue source file and ancestor,
+  trusted re-exec paths validated before first-run lock convergence,
+  fail-closed crash recovery bracketed by complete preflight checks, with
+  immediate manager reload, delayed journal removal, and full
+  target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional
+  root-owned policy installation whose rollback journal distinguishes partial
+  rollback from complete-desired convergence resume and remains through manager
+  convergence without unsafe post-unlink rollback, explicit
+  sysusers/tmpfiles application, and post-reload verification. Real host apply
+  remains explicit before Configuration Space pinning and activation.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
