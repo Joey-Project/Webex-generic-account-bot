@@ -180,11 +180,13 @@ superseded_by:
   checks for all unresolved dynamic unit-reference specifiers, including raw
   escaped and decoded policy names, pre-allocation
   rejection of static-range numeric identities,
-  boot-policy credential injection with exact/trailing-glob/glob-rename-prefix-aware
-  selectors, fail-closed complex wildcard handling, and
-  physical-file/logical-owner vendor binding plus current system and
-  credential-store inputs, and launcher-instance
-  references, fixed-path scanning for unloaded policy and dependency
+  host-policy credential assignment rejection with
+  exact/trailing-glob/glob-rename-prefix-aware selectors, fail-closed complex
+  wildcard handling, physical-file/logical-owner vendor binding, current
+  system and credential-store inputs, and systemd 258 `userdb.user.*` and
+  `userdb.group.*` rejection across system credentials, credential stores,
+  tmpfiles, and unit credential directives, plus launcher-instance reference
+  rejection, fixed-path scanning for unloaded policy and dependency
   directories across all managed units plus
   template, instance, type-level, and dash-prefix overrides, with exact
   usr-merge compatibility, semantic merged boot sysusers/tmpfiles policy
@@ -200,7 +202,9 @@ superseded_by:
   policy targets, traversal-preserving ancestor metadata, recursive parent
   handling, and root-owned stable source
   metadata for every effective catalogue file,
-  trusted re-exec paths checked before first-run lock convergence, bounded
+  trusted re-exec paths plus a complete transaction-aware read-only host
+  preflight checked before first-run lock convergence, with the checks repeated
+  under the held lock, bounded
   post-preflight stale candidate collection with
   all-before-any validation and unit
   discovery, complete recovery-before-write identity, unit, source,

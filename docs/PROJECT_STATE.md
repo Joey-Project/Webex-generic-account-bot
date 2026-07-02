@@ -114,11 +114,13 @@
   language-intersection managed-unit and launcher reachability checks for
   unresolved dynamic specifiers in unit-reference directives, with both raw
   escaped and decoded names audited, pre-allocation rejection
-  of static-range numeric identities, and boot-policy credential injection
-  rejection with exact/trailing-glob/glob-rename-prefix-aware selectors and fail-closed
-  complex wildcard handling, physical-file/logical-owner vendor
-  binding, and system-credential and credential-store absence checks,
-  assignments, and launcher-instance references, semantic merged boot sysusers/tmpfiles policy
+  of static-range numeric identities, host-policy credential assignment
+  rejection with exact/trailing-glob/glob-rename-prefix-aware selectors,
+  fail-closed complex wildcard handling, physical-file/logical-owner vendor
+  binding, system-credential and credential-store absence checks, and systemd
+  258 `userdb.user.*` and `userdb.group.*` prefix rejection across credential
+  and tmpfiles channels, plus launcher-instance reference rejection. Semantic
+  merged boot sysusers/tmpfiles policy
   auditing that protects root, runtime, identity databases, NSS policy, and
   static/runtime systemd userdb paths,
   systemd system-unit load paths, and installed policy paths from owner-modifier,
@@ -129,7 +131,9 @@
   globs and exact compatibility-link text,
   source-associated managed-policy upgrades, and copy sources while
   validating every catalogue source file and ancestor,
-  trusted re-exec paths validated before first-run lock convergence,
+  trusted re-exec paths and a complete transaction-aware read-only host
+  preflight validated before first-run lock convergence, followed by repeated
+  checks under the held lock,
   fail-closed crash recovery bracketed by complete preflight checks, with
   immediate manager reload, delayed journal removal, and full
   target-directory durability, post-preflight all-before-any stale-candidate cleanup, transactional

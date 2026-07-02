@@ -161,6 +161,10 @@ const BOOT_POLICY_CREDENTIAL_NAMES = Object.freeze([
   'sysusers.extra',
   'tmpfiles.extra',
 ]);
+const USERDB_CREDENTIAL_PREFIXES = Object.freeze([
+  'userdb.user.',
+  'userdb.group.',
+]);
 const CREDENTIAL_STORE_DIRECTORIES = Object.freeze([
   '/etc/credstore',
   '/run/credstore',
@@ -589,7 +593,7 @@ export async function provisionHost(options, dependencies = {}) {
   }
 
   const transaction = await readProvisionTransaction(plan, deps);
-  if (transaction && !options.apply) {
+  if (transaction && !options.apply && !options.recoveryPreflight) {
     throw new Error('host policy recovery is required; run --apply');
   }
   const commands = [];
@@ -609,6 +613,10 @@ export async function provisionHost(options, dependencies = {}) {
       requireLoaded: false,
       allowDaemonReloadRequired: true,
     });
+    if (options.recoveryPreflight) {
+      await inspectPolicyTransactionRecovery(transaction, plan, deps);
+      return provisionReport('dry-run', plan, recoveryInspected, commands);
+    }
     recoveryState = await recoverPolicyTransaction(transaction, plan, deps);
     try {
       commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
@@ -766,11 +774,16 @@ export async function executeLockedApply(argv, {
   nodePath = process.execPath,
   scriptPath = fileURLToPath(import.meta.url),
   verifyReexecFile = assertTrustedReexecFile,
+  preflightHost = () => provisionHost({
+    apply: false,
+    recoveryPreflight: true,
+  }),
   ensureLock = ensureProvisionLockFile,
   spawnProcess = spawn,
 } = {}) {
   await verifyReexecFile(nodePath, { executable: true }, fsApi);
   await verifyReexecFile(scriptPath, { mode: FILE_MODE }, fsApi);
+  await preflightHost();
   await ensureLock(fsApi);
   const command = buildLockedApplyCommand({ argv, nodePath, scriptPath });
   return new Promise((resolve, reject) => {
@@ -1577,46 +1590,11 @@ async function recoverPolicyTransaction(
   plan,
   deps,
 ) {
-  const directories = new Set(
-    transaction.artifacts.map(({ target }) => path.dirname(target)),
-  );
-  for (const directory of directories) {
-    await assertTrustedDirectoryChain(
-      plan.targetRoot,
-      directory,
-      deps.targetUid,
-      deps.targetGid,
-      deps.fsApi,
-    );
-  }
-  const recovery = [];
-  for (const artifact of transaction.artifacts) {
-    const current = await readOptionalTrustedFile(
-      artifact.target,
-      deps.targetUid,
-      deps.targetGid,
-      FILE_MODE,
-      deps.fsApi,
-    );
-    const existingSha256 = artifact.existing
-      ? createHash('sha256').update(artifact.existing.contents).digest('hex')
-      : null;
-    const matchesOldState = artifact.existing
-      ? current?.sha256 === existingSha256
-      : !current;
-    const matchesDesiredState = current?.sha256 === artifact.desiredSha256;
-    if (!matchesOldState && !matchesDesiredState) {
-      throw new Error(`policy target has unknown state during recovery: ${artifact.target}`);
-    }
-    recovery.push(Object.freeze({
-      artifact,
-      current,
-      restore: matchesDesiredState && !matchesOldState,
-    }));
-  }
-  const resumeDesiredState = recovery.every(
-    ({ artifact, current }) => current?.sha256 === artifact.desiredSha256,
-  );
+  const {
+    directories,
+    recovery,
+    resumeDesiredState,
+  } = await inspectPolicyTransactionRecovery(transaction, plan, deps);
   for (const entry of [...recovery].reverse()) {
     if (resumeDesiredState) break;
     if (!entry.restore) continue;
@@ -1669,6 +1647,54 @@ async function recoverPolicyTransaction(
     }
   }
   return resumeDesiredState ? 'desired' : 'old';
+}
+
+async function inspectPolicyTransactionRecovery(transaction, plan, deps) {
+  const directories = new Set(
+    transaction.artifacts.map(({ target }) => path.dirname(target)),
+  );
+  for (const directory of directories) {
+    await assertTrustedDirectoryChain(
+      plan.targetRoot,
+      directory,
+      deps.targetUid,
+      deps.targetGid,
+      deps.fsApi,
+    );
+  }
+  const recovery = [];
+  for (const artifact of transaction.artifacts) {
+    const current = await readOptionalTrustedFile(
+      artifact.target,
+      deps.targetUid,
+      deps.targetGid,
+      FILE_MODE,
+      deps.fsApi,
+    );
+    const existingSha256 = artifact.existing
+      ? createHash('sha256').update(artifact.existing.contents).digest('hex')
+      : null;
+    const matchesOldState = artifact.existing
+      ? current?.sha256 === existingSha256
+      : !current;
+    const matchesDesiredState = current?.sha256 === artifact.desiredSha256;
+    if (!matchesOldState && !matchesDesiredState) {
+      throw new Error(`policy target has unknown state during recovery: ${artifact.target}`);
+    }
+    recovery.push(Object.freeze({
+      artifact,
+      current,
+      restore: matchesDesiredState && !matchesOldState,
+    }));
+  }
+  const resumeDesiredState = recovery.every(
+    ({ artifact, current }) => current?.sha256 === artifact.desiredSha256,
+  );
+  return Object.freeze({
+    directories,
+    recovery: Object.freeze(recovery),
+    resumeDesiredState,
+  });
 }
 
 async function removeProvisionTransaction(plan, deps) {
@@ -1921,8 +1947,8 @@ function assertNoBootPolicySystemCredentials(result) {
   if (output === '' || output === 'No credentials passed to system.') return;
   for (const line of output.split('\n')) {
     const [name] = line.trim().split(/\s+/);
-    if (BOOT_POLICY_CREDENTIAL_NAMES.includes(name)) {
-      throw new Error(`system credential can inject boot policy: ${name}`);
+    if (credentialNameCanInjectHostPolicy(name)) {
+      throw new Error(`system credential can inject host policy: ${name}`);
     }
   }
 }
@@ -1935,11 +1961,16 @@ async function assertNoBootPolicyCredentialStoreFiles(fsApi) {
       fsApi,
     );
     for (const entry of entries) {
-      if (BOOT_POLICY_CREDENTIAL_NAMES.includes(entry.name)) {
-        throw new Error(`credential store can inject boot policy: ${path.join(directory, entry.name)}`);
+      if (credentialNameCanInjectHostPolicy(entry.name)) {
+        throw new Error(`credential store can inject host policy: ${path.join(directory, entry.name)}`);
       }
     }
   }
+}
+
+function credentialNameCanInjectHostPolicy(name) {
+  return BOOT_POLICY_CREDENTIAL_NAMES.includes(name)
+    || USERDB_CREDENTIAL_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 async function validateBootPolicySources(kind, catalog, fsApi) {
@@ -2148,6 +2179,8 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
   ) {
     return true;
   }
+  const credentialStorePolicy = tmpfilesCredentialStorePathTouchesManagedSurface(fields);
+  if (credentialStorePolicy !== null) return credentialStorePolicy;
   const argument = fields[6];
   if (type === 'L' && policyPath === '/var/run' && argument !== undefined) {
     if (['../run', '/run'].includes(argument)) return false;
@@ -2183,6 +2216,29 @@ function tmpfilesLineTouchesManagedSurface(fields, managedNames, managedIds, pro
       ));
   }
   return false;
+}
+
+function tmpfilesCredentialStorePathTouchesManagedSurface(fields) {
+  const policyPath = normaliseBootPolicyPath(fields[1]);
+  for (const directory of CREDENTIAL_STORE_DIRECTORIES) {
+    if (policyPath === directory) {
+      return !tmpfilesCredentialStoreDirectoryPolicyIsSafe(fields);
+    }
+    if (policyPath.startsWith(`${directory}/`)) return true;
+  }
+  return null;
+}
+
+function tmpfilesCredentialStoreDirectoryPolicyIsSafe(fields) {
+  const [type, , mode = '-', rawUser = '-', rawGroup = '-', age = '-'] = fields;
+  if (!/^[devqQz]$/.test(type ?? '') || age !== '-') return false;
+  const user = normaliseTmpfilesOwner(rawUser);
+  const group = normaliseTmpfilesOwner(rawGroup);
+  if (!['-', 'root', '0'].includes(user) || !['-', 'root', '0'].includes(group)) return false;
+  if (mode === '-') return true;
+  if (!/^[0-7]{3,4}$/.test(mode)) return false;
+  const parsedMode = Number.parseInt(mode, 8);
+  return (parsedMode & 0o700) === 0o700 && (parsedMode & 0o022) === 0;
 }
 
 function normaliseTmpfilesOwner(owner) {
@@ -2607,7 +2663,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     unitNames,
     logicalSource,
   )) {
-    throw new Error(`external systemd policy injects a boot policy credential: ${source}`);
+    throw new Error(`external systemd policy injects a host policy credential: ${source}`);
   }
   const representations = new Set([raw, decoded]);
   const expanded = new Set(unitNames.size === 0
@@ -2660,7 +2716,7 @@ function systemdPolicyInjectsBootPolicyCredential(
   return fields.some((field) => {
     const separatorOffset = field.indexOf(':');
     const credential = separatorOffset < 0 ? field : field.slice(0, separatorOffset);
-    return credential.includes('%') || BOOT_POLICY_CREDENTIAL_NAMES.includes(credential);
+    return credential.includes('%') || credentialNameCanInjectHostPolicy(credential);
   });
 }
 
@@ -2679,18 +2735,24 @@ function importCredentialSelectorTargetsBootPolicy(selector) {
     wildcardOffset !== sourcePattern.length - 1
     || sourcePattern.lastIndexOf('*') !== wildcardOffset
   )) return true;
-  if (BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
-    wildcardOffset < 0
-      ? sourcePattern === name
-      : name.startsWith(sourcePattern.slice(0, -1))
-  ))) return true;
+  if (credentialSelectorCanInjectHostPolicy(sourcePattern, wildcardOffset)) return true;
   if (renamePrefix === undefined) return false;
   if (renamePrefix.includes('*')) return true;
-  return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => (
-    wildcardOffset < 0
-      ? renamePrefix === name
-      : name.startsWith(renamePrefix)
-  ));
+  return wildcardOffset < 0
+    ? credentialNameCanInjectHostPolicy(renamePrefix)
+    : credentialPrefixCanInjectHostPolicy(renamePrefix);
+}
+
+function credentialSelectorCanInjectHostPolicy(selector, wildcardOffset) {
+  if (wildcardOffset < 0) return credentialNameCanInjectHostPolicy(selector);
+  return credentialPrefixCanInjectHostPolicy(selector.slice(0, -1));
+}
+
+function credentialPrefixCanInjectHostPolicy(prefix) {
+  return BOOT_POLICY_CREDENTIAL_NAMES.some((name) => name.startsWith(prefix))
+    || USERDB_CREDENTIAL_PREFIXES.some((managedPrefix) => (
+      managedPrefix.startsWith(prefix) || prefix.startsWith(managedPrefix)
+    ));
 }
 
 function isExpectedVendorBootPolicyCredentialImport(

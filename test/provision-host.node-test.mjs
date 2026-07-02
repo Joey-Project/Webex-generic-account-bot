@@ -168,6 +168,26 @@ describe('guarded host provisioner policy', () => {
     );
     assert.deepEqual(entrypoints, ['/trusted/node', '/untrusted/provision-host.mjs']);
     assert.equal(ensureLockCalls, 0);
+
+    const ordering = [];
+    await assert.rejects(
+      executeLockedApply(['--apply'], {
+        nodePath: '/trusted/node',
+        scriptPath: '/trusted/provision-host.mjs',
+        verifyReexecFile: async (file) => ordering.push(`verify:${file}`),
+        preflightHost: async () => {
+          ordering.push('preflight');
+          throw new Error('host policy preflight failed');
+        },
+        ensureLock: async () => ordering.push('ensure-lock'),
+      }),
+      /host policy preflight failed/,
+    );
+    assert.deepEqual(ordering, [
+      'verify:/trusted/node',
+      'verify:/trusted/provision-host.mjs',
+      'preflight',
+    ]);
   });
 
   it('accepts bootstrap, deployed, or interrupted shared lock migration metadata', () => {
@@ -688,6 +708,9 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'f /tmp/untrusted 0600 root :02001 -'],
       ['tmpfiles', 'f+! /etc/shadow 0600 root root - replacement'],
       ['tmpfiles', 'f+ /etc/userdb/1002.user 0600 root root - {}'],
+      ['tmpfiles', 'f /etc/credstore/userdb.user.injected 0600 root root - {}'],
+      ['tmpfiles', 'f /run/credstore/* 0600 root root - payload'],
+      ['tmpfiles', 'd+ /run/credstore 0700 root root -'],
       ['tmpfiles', 'L+ /run/systemd/userdb/untrusted - - - - /tmp/provider'],
       ['tmpfiles', 'L /tmp/untrusted - - - - %t/systemd/userdb'],
       ['tmpfiles', 'f+ /var/run/systemd/system/external.service 0644 root root - payload'],
@@ -755,6 +778,7 @@ describe('guarded host provisioner execution', () => {
             'd /var/lib 0711 root root -',
             'z /etc/systemd 0755 :root :root -',
             'L /var/run - - - - ../run',
+            'd /run/credstore 0700 root root -',
             '',
           ].join('\n'),
         }],
@@ -841,46 +865,58 @@ describe('guarded host provisioner execution', () => {
       /policy file metadata is not trusted: \/usr\/lib\/tmpfiles\.d\/example\.conf/,
     );
 
-    await assert.rejects(
-      readSystemBootPolicyCatalogs(
-        async (command) => {
-          if (command.endsWith('systemd-creds')) {
-            return { stdout: 'sysusers.extra insecure 42B\n', stderr: '', code: 0 };
-          }
-          const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
-          const source = `/usr/lib/${kind}.d/example.conf`;
-          return {
-            stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
-            stderr: '',
-            code: 0,
-          };
-        },
-        systemdUnitPathFs(new Map(), { filesByPath: sourceFiles }),
-      ),
-      /system credential can inject boot policy: sysusers\.extra/,
-    );
-
-    await assert.rejects(
-      readSystemBootPolicyCatalogs(
-        async (command) => {
-          if (command.endsWith('systemd-creds')) {
-            return { stdout: 'No credentials passed to system.\n', stderr: '', code: 0 };
-          }
-          const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
-          const source = `/usr/lib/${kind}.d/example.conf`;
-          return {
-            stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
-            stderr: '',
-            code: 0,
-          };
-        },
-        systemdUnitPathFs(
-          new Map([['/etc/credstore', [directoryEntry('tmpfiles.extra', false)]]]),
-          { filesByPath: sourceFiles },
+    for (const credential of [
+      'sysusers.extra',
+      'userdb.user.webex-generic-account-bot',
+      'userdb.group.webex-codex-launch',
+    ]) {
+      await assert.rejects(
+        readSystemBootPolicyCatalogs(
+          async (command) => {
+            if (command.endsWith('systemd-creds')) {
+              return { stdout: `${credential} insecure 42B\n`, stderr: '', code: 0 };
+            }
+            const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+            const source = `/usr/lib/${kind}.d/example.conf`;
+            return {
+              stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+              stderr: '',
+              code: 0,
+            };
+          },
+          systemdUnitPathFs(new Map(), { filesByPath: sourceFiles }),
         ),
-      ),
-      /credential store can inject boot policy: \/etc\/credstore\/tmpfiles\.extra/,
-    );
+        new RegExp(`system credential can inject host policy: ${credential.replaceAll('.', '\\.')}`),
+      );
+    }
+
+    for (const credential of [
+      'tmpfiles.extra',
+      'userdb.user.injected',
+      'userdb.group.injected',
+    ]) {
+      await assert.rejects(
+        readSystemBootPolicyCatalogs(
+          async (command) => {
+            if (command.endsWith('systemd-creds')) {
+              return { stdout: 'No credentials passed to system.\n', stderr: '', code: 0 };
+            }
+            const kind = command.endsWith('sysusers') ? 'sysusers' : 'tmpfiles';
+            const source = `/usr/lib/${kind}.d/example.conf`;
+            return {
+              stdout: `# ${source}\n${sourceFiles.get(source).toString('utf8')}`,
+              stderr: '',
+              code: 0,
+            };
+          },
+          systemdUnitPathFs(
+            new Map([['/etc/credstore', [directoryEntry(credential, false)]]]),
+            { filesByPath: sourceFiles },
+          ),
+        ),
+        new RegExp(`credential store can inject host policy: /etc/credstore/${credential.replaceAll('.', '\\.')}`),
+      );
+    }
   });
 
   it('upgrades source-associated managed boot policy from its trusted old contents', async (context) => {
@@ -1477,9 +1513,12 @@ describe('guarded host provisioner execution', () => {
     const sysusersDropIn = path.join(sysusersDropInDirectory, '50-extra-policy.conf');
     for (const policy of [
       'LoadCredential=sysusers.extra:/root/policy',
+      'SetCredential=userdb.user.injected:{}',
       'ImportCredential=payload:sysusers.extra',
       'ImportCredential=payload.*:sysusers.',
       'ImportCredential=payload.*:tmpfiles.',
+      'ImportCredential=userdb.user.*',
+      'ImportCredential=payload.*:userdb.group.',
       'ImportCredential=sysusers.?xtra',
       'ImportCredential=sysusers.[e]xtra',
       'ImportCredential=sysusers.[[:alpha:]]xtra',
@@ -1506,7 +1545,7 @@ describe('guarded host provisioner execution', () => {
             },
           ),
         ),
-        /external systemd policy injects a boot policy credential/,
+        /external systemd policy injects a host policy credential/,
       );
     }
 
@@ -1593,7 +1632,7 @@ describe('guarded host provisioner execution', () => {
         'external-sysusers.service',
         '/usr/lib/systemd/system/systemd-sysusers.service',
         '[Service]\nImportCredential=sysusers.*\n',
-        /external systemd policy injects a boot policy credential/,
+        /external systemd policy injects a host policy credential/,
       ],
     ]) {
       const alias = `/etc/systemd/system/${name}`;
@@ -1637,7 +1676,7 @@ describe('guarded host provisioner execution', () => {
           },
         ),
       ),
-      /external systemd policy injects a boot policy credential/,
+      /external systemd policy injects a host policy credential/,
     );
 
     const implicitDynamicUserUnit = '/etc/systemd/system/webex-config-deploy.service';
@@ -2177,6 +2216,43 @@ describe('guarded host provisioner execution', () => {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
+  });
+
+  it('preflights transaction recovery without mutating policy', async (context) => {
+    const fixture = await provisionFixture(context);
+    await writeNullTransaction(fixture);
+    const transactionBefore = await fs.readFile(fixture.plan.transactionFile);
+    const commands = [];
+
+    const report = await provisionHost(
+      { apply: false, recoveryPreflight: true },
+      fixture.dependencies({ commands }),
+    );
+
+    assert.equal(report.mode, 'dry-run');
+    assert.deepEqual(commands, []);
+    assert.deepEqual(
+      await fs.readFile(fixture.plan.transactionFile),
+      transactionBefore,
+    );
+    for (const artifact of fixture.plan.artifacts) {
+      await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
+    }
+
+    const changedTarget = fixture.plan.artifacts[0].target;
+    await fs.writeFile(changedTarget, 'unknown administrator state\n', { mode: 0o644 });
+    await fs.chmod(changedTarget, 0o644);
+    await assert.rejects(
+      provisionHost(
+        { apply: false, recoveryPreflight: true },
+        fixture.dependencies(),
+      ),
+      /policy target has unknown state during recovery/,
+    );
+    assert.equal(
+      await fs.readFile(changedTarget, 'utf8'),
+      'unknown administrator state\n',
+    );
   });
 
   it('recovers a crash-interrupted policy transaction before reapplying', async (context) => {

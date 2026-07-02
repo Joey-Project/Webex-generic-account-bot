@@ -251,13 +251,18 @@ except for the exact vendor `user@.service` user-manager assignment when both
 the physical file and logical unit owner match. Unresolved dynamic specifiers
 in unit-reference directives are symbolically checked against every managed
 unit and launcher-instance form, and external units may not use numeric identities from the static system-ID
-range before allocation. Direct boot-policy credential injection is rejected;
-credential import selectors are evaluated across exact, trailing-glob, and
+range before allocation. Direct host-policy credential injection is rejected,
+including systemd 258 `userdb.user.*` and `userdb.group.*` credentials that
+could materialise static records under `/etc/userdb`; credential import
+selectors are evaluated across exact, trailing-glob, and
 glob rename-prefix forms, while complex wildcard forms are rejected fail closed, and
 the standard vendor `ImportCredential=` consumers remain allowed only for an
 exact physical-file/logical-owner pair after the current system credential set
 and all plaintext and encrypted credential stores prove that `sysusers.extra`
-and `tmpfiles.extra` are absent. The merged systemd sysusers and tmpfiles
+and `tmpfiles.extra` plus all userdb credential prefixes are absent. Tmpfiles
+may perform only tightly bounded root-owned maintenance on credential-store
+root directories; child paths, globs, and modified operation types are
+rejected. The merged systemd sysusers and tmpfiles
 catalogues are audited before mutation and again after
 account allocation using systemd field, quoting, continuation, C-escape,
 specifier/glob-prefix, lexical path and trailing-slash normalisation including
@@ -279,8 +284,10 @@ unmanaged source.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; lexically equivalent paths are rejected.
 The same host-wide `flock` used by config deployment serialises the complete apply.
-The trusted Node and provisioner entrypoints are verified before first-run lock
-metadata can be created or converged, and the re-executed process then verifies
+The trusted Node and provisioner entrypoints and a complete transaction-aware,
+read-only host preflight are verified before first-run lock metadata can be
+created or converged. The re-executed process repeats the host checks under the
+lock and then verifies
 the kernel lock PID, device, and inode instead
 of trusting its environment. An interrupted first-run lock metadata migration
 is accepted only in a root-owned, non-writable half-migrated state, including a
