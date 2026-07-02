@@ -10,10 +10,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
+const SOURCE_ROOT_ENV = 'WEBEX_HOST_PROVISION_SOURCE_ROOT';
 
-const SYSTEMD_SOURCE_ROOT = fileURLToPath(
-  new URL('../deploy/systemd/', import.meta.url),
-);
+const inheritedSourceRoot = process.env[SOURCE_ROOT_ENV];
+if (inheritedSourceRoot && process.env[PRIVATE_MOUNT_NAMESPACE_ENV] !== '1') {
+  throw new Error('inherited host provision source root requires private mount re-exec');
+}
+if (inheritedSourceRoot && !path.isAbsolute(inheritedSourceRoot)) {
+  throw new Error('inherited host provision source root is not absolute');
+}
+
+const SYSTEMD_SOURCE_ROOT = inheritedSourceRoot
+  ? path.resolve(inheritedSourceRoot)
+  : fileURLToPath(new URL('../deploy/systemd/', import.meta.url));
 const FILE_MODE = 0o644;
 const TRANSACTION_MODE = 0o600;
 const DIRECTORY_MODE = 0o755;
@@ -40,7 +50,6 @@ const TRANSACTION_PATH =
 const PROVISION_LOCK_PATH = '/run/webex-config-deploy/deploy-config.lock';
 const PROVISION_LOCK_PARENT = path.dirname(PROVISION_LOCK_PATH);
 const PROVISION_LOCK_ENV = 'WEBEX_HOST_PROVISION_LOCKED';
-const PRIVATE_MOUNT_NAMESPACE_ENV = 'WEBEX_HOST_PROVISION_PRIVATE_MOUNT_NS';
 const PROVISION_LOCK_CONFLICT_EXIT = 75;
 const CANDIDATE_UUID_PATTERN =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
@@ -956,8 +965,14 @@ export async function provisionHost(options, dependencies = {}) {
     assertProtectedMountSnapshotUnchanged(mountsBeforeTmpfiles, mountsAfterTmpfiles);
     await verifyManagedRuntimeState(inspected, identityAfter);
     await deps.verifyProvisionLockConverged();
+    const managerMountsBeforeReload = await inspectManagerPolicyView(plan, inspected, deps);
     await deps.verifyMountNamespace('daemon-reload-final');
     commands.push(await deps.runCommand('/usr/bin/systemctl', ['daemon-reload']));
+    const managerMountsAfterReload = await inspectManagerPolicyView(plan, inspected, deps);
+    assertProtectedMountSnapshotUnchanged(
+      managerMountsBeforeReload,
+      managerMountsAfterReload,
+    );
     await verifyInstalledArtifacts(inspected, deps);
     const identityFinal = await deps.readIdentitySnapshot();
     validateIdentityPolicy(identityFinal, { requireAccounts: true });
@@ -996,56 +1011,8 @@ export async function provisionHost(options, dependencies = {}) {
 }
 
 function validateIdentityPolicyForTransactionRecovery(snapshot) {
-  try {
-    validateIdentityPolicy(snapshot);
-    return false;
-  } catch {
-    validateIdentityPolicyForDesiredRecovery(snapshot);
-    return true;
-  }
-}
-
-function validateIdentityPolicyForDesiredRecovery(snapshot) {
-  const shadowUsers = new Map(snapshot.shadowUsers);
-  const shadowGroups = new Map(snapshot.shadowGroups);
-  for (const userName of Object.values(MANAGED_USERS)) {
-    const user = snapshot.users.get(userName);
-    const shadowUser = shadowUsers.get(userName);
-    if (user?.password === 'x' && !shadowUser) {
-      shadowUsers.set(userName, Object.freeze({ name: userName, password: '!' }));
-    } else if (!user && shadowUser) {
-      if (!/^[!*]+$/.test(shadowUser.password)) {
-        throw new Error(`managed user shadow password is not locked: ${userName}`);
-      }
-      shadowUsers.delete(userName);
-    }
-  }
-  for (const groupName of Object.values(MANAGED_GROUPS)) {
-    const group = snapshot.groups.get(groupName);
-    const shadowGroup = shadowGroups.get(groupName);
-    if (group?.password === 'x' && !shadowGroup) {
-      shadowGroups.set(groupName, Object.freeze({
-        name: groupName,
-        password: '!',
-        administrators: Object.freeze([]),
-        members: Object.freeze([]),
-      }));
-    } else if (!group && shadowGroup) {
-      if (
-        !/^[!*]+$/.test(shadowGroup.password)
-        || shadowGroup.administrators.length !== 0
-        || shadowGroup.members.length !== 0
-      ) {
-        throw new Error(`managed group shadow credential is not recoverable: ${groupName}`);
-      }
-      shadowGroups.delete(groupName);
-    }
-  }
-  validateIdentityPolicy(Object.freeze({
-    ...snapshot,
-    shadowUsers,
-    shadowGroups,
-  }));
+  validateIdentityPolicy(snapshot);
+  return false;
 }
 
 export async function runCli({
@@ -1137,6 +1104,7 @@ export async function executeLockedApply(argv, {
   }),
   ensureLock = ensureProvisionLockFile,
   openExecutable = (file) => openTrustedExecutable(file, fsApi),
+  openScript = (file) => openTrustedPolicyScript(file, fsApi),
   spawnProcess = spawn,
 } = {}) {
   await verifyReexecFile(nodePath, { executable: true }, fsApi);
@@ -1145,16 +1113,17 @@ export async function executeLockedApply(argv, {
   await verifyReexecFile('/usr/bin/unshare', { executable: true }, fsApi);
   await preflightHost();
   await ensureLock(fsApi, () => assertSameMountNamespace(fsApi));
-  const executableHandles = [];
+  const reexecHandles = [];
   try {
-    executableHandles.push(await openExecutable('/usr/bin/flock'));
-    executableHandles.push(await openExecutable('/usr/bin/unshare'));
-    executableHandles.push(await openExecutable(nodePath));
-    const [flockHandle, unshareHandle, nodeHandle] = executableHandles;
+    reexecHandles.push(await openExecutable('/usr/bin/flock'));
+    reexecHandles.push(await openExecutable('/usr/bin/unshare'));
+    reexecHandles.push(await openExecutable(nodePath));
+    reexecHandles.push(await openScript(scriptPath));
+    const [flockHandle, unshareHandle, nodeHandle, scriptHandle] = reexecHandles;
     const command = buildLockedApplyCommand({
       argv,
       nodePath: '/proc/self/fd/4',
-      scriptPath,
+      scriptPath: '/proc/self/fd/5',
       unsharePath: '/proc/self/fd/3',
     });
     return await new Promise((resolve, reject) => {
@@ -1167,8 +1136,16 @@ export async function executeLockedApply(argv, {
           LC_ALL: 'C.UTF-8',
           [PROVISION_LOCK_ENV]: '1',
           [PRIVATE_MOUNT_NAMESPACE_ENV]: '1',
+          [SOURCE_ROOT_ENV]: path.resolve(path.dirname(scriptPath), '../deploy/systemd'),
         },
-        stdio: ['inherit', 'inherit', 'inherit', unshareHandle.fd, nodeHandle.fd],
+        stdio: [
+          'inherit',
+          'inherit',
+          'inherit',
+          unshareHandle.fd,
+          nodeHandle.fd,
+          scriptHandle.fd,
+        ],
       });
       child.once('error', reject);
       child.once('exit', (code, signal) => {
@@ -1180,7 +1157,7 @@ export async function executeLockedApply(argv, {
       });
     });
   } finally {
-    await Promise.all(executableHandles.map((handle) => handle.close()));
+    await Promise.all(reexecHandles.map((handle) => handle.close()));
   }
 }
 
@@ -1428,6 +1405,32 @@ async function verifyInstalledArtifacts(inspected, deps) {
       throw new Error(`installed policy digest mismatch: ${artifact.target}`);
     }
   }
+}
+
+async function verifyManagerInstalledArtifacts(inspected, deps) {
+  for (const artifact of inspected.artifacts) {
+    const managerTarget = `/proc/1/root${artifact.targetPath}`;
+    const installed = await readTrustedFile(
+      managerTarget,
+      deps.targetUid,
+      deps.targetGid,
+      FILE_MODE,
+      deps.fsApi,
+    );
+    if (installed.sha256 !== artifact.source.sha256) {
+      throw new Error(`PID 1 policy digest mismatch: ${artifact.targetPath}`);
+    }
+  }
+}
+
+async function inspectManagerPolicyView(plan, inspected, deps) {
+  const mounts = assertNoUnexpectedManagedMounts(
+    plan,
+    inspected,
+    await deps.readManagerMountInfo(),
+  );
+  await deps.verifyManagerInstalledArtifacts(inspected);
+  return mounts;
 }
 
 async function writeCandidate(target, contents, deps) {
@@ -1806,17 +1809,32 @@ export async function assertInitialPidNamespace(
   processApi = process,
   fsApi = fs,
 ) {
-  const [managerName, managerCgroup, uidMap, gidMap] = await Promise.all([
+  const [
+    managerName,
+    managerCgroup,
+    uidMap,
+    gidMap,
+    selfUserNamespace,
+    managerUserNamespace,
+  ] = await Promise.all([
     readBoundedProcFile('/proc/1/comm', 64, fsApi),
     readBoundedProcFile('/proc/1/cgroup', 4096, fsApi),
     readBoundedProcFile('/proc/self/uid_map', 4096, fsApi),
     readBoundedProcFile('/proc/self/gid_map', 4096, fsApi),
+    readNamespaceIdentity('/proc/self/ns/user', fsApi),
+    readNamespaceIdentity('/proc/1/ns/user', fsApi),
   ]);
   if (managerName !== 'systemd\n' || managerCgroup !== '0::/init.scope\n') {
     throw new Error('host provisioner is not running under the host systemd manager');
   }
   assertInitialIdNamespaceMap(uidMap, 'UID');
   assertInitialIdNamespaceMap(gidMap, 'GID');
+  if (
+    selfUserNamespace.dev !== managerUserNamespace.dev
+    || selfUserNamespace.ino !== managerUserNamespace.ino
+  ) {
+    throw new Error('host provisioner is not in the initial user namespace');
+  }
   const result = await runCommand('/usr/bin/lsns', [
     '--noheadings',
     '--output',
@@ -1828,6 +1846,16 @@ export async function assertInitialPidNamespace(
   ]);
   if (result.code !== 0 || result.stderr !== '' || String(result.stdout).trim() !== '0') {
     throw new Error('host provisioner is not in the initial PID namespace');
+  }
+}
+
+async function readNamespaceIdentity(file, fsApi) {
+  const handle = await fsApi.open(file, fsConstants.O_RDONLY);
+  try {
+    const stat = await handle.stat();
+    return Object.freeze({ dev: stat.dev, ino: stat.ino });
+  } finally {
+    await handle.close();
   }
 }
 
@@ -1855,18 +1883,9 @@ export async function assertSameMountNamespace(
     ),
   } = {},
 ) {
-  const readNamespaceIdentity = async (file) => {
-    const handle = await fsApi.open(file, fsConstants.O_RDONLY);
-    try {
-      const stat = await handle.stat();
-      return Object.freeze({ dev: stat.dev, ino: stat.ino });
-    } finally {
-      await handle.close();
-    }
-  };
   const [selfNamespace, managerNamespace] = await Promise.all([
-    readNamespaceIdentity('/proc/self/ns/mnt'),
-    readNamespaceIdentity('/proc/1/ns/mnt'),
+    readNamespaceIdentity('/proc/self/ns/mnt', fsApi),
+    readNamespaceIdentity('/proc/1/ns/mnt', fsApi),
   ]);
   const namespacesMatch = selfNamespace.dev === managerNamespace.dev
     && selfNamespace.ino === managerNamespace.ino;
@@ -1921,6 +1940,31 @@ async function openTrustedExecutable(file, fsApi) {
     ) {
       throw new Error(`fixed executable is not trusted: ${file}`);
     }
+    const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
+      new Set([file]),
+      await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+    );
+    assertProtectedMountSnapshotUnchanged(mountsBeforeOpen, mountsAfterOpen);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function openTrustedPolicyScript(file, fsApi) {
+  if (!path.isAbsolute(file)) throw new Error(`policy script path is not absolute: ${file}`);
+  await assertTrustedDirectoryChain('/', path.dirname(file), 0, 0, fsApi);
+  const mountsBeforeOpen = assertNoUnexpectedMountsForPaths(
+    new Set([file]),
+    await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
+  );
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    assertTrustedFileMetadata(file, await handle.stat(), 0, 0, FILE_MODE);
     const mountsAfterOpen = assertNoUnexpectedMountsForPaths(
       new Set([file]),
       await readBoundedProcFile('/proc/self/mountinfo', MAX_MOUNTINFO_BYTES, fsApi),
@@ -2513,13 +2557,13 @@ export async function readSystemIdentitySnapshot(fsApi = fs, runCommand = runFix
     readTrustedSensitiveIdentityFile(
       '/etc/shadow',
       new Set([0, shadowGid]),
-      new Set([0o600, 0o640]),
+      new Set([0o000, 0o600, 0o640]),
       fsApi,
     ),
     readTrustedSensitiveIdentityFile(
       '/etc/gshadow',
       new Set([0, shadowGid]),
-      new Set([0o600, 0o640]),
+      new Set([0o000, 0o600, 0o640]),
       fsApi,
     ),
   ]);
@@ -2883,6 +2927,20 @@ export async function assertManagedRuntimeAncestorsTraversable(
       || (entry.type === 'f' && stat.nlink !== 1)
     ) {
       throw new Error(`managed runtime path is not safe to mutate: ${entry.target}`);
+    }
+    await verifyNoExtendedPosixAcl(entry.target);
+    const after = await fsApi.lstat(entry.target);
+    const afterCorrectType = entry.type === 'd' ? after.isDirectory() : after.isFile();
+    if (
+      !sameFileIdentity(stat, after)
+      || !afterCorrectType
+      || after.isSymbolicLink()
+      || (entry.type === 'f' && after.nlink !== 1)
+      || after.uid !== stat.uid
+      || after.gid !== stat.gid
+      || (after.mode & 0o7777) !== (stat.mode & 0o7777)
+    ) {
+      throw new Error(`managed runtime path changed during ACL inspection: ${entry.target}`);
     }
   }
 }
@@ -3948,6 +4006,7 @@ async function resolveExistingSystemdPath(value, fsApi) {
   let components = normaliseBootPolicyPath(value).split('/').filter(Boolean);
   let current = '/';
   const visited = new Set();
+  assertTrustedDirectory('/', await fsApi.lstat('/'), 0, 0);
   while (components.length > 0) {
     const component = components.shift();
     const candidate = path.posix.join(current, component);
@@ -3961,6 +4020,9 @@ async function resolveExistingSystemdPath(value, fsApi) {
       throw error;
     }
     if (!before.isSymbolicLink()) {
+      if (components.length > 0) {
+        assertTrustedDirectory(candidate, before, 0, 0);
+      }
       current = candidate;
       continue;
     }
@@ -4313,10 +4375,14 @@ function protectedSystemdMountPaths() {
     ...FIXED_HOST_EXECUTABLE_PATHS,
     '/proc/1/cgroup',
     '/proc/1/comm',
+    '/proc/1/mountinfo',
     '/proc/1/ns/mnt',
+    '/proc/1/ns/user',
+    '/proc/1/root',
     '/proc/locks',
     '/proc/self/mountinfo',
     '/proc/self/ns/mnt',
+    '/proc/self/ns/user',
     '/run/systemd/private',
     TRANSACTION_PATH,
     PROVISION_LOCK_PATH,
@@ -5084,6 +5150,18 @@ function provisionDependencies(dependencies) {
         MAX_MOUNTINFO_BYTES,
         fsApi,
       )),
+    readManagerMountInfo: dependencies.readManagerMountInfo
+      ?? (() => readBoundedProcFile(
+        '/proc/1/mountinfo',
+        MAX_MOUNTINFO_BYTES,
+        fsApi,
+      )),
+    verifyManagerInstalledArtifacts: dependencies.verifyManagerInstalledArtifacts
+      ?? ((inspected) => verifyManagerInstalledArtifacts(inspected, {
+        fsApi,
+        targetUid: dependencies.targetUid ?? 0,
+        targetGid: dependencies.targetGid ?? 0,
+      })),
     verifyMountNamespace: dependencies.verifyMountNamespace
       ?? (() => assertSameMountNamespace(fsApi)),
     verifyPidNamespace: dependencies.verifyPidNamespace

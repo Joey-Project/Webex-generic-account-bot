@@ -165,12 +165,17 @@ describe('guarded host provisioner policy', () => {
 
   it('requires the initial PID namespace through the fixed lsns probe', async () => {
     const calls = [];
-    const hostProcFs = boundedProcFileSystem(new Map([
+    const hostProcContents = new Map([
       ['/proc/1/comm', 'systemd\n'],
       ['/proc/1/cgroup', '0::/init.scope\n'],
       ['/proc/self/uid_map', '0 0 4294967295\n'],
       ['/proc/self/gid_map', '0 0 4294967295\n'],
-    ]));
+    ]);
+    const initialUserNamespace = new Map([
+      ['/proc/self/ns/user', { dev: 4, ino: 5 }],
+      ['/proc/1/ns/user', { dev: 4, ino: 5 }],
+    ]);
+    const hostProcFs = boundedProcFileSystem(hostProcContents, initialUserNamespace);
     const runCommand = async (command, args) => {
       calls.push([command, args]);
       return { code: 0, stdout: '0\n', stderr: '' };
@@ -187,6 +192,17 @@ describe('guarded host provisioner policy', () => {
         hostProcFs,
       ),
       /not in the initial PID namespace/,
+    );
+    await assert.rejects(
+      assertInitialPidNamespace(
+        runCommand,
+        { pid: 2 },
+        boundedProcFileSystem(hostProcContents, new Map([
+          ['/proc/self/ns/user', { dev: 4, ino: 6 }],
+          ['/proc/1/ns/user', { dev: 4, ino: 5 }],
+        ])),
+      ),
+      /not in the initial user namespace/,
     );
     await assert.rejects(
       assertInitialPidNamespace(
@@ -352,17 +368,19 @@ describe('guarded host provisioner policy', () => {
     const opened = [];
     const closed = [];
     let spawned = null;
+    const openReexecFile = async (file) => {
+      const fd = 31 + opened.length;
+      opened.push(file);
+      return { fd, close: async () => closed.push(file) };
+    };
     const exitCode = await executeLockedApply(['--apply'], {
       nodePath: '/trusted/node',
       scriptPath: '/trusted/provision-host.mjs',
       verifyReexecFile: async () => {},
       preflightHost: async () => {},
       ensureLock: async () => {},
-      openExecutable: async (file) => {
-        const fd = 31 + opened.length;
-        opened.push(file);
-        return { fd, close: async () => closed.push(file) };
-      },
+      openExecutable: openReexecFile,
+      openScript: openReexecFile,
       spawnProcess: (command, args, options) => {
         spawned = { command, args, options };
         return {
@@ -374,11 +392,17 @@ describe('guarded host provisioner policy', () => {
       },
     });
     assert.equal(exitCode, 0);
-    assert.deepEqual(opened, ['/usr/bin/flock', '/usr/bin/unshare', '/trusted/node']);
+    assert.deepEqual(opened, [
+      '/usr/bin/flock',
+      '/usr/bin/unshare',
+      '/trusted/node',
+      '/trusted/provision-host.mjs',
+    ]);
     assert.deepEqual(closed, opened);
     assert.equal(spawned.command, '/proc/self/fd/31');
     assert.equal(spawned.options.argv0, '/usr/bin/flock');
-    assert.deepEqual(spawned.options.stdio.slice(3), [32, 33]);
+    assert.deepEqual(spawned.options.stdio.slice(3), [32, 33, 34]);
+    assert.equal(spawned.options.env.WEBEX_HOST_PROVISION_SOURCE_ROOT, '/deploy/systemd');
     assert.deepEqual(spawned.args.slice(6, 14), [
       '/proc/self/fd/3',
       '--mount',
@@ -386,7 +410,7 @@ describe('guarded host provisioner policy', () => {
       'private',
       '--',
       '/proc/self/fd/4',
-      '/trusted/provision-host.mjs',
+      '/proc/self/fd/5',
       '--apply',
     ]);
   });
@@ -869,6 +893,10 @@ describe('guarded host provisioner policy', () => {
   });
 
   it('rejects writable or unstable files identity databases', async () => {
+    await readSystemIdentitySnapshot(
+      systemIdentityFs({ shadowMode: 0o000, gshadowMode: 0o000 }),
+      emptySystemdIdentityLookup(),
+    );
     await assert.rejects(
       readSystemIdentitySnapshot(
         systemIdentityFs({ groupMode: 0o666 }),
@@ -943,6 +971,10 @@ describe('guarded host provisioner policy', () => {
       },
     );
 
+    const managedLock = path.join(
+      fixture.targetRoot,
+      'run/webex-config-deploy/deploy-config.lock',
+    );
     await assert.rejects(
       assertManagedRuntimeAncestorsTraversable(
         fixture.plan,
@@ -952,7 +984,9 @@ describe('guarded host provisioner policy', () => {
           targetUid: UID,
           targetGid: GID,
           verifyNoExtendedPosixAcl: async (candidate) => {
-            throw new Error(`managed runtime path has an extended POSIX ACL: ${candidate}`);
+            if (candidate === managedLock) {
+              throw new Error(`managed runtime path has an extended POSIX ACL: ${candidate}`);
+            }
           },
         },
       ),
@@ -1049,7 +1083,7 @@ describe('guarded host provisioner policy', () => {
         verifyNoExtendedPosixAcl: async (candidate) => aclChecks.push(candidate),
       },
     );
-    assert.deepEqual(aclChecks, [root, `${root}/run`, target]);
+    assert.deepEqual(aclChecks, [root, `${root}/run`, target, target]);
     await assert.rejects(
       verifyManagedTmpfilesState(
         plan,
@@ -1434,6 +1468,7 @@ describe('guarded host provisioner execution', () => {
         'L /tmp/leak - - - - /pivot /../var/lib/webex-headless-access/access-token',
       ],
       ['tmpfiles', 'Z /var/lib 0777 root root -'],
+      ['tmpfiles', 'Z /etc 0755 root root -'],
       ['tmpfiles', 'R /run/%H - - - -'],
       ['tmpfiles', 'd %t/\\x77ebex-config-deploy 0777 root root -'],
       ['tmpfiles', 'f /tmp/untrusted 0600 :webex-config-deploy root -'],
@@ -2838,6 +2873,28 @@ describe('guarded host provisioner execution', () => {
         name,
       );
     }
+
+    const writableParentMount = '/etc/systemd/system/external-writable-parent.mount';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: 'external-writable-parent.mount',
+          }]]]),
+          {
+            filesByPath: new Map([[
+              writableParentMount,
+              Buffer.from('[Mount]\nWhat=tmpfs\nWhere=/srv/user/alias/system\n'),
+            ]]),
+            directoryModesByPath: new Map([['/srv/user', 0o777]]),
+            symlinksByPath: new Map([['/srv/user/alias', '/srv/safe']]),
+          },
+        ),
+      ),
+      /policy directory is not trusted: \/srv\/user/,
+    );
 
     const protectedMountWants = '/etc/systemd/system/external.target.wants';
     const protectedMountName = 'run-webex\\x2dcodex\\x2dcanary.mount';
@@ -4735,20 +4792,13 @@ describe('guarded host provisioner execution', () => {
       /injected sysusers partial commit/,
     );
 
-    const partialIdentity = expectedIdentitySnapshot({
-      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
-      gshadowDatabase: expectedGshadowDatabase().replace(
-        'webex-config-pull:!::\n',
-        '',
-      ),
-    });
+    const partialIdentity = recoverableSysusersPartialIdentitySnapshot();
     await assert.rejects(
       provisionHost(
         { apply: false, recoveryPreflight: true },
         fixture.dependencies({
           identitySequence: [expectedIdentitySnapshot({
             configPullMembers: ['unexpected-user'],
-            shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
           })],
         }),
       ),
@@ -4803,7 +4853,7 @@ describe('guarded host provisioner execution', () => {
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
-  it('retains recovery after a partial credential commit and manager safety rollback', async (context) => {
+  it('clears recovery after a safe partial credential commit and policy rollback', async (context) => {
     const fixture = await provisionFixture(context);
     const failedInstall = fixture.dependencies({ applied: true });
     failedInstall.runCommand = async () => {
@@ -4814,13 +4864,7 @@ describe('guarded host provisioner execution', () => {
       /injected sysusers partial commit/,
     );
 
-    const partialIdentity = expectedIdentitySnapshot({
-      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
-      gshadowDatabase: expectedGshadowDatabase().replace(
-        'webex-config-pull:!::\n',
-        '',
-      ),
-    });
+    const partialIdentity = recoverableSysusersPartialIdentitySnapshot();
     const absent = unitStates({
       load: 'not-found',
       active: 'inactive',
@@ -4855,39 +4899,10 @@ describe('guarded host provisioner execution', () => {
     for (const artifact of fixture.plan.artifacts) {
       await assert.rejects(fs.stat(artifact.target), { code: 'ENOENT' });
     }
-    assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
-    const markedTransaction = JSON.parse(
-      await fs.readFile(fixture.plan.transactionFile, 'utf8'),
-    );
-    assert.equal(markedTransaction.version, 2);
-    assert.equal(markedTransaction.identity_recovery_required, true);
-
-    const loaded = unitStates({
-      load: 'loaded',
-      active: 'inactive',
-      enabled: 'disabled',
-    }, fixture.plan);
-    const retryCommands = [];
-    const report = await provisionHost(
-      { apply: true },
-      fixture.dependencies({
-        commands: retryCommands,
-        identitySequence: [partialIdentity, expectedIdentitySnapshot()],
-        unitStateSequence: [absent, absent, absent, loaded],
-      }),
-    );
-
-    assert.equal(report.mode, 'applied');
-    assert.deepEqual(retryCommands, [
-      ['/usr/bin/systemctl', ['daemon-reload']],
-      ['/usr/bin/systemd-sysusers', fixture.plan.sysusers],
-      ['/usr/bin/systemd-tmpfiles', ['--create', ...fixture.plan.tmpfiles]],
-      ['/usr/bin/systemctl', ['daemon-reload']],
-    ]);
     await assert.rejects(fs.stat(fixture.plan.transactionFile), { code: 'ENOENT' });
   });
 
-  it('carries identity recovery into a newer interrupted policy transaction', async (context) => {
+  it('carries a safe partial identity state into a newer interrupted policy transaction', async (context) => {
     const fixture = await provisionFixture(context);
     const failedInstall = fixture.dependencies({ applied: true });
     failedInstall.runCommand = async () => {
@@ -4898,9 +4913,7 @@ describe('guarded host provisioner execution', () => {
       /injected sysusers partial commit/,
     );
 
-    const partialIdentity = expectedIdentitySnapshot({
-      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
-    });
+    const partialIdentity = recoverableSysusersPartialIdentitySnapshot();
     const unitArtifact = fixture.plan.artifacts.find(({ kind }) => kind === 'unit');
     await fs.writeFile(unitArtifact.source, '[Unit]\nDescription=new revision\n', {
       mode: 0o644,
@@ -4936,7 +4949,7 @@ describe('guarded host provisioner execution', () => {
     );
     const interrupted = JSON.parse(await fs.readFile(fixture.plan.transactionFile, 'utf8'));
     assert.equal(interrupted.version, 2);
-    assert.equal(interrupted.identity_recovery_required, true);
+    assert.equal(interrupted.identity_recovery_required, false);
 
     const preflight = await provisionHost(
       { apply: false, recoveryPreflight: true },
@@ -4980,13 +4993,7 @@ describe('guarded host provisioner execution', () => {
     ]);
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
 
-    const partialIdentity = expectedIdentitySnapshot({
-      shadowDatabase: `${shadowRecord('webex-config-deploy')}\n`,
-      gshadowDatabase: expectedGshadowDatabase().replace(
-        'webex-config-pull:!::\n',
-        '',
-      ),
-    });
+    const partialIdentity = recoverableSysusersPartialIdentitySnapshot();
     const retryCommands = [];
     const report = await provisionHost(
       { apply: true },
@@ -5104,6 +5111,51 @@ describe('guarded host provisioner execution', () => {
     assert.equal((await fs.stat(fixture.plan.transactionFile)).mode & 0o777, 0o600);
   });
 
+  it('checks PID 1 policy files and mount topology around daemon-reload', async (context) => {
+    const fixture = await provisionFixture(context);
+    const commands = [];
+    let managerArtifactChecks = 0;
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        fixture.dependencies({
+          applied: true,
+          commands,
+          managerMountInfoSequence: [
+            SAFE_MOUNT_INFO,
+            mountInfoWith('/shadow-systemd', '/etc/systemd/system'),
+          ],
+          verifyManagerInstalledArtifacts: async () => {
+            managerArtifactChecks += 1;
+          },
+        }),
+      ),
+      /unexpected mount (?:overlaps|aliases) protected host path/,
+    );
+    assert.equal(managerArtifactChecks, 1);
+    assert.deepEqual(commands.at(-1), ['/usr/bin/systemctl', ['daemon-reload']]);
+
+    const blockedFixture = await provisionFixture(context);
+    const blockedCommands = [];
+    await assert.rejects(
+      provisionHost(
+        { apply: true },
+        blockedFixture.dependencies({
+          applied: true,
+          commands: blockedCommands,
+          verifyManagerInstalledArtifacts: async () => {
+            throw new Error('PID 1 policy digest mismatch: injected');
+          },
+        }),
+      ),
+      /PID 1 policy digest mismatch: injected/,
+    );
+    assert.equal(
+      blockedCommands.some(([, args]) => args[0] === 'daemon-reload'),
+      false,
+    );
+  });
+
   it('requires root for both modes and keeps help side-effect free', async () => {
     await assert.rejects(
       provisionHost(
@@ -5174,7 +5226,9 @@ async function provisionFixture(context) {
       unitStateSequence = null,
       bootPolicySequence = null,
       mountInfoSequence = null,
+      managerMountInfoSequence = null,
       verifyProvisionLockConverged = async () => {},
+      verifyManagerInstalledArtifacts = async () => {},
       verifyPidNamespace = async () => {},
       verifyMountNamespace = async () => {},
       verifyRuntimeAncestors = async () => {},
@@ -5193,9 +5247,11 @@ async function provisionFixture(context) {
       let stateIndex = 0;
       let bootPolicyIndex = 0;
       let mountInfoIndex = 0;
+      let managerMountInfoIndex = 0;
       let uuid = 0;
       const bootPolicies = bootPolicySequence ?? [bootPolicyCatalogs];
       const mountInfos = mountInfoSequence ?? [SAFE_MOUNT_INFO];
+      const managerMountInfos = managerMountInfoSequence ?? [SAFE_MOUNT_INFO];
       return {
         plan,
         fsApi,
@@ -5216,6 +5272,10 @@ async function provisionFixture(context) {
         readMountInfo: async () => mountInfos[
           Math.min(mountInfoIndex++, mountInfos.length - 1)
         ],
+        readManagerMountInfo: async () => managerMountInfos[
+          Math.min(managerMountInfoIndex++, managerMountInfos.length - 1)
+        ],
+        verifyManagerInstalledArtifacts,
         verifyPidNamespace,
         verifyMountNamespace,
         readUnitStates: async () => stateSequence[
@@ -5302,6 +5362,16 @@ async function writeRecoveryTransaction(fixture, selected, desired, existing) {
 
 function emptyIdentitySnapshot() {
   return parseIdentityDatabases('', '');
+}
+
+function recoverableSysusersPartialIdentitySnapshot() {
+  return parseIdentityDatabases(
+    '',
+    expectedGroupDatabase(),
+    {},
+    expectedGshadowDatabase(),
+    '',
+  );
 }
 
 function expectedIdentitySnapshot({
@@ -5416,6 +5486,7 @@ function systemIdentityFs({
   staticUserdbEntry = null,
   groupMode = 0o644,
   shadowMode = 0o640,
+  gshadowMode = 0o640,
   mutateGroupIdentity = false,
 } = {}) {
   const identityFiles = new Map([
@@ -5452,7 +5523,7 @@ function systemIdentityFs({
     ['/etc/gshadow', {
       contents: Buffer.from(expectedGshadowDatabase()),
       gid: 42,
-      mode: 0o640,
+      mode: gshadowMode,
     }],
   ]);
   const provider = providerName
@@ -5575,17 +5646,23 @@ function shortReadFileSystem(contents, maxChunkBytes) {
   };
 }
 
-function boundedProcFileSystem(contentsByPath) {
+function boundedProcFileSystem(contentsByPath, namespaceIdentities = new Map([
+  ['/proc/self/ns/user', { dev: 4, ino: 5 }],
+  ['/proc/1/ns/user', { dev: 4, ino: 5 }],
+])) {
   return {
     async open(file, flags) {
-      assert.equal(
-        flags,
-        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
-      );
+      const expectedFlags = namespaceIdentities.has(file)
+        ? fsConstants.O_RDONLY
+        : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW;
+      assert.equal(flags, expectedFlags);
       const payload = Buffer.from(contentsByPath.get(file) ?? '');
       let cursor = 0;
       return {
-        stat: async () => ({ isFile: () => true }),
+        stat: async () => ({
+          isFile: () => true,
+          ...(namespaceIdentities.get(file) ?? {}),
+        }),
         async read(buffer, offset, length, position) {
           assert.equal(position, null);
           const bytesRead = Math.min(length, payload.length - cursor);
