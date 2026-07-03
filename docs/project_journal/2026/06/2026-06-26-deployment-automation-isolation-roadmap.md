@@ -200,10 +200,11 @@ superseded_by:
   tool execution from external or linked helper units after unit-name executable
   and argument specifier expansion, including unresolved template instances,
   plus external `systemctl` commands with specifier-reachable managed-unit
-  targets, implicit service suffixes, or glob targets, shell `Exec*` directives
-  including the `|` prefix, unresolved executable specifiers, and standard
-  shell-family names restricted to direct or single-hop same-name package-vendor
-  provenance, every accepted `env` split-string abbreviation and protected
+  targets, implicit service suffixes, or glob targets, explicit executable and
+  effective argv0 positions audited through `env` wrapping and the command
+  carrying systemd's `|` prefix, shell payload construction and generic wrappers
+  documented as arbitrary trusted root-owned administration code outside static
+  parsing, every accepted `env` split-string abbreviation and protected
   `systemctl` inline, path, or specifier-expanded credential assignment
   rejected, non-vendor `Exec*` environment expansion and systemd-managed
   directory source or alias claims over protected Webex paths refused,

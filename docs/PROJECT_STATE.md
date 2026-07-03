@@ -132,10 +132,11 @@
   external or linked helper units after concrete or unresolved template
   unit-name executable and argument specifier expansion, and reject external
   `systemctl` commands with specifier-reachable managed-unit targets,
-  implicit service suffixes, or glob targets, while shell `Exec*` directives
-  including the `|` prefix, unresolved executable specifiers, and standard
-  shell-family names require direct or single-hop same-name package-vendor
-  provenance, reject every accepted `env` split-string abbreviation and
+  implicit service suffixes, or glob targets; audit explicit executable and
+  effective argv0 positions including `env` wrapping and the command carrying
+  systemd's `|` prefix, while treating shell payload construction and generic
+  wrappers as arbitrary trusted root-owned administration code outside static
+  parsing; reject every accepted `env` split-string abbreviation and
   protected `systemctl set-credential{,-encrypted}` inline, path, or
   specifier-expanded assignment, non-vendor `Exec*` environment expansion and
   systemd-managed directory source or alias claims over protected Webex paths,
