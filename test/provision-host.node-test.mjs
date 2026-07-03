@@ -729,6 +729,19 @@ describe('guarded host provisioner policy', () => {
       validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), null),
       { state: 'bootstrap', gid: 0, mode: 0o600, parentMode: 0o755 },
     );
+    assert.deepEqual(
+      validateProvisionLockMetadata(directoryStat(0, 0o755), lockStat(0, 0o600), 2003),
+      { state: 'bootstrap', gid: 0, mode: 0o600, parentMode: 0o755 },
+    );
+    assert.throws(
+      () => validateProvisionLockMetadata(
+        directoryStat(0, 0o755),
+        lockStat(0, 0o600),
+        2003,
+        { allowInterruptedMigration: false },
+      ),
+      /provision lock parent is not trusted/,
+    );
     for (const interruptedMode of [0o000, 0o055, 0o500, 0o700, 0o710, 0o750]) {
       assert.deepEqual(
         validateProvisionLockMetadata(
@@ -3200,7 +3213,7 @@ describe('guarded host provisioner execution', () => {
       ],
       [
         'external-sysusers.service',
-        '[Service]\nExecStart=/bin/sh -c "/usr/bin/systemd-sysusers /etc/rogue.conf"\n',
+        '[Service]\nExecStart=/usr/bin/env /usr/bin/systemd-sysusers /etc/rogue.conf\n',
       ],
       [
         'external-userdb.service',
@@ -3989,6 +4002,18 @@ describe('guarded host provisioner execution', () => {
         'set-credential-name-template',
         'set-credential userdb.us%i.webex-generic-account-bot /tmp/userdb.json',
       ],
+      [
+        'set-credential-fstab',
+        'set-credential fstab.extra /tmp/fstab.extra',
+      ],
+      [
+        'set-credential-unit',
+        'set-credential systemd.extra-unit.rogue.service /tmp/rogue.service',
+      ],
+      [
+        'set-credential-drop-in',
+        'set-credential systemd.unit-dropin.rogue.service.50-policy /tmp/50-policy.conf',
+      ],
     ]) {
       const unitName = name.includes('template')
         ? 'external@.service'
@@ -4053,56 +4078,6 @@ describe('guarded host provisioner execution', () => {
         /external systemd policy claims a protected directory/,
       );
     }
-
-    for (const [name, policy] of [
-      [
-        'external-shell-systemctl.service',
-        "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemctl isolate rescue.target'\n",
-      ],
-      [
-        'external-shell-reboot.service',
-        "[Service]\nExecStart=/bin/sh -c '/usr/bin/reboot'\n",
-      ],
-      [
-        'external-shell-prefix-systemctl.service',
-        '[Service]\nExecStart=|/usr/bin/true; /usr/bin/systemctl isolate rescue.target\n',
-      ],
-    ]) {
-      const target = `/etc/systemd/system/${name}`;
-      await assert.rejects(
-        readSystemUnitStates(
-          MANAGED_UNITS,
-          async () => ({ stdout: '', stderr: '', code: 0 }),
-          systemdUnitPathFs(
-            new Map([['/etc/systemd/system', [{ name }]]]),
-            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
-          ),
-        ),
-        /external systemd policy references a managed unit/,
-      );
-    }
-
-    const shellCredentialUnit = '/etc/systemd/system/external-shell-credential.service';
-    await assert.rejects(
-      readSystemUnitStates(
-        MANAGED_UNITS,
-        async () => ({ stdout: '', stderr: '', code: 0 }),
-        systemdUnitPathFs(
-          new Map([['/etc/systemd/system', [{
-            name: path.basename(shellCredentialUnit),
-          }]]]),
-          {
-            filesByPath: new Map([[
-              shellCredentialUnit,
-              Buffer.from(
-                "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemctl set-credential sysusers.extra=payload'\n",
-              ),
-            ]]),
-          },
-        ),
-      ),
-      /external systemd policy injects a host policy credential/,
-    );
 
     for (const [name, policy, activatorPolicy] of [
       [
@@ -4738,6 +4713,157 @@ describe('guarded host provisioner execution', () => {
       /too many entries in trusted directory/,
     );
     assert.equal(commandCalls, 0);
+  });
+
+  it('rejects protected systemd activation, transient, and environment override policy', async () => {
+    for (const [name, policy, expected, identitySnapshot] of [
+      [
+        'external-protected.path',
+        '[Path]\nPathExists=/run/webex-codex-launcher\n',
+        /external systemd policy watches a protected path/,
+        null,
+      ],
+      [
+        'external-protected-glob.path',
+        '[Path]\nPathExistsGlob=/run/webex-codex-*\n',
+        /external systemd policy watches a protected path/,
+        null,
+      ],
+      [
+        'external-protected.socket',
+        '[Socket]\nListenStream=/run/webex-codex-launcher/launcher.sock\n',
+        /external systemd policy creates a protected socket path/,
+        null,
+      ],
+      [
+        'external-fifo.socket',
+        '[Socket]\nListenFIFO=/run/webex-config-deploy/commands\n',
+        /external systemd policy creates a protected socket path/,
+        null,
+      ],
+      [
+        'external-transient-uid.service',
+        '[Service]\nExecStart=/usr/bin/systemd-run --uid=2003 /usr/bin/true\n',
+        /external systemd policy creates a transient unit/,
+        expectedIdentitySnapshot(),
+      ],
+      [
+        'external-transient-property.service',
+        '[Service]\nExecStart=/usr/bin/systemd-run -p Group=2004 /usr/bin/true\n',
+        /external systemd policy creates a transient unit/,
+        expectedIdentitySnapshot(),
+      ],
+      [
+        'external-transient-unit.service',
+        '[Service]\nExecStart=/usr/bin/systemd-run --unit=webex-config-pull-worker.service /usr/bin/true\n',
+        /external systemd policy creates a transient unit/,
+        null,
+      ],
+      [
+        'external-transient-env.service',
+        '[Service]\nExecStart=/usr/bin/env SAFE=1 /usr/bin/systemd-run /usr/bin/true\n',
+        /external systemd policy creates a transient unit/,
+        null,
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      let commandCalls = 0;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => {
+            commandCalls += 1;
+            return { stdout: '', stderr: '', code: 0 };
+          },
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+          identitySnapshot,
+        ),
+        expected,
+      );
+      assert.equal(commandCalls, 0, name);
+    }
+
+    const dropInDirectory = '/etc/systemd/system/vendor-env.service.d';
+    const dropIn = path.join(dropInDirectory, '50-override.conf');
+    const vendorUnit = '/usr/lib/systemd/system/vendor-env.service';
+    let commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{ name: 'vendor-env.service.d' }]],
+            [dropInDirectory, [{ name: '50-override.conf' }]],
+          ]),
+          {
+            filesByPath: new Map([
+              [dropIn, Buffer.from('[Service]\nEnvironment=HELPER=/opt/rogue\n')],
+              [vendorUnit, Buffer.from('[Service]\nExecStart=${HELPER}\n')],
+            ]),
+          },
+        ),
+      ),
+      /external systemd policy overrides a trusted vendor execution environment/,
+    );
+    assert.equal(commandCalls, 0);
+
+    const linkedPathUnit = '/etc/systemd/system/external-linked-path.path';
+    commandCalls = 0;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          commandCalls += 1;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{ name: 'external-linked-path.path' }]]]),
+          {
+            filesByPath: new Map([[
+              linkedPathUnit,
+              Buffer.from('[Path]\nPathExists=/opt/policy-watch\n'),
+            ]]),
+            symlinksByPath: new Map([[
+              '/opt/policy-watch',
+              '/run/webex-codex-launcher',
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy watches a protected path/,
+    );
+    assert.equal(commandCalls, 0);
+  });
+
+  it('rejects runtime credentials that can inject host policy before systemctl', async () => {
+    for (const name of [
+      'fstab.extra',
+      'systemd.extra-unit.rogue.service',
+      'systemd.unit-dropin.rogue.service.50-policy',
+    ]) {
+      let commandCalls = 0;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => {
+            commandCalls += 1;
+            return { stdout: '', stderr: '', code: 0 };
+          },
+          systemdUnitPathFs(new Map([
+            ['/run/credentials/@system', [{ name }]],
+          ])),
+        ),
+        /system credential can inject host policy/,
+      );
+      assert.equal(commandCalls, 0, name);
+    }
   });
 
   it('rejects a noncanonical usr-merge lib link before querying systemd', async () => {

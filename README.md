@@ -369,9 +369,11 @@ the same directives in provenance-bound trusted vendor-path units remain trusted
 Globbed same-basename activator names are matched against their implicit
 service targets, and each managed unit must report an empty systemd `Job=`
 property as well as an inactive state.
-Shell-mediated boot-policy tools are recognised from actual executable
-positions and their command payload. Ordinary shell commands and arguments
-remain within the root-owned host-administration boundary.
+Explicit executable checks apply to systemd command positions, including
+`env`-wrapped commands and the command carrying a systemd `|` prefix. Shell
+payload construction is not interpreted; shell scripts, substitutions, and
+commands remain arbitrary root-owned code within the trusted
+host-administration boundary.
 External `env -S`/`--split-string` and `-a`/`--argv0` argv reinterpretation,
 including every accepted GNU long-option abbreviation, combined short option,
 and specifier-generated option, is rejected. `systemctl` may not set protected
@@ -386,9 +388,17 @@ policy is rejected because it creates a second lexical path around tmpfiles
 auditing. Existing path-component symlinks in `Where=` and `What=` are resolved
 stably before the comparison, and current mount aliases are derived from both
 mountinfo `root=` and `mountPoint=` rather than only the visible target.
+External `.path` triggers and filesystem-backed `.socket` listeners, FIFOs, or
+symlinks cannot overlap protected paths, including through globs, unit
+specifiers, or existing path-component symlinks. Non-vendor policy cannot
+invoke `systemd-run`; transient UID/GID, unit, path, socket, timer, and arbitrary
+property controls are therefore outside the accepted static policy surface.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis, including unescaped unit
 specifiers that can generate a `$` marker only after template instantiation.
+External drop-ins targeting a vendor unit also cannot alter its execution
+environment, environment files, inherited variables, or executable search
+path, so a trusted vendor command cannot be redirected by merged policy.
 Every existing sysusers and
 tmpfiles search directory is validated before and after catalogue collection,
 even when the directory contributes no active file. Before a catalogue command
@@ -396,7 +406,11 @@ runs, each `.conf` entry is opened non-blocking and must be a bounded,
 root-owned regular file or a stable root-owned `/dev/null` mask; FIFOs, devices,
 directories, and other links fail closed. The runtime system-credential
 directory `/run/credentials/@system` is protected from external tmpfiles paths
-and symlink targets.
+and symlink targets. Its credential names are also checked before systemd state
+queries and manager reloads; `fstab.extra`, `systemd.extra-unit.*`,
+`systemd.unit-dropin.*`, sysusers, tmpfiles, password, shell, and userdb policy
+credentials fail closed whether they arrive at runtime or through a credential
+store.
 The legacy compatibility rule accepts only the exact `/var/run` link text
 `../run` or `/run`; path auditing resolves redundant separators, dot segments,
 parent traversal, glob patterns, relative link targets, and the `/var/run`
