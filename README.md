@@ -336,16 +336,18 @@ non-regular symlink targets, directories, and other non-regular consumer
 overrides are rejected before terminal handling can skip the vendor provenance
 check. Relative dependency links may traverse trusted leading parent
 components, but a parent traversal after entering a child component is rejected
-before lexical normalisation can hide an intermediate symlink. All `Exec*`
-directives outside package-owned vendor units are rejected. This keeps
-executable-chain interpretation inside the package provenance boundary instead
-of depending on an open-ended list of command wrappers. Vendor unit commands
-remain subject to the specific boot-policy, managed-unit, credential, shell,
-and argument-reinterpretation checks below. Unit-file mutations with path
-arguments are rejected because an out-of-path file can hide a managed `Alias=`;
-unresolved specifiers are treated as path-capable. Same-basename `.timer`,
-`.path`, and `.socket` units and systemctl targets are mapped to their implicit
-`.service` activation target.
+before lexical normalisation can hide an intermediate symlink. `Exec*` policy
+is audited for explicit boot-policy tools, managed or lifecycle controls,
+credential operations, and argument reinterpretation. This is not a sandbox
+for arbitrary root-owned executables: custom binaries and generic command
+wrappers can implement unrestricted host behaviour and remain part of the
+trusted host-administration boundary. Vendor-backed aliases inherit only their
+physical package command semantics; lifecycle actions, global targets, and
+boot-policy consumer exceptions require package-owned logical provenance. Unit
+file mutations with path arguments are rejected because an out-of-path file can
+hide a managed `Alias=`; unresolved specifiers are treated as path-capable.
+Same-basename `.timer`, `.path`, and `.socket` units and systemctl targets are
+mapped to their implicit `.service` activation target.
 Unscoped mutating commands such
 as `preset-all`, manager reloads, `isolate`, `--job-mode`, `--marked`
 operations, and opaque
@@ -358,20 +360,18 @@ positions, including through `env` wrapping and systemd's `@` argv0 override;
 ordinary command arguments containing those words and the read-only
 `runlevel` command remain valid. External policy also cannot activate terminal
 host lifecycle targets or services, including runlevel aliases, while the
-package-owned lifecycle unit graph remains auditable. Unit-level lifecycle
-actions such as `FailureAction=`, `StartLimitAction=`, and
+package-owned lifecycle unit graph remains auditable. External unit-level
+lifecycle actions such as `FailureAction=`, `StartLimitAction=`, and
 `JobTimeoutAction=`, plus isolating `OnFailureJobMode=` or
-`OnSuccessJobMode=` values, are rejected independently of executable policy.
+`OnSuccessJobMode=` values, are rejected independently of executable policy;
+the same directives in provenance-bound package-owned units remain trusted.
 Globbed same-basename activator names are matched against their implicit
 service targets, and each managed unit must report an empty systemd `Job=`
 property as well as an inactive state.
-Shell execution is accepted only from a direct package-owned vendor unit or its
-single-hop same-name dependency link; direct boot-policy tools and managed-unit
-control remain forbidden even in those vendor sources.
-The systemd `|` shell prefix and unresolved full executable-path specifiers on
-the first or any semicolon-delimited later command, plus standard shell-family
-executable names, are all treated as shell execution.
-`env -S`/`--split-string` and `-a`/`--argv0` argv reinterpretation,
+Shell-mediated boot-policy tools are recognised from actual executable
+positions and their command payload. Ordinary shell commands and arguments
+remain within the root-owned host-administration boundary.
+External `env -S`/`--split-string` and `-a`/`--argv0` argv reinterpretation,
 including every accepted GNU long-option abbreviation, combined short option,
 and specifier-generated option, is rejected. `systemctl` may not set protected
 plaintext or encrypted system credentials through inline, path,

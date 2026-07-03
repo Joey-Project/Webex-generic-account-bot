@@ -270,6 +270,11 @@ const VENDOR_SYSUSERS_CREDENTIAL_IMPORTS = new Set([
   'ImportCredential=passwd.shell.root',
   'ImportCredential=sysusers.*',
 ]);
+const VENDOR_FIRSTBOOT_CREDENTIAL_IMPORTS = new Set([
+  'ImportCredential=passwd.hashed-password.root',
+  'ImportCredential=passwd.plaintext-password.root',
+  'ImportCredential=passwd.shell.root',
+]);
 const VENDOR_USERDB_CREDENTIAL_IMPORTS = new Set([
   'ImportCredential=userdb.user.*',
   'ImportCredential=userdb.group.*',
@@ -363,6 +368,7 @@ const SYSTEMD_GLOBAL_CONTROL_EXECUTABLES = new Set([
 const SYSTEMD_GLOBAL_CONTROL_UNITS = Object.freeze([
   'ctrl-alt-del.target',
   'exit.target',
+  'factory-reset.target',
   'halt.target',
   'hibernate.target',
   'hybrid-sleep.target',
@@ -4465,14 +4471,14 @@ export async function readSystemUnitStates(
     const activeState = parseSystemctlStateQuery(active, unit, 'active');
     assertSystemctlCommandSucceeded(metadata, `managed unit metadata query: ${unit}`);
     const loadedPolicy = parseSystemUnitMetadata(metadata.stdout, unit);
-    assertSystemctlStateMatchesLoadState(
+    const verifiedActiveState = verifySystemctlActiveState(
       unit,
       active,
       activeState,
       loadedPolicy.load,
     );
     states.set(unit, Object.freeze({
-      active: activeState,
+      active: verifiedActiveState,
       ...loadedPolicy,
     }));
   }
@@ -4516,20 +4522,24 @@ function parseSystemctlStateQuery(result, unit, kind) {
   return output.slice(0, -1);
 }
 
-function assertSystemctlStateMatchesLoadState(
+function verifySystemctlActiveState(
   unit,
   activeResult,
   activeState,
   loadState,
 ) {
   if (loadState === 'not-found') {
-    if (
-      ![3, 4].includes(activeResult.code)
-      || activeState !== 'inactive'
-    ) {
+    const missingState = (
+      activeResult.code === 3
+      && activeState === 'inactive'
+    ) || (
+      activeResult.code === 4
+      && ['inactive', 'unknown'].includes(activeState)
+    );
+    if (!missingState) {
       throw new Error(`managed unit query state disagrees with load state: ${unit}`);
     }
-    return;
+    return 'inactive';
   }
   if (loadState === 'loaded') {
     const activeCodeMatchesState = (
@@ -4544,6 +4554,7 @@ function assertSystemctlStateMatchesLoadState(
       throw new Error(`managed unit query state disagrees with load state: ${unit}`);
     }
   }
+  return activeState;
 }
 
 async function assertNoUnexpectedManagedUnitPolicy(fsApi, managedIds, unitPaths) {
@@ -4773,21 +4784,35 @@ async function auditSystemdPolicyFile(
   }
   const lines = policyCatalogLines(policy.contents);
   for (const line of lines) {
-    assertSystemdPolicyDoesNotReferenceManaged(
-      line,
-      candidate,
+    try {
+      assertSystemdPolicyDoesNotReferenceManaged(
+        line,
+        candidate,
+        unitNames,
+        managedIds,
+        logicalSource,
+        symlinkDepth,
+      );
+    } catch (error) {
+      if (String(error?.message).includes(candidate)) throw error;
+      throw new Error(`${error?.message ?? 'systemd policy audit failed'}: ${candidate}`, {
+        cause: error,
+      });
+    }
+  }
+  if (!isExpectedGeneratedRootMountPolicy(
+    candidate,
+    unitNames,
+    logicalSource,
+    symlinkDepth,
+  )) {
+    await assertSystemdMountPathsResolveOutsideProtectedSurface(
+      lines,
       unitNames,
-      managedIds,
-      logicalSource,
-      symlinkDepth,
+      fsApi,
+      candidate,
     );
   }
-  await assertSystemdMountPathsResolveOutsideProtectedSurface(
-    lines,
-    unitNames,
-    fsApi,
-    candidate,
-  );
 }
 
 async function assertSystemdMountPathsResolveOutsideProtectedSurface(
@@ -4893,28 +4918,35 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       ))
     )));
   for (const candidate of expanded) {
-    if (
-      systemdPolicyInvokesBootPolicyTool(candidate)
-      && !isExpectedVendorBootPolicyConsumerSource(
+    const execCommand = parseSystemdExecCommand(candidate);
+    const packageOwnedVendorSource = isPackageOwnedVendorSystemdUnitSource(
+      source,
+      unitNames,
+      logicalSource,
+      symlinkDepth,
+    );
+    const trustedVendorExecution = execCommand !== null
+      && isExpectedVendorSystemdUnitSource(
         source,
         unitNames,
         logicalSource,
         symlinkDepth,
-      )
+      );
+    if (
+      !packageOwnedVendorSource
+      && systemdPolicyInvokesBootPolicyTool(candidate)
     ) {
       throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
     }
-    if (systemdPolicyReinterpretsCommandArguments(candidate)) {
+    if (
+      !trustedVendorExecution
+      && systemdPolicyReinterpretsCommandArguments(candidate)
+    ) {
       throw new Error(`external systemd policy reinterprets command arguments: ${source}`);
     }
     if (
-      systemdPolicyUsesEnvironmentExpansion(candidate)
-      && !isExpectedVendorSystemdUnitSource(
-        source,
-        unitNames,
-        logicalSource,
-        symlinkDepth,
-      )
+      !trustedVendorExecution
+      && systemdPolicyUsesEnvironmentExpansion(candidate)
     ) {
       throw new Error(`external systemd policy uses environment expansion: ${source}`);
     }
@@ -4929,44 +4961,47 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     ) {
       throw new Error(`external systemd policy claims a protected directory: ${source}`);
     }
-    if (systemdPolicyMountsProtectedDirectory(candidate, unitNames)) {
+    if (
+      systemdPolicyMountsProtectedDirectory(candidate, unitNames)
+      && !isExpectedGeneratedRootMountPolicy(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
       throw new Error(`external systemd policy mounts a protected directory: ${source}`);
     }
     if (
-      systemdPolicyInvokesShell(candidate)
-      && !isExpectedVendorSystemdUnitSource(
-        source,
-        unitNames,
-        logicalSource,
-        symlinkDepth,
-      )
+      !trustedVendorExecution
+      && systemdPolicyInjectsSystemCredential(candidate)
     ) {
-      throw new Error(`external systemd policy invokes a shell: ${source}`);
-    }
-    if (systemdPolicyInjectsSystemCredential(candidate)) {
       throw new Error(`external systemd policy injects a host policy credential: ${source}`);
     }
     if (
-      systemdPolicyReferencesGlobalControlUnit(candidate)
-      && !isExpectedVendorGlobalControlUnitSource(
-        source,
-        unitNames,
-        logicalSource,
-        symlinkDepth,
+      (
+        systemdPolicyReferencesGlobalControlUnit(candidate)
+        || [...unitNames].some(globalControlUnitFieldCouldMatch)
       )
+      && !packageOwnedVendorSource
     ) {
       throw new Error(`external systemd policy references a host lifecycle unit: ${source}`);
     }
-    if (systemdPolicyRequestsGlobalAction(candidate)) {
+    if (
+      systemdPolicyRequestsGlobalAction(candidate)
+      && !packageOwnedVendorSource
+    ) {
       throw new Error(`external systemd policy requests a host lifecycle action: ${source}`);
     }
     if (
-      MANAGED_UNITS.some((unit) => candidate.includes(unit))
-      || LAUNCHER_REFERENCE_PATTERN.test(candidate)
+      (!trustedVendorExecution && (
+        MANAGED_UNITS.some((unit) => candidate.includes(unit))
+        || LAUNCHER_REFERENCE_PATTERN.test(candidate)
+        || systemdPolicyInvokesManagedUnitControl(candidate)
+        || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
+      ))
       || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
-      || systemdPolicyInvokesManagedUnitControl(candidate)
       || [...unitNames].some(systemctlUnitFieldCouldMatch)
-      || MANAGED_IDENTITY_PATTERNS.some((pattern) => pattern.test(candidate))
       || [...unitNames].some(unitNameClaimsManagedIdentity)
       || systemdIdentityDirectiveUsesManagedId(
         candidate,
@@ -4978,24 +5013,21 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     ) {
       throw new Error(`external systemd policy references a managed unit: ${source}`);
     }
-    if (
-      parseSystemdExecCommand(candidate) !== null
-      && !isExpectedVendorSystemdUnitSource(
-        source,
-        unitNames,
-        logicalSource,
-        symlinkDepth,
-      )
-    ) {
-      throw new Error(`external systemd execution policy is not trusted: ${source}`);
-    }
   }
 }
 
 function systemdPolicyInvokesBootPolicyTool(value) {
   const command = parseSystemdExecCommand(value);
   if (!command) return false;
-  const { names, tokens } = command;
+  const invocationNames = command.invocations.map(({ name }) => name);
+  const names = invocationNames.some(systemdExecutableNameCouldBeShell)
+    ? [
+      ...invocationNames,
+      ...command.tokens.map((token) => (
+        path.basename(token.replace(/^[-@:+!|]+/, ''))
+      )),
+    ]
+    : invocationNames;
   if (names.some((name) => (
     BOOT_POLICY_EXECUTABLES.has(name)
     || systemdSpecifierFieldCouldMatch(name, [...BOOT_POLICY_EXECUTABLES])
@@ -5004,7 +5036,7 @@ function systemdPolicyInvokesBootPolicyTool(value) {
     name === 'systemd-userdbd'
     || systemdSpecifierFieldCouldMatch(name, ['systemd-userdbd'])
   ));
-  return invokesUserdbLoader && tokens.some((token) => (
+  return invokesUserdbLoader && command.tokens.some((token) => (
     token === '--load-credentials'
     || systemdSpecifierFieldCouldMatch(token, ['--load-credentials'])
   ));
@@ -5075,46 +5107,13 @@ function systemctlOptionCouldSelectJobMode(token) {
     || systemdSpecifierFieldCouldMatch(option, SYSTEMCTL_JOB_MODE_OPTION_PREFIXES);
 }
 
-function systemdPolicyInvokesShell(value) {
-  const command = parseSystemdExecCommand(value);
-  if (!command) return false;
-  const { fields, tokens } = command;
-  for (const executable of systemdExecCommandExecutables(fields)) {
-    const prefixes = executable.match(/^[-@:+!|]+/)?.[0] ?? '';
-    const executablePath = executable.replace(/^[-@:+!|]+/, '');
-    const executableName = path.basename(executablePath);
-    if (
-      prefixes.includes('|')
-      || hasUnresolvedSystemdSpecifier(executablePath)
-      || shellExecutableName(executableName)
-    ) return true;
-  }
-  return tokens.some((token) => {
-    const prefixes = token.match(/^[-@:+!|]+/)?.[0] ?? '';
-    const name = path.basename(token.replace(/^[-@:+!|]+/, ''));
-    return prefixes.includes('|')
-      || shellExecutableName(name)
-      || systemdSpecifierFieldCouldMatch(
-        name,
-        [...SYSTEMD_SHELL_EXECUTABLES],
-        { includeShellFamilies: true },
-      );
-  });
-}
-
-function systemdExecCommandExecutables(fields) {
-  const executables = [];
-  let expectsExecutable = true;
-  for (const field of fields) {
-    if (field === ';') {
-      expectsExecutable = true;
-      continue;
-    }
-    if (!expectsExecutable) continue;
-    executables.push(field);
-    expectsExecutable = false;
-  }
-  return executables;
+function systemdExecutableNameCouldBeShell(name) {
+  return shellExecutableName(name)
+    || systemdSpecifierFieldCouldMatch(
+      name,
+      [...SYSTEMD_SHELL_EXECUTABLES],
+      { includeShellFamilies: true },
+    );
 }
 
 function systemdPolicyReinterpretsCommandArguments(value) {
@@ -5183,6 +5182,7 @@ function systemdPolicyMountsProtectedDirectory(value, unitNames) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
+  if (!['Alias', 'Also', 'Options', 'What', 'Where'].includes(directive)) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
   if (directive === 'Where') {
     return fields.some((field) => {
@@ -5213,6 +5213,26 @@ function systemdPolicyMountsProtectedDirectory(value, unitNames) {
     systemdPathUnitOverlapsProtectedDirectory(field)
     || systemdSpecifierFieldCouldMatch(field, protectedSystemdPathUnitNames())
   ));
+}
+
+function isExpectedGeneratedRootMountPolicy(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
+  if (!systemdUnitNamesEqual(unitNames, '-.mount')) return false;
+  const unit = '/run/systemd/generator/-.mount';
+  const dependency = '/run/systemd/generator/local-fs.target.requires/-.mount';
+  return (
+    [0, 1].includes(symlinkDepth)
+    && source === logicalSource
+    && [unit, dependency].includes(source)
+  ) || (
+    symlinkDepth === 1
+    && source === unit
+    && logicalSource === dependency
+  );
 }
 
 function systemdPathUnitOverlapsProtectedDirectory(unitName) {
@@ -5313,12 +5333,10 @@ function parseSystemdExecCommand(value) {
   if (!/^Exec[A-Z][A-Za-z]*$/.test(directive)) return null;
   const fields = parseSystemdFields(value.slice(separator + 1));
   const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
-  const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
   const invocations = systemdExecInvocationMetadata(fields);
   return Object.freeze({
     fields,
     tokens,
-    names,
     invocations: invocations.invocations,
     envOptions: invocations.envOptions,
   });
@@ -5447,25 +5465,14 @@ function systemdPolicyReferencesGlobalControlUnit(value) {
     .some(globalControlUnitFieldCouldMatch);
 }
 
-function isExpectedVendorGlobalControlUnitSource(
-  source,
-  unitNames,
-  logicalSource,
-  symlinkDepth,
-) {
-  const vendorDirectories = new Set(['/usr/lib/systemd/system', '/lib/systemd/system']);
-  return vendorDirectories.has(path.dirname(source))
-    && vendorDirectories.has(path.dirname(logicalSource))
-    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(source))
-    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(logicalSource))
-    && [...unitNames].every((unit) => SYSTEMD_GLOBAL_CONTROL_UNITS.includes(unit))
-    && symlinkDepth <= 1;
-}
-
 function systemdPolicyRequestsGlobalAction(value) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
   const directive = value.slice(0, separator).trim();
+  if (
+    !SYSTEMD_GLOBAL_ACTION_DIRECTIVES.has(directive)
+    && !SYSTEMD_GLOBAL_JOB_MODE_DIRECTIVES.has(directive)
+  ) return false;
   const fields = parseSystemdFields(value.slice(separator + 1));
   if (fields.length === 0) return false;
   if (fields.length > 1) {
@@ -5476,7 +5483,7 @@ function systemdPolicyRequestsGlobalAction(value) {
     return fields[0] !== 'none';
   }
   if (SYSTEMD_GLOBAL_JOB_MODE_DIRECTIVES.has(directive)) {
-    return !['fail', 'replace'].includes(fields[0]);
+    return !['fail', 'replace', 'replace-irreversibly'].includes(fields[0]);
   }
   return false;
 }
@@ -5625,13 +5632,23 @@ function isExpectedVendorBootPolicyCredentialImport(
   logicalSource,
   symlinkDepth,
 ) {
+  const unit = path.basename(source);
+  if (
+    unit === 'systemd-firstboot.service'
+    && VENDOR_FIRSTBOOT_CREDENTIAL_IMPORTS.has(line)
+    && isPackageOwnedVendorSystemdUnitSource(
+      source,
+      unitNames,
+      logicalSource,
+      symlinkDepth,
+    )
+  ) return true;
   if (!isExpectedVendorBootPolicyConsumerSource(
     source,
     unitNames,
     logicalSource,
     symlinkDepth,
   )) return false;
-  const unit = path.basename(source);
   return (
     unit === 'systemd-sysusers.service'
     && VENDOR_SYSUSERS_CREDENTIAL_IMPORTS.has(line)
@@ -5684,7 +5701,7 @@ function isExpectedVendorBootPolicyConsumerSource(
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
   if (!BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit)) return false;
-  return isExpectedVendorSystemdUnitSource(
+  return isPackageOwnedVendorSystemdUnitSource(
     source,
     unitNames,
     logicalSource,
@@ -5698,23 +5715,84 @@ function isExpectedVendorSystemdUnitSource(
   logicalSource,
   symlinkDepth,
 ) {
-  const directory = path.dirname(source);
-  if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
+  if (isPackageOwnedVendorSystemdUnitSource(
+    source,
+    unitNames,
+    logicalSource,
+    symlinkDepth,
+  )) return true;
+  const vendorDirectories = ['/usr/lib/systemd/system', '/lib/systemd/system'];
+  if (!vendorDirectories.includes(path.dirname(source))) return false;
   const unit = path.basename(source);
-  if (!SYSTEMD_UNIT_NAME_PATTERN.test(unit)) return false;
-  if (!systemdUnitNamesEqual(unitNames, unit)) return false;
-  const directVendorFile = symlinkDepth === 0 && logicalSource === source;
-  const directDependencyLink = (
-    symlinkDepth === 1
-    && path.basename(logicalSource) === unit
+  const logicalUnit = path.basename(logicalSource);
+  if (
+    !SYSTEMD_UNIT_NAME_PATTERN.test(unit)
+    || !SYSTEMD_UNIT_NAME_PATTERN.test(logicalUnit)
+    || symlinkDepth !== 1
+  ) return false;
+  const vendorBackedAlias = (
+    SYSTEMD_PROTECTED_UNIT_PATHS.includes(path.dirname(logicalSource))
+    && systemdUnitNamesMatch(unitNames, new Set([unit, logicalUnit]))
+  );
+  const vendorBackedDependencyLink = (
+    systemdUnitNamesMatch(unitNames, new Set([unit, logicalUnit]))
+    && (logicalUnit === unit || systemdUnitIsInstanceOfTemplate(logicalUnit, unit))
     && /\.(?:wants|requires|upholds)$/.test(path.basename(path.dirname(logicalSource)))
     && SYSTEMD_PROTECTED_UNIT_PATHS.includes(path.dirname(path.dirname(logicalSource)))
   );
-  return directVendorFile || directDependencyLink;
+  return vendorBackedAlias || vendorBackedDependencyLink;
+}
+
+function isPackageOwnedVendorSystemdUnitSource(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
+  const directory = path.dirname(source);
+  const vendorDirectories = ['/usr/lib/systemd/system', '/lib/systemd/system'];
+  if (!vendorDirectories.includes(directory)) return false;
+  const unit = path.basename(source);
+  if (!SYSTEMD_UNIT_NAME_PATTERN.test(unit)) return false;
+  const logicalUnit = path.basename(logicalSource);
+  const directVendorFile = (
+    symlinkDepth === 0
+    && logicalSource === source
+    && systemdUnitNamesEqual(unitNames, unit)
+  );
+  const directVendorAlias = (
+    symlinkDepth === 1
+    && vendorDirectories.includes(path.dirname(logicalSource))
+    && SYSTEMD_UNIT_NAME_PATTERN.test(logicalUnit)
+    && systemdUnitNamesMatch(unitNames, new Set([unit, logicalUnit]))
+  );
+  const directDependencyLink = (
+    symlinkDepth === 1
+    && systemdUnitNamesMatch(unitNames, new Set([unit, logicalUnit]))
+    && (logicalUnit === unit || systemdUnitIsInstanceOfTemplate(logicalUnit, unit))
+    && /\.(?:wants|requires|upholds)$/.test(path.basename(path.dirname(logicalSource)))
+    && vendorDirectories.includes(path.dirname(path.dirname(logicalSource)))
+  );
+  return directVendorFile || directVendorAlias || directDependencyLink;
 }
 
 function systemdUnitNamesEqual(unitNames, unit) {
   return unitNames.size === 1 && unitNames.has(unit);
+}
+
+function systemdUnitNamesMatch(unitNames, expected) {
+  return unitNames.size === expected.size
+    && [...unitNames].every((unit) => expected.has(unit));
+}
+
+function systemdUnitIsInstanceOfTemplate(unit, template) {
+  const marker = template.indexOf('@.');
+  if (marker < 0) return false;
+  const prefix = template.slice(0, marker + 1);
+  const suffix = template.slice(marker + 1);
+  if (!unit.startsWith(prefix) || !unit.endsWith(suffix)) return false;
+  const instance = unit.slice(prefix.length, unit.length - suffix.length);
+  return instance !== '' && !/[@/\s]/.test(instance);
 }
 
 function unresolvedSpecifierCouldReferenceManagedUnit(value) {
@@ -5970,6 +6048,12 @@ function decodeSystemdEscapesForAudit(value) {
   for (let offset = 0; offset < value.length; offset += 1) {
     if (value[offset] !== '\\') {
       decoded += value[offset];
+      continue;
+    }
+    if (['a', 'b', 'e', 'f', 'n', 'r', 's', 't', 'v', '\\', '"', "'"]
+      .includes(value[offset + 1])) {
+      decoded += value.slice(offset, offset + 2);
+      offset += 1;
       continue;
     }
     try {

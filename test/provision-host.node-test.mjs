@@ -3040,6 +3040,7 @@ describe('guarded host provisioner execution', () => {
       'LoadCredential=sysusers.extra:/root/policy',
       'LoadCredential=passwd.hashed-password.webex-generic-account-bot:/root/password',
       'SetCredential=passwd.plaintext-password.webex-config-deploy:secret',
+      'ImportCredential=passwd.shell.root',
       'ImportCredential=passwd.shell.*',
       'ImportCredential=payload.*:passwd.shell.',
       'SetCredential=userdb.user.injected:{}',
@@ -3438,6 +3439,49 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy mounts a protected directory/,
     );
 
+    const generatedRootMount = '/run/systemd/generator/-.mount';
+    const generatedRootMountDirectory =
+      '/run/systemd/generator/local-fs.target.requires';
+    const generatedRootMountLink = `${generatedRootMountDirectory}/-.mount`;
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          throw new Error('accepted generated root mount reached systemctl');
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/run/systemd/generator', [
+              { name: '-.mount' },
+              {
+                name: 'local-fs.target.requires',
+                isFile: () => false,
+                isDirectory: () => true,
+                isSymbolicLink: () => false,
+              },
+            ]],
+            [generatedRootMountDirectory, [{
+              name: '-.mount',
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              generatedRootMount,
+              Buffer.from('[Mount]\nWhat=/dev/root\nWhere=/\n'),
+            ]]),
+            symlinksByPath: new Map([[
+              generatedRootMountLink,
+              generatedRootMount,
+            ]]),
+          },
+        ),
+      ),
+      /accepted generated root mount reached systemctl/,
+    );
+
     const protectedMountWants = '/etc/systemd/system/external.target.wants';
     const protectedMountName = 'run-webex\\x2dcodex\\x2dcanary.mount';
     const protectedMountLink = `${protectedMountWants}/${protectedMountName}`;
@@ -3480,6 +3524,7 @@ describe('guarded host provisioner execution', () => {
       'systemctl --mark reload-or-restart',
       'systemctl start runlevel6.target',
       'systemctl start systemd-reboot.service',
+      'systemctl start factory-reset.target',
       'halt',
       'init 1',
       'poweroff',
@@ -3564,6 +3609,10 @@ describe('guarded host provisioner execution', () => {
         'external@reboot.service',
         '[Unit]\nOnFailure=%i.target\n',
       ],
+      [
+        'external-factory-reset.service',
+        '[Unit]\nOnFailure=factory-reset.target\n',
+      ],
     ]) {
       const target = `/etc/systemd/system/${name}`;
       await assert.rejects(
@@ -3639,32 +3688,30 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
-    for (const [index, command] of [
-      '/usr/bin/echo benign',
-      '/usr/bin/nice /usr/bin/reboot',
-      '/usr/bin/timeout 5 /usr/bin/reboot',
-      '/usr/bin/flock /tmp/host.lock /usr/bin/reboot',
-      '/usr/bin/env FLAG%i=1 /usr/bin/reboot',
-    ].entries()) {
-      const name = `external-execution-${index}@worker.service`;
-      const target = `/etc/systemd/system/${name}`;
-      await assert.rejects(
-        readSystemUnitStates(
-          MANAGED_UNITS,
-          async () => ({ stdout: '', stderr: '', code: 0 }),
-          systemdUnitPathFs(
-            new Map([['/etc/systemd/system', [{ name }]]]),
-            {
-              filesByPath: new Map([[
-                target,
-                Buffer.from(`[Service]\nExecStart=${command}\n`),
-              ]]),
-            },
-          ),
+    const safeJobModeUnit = '/etc/systemd/system/external-safe-job-mode.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          throw new Error('accepted safe external job mode reached systemctl');
+        },
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: path.basename(safeJobModeUnit),
+          }]]]),
+          {
+            filesByPath: new Map([[
+              safeJobModeUnit,
+              Buffer.from(
+                "[Unit]\nDescription=Generate yesterday's summary\n"
+                + 'OnFailureJobMode=replace-irreversibly\n',
+              ),
+            ]]),
+          },
         ),
-        /external systemd (?:execution policy is not trusted|policy references a managed unit)/,
-      );
-    }
+      ),
+      /accepted safe external job mode reached systemctl/,
+    );
 
     for (const [name, policy] of [
       [
@@ -3677,6 +3724,11 @@ describe('guarded host provisioner execution', () => {
           'ExecStart=/usr/sbin/runlevel',
           'ExecStart=/usr/bin/env -C/var/lib /usr/bin/true',
           'ExecStart=@/usr/bin/env shutdown /usr/bin/systemctl show',
+          'ExecStart=/usr/bin/echo finish',
+          'ExecStart=/usr/bin/echo systemd-sysusers',
+          'ExecStart=/usr/bin/env --un%I FOO /usr/bin/reboot',
+          'ExecStart=@/usr/bin/systemctl ${MODE} -r now',
+          'ExecStart=/usr%f',
           '',
         ].join('\n'),
       ],
@@ -3689,6 +3741,14 @@ describe('guarded host provisioner execution', () => {
           'OnFailureJobMode=replace',
           '',
         ].join('\n'),
+      ],
+      [
+        'local-fs.target',
+        '[Unit]\nOnFailureJobMode=replace-irreversibly\n',
+      ],
+      [
+        'systemd-reboot.service',
+        '[Service]\nSuccessAction=reboot-force\nExecStart=/usr/bin/systemctl reboot\n',
       ],
     ]) {
       const directory = '/usr/lib/systemd/system';
@@ -3712,6 +3772,71 @@ describe('guarded host provisioner execution', () => {
         new RegExp(`accepted policy reached systemctl: ${name.replace('.', '\\.')}`),
       );
     }
+
+    const vendorAlias = '/usr/lib/systemd/system/dbus-org.freedesktop.login1.service';
+    const vendorAliasTarget = '/usr/lib/systemd/system/systemd-logind.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          throw new Error('accepted package-owned vendor alias reached systemctl');
+        },
+        systemdUnitPathFs(
+          new Map([['/usr/lib/systemd/system', [{
+            name: path.basename(vendorAlias),
+            isFile: () => false,
+            isDirectory: () => false,
+            isSymbolicLink: () => true,
+          }]]]),
+          {
+            filesByPath: new Map([[
+              vendorAliasTarget,
+              Buffer.from('[Service]\nExecStart=/usr/lib/systemd/systemd-logind\n'),
+            ]]),
+            symlinksByPath: new Map([[vendorAlias, vendorAliasTarget]]),
+          },
+        ),
+      ),
+      /accepted package-owned vendor alias reached systemctl/,
+    );
+
+    const gettyWants = '/etc/systemd/system/getty.target.wants';
+    const gettyInstance = `${gettyWants}/getty@tty1.service`;
+    const gettyTemplate = '/usr/lib/systemd/system/getty@.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => {
+          throw new Error('accepted vendor template instance reached systemctl');
+        },
+        systemdUnitPathFs(
+          new Map([
+            ['/etc/systemd/system', [{
+              name: path.basename(gettyWants),
+              isFile: () => false,
+              isDirectory: () => true,
+              isSymbolicLink: () => false,
+            }]],
+            [gettyWants, [{
+              name: path.basename(gettyInstance),
+              isFile: () => false,
+              isDirectory: () => false,
+              isSymbolicLink: () => true,
+            }]],
+          ]),
+          {
+            filesByPath: new Map([[
+              gettyTemplate,
+              Buffer.from(
+                "[Service]\nExecStart=-/sbin/agetty -o '-p -- \\\\u' --noclear - $TERM\n",
+              ),
+            ]]),
+            symlinksByPath: new Map([[gettyInstance, gettyTemplate]]),
+          },
+        ),
+      ),
+      /accepted vendor template instance reached systemctl/,
+    );
 
     const markedSpecifierUnit = '/etc/systemd/system/external@k.service';
     await assert.rejects(
@@ -3922,8 +4047,8 @@ describe('guarded host provisioner execution', () => {
 
     for (const [name, policy, activatorPolicy] of [
       [
-        'external-shell.service',
-        "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemd-\"sysusers\" /etc/rogue.conf'\n",
+        'external-benign-argument.service',
+        '[Service]\nExecStart=/usr/bin/echo finish\n',
         null,
       ],
       [
@@ -3970,13 +4095,15 @@ describe('guarded host provisioner execution', () => {
       await assert.rejects(
         readSystemUnitStates(
           MANAGED_UNITS,
-          async () => ({ stdout: '', stderr: '', code: 0 }),
+          async () => {
+            throw new Error('accepted benign external execution reached systemctl');
+          },
           systemdUnitPathFs(
             new Map([['/etc/systemd/system', entries]]),
             { filesByPath: new Map(files) },
           ),
         ),
-        /external systemd policy invokes a shell/,
+        /accepted benign external execution reached systemctl/,
       );
     }
 
@@ -4032,6 +4159,7 @@ describe('guarded host provisioner execution', () => {
               { name: 'systemd-sysusers.service' },
               { name: 'systemd-userdb-load-credentials.service' },
               { name: 'systemd-tmpfiles-setup.service' },
+              { name: 'systemd-firstboot.service' },
               { name: 'systemd-pcrfs@.service' },
               { name: 'user@.service' },
               { name: 'vendor-shell.service' },
@@ -4076,6 +4204,17 @@ describe('guarded host provisioner execution', () => {
               [
                 '/usr/lib/systemd/system/systemd-tmpfiles-setup.service',
                 Buffer.from('[Service]\nImportCredential=tmpfiles.*\n'),
+              ],
+              [
+                '/usr/lib/systemd/system/systemd-firstboot.service',
+                Buffer.from([
+                  '[Service]',
+                  'ImportCredential=passwd.hashed-password.root',
+                  'ImportCredential=passwd.plaintext-password.root',
+                  'ImportCredential=passwd.shell.root',
+                  'ImportCredential=firstboot.*',
+                  '',
+                ].join('\n')),
               ],
               [
                 '/usr/lib/systemd/system/systemd-pcrfs@.service',
@@ -4591,6 +4730,27 @@ describe('guarded host provisioner execution', () => {
       systemdUnitPathFs(new Map(), { usrMerged: false }),
     );
     assert.equal(splitStates.size, MANAGED_UNITS.length);
+
+    const unknownMissingStates = await readSystemUnitStatesImpl(
+      MANAGED_UNITS,
+      async (_command, args) => {
+        if (args.join('\0') === 'show\0--property=UnitPath\0--value') {
+          return { stdout: `${SYSTEMD_MANAGER_UNIT_PATH}\n`, stderr: '', code: 0 };
+        }
+        if (args[0] === 'list-units' || args[0] === 'list-unit-files') {
+          return { stdout: '', stderr: '', code: 0 };
+        }
+        if (args[0] === 'is-active') {
+          return { stdout: 'unknown\n', stderr: '', code: 4 };
+        }
+        return { stdout: systemdUnitMetadata('not-found'), stderr: '', code: 0 };
+      },
+      systemdUnitPathFs(),
+    );
+    assert.deepEqual(
+      [...unknownMissingStates.values()].map(({ active }) => active),
+      MANAGED_UNITS.map(() => 'inactive'),
+    );
   });
 
   it('rejects malformed or load-inconsistent systemctl state queries', async () => {
