@@ -3206,6 +3206,14 @@ describe('guarded host provisioner execution', () => {
         'external-userdb.service',
         '[Service]\nExecStart=/usr/lib/systemd/systemd-userdbd --load-credentials\n',
       ],
+      [
+        'external-firstboot.service',
+        '[Service]\nExecStart=/usr/bin/systemd-firstboot --root=/ --force --delete-root-password\n',
+      ],
+      [
+        'external-firstboot-env.service',
+        '[Service]\nExecStart=/usr/bin/env /usr/bin/systemd-firstboot --root=/ --force\n',
+      ],
     ]) {
       const target = `/etc/systemd/system/${name}`;
       await assert.rejects(
@@ -3253,6 +3261,7 @@ describe('guarded host provisioner execution', () => {
       ['tmpfiles', 'systemd-%i', '--create /etc/rogue.conf'],
       ['sysusers', 'systemd-%I', '/etc/rogue.conf'],
       ['userdbd', 'systemd-%i', '--load-credentials'],
+      ['firstboot', 'systemd-%i', '--root=/ --force --delete-root-password'],
       ['--load-credentials', 'systemd-userdbd', '%i'],
     ]) {
       const template = '/etc/systemd/system/external@.service';
@@ -3779,7 +3788,7 @@ describe('guarded host provisioner execution', () => {
       readSystemUnitStates(
         MANAGED_UNITS,
         async () => {
-          throw new Error('accepted package-owned vendor alias reached systemctl');
+          throw new Error('accepted trusted vendor-path alias reached systemctl');
         },
         systemdUnitPathFs(
           new Map([['/usr/lib/systemd/system', [{
@@ -3797,7 +3806,7 @@ describe('guarded host provisioner execution', () => {
           },
         ),
       ),
-      /accepted package-owned vendor alias reached systemctl/,
+      /accepted trusted vendor-path alias reached systemctl/,
     );
 
     const gettyWants = '/etc/systemd/system/getty.target.wants';
@@ -4045,6 +4054,56 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    for (const [name, policy] of [
+      [
+        'external-shell-systemctl.service',
+        "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemctl isolate rescue.target'\n",
+      ],
+      [
+        'external-shell-reboot.service',
+        "[Service]\nExecStart=/bin/sh -c '/usr/bin/reboot'\n",
+      ],
+      [
+        'external-shell-prefix-systemctl.service',
+        '[Service]\nExecStart=|/usr/bin/true; /usr/bin/systemctl isolate rescue.target\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            { filesByPath: new Map([[target, Buffer.from(policy)]]) },
+          ),
+        ),
+        /external systemd policy references a managed unit/,
+      );
+    }
+
+    const shellCredentialUnit = '/etc/systemd/system/external-shell-credential.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: path.basename(shellCredentialUnit),
+          }]]]),
+          {
+            filesByPath: new Map([[
+              shellCredentialUnit,
+              Buffer.from(
+                "[Service]\nExecStart=/bin/sh -c '/usr/bin/systemctl set-credential sysusers.extra=payload'\n",
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy injects a host policy credential/,
+    );
+
     for (const [name, policy, activatorPolicy] of [
       [
         'external-benign-argument.service',
@@ -4141,6 +4200,38 @@ describe('guarded host provisioner execution', () => {
         ),
       ),
       /external systemd policy invokes a boot policy tool/,
+    );
+
+    const externalVendorControlAlias =
+      '/etc/systemd/system/external-vendor-control.service';
+    const externalVendorControlTarget =
+      '/usr/lib/systemd/system/vendor-control.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: path.basename(externalVendorControlAlias),
+            isFile: () => false,
+            isDirectory: () => false,
+            isSymbolicLink: () => true,
+          }]]]),
+          {
+            filesByPath: new Map([[
+              externalVendorControlTarget,
+              Buffer.from(
+                '[Service]\nExecStart=/usr/bin/systemctl isolate rescue.target\n',
+              ),
+            ]]),
+            symlinksByPath: new Map([[
+              externalVendorControlAlias,
+              externalVendorControlTarget,
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
     );
 
     let vendorImportCommandCalls = 0;

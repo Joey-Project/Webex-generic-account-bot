@@ -295,6 +295,7 @@ const BOOT_POLICY_SYSTEMD_CONSUMER_POLICY_DIRECTORY_NAMES = new Set(
   ]),
 );
 const BOOT_POLICY_EXECUTABLES = new Set([
+  'systemd-firstboot',
   'systemd-sysusers',
   'systemd-tmpfiles',
 ]);
@@ -4919,7 +4920,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     )));
   for (const candidate of expanded) {
     const execCommand = parseSystemdExecCommand(candidate);
-    const packageOwnedVendorSource = isPackageOwnedVendorSystemdUnitSource(
+    const trustedVendorPathSource = isTrustedVendorPathSystemdUnitSource(
       source,
       unitNames,
       logicalSource,
@@ -4933,7 +4934,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
         symlinkDepth,
       );
     if (
-      !packageOwnedVendorSource
+      !trustedVendorPathSource
       && systemdPolicyInvokesBootPolicyTool(candidate)
     ) {
       throw new Error(`external systemd policy invokes a boot policy tool: ${source}`);
@@ -4973,7 +4974,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy mounts a protected directory: ${source}`);
     }
     if (
-      !trustedVendorExecution
+      !trustedVendorPathSource
       && systemdPolicyInjectsSystemCredential(candidate)
     ) {
       throw new Error(`external systemd policy injects a host policy credential: ${source}`);
@@ -4983,18 +4984,18 @@ function assertSystemdPolicyDoesNotReferenceManaged(
         systemdPolicyReferencesGlobalControlUnit(candidate)
         || [...unitNames].some(globalControlUnitFieldCouldMatch)
       )
-      && !packageOwnedVendorSource
+      && !trustedVendorPathSource
     ) {
       throw new Error(`external systemd policy references a host lifecycle unit: ${source}`);
     }
     if (
       systemdPolicyRequestsGlobalAction(candidate)
-      && !packageOwnedVendorSource
+      && !trustedVendorPathSource
     ) {
       throw new Error(`external systemd policy requests a host lifecycle action: ${source}`);
     }
     if (
-      (!trustedVendorExecution && (
+      (!trustedVendorPathSource && (
         MANAGED_UNITS.some((unit) => candidate.includes(unit))
         || LAUNCHER_REFERENCE_PATTERN.test(candidate)
         || systemdPolicyInvokesManagedUnitControl(candidate)
@@ -5019,15 +5020,7 @@ function assertSystemdPolicyDoesNotReferenceManaged(
 function systemdPolicyInvokesBootPolicyTool(value) {
   const command = parseSystemdExecCommand(value);
   if (!command) return false;
-  const invocationNames = command.invocations.map(({ name }) => name);
-  const names = invocationNames.some(systemdExecutableNameCouldBeShell)
-    ? [
-      ...invocationNames,
-      ...command.tokens.map((token) => (
-        path.basename(token.replace(/^[-@:+!|]+/, ''))
-      )),
-    ]
-    : invocationNames;
+  const names = systemdPolicyExecutableNames(command);
   if (names.some((name) => (
     BOOT_POLICY_EXECUTABLES.has(name)
     || systemdSpecifierFieldCouldMatch(name, [...BOOT_POLICY_EXECUTABLES])
@@ -5045,25 +5038,29 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
   if (command === null) return false;
-  if (command.invocations.some(({ name, argv0 }) => (
-    SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
-    || systemdSpecifierFieldCouldMatch(
-      name,
-      [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
-    )
-    || (
-      (name === 'systemctl' || systemdSpecifierFieldCouldMatch(name, ['systemctl']))
-      && argv0 !== null
-      && (
-        SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(argv0)
-        || systemdSpecifierFieldCouldMatch(
-          argv0,
-          [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+  if (
+    systemdPolicyExecutableNames(command).some((name) => (
+      SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
+      || systemdSpecifierFieldCouldMatch(
+        name,
+        [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+      )
+    ))
+    || command.invocations.some(({ name, argv0 }) => (
+      (
+        (name === 'systemctl' || systemdSpecifierFieldCouldMatch(name, ['systemctl']))
+        && argv0 !== null
+        && (
+          SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(argv0)
+          || systemdSpecifierFieldCouldMatch(
+            argv0,
+            [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+          )
         )
       )
-    )
-  ))) return true;
-  if (!systemdExecInvokes(command, 'systemctl')) return false;
+    ))
+  ) return true;
+  if (!systemdExecInvokesIncludingShellPayload(command, 'systemctl')) return false;
   const unitFileMutation = command.tokens.some((token) => (
     SYSTEMCTL_UNIT_FILE_MUTATION_VERBS.has(token)
     || systemdSpecifierFieldCouldMatch(
@@ -5089,6 +5086,26 @@ function systemdPolicyInvokesManagedUnitControl(value) {
         || systemctlOptionCouldSelectJobMode(token)
       ))
   );
+}
+
+function systemdPolicyExecutableNames(command) {
+  const names = command.invocations.map(({ name }) => name);
+  if (
+    command.shellMediated
+    || names.some(systemdExecutableNameCouldBeShell)
+  ) {
+    names.push(...command.tokens.map((token) => (
+      path.basename(token.replace(/^[-@:+!|]+/, ''))
+    )));
+  }
+  return names;
+}
+
+function systemdExecInvokesIncludingShellPayload(command, executable) {
+  return systemdPolicyExecutableNames(command).some((name) => (
+    name === executable
+    || systemdSpecifierFieldCouldMatch(name, [executable])
+  ));
 }
 
 function systemctlOptionCouldBeMarked(token) {
@@ -5303,7 +5320,10 @@ function systemdPathsOverlap(left, right) {
 
 function systemdPolicyInjectsSystemCredential(value) {
   const command = parseSystemdExecCommand(value);
-  if (command === null || !systemdExecInvokes(command, 'systemctl')) return false;
+  if (
+    command === null
+    || !systemdExecInvokesIncludingShellPayload(command, 'systemctl')
+  ) return false;
   const verbOffset = command.tokens.findIndex((token) => (
     token === 'set-credential'
     || token === 'set-credential-encrypted'
@@ -5339,6 +5359,7 @@ function parseSystemdExecCommand(value) {
     tokens,
     invocations: invocations.invocations,
     envOptions: invocations.envOptions,
+    shellMediated: invocations.shellMediated,
   });
 }
 
@@ -5352,6 +5373,7 @@ function systemdExecInvokes(command, executable) {
 function systemdExecInvocationMetadata(fields) {
   const invocations = [];
   const envOptions = [];
+  let shellMediated = false;
   for (const segment of systemdExecCommandSegments(fields)) {
     let offset = 0;
     let direct = true;
@@ -5363,6 +5385,7 @@ function systemdExecInvocationMetadata(fields) {
         : rawExecutable;
       const name = path.basename(executable);
       offset += 1;
+      if (direct && prefixes.includes('|')) shellMediated = true;
       let argv0 = null;
       if (direct && prefixes.includes('@') && offset < segment.length) {
         argv0 = path.basename(segment[offset]);
@@ -5380,6 +5403,7 @@ function systemdExecInvocationMetadata(fields) {
   return Object.freeze({
     invocations: Object.freeze(invocations),
     envOptions: Object.freeze(envOptions),
+    shellMediated,
   });
 }
 
@@ -5636,7 +5660,7 @@ function isExpectedVendorBootPolicyCredentialImport(
   if (
     unit === 'systemd-firstboot.service'
     && VENDOR_FIRSTBOOT_CREDENTIAL_IMPORTS.has(line)
-    && isPackageOwnedVendorSystemdUnitSource(
+    && isTrustedVendorPathSystemdUnitSource(
       source,
       unitNames,
       logicalSource,
@@ -5701,7 +5725,7 @@ function isExpectedVendorBootPolicyConsumerSource(
   if (!['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory)) return false;
   const unit = path.basename(source);
   if (!BOOT_POLICY_SYSTEMD_CONSUMER_UNITS.has(unit)) return false;
-  return isPackageOwnedVendorSystemdUnitSource(
+  return isTrustedVendorPathSystemdUnitSource(
     source,
     unitNames,
     logicalSource,
@@ -5715,7 +5739,7 @@ function isExpectedVendorSystemdUnitSource(
   logicalSource,
   symlinkDepth,
 ) {
-  if (isPackageOwnedVendorSystemdUnitSource(
+  if (isTrustedVendorPathSystemdUnitSource(
     source,
     unitNames,
     logicalSource,
@@ -5743,7 +5767,7 @@ function isExpectedVendorSystemdUnitSource(
   return vendorBackedAlias || vendorBackedDependencyLink;
 }
 
-function isPackageOwnedVendorSystemdUnitSource(
+function isTrustedVendorPathSystemdUnitSource(
   source,
   unitNames,
   logicalSource,

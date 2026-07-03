@@ -343,7 +343,8 @@ for arbitrary root-owned executables: custom binaries and generic command
 wrappers can implement unrestricted host behaviour and remain part of the
 trusted host-administration boundary. Vendor-backed aliases inherit only their
 physical package command semantics; lifecycle actions, global targets, and
-boot-policy consumer exceptions require package-owned logical provenance. Unit
+boot-policy consumer exceptions require root-owned, non-writable, stable
+vendor-path logical provenance. Unit
 file mutations with path arguments are rejected because an out-of-path file can
 hide a managed `Alias=`; unresolved specifiers are treated as path-capable.
 Same-basename `.timer`, `.path`, and `.socket` units and systemctl targets are
@@ -360,11 +361,11 @@ positions, including through `env` wrapping and systemd's `@` argv0 override;
 ordinary command arguments containing those words and the read-only
 `runlevel` command remain valid. External policy also cannot activate terminal
 host lifecycle targets or services, including runlevel aliases, while the
-package-owned lifecycle unit graph remains auditable. External unit-level
+trusted vendor-path lifecycle unit graph remains auditable. External unit-level
 lifecycle actions such as `FailureAction=`, `StartLimitAction=`, and
 `JobTimeoutAction=`, plus isolating `OnFailureJobMode=` or
 `OnSuccessJobMode=` values, are rejected independently of executable policy;
-the same directives in provenance-bound package-owned units remain trusted.
+the same directives in provenance-bound trusted vendor-path units remain trusted.
 Globbed same-basename activator names are matched against their implicit
 service targets, and each managed unit must report an empty systemd `Job=`
 property as well as an inactive state.
