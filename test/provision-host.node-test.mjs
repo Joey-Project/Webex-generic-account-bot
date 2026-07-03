@@ -473,9 +473,13 @@ describe('guarded host provisioner policy', () => {
 
     let identitySpawn = null;
     const identityClosed = [];
+    let provisionLockOptions = null;
     await executeIdentityRecovery({
       allowTestInvocation: true,
-      resolveProvisionLock: async () => ({ fd: 46 }),
+      resolveProvisionLock: async (options) => {
+        provisionLockOptions = options;
+        return { fd: 46 };
+      },
       processApi: { pid: 4321 },
       openExecutable: async (file) => {
         assert.equal(
@@ -495,6 +499,7 @@ describe('guarded host provisioner policy', () => {
       },
     });
     assert.equal(identitySpawn.command, '/proc/self/fd/44');
+    assert.deepEqual(provisionLockOptions, { allowInterruptedMigration: true });
     assert.deepEqual(identitySpawn.args, []);
     assert.equal(
       identitySpawn.options.argv0,
@@ -4730,6 +4735,12 @@ describe('guarded host provisioner execution', () => {
         null,
       ],
       [
+        'external-unresolved-glob.path',
+        '[Path]\nPathExistsGlob=/home/*/watch/launcher.sock\n',
+        /external systemd policy watches a protected path/,
+        null,
+      ],
+      [
         'external-protected.socket',
         '[Socket]\nListenStream=/run/webex-codex-launcher/launcher.sock\n',
         /external systemd policy creates a protected socket path/,
@@ -4813,6 +4824,70 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy overrides a trusted vendor execution environment/,
     );
     assert.equal(commandCalls, 0);
+
+    for (const {
+      aliasName,
+      dropInName,
+      directive,
+      vendorName,
+    } of [
+      {
+        aliasName: 'vendor-alias.service',
+        dropInName: 'vendor-alias.service',
+        directive: 'EnvironmentFile=/opt/rogue/environment',
+        vendorName: 'vendor-target.service',
+      },
+      {
+        aliasName: 'vendor-template-alias@.service',
+        dropInName: 'vendor-template-alias@instance.service',
+        directive: 'ExecSearchPath=/opt/rogue/bin',
+        vendorName: 'vendor-target@.service',
+      },
+    ]) {
+      const alias = `/etc/systemd/system/${aliasName}`;
+      const aliasDropInDirectory = `/etc/systemd/system/${dropInName}.d`;
+      const aliasDropIn = path.join(aliasDropInDirectory, '50-override.conf');
+      const vendorTarget = `/usr/lib/systemd/system/${vendorName}`;
+      commandCalls = 0;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => {
+            commandCalls += 1;
+            return { stdout: '', stderr: '', code: 0 };
+          },
+          systemdUnitPathFs(
+            new Map([
+              ['/etc/systemd/system', [
+                {
+                  name: aliasName,
+                  isFile: () => false,
+                  isDirectory: () => false,
+                  isSymbolicLink: () => true,
+                },
+                { name: `${dropInName}.d` },
+              ]],
+              [aliasDropInDirectory, [{ name: '50-override.conf' }]],
+            ]),
+            {
+              filesByPath: new Map([
+                [
+                  vendorTarget,
+                  Buffer.from('[Service]\nExecStart=${HELPER}\n'),
+                ],
+                [
+                  aliasDropIn,
+                  Buffer.from(`[Service]\n${directive}\n`),
+                ],
+              ]),
+              symlinksByPath: new Map([[alias, vendorTarget]]),
+            },
+          ),
+        ),
+        /external systemd policy overrides a trusted vendor execution environment/,
+      );
+      assert.equal(commandCalls, 0, aliasName);
+    }
 
     const linkedPathUnit = '/etc/systemd/system/external-linked-path.path';
     commandCalls = 0;

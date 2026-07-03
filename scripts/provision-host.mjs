@@ -1312,8 +1312,8 @@ export async function executeIdentityRecovery({
   fsApi = fs,
   openExecutable = (file) => openTrustedExecutable(file, fsApi),
   processApi = process,
-  resolveProvisionLock = () => assertProvisionLockHeld({
-    allowInterruptedMigration: false,
+  resolveProvisionLock = (options) => assertProvisionLockHeld({
+    ...options,
     fsApi,
     processApi,
   }),
@@ -1327,7 +1327,9 @@ export async function executeIdentityRecovery({
   )) {
     throw new Error('identity recovery requires the locked private host provisioner');
   }
-  const provisionLock = await resolveProvisionLock();
+  const provisionLock = await resolveProvisionLock({
+    allowInterruptedMigration: true,
+  });
   if (!Number.isInteger(provisionLock?.fd) || provisionLock.fd < 3) {
     throw new Error('identity recovery requires the inherited host provision lock descriptor');
   }
@@ -4887,17 +4889,63 @@ async function systemdDropInCanOverrideTrustedVendorUnit(
       );
     }
     for (const candidate of candidates) {
-      for (const directory of ['/usr/lib/systemd/system', '/lib/systemd/system']) {
-        try {
-          const stat = await fsApi.lstat(path.join(directory, candidate));
-          if (stat.isFile() || stat.isSymbolicLink()) return true;
-        } catch (error) {
-          if (error?.code !== 'ENOENT') throw error;
-        }
-      }
+      if (await systemdUnitNameResolvesToTrustedVendorPath(candidate, fsApi)) return true;
     }
   }
   return false;
+}
+
+async function systemdUnitNameResolvesToTrustedVendorPath(unitName, fsApi) {
+  const unitPaths = await reviewedSystemdManagerUnitPaths(fsApi);
+  for (const directory of unitPaths) {
+    const candidate = path.join(directory, unitName);
+    let stat;
+    try {
+      stat = await fsApi.lstat(candidate);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      return systemdAliasResolvesToTrustedVendorPath(candidate, fsApi);
+    }
+    if (stat.isFile()) {
+      return ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(directory);
+    }
+  }
+  return false;
+}
+
+async function systemdAliasResolvesToTrustedVendorPath(candidate, fsApi) {
+  const visited = new Set();
+  let current = candidate;
+  while (true) {
+    if (visited.has(current) || visited.size >= 32) {
+      throw new Error(`systemd policy symlink chain is invalid: ${candidate}`);
+    }
+    visited.add(current);
+    let before;
+    try {
+      before = await fsApi.lstat(current);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!before.isSymbolicLink()) {
+      return before.isFile()
+        && ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(
+          path.dirname(current),
+        )
+        && SYSTEMD_UNIT_NAME_PATTERN.test(path.basename(current));
+    }
+    const target = await fsApi.readlink(current);
+    const after = await fsApi.lstat(current);
+    if (!after.isSymbolicLink() || !sameFileIdentity(before, after)) {
+      throw new Error(`systemd policy symlink changed while reading: ${current}`);
+    }
+    assertSystemdPolicySymlinkTraversalSafe(current, target);
+    current = path.resolve(path.dirname(current), target);
+  }
 }
 
 async function assertSystemdPathsResolveOutsideProtectedSurface(
@@ -5298,6 +5346,10 @@ function systemdPolicyDirectiveUsesProtectedPath(value, directives) {
   if (!directives.has(directive)) return false;
   return parseSystemdFields(value.slice(separator + 1)).some((field) => {
     if (hasUnresolvedSystemdSpecifier(field)) return true;
+    if (
+      directive === 'PathExistsGlob'
+      && ['*', '?', '[', ']'].some((marker) => field.includes(marker))
+    ) return true;
     if (!path.posix.isAbsolute(field)) return false;
     return pathFieldTouchesProtected(field, false, protectedSystemdMountPaths());
   });

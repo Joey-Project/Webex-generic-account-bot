@@ -389,14 +389,17 @@ auditing. Existing path-component symlinks in `Where=` and `What=` are resolved
 stably before the comparison, and current mount aliases are derived from both
 mountinfo `root=` and `mountPoint=` rather than only the visible target.
 External `.path` triggers and filesystem-backed `.socket` listeners, FIFOs, or
-symlinks cannot overlap protected paths, including through globs, unit
-specifiers, or existing path-component symlinks. Non-vendor policy cannot
+symlinks cannot overlap protected paths through unit specifiers or existing
+path-component symlinks. Wildcard-bearing `PathExistsGlob=` in non-vendor-path
+policy fails closed because later path components cannot be proven free of
+future user-controlled symlinks. Non-vendor policy cannot
 invoke `systemd-run`; transient UID/GID, unit, path, socket, timer, and arbitrary
 property controls are therefore outside the accepted static policy surface.
 Non-vendor `Exec*` environment expansion is rejected instead of attempting
 incomplete cross-directive data-flow analysis, including unescaped unit
 specifiers that can generate a `$` marker only after template instantiation.
-External drop-ins targeting a vendor unit also cannot alter its execution
+External drop-ins targeting a vendor unit, including through ordinary or
+template aliases, also cannot alter its execution
 environment, environment files, inherited variables, or executable search
 path, so a trusted vendor command cannot be redirected by merged policy.
 Every existing sysusers and
@@ -459,6 +462,9 @@ safe mode narrowed to any value by the caller's umask before the first metadata
 update, or in the unique safe group-owned mode left when tmpfiles completes
 `chown` before `chmod`. A rerun first converges that directory to the exact
 bootstrap or deployed mode.
+Transaction-authorised identity recovery may retain the safe bootstrap metadata
+while it holds the same flock open-file description; strict final convergence
+still requires the deployed group ownership after tmpfiles runs.
 Apply must then prove
 that tmpfiles converged the same held inode to deployed metadata. Apply streams
 a bounded number of directory entries and removes only bounded, exact-name,
