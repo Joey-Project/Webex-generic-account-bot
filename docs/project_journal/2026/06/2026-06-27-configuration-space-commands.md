@@ -112,8 +112,11 @@ superseded_by:
 - Depend on the bot repository's base-service contract and guarded host
   provisioner so the reviewed config can be activated reproducibly rather than
   against the current tmux-only staging layout.
-- Pin the dedicated Configuration Space and administrator in host policy, then
-  update the config repository to all-ephemeral execution with only `status`
+- Pin the dedicated `miku bot configuration` Space
+  (`Y2lzY29zcGFyazovL3VzL1JPT00vZWI2YTA1MjAtNzY5My0xMWYxLThlYTUtM2YzYjFjMjYzYzA3`)
+  and `hoteng@cisco.com` in bot host policy. The companion config change and
+  deployment remain separate gates.
+- Update the config repository to all-ephemeral execution with only `status`
   and `pull` enabled.
 - Activate the runner and worker socket permission in one reviewed deployment,
   then verify durable enqueue, duplicate-event convergence, status, and

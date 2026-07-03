@@ -53,6 +53,9 @@ const CONTAINED_PROCESS_TREE_INSPECTOR = Object.freeze({
   },
 });
 
+const CONFIG_COMMANDS_ROOM_ID =
+  'Y2lzY29zcGFyazovL3VzL1JPT00vZWI2YTA1MjAtNzY5My0xMWYxLThlYTUtM2YzYjFjMjYzYzA3';
+
 function runContainedCommand(commandSpec, env, signal = null) {
   return runCommand(commandSpec, env, signal, CONTAINED_PROCESS_TREE_INSPECTOR);
 }
@@ -1072,7 +1075,7 @@ describe('trusted config policy', () => {
     assert.match(result.stderr, /room_id is not allowlisted by host policy: attacker-controlled-room/);
   });
 
-  it('keeps config commands disabled until host policy pins the admin Space', async () => {
+  it('pins config commands to the reviewed admin Space', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'static-config-policy-test-'));
     const config = path.join(temp, 'config-commands.toml');
     const current = await staticPolicyRenderedConfig(
@@ -1085,7 +1088,7 @@ describe('trusted config policy', () => {
     assert.notEqual(firstRoom, -1);
     const configCommands = [
       '[config_commands]',
-      'room_id = "unreviewed-admin-room"',
+      `room_id = "${CONFIG_COMMANDS_ROOM_ID}"`,
       'allowed_person_ids = []',
       'allowed_person_emails = ["hoteng@cisco.com"]',
       'allowed_commands = ["status", "pull"]',
@@ -1097,15 +1100,20 @@ describe('trusted config policy', () => {
       'utf8',
     );
 
-    const result = runStaticConfigPolicy(config);
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stderr,
-      /config_commands are disabled until host policy pins the reviewed admin Space/,
+    const accepted = runStaticConfigPolicy(config);
+    assert.equal(accepted.status, 0, accepted.stderr);
+
+    await fs.writeFile(
+      config,
+      (await fs.readFile(config, 'utf8')).replace(
+        CONFIG_COMMANDS_ROOM_ID,
+        'unreviewed-admin-room',
+      ),
+      'utf8',
     );
-    assert.doesNotMatch(result.stderr, /config_commands\.allowed_/);
-    assert.doesNotMatch(result.stderr, /config_commands require codex\.isolation/);
-    assert.doesNotMatch(result.stderr, /not an allowed production config field/);
+    const rejected = runStaticConfigPolicy(config);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /config_commands\.room_id must be/);
     await fs.rm(temp, { recursive: true, force: true });
   });
 
@@ -1122,7 +1130,7 @@ describe('trusted config policy', () => {
     assert.notEqual(firstRoom, -1);
     const configCommands = [
       '[config_commands]',
-      'room_id = "unreviewed-admin-room"',
+      `room_id = "${CONFIG_COMMANDS_ROOM_ID}"`,
       'allowed_person_ids = []',
       'allowed_person_emails = ["hoteng@cisco.com"]',
       'allowed_commands = ["status", "pull"]',
@@ -1167,7 +1175,7 @@ describe('trusted config policy', () => {
     assert.notEqual(firstRoom, -1);
     const configCommands = [
       '[config_commands]',
-      'room_id = "unreviewed-admin-room"',
+      `room_id = "${CONFIG_COMMANDS_ROOM_ID}"`,
       'allowed_person_ids = ["attacker-person"]',
       'allowed_person_emails = ["attacker@example.com"]',
       'allowed_commands = ["status", "sync"]',

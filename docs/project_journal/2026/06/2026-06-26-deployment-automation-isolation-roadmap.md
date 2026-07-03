@@ -153,9 +153,9 @@ superseded_by:
   only for a fully ephemeral effective runner configuration, while `reload`
   and `sync` remain invalid. Transient Codex receives only the input group and
   continues to hide and deny `/run/webex-config-pull`; the activation canary
-  probes the real worker socket. Host policy recognises the command schema but
-  keeps the admin Space pin disabled. PR 2b2b2 owns the exact room pin,
-  companion config change, deployment, and Webex E2E.
+  probes the real worker socket. PR 2b2b2 pins the dedicated Configuration
+  Space and administrator in host policy; its companion config change,
+  deployment, and Webex E2E remain separate gates.
 - Host discovery after PR 2b2b1 found no installed bot, activation, or worker
   units and no repository-owned base bot service. PR 4d1 therefore adds the
   stable unprivileged bot identity, fixed service, and root-managed versus
@@ -433,10 +433,10 @@ superseded_by:
   production admin-room pin disabled.
 
 #### PR 2b2b2: Reviewed Pull Enablement
-- Pin the exact admin Space and sender, update the reviewed config repository,
-  and enable `/config pull` only after socket authorization, queue durability,
-  duplicate-event, crash-recovery, fixed-argv, ownership, symlink, and
-  isolated-child denial tests pass.
+- Pin the exact admin Space and sender in bot host policy, then update the
+  reviewed config repository and enable `/config pull` only after socket
+  authorization, queue durability, duplicate-event, crash-recovery, fixed-argv,
+  ownership, symlink, and isolated-child denial tests pass.
 
 #### PR 2b3: Recoverable Activation
 - Add activation of an already staged immutable revision without network fetch,

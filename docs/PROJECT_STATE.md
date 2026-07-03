@@ -87,8 +87,10 @@
   Ordinary apply requires current-user policy before permission activation and
   ephemeral-only policy afterwards; only explicit activation may cross modes.
   The fixed bot drop-in grants the launch and config-worker socket groups plus
-  pending-input access. Production config commands remain disabled until the
-  reviewed admin Space is pinned, and `reload` and `sync` remain invalid.
+  pending-input access. Host policy pins the dedicated Configuration Space,
+  `hoteng@cisco.com`, and only `status`/`pull`; production config does not enable
+  them until the companion all-ephemeral config PR. `reload` and `sync` remain
+  invalid.
   Production stays on `current-user` until the deployment host completes the
   real-reboot challenge and activates a matching reviewed config.
 - Host deployment discovery found that the repository had privileged launcher,
@@ -197,7 +199,7 @@
   identity convergence,
   and stale-cache outer preflight remains read-only, explicit
   sysusers/tmpfiles application, and post-reload verification. Real host apply
-  remains explicit before Configuration Space pinning and activation.
+  remains explicit before runner activation and companion config enablement.
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`

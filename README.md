@@ -81,10 +81,11 @@ fail closed. This deployment journal is separate
 from the worker's private queue and staging state. A strict, bounded mode
 `0644` public worker status file projects only the latest pull action state and
 prepared revision, without exposing private queue records or failure output.
-The current production host policy rejects the entire table until a companion
-config PR pins the exact admin Space and sender allowlist. The example above is
-therefore for local validation and a future reviewed deployment, not yet for
-`scripts/deploy-config.mjs --apply`.
+The production host policy pins the dedicated `miku bot configuration` Space,
+`hoteng@cisco.com`, and the `status`/`pull` command set. The production config
+does not include this table until its companion config PR moves every effective
+runner to `ephemeral-linux-user`; the example above is therefore not yet active
+on the deployment host.
 
 For staging production Space behaviour, a room policy can set
 `output_room_id`, `forward_source_message = true`, and

@@ -160,7 +160,9 @@ ALLOWED_CONFIG_COMMAND_KEYS = {
     "allowed_person_emails",
     "allowed_commands",
 }
-CONFIG_COMMANDS_ROOM_ID: str | None = None
+CONFIG_COMMANDS_ROOM_ID = (
+    "Y2lzY29zcGFyazovL3VzL1JPT00vZWI2YTA1MjAtNzY5My0xMWYxLThlYTUtM2YzYjFjMjYzYzA3"
+)
 CONFIG_COMMANDS_ALLOWED_PERSON_IDS: list[str] = []
 CONFIG_COMMANDS_ALLOWED_PERSON_EMAILS = ["hoteng@cisco.com"]
 CONFIG_COMMANDS_ALLOWED_COMMANDS = ["status", "pull"]
