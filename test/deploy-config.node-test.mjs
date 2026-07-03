@@ -1103,9 +1103,24 @@ describe('trusted config policy', () => {
     const accepted = runStaticConfigPolicy(config);
     assert.equal(accepted.status, 0, accepted.stderr);
 
+    const acceptedConfig = await fs.readFile(config, 'utf8');
     await fs.writeFile(
       config,
-      (await fs.readFile(config, 'utf8')).replace(
+      acceptedConfig
+        .replace('mode = "ephemeral-linux-user"', 'mode = "current-user"')
+        .replace('trusted_prompt_authors = false', 'trusted_prompt_authors = true'),
+      'utf8',
+    );
+    const currentUserRejected = runStaticConfigPolicy(config);
+    assert.notEqual(currentUserRejected.status, 0);
+    assert.match(
+      currentUserRejected.stderr,
+      /config_commands require codex\.isolation\.mode = 'ephemeral-linux-user'/,
+    );
+
+    await fs.writeFile(
+      config,
+      acceptedConfig.replace(
         CONFIG_COMMANDS_ROOM_ID,
         'unreviewed-admin-room',
       ),
