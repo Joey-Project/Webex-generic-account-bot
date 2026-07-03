@@ -360,6 +360,46 @@ const SYSTEMD_GLOBAL_CONTROL_EXECUTABLES = new Set([
   'shutdown',
   'telinit',
 ]);
+const SYSTEMD_GLOBAL_CONTROL_UNITS = Object.freeze([
+  'ctrl-alt-del.target',
+  'exit.target',
+  'halt.target',
+  'hibernate.target',
+  'hybrid-sleep.target',
+  'kexec.target',
+  'poweroff.target',
+  'reboot.target',
+  'runlevel0.target',
+  'runlevel6.target',
+  'shutdown.target',
+  'sleep.target',
+  'soft-reboot.target',
+  'suspend-then-hibernate.target',
+  'suspend.target',
+  'systemd-exit.service',
+  'systemd-halt.service',
+  'systemd-hibernate.service',
+  'systemd-hybrid-sleep.service',
+  'systemd-kexec.service',
+  'systemd-poweroff.service',
+  'systemd-reboot.service',
+  'systemd-soft-reboot.service',
+  'systemd-suspend-then-hibernate.service',
+  'systemd-suspend.service',
+]);
+const SYSTEMD_GLOBAL_ACTIVATION_DIRECTIVES = new Set([
+  'Alias',
+  'Also',
+  'BindsTo',
+  'OnFailure',
+  'OnSuccess',
+  'Requires',
+  'Service',
+  'Sockets',
+  'Unit',
+  'Upholds',
+  'Wants',
+]);
 const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
   'add-requires',
   'add-wants',
@@ -385,6 +425,10 @@ const SYSTEMCTL_JOB_MODE_OPTION_PREFIXES = Object.freeze(Array.from(
 const ENV_SPLIT_STRING_OPTION_PREFIXES = Object.freeze(Array.from(
   { length: '--split-string'.length - 2 },
   (_, index) => '--split-string'.slice(0, index + 3),
+));
+const ENV_ARGV0_OPTION_PREFIXES = Object.freeze(Array.from(
+  { length: '--argv0'.length - 2 },
+  (_, index) => '--argv0'.slice(0, index + 3),
 ));
 const SYSTEMD_IMPLICIT_SERVICE_ACTIVATOR_SUFFIXES = Object.freeze([
   '.path',
@@ -4892,6 +4936,12 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       throw new Error(`external systemd policy injects a host policy credential: ${source}`);
     }
     if (
+      systemdPolicyReferencesGlobalControlUnit(candidate)
+      && !isExpectedVendorGlobalControlUnitSource(source)
+    ) {
+      throw new Error(`external systemd policy references a host lifecycle unit: ${source}`);
+    }
+    if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
       || LAUNCHER_REFERENCE_PATTERN.test(candidate)
       || unresolvedSpecifierCouldReferenceManagedUnit(candidate)
@@ -4933,13 +4983,23 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
   if (command === null) return false;
-  if (command.names.some((name) => (
+  if (command.invocationNames.some((name) => (
     SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
     || systemdSpecifierFieldCouldMatch(
       name,
       [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
     )
   ))) return true;
+  if (
+    systemdExecInvokes(command, 'systemctl')
+    && command.argv0Names.some((name) => (
+      SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
+      || systemdSpecifierFieldCouldMatch(
+        name,
+        [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+      )
+    ))
+  ) return true;
   if (!systemdExecInvokes(command, 'systemctl')) return false;
   const unitFileMutation = command.tokens.some((token) => (
     SYSTEMCTL_UNIT_FILE_MUTATION_VERBS.has(token)
@@ -4954,6 +5014,7 @@ function systemdPolicyInvokesManagedUnitControl(value) {
   ));
   return (
       command.tokens.some(systemctlUnitFieldCouldMatch)
+      || command.tokens.some(globalControlUnitFieldCouldMatch)
       || (unitFileMutation && externalUnitPath)
       || command.tokens.some((token) => (
         SYSTEMCTL_UNSCOPED_MUTATION_VERBS.has(token)
@@ -5029,17 +5090,19 @@ function systemdPolicyReinterpretsCommandArguments(value) {
   const command = parseSystemdExecCommand(value);
   return command !== null
     && systemdExecInvokes(command, 'env')
-    && command.tokens.some((token) => {
-      if (/^-[^-]*S/.test(token)) return true;
+    && command.envOptions.some((token) => {
+      if (/^-[^-]*[Sa]/.test(token)) return true;
       const longOption = token.slice(0, token.indexOf('=') < 0
         ? token.length
         : token.indexOf('='));
       return ENV_SPLIT_STRING_OPTION_PREFIXES.includes(longOption)
+        || ENV_ARGV0_OPTION_PREFIXES.includes(longOption)
         || systemdSpecifierFieldCouldMatch(
           longOption,
-          ENV_SPLIT_STRING_OPTION_PREFIXES,
+          [...ENV_SPLIT_STRING_OPTION_PREFIXES, ...ENV_ARGV0_OPTION_PREFIXES],
         )
-        || systemdSpecifierCouldEnableEnvSplitShortOption(token);
+        || systemdSpecifierCouldEnableEnvShortOption(token, 'S')
+        || systemdSpecifierCouldEnableEnvShortOption(token, 'a');
     });
 }
 
@@ -5218,14 +5281,125 @@ function parseSystemdExecCommand(value) {
   const fields = parseSystemdFields(value.slice(separator + 1));
   const tokens = fields.flatMap((field) => field.split(/[;\s]+/).filter(Boolean));
   const names = tokens.map((token) => path.basename(token.replace(/^[-@:+!|]+/, '')));
-  return Object.freeze({ fields, tokens, names });
+  const invocations = systemdExecInvocationMetadata(fields);
+  return Object.freeze({
+    fields,
+    tokens,
+    names,
+    invocationNames: invocations.names,
+    argv0Names: invocations.argv0Names,
+    envOptions: invocations.envOptions,
+  });
 }
 
 function systemdExecInvokes(command, executable) {
-  return command.names.some((name) => (
+  return command.invocationNames.some((name) => (
     name === executable
     || systemdSpecifierFieldCouldMatch(name, [executable])
   ));
+}
+
+function systemdExecInvocationMetadata(fields) {
+  const names = [];
+  const argv0Names = [];
+  const envOptions = [];
+  for (const segment of systemdExecCommandSegments(fields)) {
+    let offset = 0;
+    let direct = true;
+    while (offset < segment.length) {
+      const rawExecutable = segment[offset];
+      const prefixes = direct ? rawExecutable.match(/^[-@:+!|]+/)?.[0] ?? '' : '';
+      const executable = direct
+        ? rawExecutable.replace(/^[-@:+!|]+/, '')
+        : rawExecutable;
+      const name = path.basename(executable);
+      names.push(name);
+      offset += 1;
+      if (direct && prefixes.includes('@') && offset < segment.length) {
+        argv0Names.push(path.basename(segment[offset]));
+        offset += 1;
+      }
+      direct = false;
+      if (name !== 'env') break;
+      const env = parseSystemdEnvInvocation(segment, offset);
+      envOptions.push(...env.options);
+      if (env.commandOffset === null) break;
+      offset = env.commandOffset;
+    }
+  }
+  return Object.freeze({
+    names: Object.freeze(names),
+    argv0Names: Object.freeze(argv0Names),
+    envOptions: Object.freeze(envOptions),
+  });
+}
+
+function systemdExecCommandSegments(fields) {
+  const segments = [[]];
+  for (const field of fields) {
+    if (field === ';') {
+      if (segments.at(-1).length !== 0) segments.push([]);
+      continue;
+    }
+    segments.at(-1).push(field);
+  }
+  return segments.filter((segment) => segment.length !== 0);
+}
+
+function parseSystemdEnvInvocation(segment, start) {
+  const options = [];
+  for (let offset = start; offset < segment.length; offset += 1) {
+    const field = segment[offset];
+    if (field === '--') {
+      return Object.freeze({
+        options: Object.freeze(options),
+        commandOffset: offset + 1 < segment.length ? offset + 1 : null,
+      });
+    }
+    if (field === '-' || field.startsWith('-')) {
+      options.push(field);
+      if (envOptionConsumesFollowingField(field)) offset += 1;
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(field)) continue;
+    return Object.freeze({
+      options: Object.freeze(options),
+      commandOffset: offset,
+    });
+  }
+  return Object.freeze({ options: Object.freeze(options), commandOffset: null });
+}
+
+function envOptionConsumesFollowingField(field) {
+  if (field.startsWith('--')) {
+    if (field.includes('=')) return false;
+    return [
+      '--argv0',
+      '--chdir',
+      '--split-string',
+      '--unset',
+    ].some((option) => option.startsWith(field));
+  }
+  const options = field.slice(1);
+  for (const [offset, option] of [...options].entries()) {
+    if (!'aCSu'.includes(option)) continue;
+    return offset === options.length - 1;
+  }
+  return false;
+}
+
+function systemdPolicyReferencesGlobalControlUnit(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  if (!SYSTEMD_GLOBAL_ACTIVATION_DIRECTIVES.has(directive)) return false;
+  return parseSystemdFields(value.slice(separator + 1))
+    .some(globalControlUnitFieldCouldMatch);
+}
+
+function isExpectedVendorGlobalControlUnitSource(source) {
+  return ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(path.dirname(source))
+    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(source));
 }
 
 function shellExecutableName(name) {
@@ -5253,6 +5427,19 @@ function systemctlUnitFieldCouldMatch(field) {
           ),
         );
     });
+}
+
+function globalControlUnitFieldCouldMatch(field) {
+  const basename = path.posix.basename(field);
+  return [...new Set([field, basename])].some((candidate) => {
+    const tokens = systemdUnitPatternTokens(candidate);
+    const pattern = tokens.map((token) => {
+      if (token.literal !== undefined) return escapeRegExp(token.literal);
+      return token.repeat ? '[^\\s/]*' : '[^\\s/]';
+    }).join('');
+    const reference = new RegExp(`^${pattern}$`);
+    return SYSTEMD_GLOBAL_CONTROL_UNITS.some((unit) => reference.test(unit));
+  });
 }
 
 function systemdUnitPatternTokens(field) {
@@ -5509,13 +5696,13 @@ function systemdSpecifierPatternTokens(field) {
   return Object.freeze({ hasUnresolvedSpecifier, tokens: Object.freeze(tokens) });
 }
 
-function systemdSpecifierCouldEnableEnvSplitShortOption(field) {
+function systemdSpecifierCouldEnableEnvShortOption(field, option) {
   const { hasUnresolvedSpecifier, tokens } = systemdSpecifierPatternTokens(field);
   if (!hasUnresolvedSpecifier) return false;
   return systemdTokenPatternsIntersect(tokens, [
     { literal: '-', repeat: false },
     { characterClass: 'env-short-option', repeat: true },
-    { literal: 'S', repeat: false },
+    { literal: option, repeat: false },
     { characterClass: 'unit', repeat: true },
   ]);
 }

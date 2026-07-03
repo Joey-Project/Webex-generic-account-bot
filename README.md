@@ -344,10 +344,18 @@ out-of-path file can hide a managed `Alias=`; unresolved specifiers are treated
 as path-capable. Same-basename `.timer`, `.path`, and `.socket` units and
 systemctl targets are mapped to their implicit `.service` activation target.
 Unscoped mutating commands such
-as `preset-all`, manager reloads, `--marked` operations, and opaque
+as `preset-all`, manager reloads, `isolate`, `--job-mode`, `--marked`
+operations, and opaque
 `edit --stdin` policy replacement are also rejected,
 including through linked helper units, unit-name specifier expansion, or
 unresolved template-instance executable and argument specifiers.
+The `halt`, `init`, `poweroff`, `reboot`, `shutdown`, and `telinit`
+compatibility entrypoints are rejected only in executable or effective argv0
+positions, including through `env` wrapping and systemd's `@` argv0 override;
+ordinary command arguments containing those words and the read-only
+`runlevel` command remain valid. External policy also cannot activate terminal
+host lifecycle targets or services, including runlevel aliases, while the
+package-owned lifecycle unit graph remains auditable.
 Globbed same-basename activator names are matched against their implicit
 service targets, and each managed unit must report an empty systemd `Job=`
 property as well as an inactive state.
@@ -358,8 +366,9 @@ tools and managed-unit control remain forbidden even in those vendor sources.
 The systemd `|` shell prefix and unresolved full executable-path specifiers on
 the first or any semicolon-delimited later command, plus standard shell-family
 executable names, are all treated as shell execution.
-`env -S`/`--split-string` argv reinterpretation, including every accepted GNU
-long-option abbreviation and specifier-generated option, is rejected. `systemctl` may not set protected
+`env -S`/`--split-string` and `-a`/`--argv0` argv reinterpretation,
+including every accepted GNU long-option abbreviation, combined short option,
+and specifier-generated option, is rejected. `systemctl` may not set protected
 plaintext or encrypted system credentials through inline, path,
 option-interleaved, or specifier-expanded arguments; unresolved credential-name
 arguments fail closed. Non-vendor units also cannot claim protected

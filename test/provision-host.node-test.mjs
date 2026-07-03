@@ -2967,7 +2967,7 @@ describe('guarded host provisioner execution', () => {
             { filesByPath: new Map([[target, Buffer.from(policy)]]) },
           ),
         ),
-        /external systemd policy references a managed unit/,
+        /external systemd policy references a (?:managed|host lifecycle) unit/,
       );
     }
 
@@ -3478,6 +3478,8 @@ describe('guarded host provisioner execution', () => {
       'systemctl --job-mode=isolate start rescue.target',
       'systemctl --marked reload-or-restart',
       'systemctl --mark reload-or-restart',
+      'systemctl start runlevel6.target',
+      'systemctl start systemd-reboot.service',
       'halt',
       'init 1',
       'poweroff',
@@ -3530,6 +3532,97 @@ describe('guarded host provisioner execution', () => {
       /external systemd policy references a managed unit/,
     );
 
+    const compatibilityArgv0Unit =
+      '/etc/systemd/system/external-argv0.service';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: 'external-argv0.service',
+          }]]]),
+          {
+            filesByPath: new Map([[
+              compatibilityArgv0Unit,
+              Buffer.from(
+                '[Service]\nExecStart=@/usr/bin/systemctl shutdown -r now\n',
+              ),
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a managed unit/,
+    );
+
+    for (const [name, policy] of [
+      [
+        'external-lifecycle.service',
+        '[Unit]\nOnFailure=reboot.target\n',
+      ],
+      [
+        'external@reboot.service',
+        '[Unit]\nOnFailure=%i.target\n',
+      ],
+    ]) {
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
+                Buffer.from(policy),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd policy references a host lifecycle unit/,
+      );
+    }
+
+    for (const [name, policy] of [
+      [
+        'external-benign-global-words.service',
+        [
+          '[Service]',
+          'ExecStart=/usr/bin/systemd-update-utmp reboot',
+          'ExecStart=/usr/bin/systemd-pcrextend --graceful shutdown',
+          'ExecStart=/usr/bin/cloud-init init',
+          'ExecStart=/usr/sbin/runlevel',
+          '',
+        ].join('\n'),
+      ],
+      [
+        'reboot.target',
+        '[Unit]\nRequires=systemd-reboot.service\n',
+      ],
+    ]) {
+      const directory = '/usr/lib/systemd/system';
+      const target = `${directory}/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => {
+            throw new Error(`accepted policy reached systemctl: ${name}`);
+          },
+          systemdUnitPathFs(
+            new Map([[directory, [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
+                Buffer.from(policy),
+              ]]),
+            },
+          ),
+        ),
+        new RegExp(`accepted policy reached systemctl: ${name.replace('.', '\\.')}`),
+      );
+    }
+
     const markedSpecifierUnit = '/etc/systemd/system/external@k.service';
     await assert.rejects(
       readSystemUnitStates(
@@ -3557,6 +3650,11 @@ describe('guarded host provisioner execution', () => {
       '"--s=/usr/bin/echo safe"',
       '"--spl=/usr/bin/echo safe"',
       '"-iS /usr/bin/echo safe"',
+      '"--argv0=shutdown" /usr/bin/systemctl -r now',
+      '"--arg=shutdown" /usr/bin/systemctl -r now',
+      '"-a" shutdown /usr/bin/systemctl -r now',
+      '"-ia" shutdown /usr/bin/systemctl -r now',
+      '"-ashutdown" /usr/bin/systemctl -r now',
     ]) {
       await assert.rejects(
         readSystemUnitStates(
@@ -3579,6 +3677,8 @@ describe('guarded host provisioner execution', () => {
     for (const [name, option] of [
       ['external@it-str.service', '"--spl%iing=/usr/bin/echo safe"'],
       ['external@S.service', '"-i%i/usr/bin/echo safe"'],
+      ['external@0.service', '"--argv%i=shutdown" /usr/bin/systemctl -r now'],
+      ['external@a.service', '"-i%i" shutdown /usr/bin/systemctl -r now'],
     ]) {
       const target = `/etc/systemd/system/${name}`;
       await assert.rejects(
@@ -3975,7 +4075,7 @@ describe('guarded host provisioner execution', () => {
           },
         ),
       ),
-      /external systemd policy references a managed unit/,
+      /external systemd policy references a (?:managed|host lifecycle) unit/,
     );
 
     for (const [name, target, contents, expected] of [
