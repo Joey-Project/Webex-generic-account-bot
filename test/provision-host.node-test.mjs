@@ -3320,7 +3320,7 @@ describe('guarded host provisioner execution', () => {
             },
           ),
         ),
-        /external systemd policy (?:references a managed unit|uses environment expansion)/,
+        /external systemd (?:execution policy is not trusted|policy (?:references a managed unit|uses environment expansion))/,
       );
     }
 
@@ -3584,6 +3584,88 @@ describe('guarded host provisioner execution', () => {
       );
     }
 
+    const externalLifecycleAlias = '/etc/systemd/system/escape.target';
+    const vendorLifecycleTarget = '/usr/lib/systemd/system/reboot.target';
+    await assert.rejects(
+      readSystemUnitStates(
+        MANAGED_UNITS,
+        async () => ({ stdout: '', stderr: '', code: 0 }),
+        systemdUnitPathFs(
+          new Map([['/etc/systemd/system', [{
+            name: 'escape.target',
+            isFile: () => false,
+            isDirectory: () => false,
+            isSymbolicLink: () => true,
+          }]]]),
+          {
+            filesByPath: new Map([[
+              vendorLifecycleTarget,
+              Buffer.from('[Unit]\nRequires=systemd-reboot.service\n'),
+            ]]),
+            symlinksByPath: new Map([[
+              externalLifecycleAlias,
+              vendorLifecycleTarget,
+            ]]),
+          },
+        ),
+      ),
+      /external systemd policy references a host lifecycle unit/,
+    );
+
+    for (const [index, policy] of [
+      'FailureAction=reboot-immediate',
+      'StartLimitAction=poweroff',
+      'JobTimeoutAction=reboot',
+      'OnFailureJobMode=isolate',
+      'OnSuccessJobMode=flush',
+    ].entries()) {
+      const name = `external-lifecycle-action-${index}.service`;
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
+                Buffer.from(`[Unit]\n${policy}\n`),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd policy requests a host lifecycle action/,
+      );
+    }
+
+    for (const [index, command] of [
+      '/usr/bin/echo benign',
+      '/usr/bin/nice /usr/bin/reboot',
+      '/usr/bin/timeout 5 /usr/bin/reboot',
+      '/usr/bin/flock /tmp/host.lock /usr/bin/reboot',
+      '/usr/bin/env FLAG%i=1 /usr/bin/reboot',
+    ].entries()) {
+      const name = `external-execution-${index}@worker.service`;
+      const target = `/etc/systemd/system/${name}`;
+      await assert.rejects(
+        readSystemUnitStates(
+          MANAGED_UNITS,
+          async () => ({ stdout: '', stderr: '', code: 0 }),
+          systemdUnitPathFs(
+            new Map([['/etc/systemd/system', [{ name }]]]),
+            {
+              filesByPath: new Map([[
+                target,
+                Buffer.from(`[Service]\nExecStart=${command}\n`),
+              ]]),
+            },
+          ),
+        ),
+        /external systemd (?:execution policy is not trusted|policy references a managed unit)/,
+      );
+    }
+
     for (const [name, policy] of [
       [
         'external-benign-global-words.service',
@@ -3593,12 +3675,20 @@ describe('guarded host provisioner execution', () => {
           'ExecStart=/usr/bin/systemd-pcrextend --graceful shutdown',
           'ExecStart=/usr/bin/cloud-init init',
           'ExecStart=/usr/sbin/runlevel',
+          'ExecStart=/usr/bin/env -C/var/lib /usr/bin/true',
+          'ExecStart=@/usr/bin/env shutdown /usr/bin/systemctl show',
           '',
         ].join('\n'),
       ],
       [
         'reboot.target',
-        '[Unit]\nRequires=systemd-reboot.service\n',
+        [
+          '[Unit]',
+          'Requires=systemd-reboot.service',
+          'FailureAction=none',
+          'OnFailureJobMode=replace',
+          '',
+        ].join('\n'),
       ],
     ]) {
       const directory = '/usr/lib/systemd/system';

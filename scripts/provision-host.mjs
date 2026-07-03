@@ -400,6 +400,17 @@ const SYSTEMD_GLOBAL_ACTIVATION_DIRECTIVES = new Set([
   'Upholds',
   'Wants',
 ]);
+const SYSTEMD_GLOBAL_ACTION_DIRECTIVES = new Set([
+  'EmergencyAction',
+  'FailureAction',
+  'JobTimeoutAction',
+  'StartLimitAction',
+  'SuccessAction',
+]);
+const SYSTEMD_GLOBAL_JOB_MODE_DIRECTIVES = new Set([
+  'OnFailureJobMode',
+  'OnSuccessJobMode',
+]);
 const SYSTEMCTL_UNIT_FILE_MUTATION_VERBS = new Set([
   'add-requires',
   'add-wants',
@@ -4937,9 +4948,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
     }
     if (
       systemdPolicyReferencesGlobalControlUnit(candidate)
-      && !isExpectedVendorGlobalControlUnitSource(source)
+      && !isExpectedVendorGlobalControlUnitSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
     ) {
       throw new Error(`external systemd policy references a host lifecycle unit: ${source}`);
+    }
+    if (systemdPolicyRequestsGlobalAction(candidate)) {
+      throw new Error(`external systemd policy requests a host lifecycle action: ${source}`);
     }
     if (
       MANAGED_UNITS.some((unit) => candidate.includes(unit))
@@ -4958,6 +4977,17 @@ function assertSystemdPolicyDoesNotReferenceManaged(
       )
     ) {
       throw new Error(`external systemd policy references a managed unit: ${source}`);
+    }
+    if (
+      parseSystemdExecCommand(candidate) !== null
+      && !isExpectedVendorSystemdUnitSource(
+        source,
+        unitNames,
+        logicalSource,
+        symlinkDepth,
+      )
+    ) {
+      throw new Error(`external systemd execution policy is not trusted: ${source}`);
     }
   }
 }
@@ -4983,23 +5013,24 @@ function systemdPolicyInvokesBootPolicyTool(value) {
 function systemdPolicyInvokesManagedUnitControl(value) {
   const command = parseSystemdExecCommand(value);
   if (command === null) return false;
-  if (command.invocationNames.some((name) => (
+  if (command.invocations.some(({ name, argv0 }) => (
     SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
     || systemdSpecifierFieldCouldMatch(
       name,
       [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
     )
-  ))) return true;
-  if (
-    systemdExecInvokes(command, 'systemctl')
-    && command.argv0Names.some((name) => (
-      SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(name)
-      || systemdSpecifierFieldCouldMatch(
-        name,
-        [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+    || (
+      (name === 'systemctl' || systemdSpecifierFieldCouldMatch(name, ['systemctl']))
+      && argv0 !== null
+      && (
+        SYSTEMD_GLOBAL_CONTROL_EXECUTABLES.has(argv0)
+        || systemdSpecifierFieldCouldMatch(
+          argv0,
+          [...SYSTEMD_GLOBAL_CONTROL_EXECUTABLES],
+        )
       )
-    ))
-  ) return true;
+    )
+  ))) return true;
   if (!systemdExecInvokes(command, 'systemctl')) return false;
   const unitFileMutation = command.tokens.some((token) => (
     SYSTEMCTL_UNIT_FILE_MUTATION_VERBS.has(token)
@@ -5091,7 +5122,9 @@ function systemdPolicyReinterpretsCommandArguments(value) {
   return command !== null
     && systemdExecInvokes(command, 'env')
     && command.envOptions.some((token) => {
-      if (/^-[^-]*[Sa]/.test(token)) return true;
+      if (envShortOptionSelects(token, 'S') || envShortOptionSelects(token, 'a')) {
+        return true;
+      }
       const longOption = token.slice(0, token.indexOf('=') < 0
         ? token.length
         : token.indexOf('='));
@@ -5286,22 +5319,20 @@ function parseSystemdExecCommand(value) {
     fields,
     tokens,
     names,
-    invocationNames: invocations.names,
-    argv0Names: invocations.argv0Names,
+    invocations: invocations.invocations,
     envOptions: invocations.envOptions,
   });
 }
 
 function systemdExecInvokes(command, executable) {
-  return command.invocationNames.some((name) => (
+  return command.invocations.some(({ name }) => (
     name === executable
     || systemdSpecifierFieldCouldMatch(name, [executable])
   ));
 }
 
 function systemdExecInvocationMetadata(fields) {
-  const names = [];
-  const argv0Names = [];
+  const invocations = [];
   const envOptions = [];
   for (const segment of systemdExecCommandSegments(fields)) {
     let offset = 0;
@@ -5313,12 +5344,13 @@ function systemdExecInvocationMetadata(fields) {
         ? rawExecutable.replace(/^[-@:+!|]+/, '')
         : rawExecutable;
       const name = path.basename(executable);
-      names.push(name);
       offset += 1;
+      let argv0 = null;
       if (direct && prefixes.includes('@') && offset < segment.length) {
-        argv0Names.push(path.basename(segment[offset]));
+        argv0 = path.basename(segment[offset]);
         offset += 1;
       }
+      invocations.push(Object.freeze({ name, argv0 }));
       direct = false;
       if (name !== 'env') break;
       const env = parseSystemdEnvInvocation(segment, offset);
@@ -5328,8 +5360,7 @@ function systemdExecInvocationMetadata(fields) {
     }
   }
   return Object.freeze({
-    names: Object.freeze(names),
-    argv0Names: Object.freeze(argv0Names),
+    invocations: Object.freeze(invocations),
     envOptions: Object.freeze(envOptions),
   });
 }
@@ -5348,6 +5379,7 @@ function systemdExecCommandSegments(fields) {
 
 function parseSystemdEnvInvocation(segment, start) {
   const options = [];
+  let assignmentsStarted = false;
   for (let offset = start; offset < segment.length; offset += 1) {
     const field = segment[offset];
     if (field === '--') {
@@ -5356,18 +5388,26 @@ function parseSystemdEnvInvocation(segment, start) {
         commandOffset: offset + 1 < segment.length ? offset + 1 : null,
       });
     }
-    if (field === '-' || field.startsWith('-')) {
+    if (systemdEnvFieldCouldBeAssignment(field)) {
+      assignmentsStarted = true;
+      continue;
+    }
+    if (!assignmentsStarted && (field === '-' || field.startsWith('-'))) {
       options.push(field);
       if (envOptionConsumesFollowingField(field)) offset += 1;
       continue;
     }
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(field)) continue;
     return Object.freeze({
       options: Object.freeze(options),
       commandOffset: offset,
     });
   }
   return Object.freeze({ options: Object.freeze(options), commandOffset: null });
+}
+
+function systemdEnvFieldCouldBeAssignment(field) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(field)
+    || (field.includes('=') && hasUnresolvedSystemdSpecifier(field));
 }
 
 function envOptionConsumesFollowingField(field) {
@@ -5388,6 +5428,16 @@ function envOptionConsumesFollowingField(field) {
   return false;
 }
 
+function envShortOptionSelects(field, expected) {
+  if (!/^-[^-]/.test(field)) return false;
+  const options = [...field.slice(1)];
+  for (const option of options) {
+    if (option === expected) return true;
+    if ('aCSu'.includes(option)) return false;
+  }
+  return false;
+}
+
 function systemdPolicyReferencesGlobalControlUnit(value) {
   const separator = value.indexOf('=');
   if (separator <= 0) return false;
@@ -5397,9 +5447,38 @@ function systemdPolicyReferencesGlobalControlUnit(value) {
     .some(globalControlUnitFieldCouldMatch);
 }
 
-function isExpectedVendorGlobalControlUnitSource(source) {
-  return ['/usr/lib/systemd/system', '/lib/systemd/system'].includes(path.dirname(source))
-    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(source));
+function isExpectedVendorGlobalControlUnitSource(
+  source,
+  unitNames,
+  logicalSource,
+  symlinkDepth,
+) {
+  const vendorDirectories = new Set(['/usr/lib/systemd/system', '/lib/systemd/system']);
+  return vendorDirectories.has(path.dirname(source))
+    && vendorDirectories.has(path.dirname(logicalSource))
+    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(source))
+    && SYSTEMD_GLOBAL_CONTROL_UNITS.includes(path.basename(logicalSource))
+    && [...unitNames].every((unit) => SYSTEMD_GLOBAL_CONTROL_UNITS.includes(unit))
+    && symlinkDepth <= 1;
+}
+
+function systemdPolicyRequestsGlobalAction(value) {
+  const separator = value.indexOf('=');
+  if (separator <= 0) return false;
+  const directive = value.slice(0, separator).trim();
+  const fields = parseSystemdFields(value.slice(separator + 1));
+  if (fields.length === 0) return false;
+  if (fields.length > 1) {
+    return SYSTEMD_GLOBAL_ACTION_DIRECTIVES.has(directive)
+      || SYSTEMD_GLOBAL_JOB_MODE_DIRECTIVES.has(directive);
+  }
+  if (SYSTEMD_GLOBAL_ACTION_DIRECTIVES.has(directive)) {
+    return fields[0] !== 'none';
+  }
+  if (SYSTEMD_GLOBAL_JOB_MODE_DIRECTIVES.has(directive)) {
+    return !['fail', 'replace'].includes(fields[0]);
+  }
+  return false;
 }
 
 function shellExecutableName(name) {

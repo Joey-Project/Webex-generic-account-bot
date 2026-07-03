@@ -336,13 +336,16 @@ non-regular symlink targets, directories, and other non-regular consumer
 overrides are rejected before terminal handling can skip the vendor provenance
 check. Relative dependency links may traverse trusted leading parent
 components, but a parent traversal after entering a child component is rejected
-before lexical normalisation can hide an intermediate symlink. External unit execution directives may not invoke
-`systemd-sysusers`, `systemd-tmpfiles`, or the userdb credential loader directly,
-or use `systemctl` with a literal, path-qualified, or specifier-reachable managed
-unit target. Unit-file mutations with path arguments are rejected because an
-out-of-path file can hide a managed `Alias=`; unresolved specifiers are treated
-as path-capable. Same-basename `.timer`, `.path`, and `.socket` units and
-systemctl targets are mapped to their implicit `.service` activation target.
+before lexical normalisation can hide an intermediate symlink. All `Exec*`
+directives outside package-owned vendor units are rejected. This keeps
+executable-chain interpretation inside the package provenance boundary instead
+of depending on an open-ended list of command wrappers. Vendor unit commands
+remain subject to the specific boot-policy, managed-unit, credential, shell,
+and argument-reinterpretation checks below. Unit-file mutations with path
+arguments are rejected because an out-of-path file can hide a managed `Alias=`;
+unresolved specifiers are treated as path-capable. Same-basename `.timer`,
+`.path`, and `.socket` units and systemctl targets are mapped to their implicit
+`.service` activation target.
 Unscoped mutating commands such
 as `preset-all`, manager reloads, `isolate`, `--job-mode`, `--marked`
 operations, and opaque
@@ -355,14 +358,16 @@ positions, including through `env` wrapping and systemd's `@` argv0 override;
 ordinary command arguments containing those words and the read-only
 `runlevel` command remain valid. External policy also cannot activate terminal
 host lifecycle targets or services, including runlevel aliases, while the
-package-owned lifecycle unit graph remains auditable.
+package-owned lifecycle unit graph remains auditable. Unit-level lifecycle
+actions such as `FailureAction=`, `StartLimitAction=`, and
+`JobTimeoutAction=`, plus isolating `OnFailureJobMode=` or
+`OnSuccessJobMode=` values, are rejected independently of executable policy.
 Globbed same-basename activator names are matched against their implicit
 service targets, and each managed unit must report an empty systemd `Job=`
 property as well as an inactive state.
-Administrator, runtime, generator, and local-vendor `Exec*` directives may not
-invoke a shell. Shell execution is accepted only from a direct package-owned
-vendor unit or its single-hop same-name dependency link; direct boot-policy
-tools and managed-unit control remain forbidden even in those vendor sources.
+Shell execution is accepted only from a direct package-owned vendor unit or its
+single-hop same-name dependency link; direct boot-policy tools and managed-unit
+control remain forbidden even in those vendor sources.
 The systemd `|` shell prefix and unresolved full executable-path specifiers on
 the first or any semicolon-delimited later command, plus standard shell-family
 executable names, are all treated as shell execution.
