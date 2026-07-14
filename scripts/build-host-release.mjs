@@ -21,13 +21,12 @@ import {
   bundlePayloadPath,
 } from './host-release-contract.mjs';
 import * as releaseContract from './host-release-contract.mjs';
-import { validateBundle } from './install-host-release.mjs';
+import { consumeExactFile, validateBundle } from './install-host-release.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const MANIFEST_NAME = 'manifest.json';
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
-const COPY_BUFFER_BYTES = 1024 * 1024;
 
 export function parseArgs(argv) {
   const options = {};
@@ -73,6 +72,7 @@ export async function buildHostRelease(options, injected = {}) {
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  await assertNoStaleBuildState(parent, output);
   const scratch = path.join(
     parent,
     `.${path.basename(output)}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.build`,
@@ -287,6 +287,11 @@ export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalR
     PATH: `${path.join(toolchainRoot, 'bin')}:/usr/bin:/bin`,
     RUSTC: path.join(toolchainRoot, 'bin/rustc'),
     RUSTDOC: path.join(toolchainRoot, 'bin/rustdoc'),
+    CC: '/usr/bin/cc',
+    AR: '/usr/bin/ar',
+    CC_x86_64_unknown_linux_gnu: '/usr/bin/cc',
+    AR_x86_64_unknown_linux_gnu: '/usr/bin/ar',
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: '/usr/bin/cc',
     CARGO_INCREMENTAL: '0',
     CARGO_ENCODED_RUSTFLAGS: [
       `--remap-path-prefix=${scratch}=/build`,
@@ -380,21 +385,15 @@ async function copyMeasuredFile(source, destination, mode) {
       mode,
     );
     const digest = crypto.createHash('sha256');
-    const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
-    let position = 0;
-    while (true) {
-      const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
-      if (bytesRead === 0) break;
-      const chunk = buffer.subarray(0, bytesRead);
+    await consumeExactFile(input, before.size, source, async (chunk, position) => {
       digest.update(chunk);
       await writeAll(output, chunk, position);
-      position += bytesRead;
-    }
+    });
     const after = await input.stat();
     assertStableMetadata(before, after, source);
     await output.chmod(mode);
     await output.sync();
-    return { size: position, sha256: digest.digest('hex') };
+    return { size: before.size, sha256: digest.digest('hex') };
   } finally {
     await output?.close();
     await input.close();
@@ -430,7 +429,12 @@ async function readBoundedRegularFile(file, limit) {
     if (!metadata.isFile() || metadata.size <= 0 || metadata.size > limit) {
       throw new Error(`file is outside the permitted size: ${file}`);
     }
-    return handle.readFile();
+    const bytes = Buffer.allocUnsafe(metadata.size);
+    await consumeExactFile(handle, metadata.size, file, (chunk, position) => {
+      chunk.copy(bytes, position);
+    });
+    assertStableMetadata(metadata, await handle.stat(), file);
+    return bytes;
   } finally {
     await handle.close();
   }
@@ -474,6 +478,31 @@ async function collectDirectories(root, current = root, result = []) {
     }
   }
   return result;
+}
+
+async function assertNoStaleBuildState(parent, output) {
+  const prefix = `.${path.basename(output)}-`;
+  const directory = await fs.opendir(parent);
+  for await (const entry of directory) {
+    if (
+      !entry.name.startsWith(prefix)
+      || (!entry.name.endsWith('.build') && !entry.name.endsWith('.tmp'))
+    ) {
+      continue;
+    }
+    const stagingPath = path.join(parent, entry.name);
+    const metadata = await fs.lstat(stagingPath);
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== process.getuid()
+      || metadata.gid !== process.getgid()
+      || (metadata.mode & 0o7777) !== 0o700
+    ) {
+      throw new Error(`untrusted release staging path requires inspection: ${stagingPath}`);
+    }
+    throw new Error(`stale release staging path requires cleanup: ${stagingPath}`);
+  }
 }
 
 export async function publishDirectoryNoReplace(source, destination, run = execFileAsync) {

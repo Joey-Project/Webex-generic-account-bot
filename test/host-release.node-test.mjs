@@ -22,6 +22,7 @@ import {
   bundlePayloadPath,
 } from '../scripts/host-release-contract.mjs';
 import {
+  consumeExactFile,
   installHostRelease,
   parseArgs as parseInstallArgs,
   publishCandidate,
@@ -87,6 +88,11 @@ describe('host release bootstrap', () => {
     assert.equal(environment.HOME, '/tmp/release scratch/home');
     assert.equal(environment.CARGO_HOME, '/tmp/release scratch/cargo-home');
     assert.equal(environment.SOURCE_DATE_EPOCH, '0');
+    assert.equal(environment.CC, '/usr/bin/cc');
+    assert.equal(environment.AR, '/usr/bin/ar');
+    assert.equal(environment.CC_x86_64_unknown_linux_gnu, '/usr/bin/cc');
+    assert.equal(environment.AR_x86_64_unknown_linux_gnu, '/usr/bin/ar');
+    assert.equal(environment.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER, '/usr/bin/cc');
     assert.equal(
       environment.CARGO_ENCODED_RUSTFLAGS,
       [
@@ -95,6 +101,27 @@ describe('host release bootstrap', () => {
       ].join('\u001f'),
     );
     assert.equal('RUSTUP_HOME' in environment, false);
+  });
+
+  it('stops exact reads at the trusted size and probes EOF once', async () => {
+    const reads = [];
+    const chunks = [];
+    const handle = {
+      async read(buffer, offset, length, position) {
+        reads.push({ length, position });
+        buffer.fill(0x61, offset, offset + length);
+        return { bytesRead: position < 4 ? length : 1 };
+      },
+    };
+    await assert.rejects(
+      consumeExactFile(handle, 4, 'fixture', (chunk) => chunks.push(Buffer.from(chunk))),
+      /host release file changed/,
+    );
+    assert.deepEqual(reads, [
+      { length: 4, position: 0 },
+      { length: 1, position: 4 },
+    ]);
+    assert.equal(Buffer.concat(chunks).toString('utf8'), 'aaaa');
   });
 
   it('builds, validates, and atomically installs the exact first-release tree', async () => {
@@ -336,6 +363,22 @@ describe('host release bootstrap', () => {
       ),
       /no tracked or untracked changes/,
     );
+  });
+
+  it('refuses to compound interrupted staging trees', async () => {
+    const fixture = await createFixture();
+    const stale = path.join(fixture.root, `.bundle-123-${'a'.repeat(24)}.build`);
+    try {
+      await fs.mkdir(stale, { mode: 0o700 });
+      await assert.rejects(
+        buildFixtureResult(fixture),
+        /stale release staging path requires cleanup/,
+      );
+      assert.equal((await fs.lstat(stale)).isDirectory(), true);
+      await assertMissing(fixture.bundle);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('recovers a matching bundle output after parent sync failure', async () => {

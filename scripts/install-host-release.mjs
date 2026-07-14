@@ -202,7 +202,12 @@ export async function validateBundle(
     throw new Error('host release manifest does not match the trusted bot revision');
   }
   const expectedTree = expectedBundleTree(manifest, contract.bundlePayloadPath);
-  const actualTree = await readBundleTree(bundleRoot, expectedUid, expectedGid);
+  const actualTree = await readBundleTree(
+    bundleRoot,
+    expectedUid,
+    expectedGid,
+    expectedTree,
+  );
   if (
     actualTree.size !== expectedTree.size
     || [...expectedTree].some(([entry, kind]) => actualTree.get(entry) !== kind)
@@ -309,12 +314,27 @@ export function parseManifest(value, contract) {
   });
 }
 
-async function readBundleTree(root, expectedUid, expectedGid, current = root, result = new Map()) {
-  for (const name of await fs.readdir(current)) {
-    const full = path.join(current, name);
+async function readBundleTree(
+  root,
+  expectedUid,
+  expectedGid,
+  expectedTree,
+  current = root,
+  result = new Map(),
+) {
+  const directory = await fs.opendir(current);
+  for await (const entry of directory) {
+    const full = path.join(current, entry.name);
     const relative = path.relative(root, full).split(path.sep).join('/');
+    const expectedKind = expectedTree.get(relative);
+    if (expectedKind === undefined) {
+      throw new Error('host release bundle contains missing or unexpected entries');
+    }
     const metadata = await fs.lstat(full);
     if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+      if (expectedKind !== 'directory') {
+        throw new Error('host release bundle contains missing or unexpected entries');
+      }
       if (
         metadata.uid !== expectedUid
         || metadata.gid !== expectedGid
@@ -323,8 +343,11 @@ async function readBundleTree(root, expectedUid, expectedGid, current = root, re
         throw new Error(`host release directory metadata is invalid: ${relative}`);
       }
       result.set(relative, 'directory');
-      await readBundleTree(root, expectedUid, expectedGid, full, result);
+      await readBundleTree(root, expectedUid, expectedGid, expectedTree, full, result);
     } else if (metadata.isFile() && !metadata.isSymbolicLink()) {
+      if (expectedKind !== 'file') {
+        throw new Error('host release bundle contains missing or unexpected entries');
+      }
       result.set(relative, 'file');
     } else {
       throw new Error(`host release bundle contains a special file: ${relative}`);
@@ -337,7 +360,12 @@ async function validateInstalledRelease(root, manifest, expectedUid, expectedGid
   const rootMetadata = await fs.lstat(root);
   assertDirectoryMetadata(rootMetadata, root, expectedUid, expectedGid, 0o755);
   const expectedTree = expectedInstalledTree(manifest);
-  const actualTree = await readInstalledTree(root, expectedUid, expectedGid);
+  const actualTree = await readInstalledTree(
+    root,
+    expectedUid,
+    expectedGid,
+    expectedTree,
+  );
   if (
     actualTree.size !== expectedTree.size
     || [...expectedTree].some(([entry, kind]) => actualTree.get(entry) !== kind)
@@ -362,6 +390,9 @@ async function validateInstalledRelease(root, manifest, expectedUid, expectedGid
   const releaseMetadata = await fs.lstat(releasePath);
   assertFileMetadata(releaseMetadata, releasePath, expectedUid, expectedGid, 0o444);
   const expectedRelease = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  if (releaseMetadata.size !== expectedRelease.length) {
+    throw new Error('existing host release metadata does not match the trusted manifest');
+  }
   const releaseBytes = await readStableFile(releasePath, releaseMetadata);
   if (!releaseBytes.equals(expectedRelease)) {
     throw new Error('existing host release metadata does not match the trusted manifest');
@@ -394,16 +425,34 @@ async function syncRegularFile(file) {
   }
 }
 
-async function readInstalledTree(root, expectedUid, expectedGid, current = root, result = new Map()) {
-  for (const name of await fs.readdir(current)) {
-    const full = path.join(current, name);
+async function readInstalledTree(
+  root,
+  expectedUid,
+  expectedGid,
+  expectedTree,
+  current = root,
+  result = new Map(),
+) {
+  const directory = await fs.opendir(current);
+  for await (const entry of directory) {
+    const full = path.join(current, entry.name);
     const relative = path.relative(root, full).split(path.sep).join('/');
+    const expectedKind = expectedTree.get(relative);
+    if (expectedKind === undefined) {
+      throw new Error('existing host release does not match the trusted release tree');
+    }
     const metadata = await fs.lstat(full);
     if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+      if (expectedKind !== 'directory') {
+        throw new Error('existing host release does not match the trusted release tree');
+      }
       assertDirectoryMetadata(metadata, full, expectedUid, expectedGid, 0o755);
       result.set(relative, 'directory');
-      await readInstalledTree(root, expectedUid, expectedGid, full, result);
+      await readInstalledTree(root, expectedUid, expectedGid, expectedTree, full, result);
     } else if (metadata.isFile() && !metadata.isSymbolicLink()) {
+      if (expectedKind !== 'file') {
+        throw new Error('existing host release does not match the trusted release tree');
+      }
       result.set(relative, 'file');
     } else {
       throw new Error(`existing host release contains a special file: ${relative}`);
@@ -450,6 +499,16 @@ async function copyVerifiedFile(source, destination, expected, expectedUid, expe
   let output;
   try {
     const before = await input.stat();
+    assertFileMetadata(
+      before,
+      source,
+      expectedUid,
+      expectedGid,
+      Number.parseInt(expected.mode, 8),
+    );
+    if (before.size !== expected.size) {
+      throw new Error(`host release source changed during install: ${expected.path}`);
+    }
     await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o755 });
     output = await fs.open(
       destination,
@@ -461,19 +520,13 @@ async function copyVerifiedFile(source, destination, expected, expectedUid, expe
       Number.parseInt(expected.mode, 8),
     );
     const digest = crypto.createHash('sha256');
-    const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
-    let position = 0;
-    while (true) {
-      const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
-      if (bytesRead === 0) break;
-      const chunk = buffer.subarray(0, bytesRead);
+    await consumeExactFile(input, expected.size, source, async (chunk, position) => {
       digest.update(chunk);
       await writeAll(output, chunk, position);
-      position += bytesRead;
-    }
+    });
     const after = await input.stat();
     assertStableMetadata(before, after, source);
-    if (position !== expected.size || digest.digest('hex') !== expected.sha256) {
+    if (digest.digest('hex') !== expected.sha256) {
       throw new Error(`host release source changed during install: ${expected.path}`);
     }
     await output.chmod(Number.parseInt(expected.mode, 8));
@@ -492,14 +545,7 @@ async function hashStableFile(file, before) {
   );
   try {
     const digest = crypto.createHash('sha256');
-    const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
-    let position = 0;
-    while (true) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-      if (bytesRead === 0) break;
-      digest.update(buffer.subarray(0, bytesRead));
-      position += bytesRead;
-    }
+    await consumeExactFile(handle, before.size, file, (chunk) => digest.update(chunk));
     assertStableMetadata(before, await handle.stat(), file);
     return digest.digest('hex');
   } finally {
@@ -515,12 +561,37 @@ async function readStableFile(file, expectedMetadata) {
   try {
     const before = await handle.stat();
     assertStableMetadata(expectedMetadata, before, file);
-    const bytes = await handle.readFile();
+    const bytes = Buffer.allocUnsafe(before.size);
+    await consumeExactFile(handle, before.size, file, (chunk, position) => {
+      chunk.copy(bytes, position);
+    });
     assertStableMetadata(before, await handle.stat(), file);
     return bytes;
   } finally {
     await handle.close();
   }
+}
+
+export async function consumeExactFile(handle, expectedSize, file, consume) {
+  if (
+    !Number.isSafeInteger(expectedSize)
+    || expectedSize < 0
+    || expectedSize > MAX_FILE_BYTES
+  ) {
+    throw new Error(`host release file size is outside the permitted range: ${file}`);
+  }
+  const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
+  let position = 0;
+  while (position < expectedSize) {
+    const length = Math.min(buffer.length, expectedSize - position);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    if (bytesRead === 0) throw new Error(`host release file changed: ${file}`);
+    const chunk = buffer.subarray(0, bytesRead);
+    await consume(chunk, position);
+    position += bytesRead;
+  }
+  const probe = await handle.read(buffer, 0, 1, expectedSize);
+  if (probe.bytesRead !== 0) throw new Error(`host release file changed: ${file}`);
 }
 
 async function writeReleaseMetadata(file, manifest, expectedUid, expectedGid) {

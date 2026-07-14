@@ -297,7 +297,8 @@ superseded_by:
 - Each implementation PR uses its own worktree and branch.
 - After each PR merges, refresh the target branch locally before creating the next worktree.
 - Each PR must pass the complete local test/build gate, one local Codex review,
-  one Claude review, CI, and the remote PR Codex review/required gate.
+  one Claude review, and CI. GitHub `@codex review` is waived for all
+  `WebexServices-staging/*` repositories by explicit owner approval.
 - Before merge, all actionable PR conversations must be fixed or explicitly resolved.
 - Do not use admin bypass or forced checks unless Joey explicitly authorises that exact exception.
 

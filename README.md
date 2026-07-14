@@ -256,7 +256,10 @@ resulting immutable image before using the pinned size and digest.
 The builder copies and verifies that image before extracting it into private
 scratch space; it never executes the caller's mutable Rustup shims or toolchain.
 Rust compiler paths are remapped to `/build`, and reproducibility inputs are
-fixed so a retry can compare a newly built manifest with a completed output.
+fixed so a same-host retry can compare a newly built manifest with a completed
+output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
+sysroot remain an explicit build-host trust base; the builder selects their
+absolute paths and never substitutes caller-controlled native tools.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
@@ -264,8 +267,11 @@ deployment-host BusyBox. The builder normalises and syncs every bundle
 directory, publishes without clobbering, and prints the complete manifest
 digest for independent release approval. Retrying after a parent-directory
 sync interruption accepts only the exact completed output and syncs the parent
-again. It includes no tokens, environment files, deploy keys, rendered config,
-runtime image, systemd installation, or service state.
+again. A staging directory left by `SIGKILL`, power loss, or reboot blocks a
+later build for explicit inspection and cleanup, preventing repeated retries
+from silently accumulating full build trees. It includes no tokens, environment
+files, deploy keys, rendered config, runtime image, systemd installation, or
+service state.
 
 The installer, contract, and environment-clearing wrapper are a separate trust
 anchor and are never loaded from the bundle. A reviewed release-delivery step
