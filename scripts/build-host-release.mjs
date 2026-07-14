@@ -29,18 +29,23 @@ import {
 } from './install-host-release.mjs';
 
 const execFileAsync = promisify(execFile);
-const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+const PRODUCTION_BUILDER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release.mjs`;
+const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
+const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
 const MANIFEST_NAME = 'manifest.json';
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
 const MAX_SOURCE_TREE_BYTES = 16 * 1024 * 1024;
 const MAX_SOURCE_BLOB_BYTES = 64 * 1024 * 1024;
+const MAX_SOURCE_TOTAL_BYTES = 1024 * 1024 * 1024;
 const MAX_SOURCE_FILES = 100_000;
 
 export function parseArgs(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === '--output') options.output = requireValue(argv, ++index, arg);
+    if (arg === '--repo') options.repoRoot = requireValue(argv, ++index, arg);
+    else if (arg === '--output') options.output = requireValue(argv, ++index, arg);
     else if (arg === '--input-root') options.inputRoot = requireValue(argv, ++index, arg);
     else if (arg === '--codex-package-root') {
       options.codexPackageRoot = requireValue(argv, ++index, arg);
@@ -54,7 +59,8 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: scripts/build-host-release.mjs --output <directory> --input-root <directory>',
+    `Usage: ${PRODUCTION_BUILDER_PATH} --repo <directory> --output <directory>`,
+    '       --input-root <directory>',
     '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
@@ -63,7 +69,8 @@ export function usage() {
 
 export async function buildHostRelease(options, injected = {}) {
   assertSupportedNodeVersion();
-  const repoRoot = path.resolve(injected.repoRoot ?? REPO_ROOT);
+  assertUnprivilegedBuilder();
+  const repoRoot = requireAbsolutePath(injected.repoRoot ?? options.repoRoot, '--repo');
   const output = requireAbsolutePath(options.output, '--output');
   const inputRoot = requireAbsolutePath(options.inputRoot, '--input-root');
   const codexPackageRoot = requireAbsolutePath(
@@ -211,6 +218,24 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
     maxBuffer: MAX_SOURCE_TREE_BYTES,
   });
   const entries = parseGitTree(listing.stdout);
+  let totalBytes = 0;
+  for (const entry of entries) {
+    const sizeResult = await run('/usr/bin/git', gitArguments([
+      'cat-file',
+      '-s',
+      entry.object,
+    ]), {
+      cwd: repoRoot,
+      env: environment,
+      maxBuffer: 1024 * 1024,
+    });
+    const sizeText = sizeResult.stdout.trim();
+    if (!/^(?:0|[1-9][0-9]*)$/.test(sizeText)) {
+      throw new Error(`committed source blob size is invalid: ${entry.path}`);
+    }
+    entry.size = Number(sizeText);
+    totalBytes = accountSourceBlobBytes(totalBytes, entry.size, entry.path);
+  }
   for (const entry of entries) {
     const blob = await run('/usr/bin/git', gitArguments([
       'cat-file',
@@ -223,14 +248,39 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
       maxBuffer: MAX_SOURCE_BLOB_BYTES,
     });
     const bytes = toBuffer(blob.stdout);
-    if (bytes.length > MAX_SOURCE_BLOB_BYTES) {
-      throw new Error(`committed source blob is too large: ${entry.path}`);
+    if (bytes.length !== entry.size) {
+      throw new Error(`committed source blob size changed: ${entry.path}`);
     }
     const destination = path.join(sourceRoot, ...entry.path.split('/'));
     await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
     await writeBytesFile(destination, bytes, entry.mode);
   }
   return sourceRoot;
+}
+
+export function accountSourceBlobBytes(
+  total,
+  size,
+  sourcePath,
+  limit = MAX_SOURCE_TOTAL_BYTES,
+) {
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_SOURCE_BLOB_BYTES) {
+    throw new Error(`committed source blob is too large: ${sourcePath}`);
+  }
+  const next = total + size;
+  if (!Number.isSafeInteger(total) || total < 0 || !Number.isSafeInteger(next) || next > limit) {
+    throw new Error('committed source tree exceeds the aggregate byte limit');
+  }
+  return next;
+}
+
+export function assertUnprivilegedBuilder(
+  realUid = process.getuid(),
+  effectiveUid = process.geteuid(),
+) {
+  if (realUid === 0 || effectiveUid === 0) {
+    throw new Error('host release builder must not run as root');
+  }
 }
 
 async function buildRustArtifacts(
@@ -891,6 +941,9 @@ function requireValue(argv, index, flag) {
 }
 
 async function main() {
+  assertSupportedNodeVersion();
+  assertUnprivilegedBuilder();
+  await assertProductionBuilderTrustAnchor();
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     process.stdout.write(`${usage()}\n`);
@@ -903,6 +956,65 @@ async function main() {
   process.stdout.write(`manifest_sha256=${result.manifestSha256}\n`);
   process.stdout.write(`file_count=${result.manifest.files.length}\n`);
   process.stdout.write(`output=${options.output}\n`);
+}
+
+async function assertProductionBuilderTrustAnchor() {
+  if (fileURLToPath(import.meta.url) !== PRODUCTION_BUILDER_PATH) {
+    throw new Error(`production builder must run from ${PRODUCTION_BUILDER_PATH}`);
+  }
+  await assertTrustedRootAncestors(PRODUCTION_TRUST_ROOT);
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_TRUST_ROOT),
+    PRODUCTION_TRUST_ROOT,
+    0o755,
+    'directory',
+  );
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_BUILDER_PATH),
+    PRODUCTION_BUILDER_PATH,
+    0o555,
+    'file',
+  );
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_INSTALLER_PATH),
+    PRODUCTION_INSTALLER_PATH,
+    0o444,
+    'file',
+  );
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_CONTRACT_PATH),
+    PRODUCTION_CONTRACT_PATH,
+    0o444,
+    'file',
+  );
+}
+
+async function assertTrustedRootAncestors(start) {
+  let current = path.resolve(start);
+  while (true) {
+    const metadata = await fs.lstat(current);
+    assertRootOwnedMetadata(metadata, current, metadata.mode & 0o7777, 'directory');
+    if ((metadata.mode & 0o022) !== 0) {
+      throw new Error(`builder trust-anchor ancestor is writable: ${current}`);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+function assertRootOwnedMetadata(metadata, target, mode, kind) {
+  const expectedType = kind === 'directory' ? metadata.isDirectory() : metadata.isFile();
+  if (
+    !expectedType
+    || metadata.isSymbolicLink()
+    || metadata.uid !== 0
+    || metadata.gid !== 0
+    || (metadata.mode & 0o7777) !== mode
+    || (kind === 'file' && metadata.nlink !== 1)
+  ) {
+    throw new Error(`builder trust-anchor metadata is invalid: ${target}`);
+  }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);

@@ -45,6 +45,9 @@ superseded_by:
   identities across compilation.
   Git promisor lazy fetching is disabled so a missing committed object fails
   without running a repository-configured remote helper.
+  The builder is now a root-owned read-only trust-anchor member that accepts an
+  explicit repository path while refusing root execution. Committed source is
+  size-preflighted and capped at 1 GiB in aggregate before materialisation.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR

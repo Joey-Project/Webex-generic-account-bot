@@ -8,7 +8,9 @@ import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
 import {
+  accountSourceBlobBytes,
   assertCargoConfigurationIsolated,
+  assertUnprivilegedBuilder,
   buildEnvironment,
   buildHostRelease,
   cargoBuildInvocation,
@@ -79,12 +81,14 @@ describe('host release bootstrap', () => {
   it('parses only explicit build inputs and fixed install modes', () => {
     assert.deepEqual(
       parseBuildArgs([
+        '--repo', '/tmp/repo',
         '--output', '/tmp/release',
         '--input-root', '/tmp/release-inputs',
         '--codex-package-root', '/tmp/codex',
         '--rust-toolchain-image', '/tmp/rust-toolchain.squashfs',
       ]),
       {
+        repoRoot: '/tmp/repo',
         output: '/tmp/release',
         inputRoot: '/tmp/release-inputs',
         codexPackageRoot: '/tmp/codex',
@@ -118,6 +122,21 @@ describe('host release bootstrap', () => {
     assert.doesNotThrow(() => assertSupportedNodeVersion('26.3.0'));
     assert.throws(() => assertSupportedNodeVersion('23.11.1'), /Node\.js 24 or newer/);
     assert.throws(() => assertSupportedNodeVersion('invalid'), /Node\.js 24 or newer/);
+  });
+
+  it('requires an unprivileged builder and bounds the complete source snapshot', () => {
+    assert.doesNotThrow(() => assertUnprivilegedBuilder(1000, 1000));
+    assert.throws(() => assertUnprivilegedBuilder(0, 1000), /must not run as root/);
+    assert.throws(() => assertUnprivilegedBuilder(1000, 0), /must not run as root/);
+    assert.equal(accountSourceBlobBytes(4, 6, 'source', 10), 10);
+    assert.throws(
+      () => accountSourceBlobBytes(10, 1, 'source', 10),
+      /aggregate byte limit/,
+    );
+    assert.throws(
+      () => accountSourceBlobBytes(0, (64 * 1024 * 1024) + 1, 'source'),
+      /blob is too large/,
+    );
   });
 
   it('remaps private build paths and fixes reproducibility inputs', () => {

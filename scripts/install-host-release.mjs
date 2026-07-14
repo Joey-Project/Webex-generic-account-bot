@@ -13,6 +13,7 @@ const execFileAsync = promisify(execFile);
 const PRODUCTION_BUNDLE_ROOT = '/var/lib/webex-host-release/bundle';
 const PRODUCTION_INSTALL_ROOT = '/opt/webex-generic-account-bot';
 const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+const PRODUCTION_BUILDER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release.mjs`;
 const PRODUCTION_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
 const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
 const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
@@ -830,6 +831,13 @@ async function assertProductionTrustAnchor() {
   assertFileMetadata(
     await fs.lstat(PRODUCTION_WRAPPER_PATH),
     PRODUCTION_WRAPPER_PATH,
+    0,
+    0,
+    0o555,
+  );
+  assertFileMetadata(
+    await fs.lstat(PRODUCTION_BUILDER_PATH),
+    PRODUCTION_BUILDER_PATH,
     0,
     0,
     0o555,

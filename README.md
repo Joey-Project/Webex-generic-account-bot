@@ -228,13 +228,19 @@ environment before starting the fixed system Node and script, so `NODE_OPTIONS`,
 a caller-controlled `PATH`, and the caller's working directory cannot select
 root-loaded code.
 
-The initial root-owned host release is a separate first-install boundary. The
-unprivileged builder requires Node.js 24 or newer and uses the fixed Rust
+The initial root-owned host release is a separate first-install boundary. A
+reviewed release-delivery step first installs Node.js 24 or newer at
+`/usr/bin/node`, then installs `build-host-release.mjs` as root-owned mode
+`0555` and `install-host-release.mjs` plus `host-release-contract.mjs` as
+root-owned mode `0444` under `/usr/local/libexec/webex-host-release`. The
+builder refuses real or effective UID 0; an ordinary release user invokes this
+root-owned trust anchor to build from a separate repository checkout. It uses the fixed Rust
 `1.96.0` toolchain to rebuild the host
 and static runtime binaries from the clean reviewed commit, then creates a
 content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
 
 ```bash
+repo_root=/path/to/reviewed/webex-generic-account-bot
 input_root="$(/usr/bin/mktemp -d /tmp/webex-host-release-inputs.XXXXXXXXXX)"
 codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
 # Materialise the separately reviewed Codex package at "$codex_package_root".
@@ -247,7 +253,8 @@ codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
 /usr/bin/chmod -R go-w "$input_root"
 
 release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
-scripts/build-host-release.mjs \
+/usr/local/libexec/webex-host-release/build-host-release.mjs \
+  --repo "$repo_root" \
   --output "$release_parent/bundle" \
   --input-root "$input_root" \
   --codex-package-root "$codex_package_root" \
@@ -255,7 +262,7 @@ scripts/build-host-release.mjs \
     "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
-The executable builder clears the complete caller environment in its shebang
+The root-owned executable builder clears the complete caller environment in its shebang
 and starts the root-owned `/usr/bin/node` directly, so caller `PATH`,
 `NODE_OPTIONS`, loaders, and preloads cannot run before the builder's checks.
 The builder materialises the exact `HEAD` commit into an isolated source
@@ -269,7 +276,9 @@ system/global configuration, local fsmonitor execution, hooks, external
 attribute files, replacement objects, and promisor lazy fetching. Missing Git
 objects therefore fail closed instead of invoking a repository-configured
 remote helper, and repository-local behaviour or `refs/replace` cannot change
-the objects exported under the approved commit SHA. The Rust toolchain must be an
+the objects exported under the approved commit SHA. Source materialisation is
+preflighted per blob and capped at 1 GiB in aggregate before any committed file
+is written. The Rust toolchain must be an
 independently reviewed SquashFS
 image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
@@ -316,13 +325,14 @@ from silently accumulating full build trees. It includes no tokens, environment
 files, deploy keys, rendered config, runtime image, systemd installation, or
 service state.
 
-The installer, contract, and environment-clearing wrapper are a separate trust
+The builder, installer, contract, and environment-clearing wrapper are a separate trust
 anchor and are never loaded from the bundle. A reviewed release-delivery step
 must first install a root-owned Node.js 24 or newer runtime at `/usr/bin/node`;
 the builder and installer reject older runtimes explicitly before using modern
 JavaScript APIs or loading the dynamic release contract. It then
-must install the wrapper as root-owned mode `0555` and the two JavaScript files
-as root-owned mode `0444` under `/usr/local/libexec/webex-host-release`, then
+must install the wrapper and builder as root-owned mode `0555` and the installer
+plus contract as root-owned mode `0444` under
+`/usr/local/libexec/webex-host-release`, then
 stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
 mode `0700` tree. Carry the approved commit and manifest digest over an
 independent trusted channel and require both on dry-run and apply:
