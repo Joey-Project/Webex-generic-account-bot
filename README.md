@@ -262,6 +262,10 @@ sysroot remain an explicit build-host trust base; the builder selects their
 absolute paths and never substitutes caller-controlled native tools. Cargo runs
 from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
 files beside or above the caller-selected output directory are not loaded.
+The builder creates missing output ancestors one component at a time and accepts
+only non-writable root/current-user ancestors or a root-owned sticky directory
+such as `/tmp`; it revalidates that chain and its private `0700` staging tree
+immediately before no-clobber publication.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the

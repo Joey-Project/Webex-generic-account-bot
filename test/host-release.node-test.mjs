@@ -442,6 +442,56 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('rejects writable and symlinked build parents', async () => {
+    for (const mutation of ['writable', 'symlink']) {
+      const fixture = await createFixture();
+      try {
+        if (mutation === 'writable') {
+          await fs.chmod(fixture.root, 0o777);
+        } else {
+          const realParent = path.join(fixture.root, 'real-output');
+          const linkParent = path.join(fixture.root, 'output-link');
+          await fs.mkdir(realParent, { mode: 0o700 });
+          await fs.symlink(realParent, linkParent);
+          fixture.bundle = path.join(linkParent, 'bundle');
+        }
+        await assert.rejects(
+          buildFixtureResult(fixture),
+          /untrusted release build ancestor/,
+        );
+        await assertMissing(fixture.bundle);
+      } finally {
+        await fs.chmod(fixture.root, 0o700).catch(() => {});
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rechecks build parent trust before publishing', async () => {
+    const fixture = await createFixture();
+    try {
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, {
+          buildArtifacts: async () => {
+            await fs.chmod(fixture.root, 0o777);
+            return {
+              hostBinDir: fixture.hostBinDir,
+              staticBinDir: fixture.staticBinDir,
+              cargoVersion: CARGO_VERSION,
+              rustcVersion: RUSTC_VERSION,
+              toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+            };
+          },
+        }),
+        /untrusted release build ancestor/,
+      );
+      await assertMissing(fixture.bundle);
+    } finally {
+      await fs.chmod(fixture.root, 0o700).catch(() => {});
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('recovers a matching bundle output after parent sync failure', async () => {
     const fixture = await createFixture();
     try {

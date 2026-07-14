@@ -71,7 +71,7 @@ export async function buildHostRelease(options, injected = {}) {
 
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
-  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  await ensureTrustedBuildParent(parent);
   await assertNoStaleBuildState(parent, output);
   const scratch = path.join(
     parent,
@@ -82,6 +82,7 @@ export async function buildHostRelease(options, injected = {}) {
     `.${path.basename(output)}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.tmp`,
   );
   await fs.mkdir(scratch, { mode: 0o700 });
+  await assertPrivateBuildDirectory(scratch);
   try {
     const sourceRoot = injected.revision
       ? repoRoot
@@ -89,7 +90,10 @@ export async function buildHostRelease(options, injected = {}) {
     const artifacts = injected.buildArtifacts
       ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
       : await buildRustArtifacts(sourceRoot, scratch, rustToolchainImage, run);
+    await assertTrustedBuildAncestors(parent);
+    await assertPrivateBuildDirectory(scratch);
     await fs.mkdir(temporary, { mode: 0o700 });
+    await assertPrivateBuildDirectory(temporary);
     const files = [];
     for (const entry of RELEASE_FILES) {
       const source = releaseSource(entry, {
@@ -136,6 +140,8 @@ export async function buildHostRelease(options, injected = {}) {
     const manifestSha256 = crypto.createHash('sha256').update(manifestBytes).digest('hex');
     await writeBytesFile(path.join(temporary, MANIFEST_NAME), manifestBytes, 0o444);
     await normaliseAndSyncBundleDirectories(temporary);
+    await assertTrustedBuildAncestors(parent);
+    await assertPrivateBuildDirectory(temporary);
     let status = 'built';
     try {
       await (injected.publishOutput ?? publishDirectoryNoReplace)(temporary, output);
@@ -490,6 +496,64 @@ async function collectDirectories(root, current = root, result = []) {
     }
   }
   return result;
+}
+
+async function ensureTrustedBuildParent(parent) {
+  const missing = [];
+  let current = path.resolve(parent);
+  while (true) {
+    try {
+      await fs.lstat(current);
+      break;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      missing.push(current);
+      const ancestor = path.dirname(current);
+      if (ancestor === current) throw new Error(`release build parent is unavailable: ${parent}`);
+      current = ancestor;
+    }
+  }
+  await assertTrustedBuildAncestors(current);
+  for (const directory of missing.toReversed()) {
+    await fs.mkdir(directory, { mode: 0o700 });
+    await assertPrivateBuildDirectory(directory);
+  }
+  await assertTrustedBuildAncestors(parent);
+}
+
+async function assertTrustedBuildAncestors(start) {
+  let current = path.resolve(start);
+  while (true) {
+    const metadata = await fs.lstat(current);
+    const mode = metadata.mode & 0o7777;
+    const trustedOwner = metadata.uid === 0 || metadata.uid === process.getuid();
+    const nonWritable = (mode & 0o022) === 0;
+    const rootSticky = metadata.uid === 0 && (mode & 0o1000) !== 0;
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || !trustedOwner
+      || (!nonWritable && !rootSticky)
+    ) {
+      throw new Error(`untrusted release build ancestor: ${current}`);
+    }
+    const ancestor = path.dirname(current);
+    if (ancestor === current) return;
+    current = ancestor;
+  }
+}
+
+async function assertPrivateBuildDirectory(directory) {
+  const metadata = await fs.lstat(directory);
+  if (
+    !metadata.isDirectory()
+    || metadata.isSymbolicLink()
+    || metadata.uid !== process.getuid()
+    || metadata.gid !== process.getgid()
+    || (metadata.mode & 0o7777) !== 0o700
+  ) {
+    throw new Error(`untrusted release build directory: ${directory}`);
+  }
 }
 
 async function assertNoStaleBuildState(parent, output) {
