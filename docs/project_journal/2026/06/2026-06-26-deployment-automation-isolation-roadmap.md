@@ -35,6 +35,10 @@ superseded_by:
   The host release entrypoints require and explicitly verify Node.js 24 or newer;
   deployment must install that root-owned runtime at `/usr/bin/node` before the
   trust anchor.
+  Committed source materialisation now uses bounded `ls-tree`/`cat-file` reads
+  with local Git behaviour disabled instead of attribute-sensitive archives.
+  Cargo rejects fixed-root configuration, manifest ordering is locale
+  independent, and recovered bundles are fully re-synced before acceptance.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR

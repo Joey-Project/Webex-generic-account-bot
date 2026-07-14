@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
 import {
+  assertCargoConfigurationIsolated,
   buildEnvironment,
   buildHostRelease,
   cargoBuildInvocation,
@@ -15,6 +16,7 @@ import {
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
   readBoundedRegularFile,
+  resyncBundle,
 } from '../scripts/build-host-release.mjs';
 import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
@@ -26,6 +28,7 @@ import {
   RUSTC_VERSION,
   RUST_TOOLCHAIN_IMAGE_SHA256,
   bundlePayloadPath,
+  compareReleasePaths,
 } from '../scripts/host-release-contract.mjs';
 import {
   assertSupportedNodeVersion,
@@ -43,6 +46,18 @@ const execFileAsync = promisify(execFile);
 describe('host release bootstrap', () => {
   it('keeps the release contract unique and path confined', () => {
     assert.equal(new Set(RELEASE_PATHS).size, RELEASE_FILES.length);
+    assert.deepEqual(
+      [
+        'webex-codex-launcher@.service',
+        'webex-codex-launcher.socket',
+        'webex-codex-launcher.sysusers.conf',
+      ].sort(compareReleasePaths),
+      [
+        'webex-codex-launcher.socket',
+        'webex-codex-launcher.sysusers.conf',
+        'webex-codex-launcher@.service',
+      ],
+    );
     for (const entry of RELEASE_FILES) {
       assert.match(entry.installPath, /^(?:bin|code|runtime-sources)\//);
       assert.equal(path.posix.normalize(entry.installPath), entry.installPath);
@@ -182,6 +197,24 @@ describe('host release bootstrap', () => {
         },
         maxBuffer: 1024 * 1024,
       });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects Cargo configuration at the fixed build working-directory root', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-root-config-test-'));
+    try {
+      await assert.doesNotReject(assertCargoConfigurationIsolated(root));
+      await fs.mkdir(path.join(root, '.cargo'));
+      await fs.writeFile(
+        path.join(root, '.cargo', 'config.toml'),
+        '[build]\nrustc-wrapper = "/unreviewed/rustc-wrapper"\n',
+      );
+      await assert.rejects(
+        assertCargoConfigurationIsolated(root),
+        /Cargo configuration is not permitted/,
+      );
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -494,6 +527,60 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('does not execute local Git behaviour or apply unreviewed archive attributes', async () => {
+    const fixture = await createFixture();
+    const sourcePath = 'scripts/provision-host.mjs';
+    const fsmonitor = path.join(fixture.root, 'fsmonitor');
+    const fsmonitorMarker = path.join(fixture.root, 'fsmonitor-ran');
+    const attributes = path.join(fixture.root, 'global-attributes');
+    const git = (args) => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+      await fs.writeFile(
+        fsmonitor,
+        `#!/bin/sh\nprintf ran > "${fsmonitorMarker}"\n`,
+        { mode: 0o755 },
+      );
+      await fs.writeFile(attributes, `${sourcePath} export-ignore\n`);
+      await fs.writeFile(
+        path.join(fixture.repoRoot, '.git', 'info', 'attributes'),
+        `${sourcePath} export-ignore\n`,
+      );
+      await git(['config', 'core.fsmonitor', fsmonitor]);
+      await git(['config', 'core.attributesFile', attributes]);
+
+      const result = await buildFixtureResult(fixture, undefined, { revision: undefined });
+      assert.notEqual(result.manifest.bot_revision, REVISION);
+      await assertMissing(fsmonitorMarker);
+      assert.equal(
+        await fs.readFile(
+          path.join(fixture.bundle, bundlePayloadPath(`code/${sourcePath}`)),
+          'utf8',
+        ),
+        sourceContents(`code/${sourcePath}`),
+      );
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('refuses to compound interrupted staging trees', async () => {
     const fixture = await createFixture();
     const stale = path.join(fixture.root, `.bundle-123-${'a'.repeat(24)}.build`);
@@ -630,9 +717,16 @@ describe('host release bootstrap', () => {
       );
       assert.equal((await fs.lstat(fixture.bundle)).isDirectory(), true);
 
-      const recovered = await buildFixtureResult(fixture);
+      const events = [];
+      const recovered = await buildFixtureResult(fixture, undefined, {
+        resyncBundle: async (root, manifest) => {
+          events.push('resync');
+          await resyncBundle(root, manifest);
+        },
+      });
       assert.equal(recovered.status, 'recovered');
       assert.equal(recovered.manifest.bot_revision, REVISION);
+      assert.deepEqual(events, ['resync']);
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }

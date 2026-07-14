@@ -255,11 +255,15 @@ node scripts/build-host-release.mjs \
     "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
-The builder rejects tracked and untracked worktree changes, exports the exact
-commit to an isolated source snapshot, and uses a build-local Cargo home and
-home directory. Every Git subprocess disables system/global configuration and
-replacement objects, so repository-local `refs/replace` cannot change the
-objects exported under the approved commit SHA. The Rust toolchain must be an
+The builder rejects tracked and untracked worktree changes, materialises the
+exact commit into an isolated source snapshot from bounded `ls-tree` and
+`cat-file` results, and uses a build-local Cargo home and home directory. It
+does not use `git archive`, so unreviewed local/global/info attributes cannot
+omit or substitute committed files. Every Git subprocess disables
+system/global configuration, local fsmonitor execution, hooks, external
+attribute files, and replacement objects, so repository-local behaviour and
+`refs/replace` cannot change the objects exported under the approved commit
+SHA. The Rust toolchain must be an
 independently reviewed SquashFS
 image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
@@ -273,7 +277,9 @@ output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
 sysroot remain an explicit build-host trust base; the builder selects their
 absolute paths and never substitutes caller-controlled native tools. Cargo runs
 from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
-files beside or above the caller-selected output directory are not loaded.
+files beside or above the caller-selected output directory are not loaded. The
+builder rejects `/.cargo/config` and `/.cargo/config.toml` before and after the
+Cargo work, closing the remaining fixed-working-directory configuration path.
 The output parent must already be a current-UID/GID mode `0700` directory; the
 documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned
@@ -286,13 +292,16 @@ non-group/world-writable directories below that root. Retained input file
 descriptors use non-blocking, no-follow opens before type, size, digest, and
 metadata-stability checks, so a FIFO or special file cannot stall the builder.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
-digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
+digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Manifest
+paths use locale-independent code-point ordering, so caller locale and ICU
+defaults cannot change the trust-anchor digest. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
 deployment-host BusyBox. The builder normalises and syncs every bundle
 directory, publishes without clobbering, and prints the complete manifest
 digest for independent release approval. Retrying after a parent-directory
-sync interruption accepts only the exact completed output and syncs the parent
-again. A staging directory left by `SIGKILL`, power loss, or reboot blocks a
+sync interruption accepts only the exact completed output, re-syncs every
+payload file, manifest, and bundle directory, then syncs the parent again. A
+staging directory left by `SIGKILL`, power loss, or reboot blocks a
 later build for explicit inspection and cleanup, preventing repeated retries
 from silently accumulating full build trees. It includes no tokens, environment
 files, deploy keys, rendered config, runtime image, systemd installation, or

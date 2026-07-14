@@ -237,6 +237,7 @@ export function parseManifest(value, contract) {
   const {
     CARGO_VERSION,
     CODEX_VERSION,
+    compareReleasePaths,
     RELEASE_FILES,
     RELEASE_PATHS,
     RELEASE_VERSION,
@@ -312,7 +313,9 @@ export function parseManifest(value, contract) {
     bot_revision: value.bot_revision,
     codex_version: value.codex_version,
     build: Object.freeze({ ...value.build }),
-    files: Object.freeze(files.toSorted((left, right) => left.path.localeCompare(right.path))),
+    files: Object.freeze(files.toSorted((left, right) => (
+      compareReleasePaths(left.path, right.path)
+    ))),
   });
 }
 
@@ -698,6 +701,7 @@ function assertReleaseContract(contract) {
     || typeof contract !== 'object'
     || !Number.isSafeInteger(contract.RELEASE_VERSION)
     || contract.MINIMUM_NODE_MAJOR !== REQUIRED_NODE_MAJOR
+    || typeof contract.compareReleasePaths !== 'function'
     || typeof contract.CODEX_VERSION !== 'string'
     || typeof contract.CARGO_VERSION !== 'string'
     || typeof contract.RUSTC_VERSION !== 'string'

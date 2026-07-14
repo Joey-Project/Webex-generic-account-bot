@@ -96,8 +96,14 @@ export const RELEASE_FILES = Object.freeze([
 ]);
 
 export const RELEASE_PATHS = Object.freeze(
-  RELEASE_FILES.map(({ installPath }) => installPath).sort(),
+  RELEASE_FILES.map(({ installPath }) => installPath).sort(compareReleasePaths),
 );
+
+export function compareReleasePaths(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
 
 export const TRUSTED_SOURCE_SHA256 = Object.freeze({
   'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',

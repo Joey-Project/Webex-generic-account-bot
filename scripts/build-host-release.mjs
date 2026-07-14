@@ -19,6 +19,7 @@ import {
   RUST_TOOLCHAIN_IMAGE_SIZE,
   TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
+  compareReleasePaths,
 } from './host-release-contract.mjs';
 import * as releaseContract from './host-release-contract.mjs';
 import {
@@ -31,6 +32,9 @@ const execFileAsync = promisify(execFile);
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const MANIFEST_NAME = 'manifest.json';
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
+const MAX_SOURCE_TREE_BYTES = 16 * 1024 * 1024;
+const MAX_SOURCE_BLOB_BYTES = 64 * 1024 * 1024;
+const MAX_SOURCE_FILES = 100_000;
 
 export function parseArgs(argv) {
   const options = {};
@@ -73,6 +77,7 @@ export async function buildHostRelease(options, injected = {}) {
   const busybox = path.resolve(injected.busybox ?? '/usr/bin/busybox');
   const run = injected.execFileAsync ?? execFileAsync;
   const sync = injected.syncDirectory ?? syncDirectory;
+  const resync = injected.resyncBundle ?? resyncBundle;
   const revision = injected.revision ?? await readCleanRevision(repoRoot, run);
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('bot revision must be a full Git SHA');
 
@@ -100,7 +105,13 @@ export async function buildHostRelease(options, injected = {}) {
       : await materializeRevision(repoRoot, scratch, revision, run);
     const artifacts = injected.buildArtifacts
       ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
-      : await buildRustArtifacts(sourceRoot, scratch, rustToolchainImage, run);
+      : await buildRustArtifacts(
+        sourceRoot,
+        scratch,
+        rustToolchainImage,
+        run,
+        injected.assertCargoConfiguration ?? assertCargoConfigurationIsolated,
+      );
     await assertTrustedBuildInputs(inputRoot, codexInputFiles);
     await assertTrustedBuildAncestors(parent);
     await assertPrivateBuildDirectory(scratch);
@@ -136,7 +147,7 @@ export async function buildHostRelease(options, injected = {}) {
         sha256: measured.sha256,
       });
     }
-    files.sort((left, right) => left.path.localeCompare(right.path));
+    files.sort((left, right) => compareReleasePaths(left.path, right.path));
     const manifest = {
       version: RELEASE_VERSION,
       bot_revision: revision,
@@ -170,6 +181,7 @@ export async function buildHostRelease(options, injected = {}) {
       } catch {
         throw publishError;
       }
+      await resync(output, manifest);
       await fs.rm(temporary, { recursive: true, force: true });
       status = 'recovered';
     }
@@ -185,35 +197,49 @@ export async function buildHostRelease(options, injected = {}) {
 
 async function materializeRevision(repoRoot, scratch, revision, run) {
   const sourceRoot = path.join(scratch, 'source');
-  const archive = path.join(scratch, 'source.tar');
   await fs.mkdir(sourceRoot, { mode: 0o700 });
   const environment = gitEnvironment();
-  await run('/usr/bin/git', [
-    'archive',
-    '--format=tar',
-    `--output=${archive}`,
+  const listing = await run('/usr/bin/git', gitArguments([
+    'ls-tree',
+    '-rz',
+    '--full-tree',
     revision,
-  ], {
+  ]), {
     cwd: repoRoot,
     env: environment,
-    maxBuffer: 1024 * 1024,
+    encoding: 'buffer',
+    maxBuffer: MAX_SOURCE_TREE_BYTES,
   });
-  await run('/usr/bin/tar', [
-    '--extract',
-    `--file=${archive}`,
-    `--directory=${sourceRoot}`,
-    '--no-same-owner',
-    '--no-same-permissions',
-  ], {
-    cwd: '/',
-    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
-    maxBuffer: 1024 * 1024,
-  });
-  await fs.rm(archive);
+  const entries = parseGitTree(listing.stdout);
+  for (const entry of entries) {
+    const blob = await run('/usr/bin/git', gitArguments([
+      'cat-file',
+      'blob',
+      entry.object,
+    ]), {
+      cwd: repoRoot,
+      env: environment,
+      encoding: 'buffer',
+      maxBuffer: MAX_SOURCE_BLOB_BYTES,
+    });
+    const bytes = toBuffer(blob.stdout);
+    if (bytes.length > MAX_SOURCE_BLOB_BYTES) {
+      throw new Error(`committed source blob is too large: ${entry.path}`);
+    }
+    const destination = path.join(sourceRoot, ...entry.path.split('/'));
+    await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+    await writeBytesFile(destination, bytes, entry.mode);
+  }
   return sourceRoot;
 }
 
-async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
+async function buildRustArtifacts(
+  repoRoot,
+  scratch,
+  rustToolchainImage,
+  run,
+  assertCargoConfiguration,
+) {
   const toolchainImage = path.join(scratch, 'rust-toolchain.squashfs');
   const measuredToolchain = await copyMeasuredFile(rustToolchainImage, toolchainImage, 0o400);
   if (
@@ -237,63 +263,68 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
   await fs.mkdir(path.join(scratch, 'home'), { mode: 0o700 });
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');
-  const cargoVersion = (await run(cargoBin, ['--version'], {
-    cwd: '/',
-    env: buildEnvironment(scratch, toolchainRoot),
-    maxBuffer: 1024 * 1024,
-  })).stdout.trim();
-  const rustcVersion = (await run(rustcBin, ['--version'], {
-    cwd: '/',
-    env: buildEnvironment(scratch, toolchainRoot),
-    maxBuffer: 1024 * 1024,
-  })).stdout.trim();
-  if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
-    throw new Error(`release build requires ${CARGO_VERSION} and ${RUSTC_VERSION}`);
-  }
+  await assertCargoConfiguration();
+  try {
+    const cargoVersion = (await run(cargoBin, ['--version'], {
+      cwd: '/',
+      env: buildEnvironment(scratch, toolchainRoot),
+      maxBuffer: 1024 * 1024,
+    })).stdout.trim();
+    const rustcVersion = (await run(rustcBin, ['--version'], {
+      cwd: '/',
+      env: buildEnvironment(scratch, toolchainRoot),
+      maxBuffer: 1024 * 1024,
+    })).stdout.trim();
+    if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
+      throw new Error(`release build requires ${CARGO_VERSION} and ${RUSTC_VERSION}`);
+    }
 
-  const hostTarget = path.join(scratch, 'host-target');
-  const staticTarget = path.join(scratch, 'static-target');
-  const hostBuild = cargoBuildInvocation(repoRoot, [
-    '--locked',
-    '--release',
-    '--all-features',
-    '--target',
-    'x86_64-unknown-linux-gnu',
-    '--bins',
-  ]);
-  await run(cargoBin, hostBuild.args, {
-    cwd: hostBuild.cwd,
-    env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  const staticBuild = cargoBuildInvocation(repoRoot, [
-    '--locked',
-    '--release',
-    '--all-features',
-    '--target',
-    'x86_64-unknown-linux-gnu',
-    '--bin',
-    'webex-codex-runtime',
-    '--bin',
-    'webex-codex-canary-probe',
-  ]);
-  await run(cargoBin, staticBuild.args, {
-    cwd: staticBuild.cwd,
-    env: buildEnvironment(
-      scratch,
-      toolchainRoot,
-      { CARGO_TARGET_DIR: staticTarget },
-      ['-Ctarget-feature=+crt-static'],
-    ),
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  return {
-    hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
-    staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
-    cargoVersion,
-    rustcVersion,
-    toolchainSha256: measuredToolchain.sha256,
-  };
+    const hostTarget = path.join(scratch, 'host-target');
+    const staticTarget = path.join(scratch, 'static-target');
+    const hostBuild = cargoBuildInvocation(repoRoot, [
+      '--locked',
+      '--release',
+      '--all-features',
+      '--target',
+      'x86_64-unknown-linux-gnu',
+      '--bins',
+    ]);
+    await run(cargoBin, hostBuild.args, {
+      cwd: hostBuild.cwd,
+      env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const staticBuild = cargoBuildInvocation(repoRoot, [
+      '--locked',
+      '--release',
+      '--all-features',
+      '--target',
+      'x86_64-unknown-linux-gnu',
+      '--bin',
+      'webex-codex-runtime',
+      '--bin',
+      'webex-codex-canary-probe',
+    ]);
+    await run(cargoBin, staticBuild.args, {
+      cwd: staticBuild.cwd,
+      env: buildEnvironment(
+        scratch,
+        toolchainRoot,
+        { CARGO_TARGET_DIR: staticTarget },
+        ['-Ctarget-feature=+crt-static'],
+      ),
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return {
+      hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
+      staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
+      cargoVersion,
+      rustcVersion,
+      toolchainSha256: measuredToolchain.sha256,
+    };
+  } finally {
+    await assertCargoConfiguration();
+  }
 }
 
 export function cargoBuildInvocation(repoRoot, args) {
@@ -334,13 +365,18 @@ export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalR
 
 async function readCleanRevision(repoRoot, run = execFileAsync) {
   const environment = gitEnvironment();
-  const status = await run('/usr/bin/git', ['status', '--porcelain', '--untracked-files=all'], {
+  const status = await run('/usr/bin/git', gitArguments([
+    'status',
+    '--porcelain',
+    '--untracked-files=all',
+    '--ignored=matching',
+  ]), {
     cwd: repoRoot,
     env: environment,
     maxBuffer: 1024 * 1024,
   });
   if (status.stdout !== '') throw new Error('worktree must contain no tracked or untracked changes');
-  const revision = await run('/usr/bin/git', ['rev-parse', 'HEAD'], {
+  const revision = await run('/usr/bin/git', gitArguments(['rev-parse', 'HEAD']), {
     cwd: repoRoot,
     env: environment,
     maxBuffer: 1024 * 1024,
@@ -355,8 +391,85 @@ function gitEnvironment() {
     PATH: '/usr/bin:/bin',
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_ATTR_NOSYSTEM: '1',
     GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_OPTIONAL_LOCKS: '0',
   };
+}
+
+function gitArguments(args) {
+  return [
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.attributesFile=/dev/null',
+    '-c', 'core.hooksPath=/dev/null',
+    ...args,
+  ];
+}
+
+function parseGitTree(stdout) {
+  const bytes = toBuffer(stdout);
+  const entries = [];
+  const seen = new Set();
+  let offset = 0;
+  while (offset < bytes.length) {
+    const end = bytes.indexOf(0, offset);
+    if (end === -1) throw new Error('committed source tree listing is malformed');
+    const record = bytes.subarray(offset, end);
+    const separator = record.indexOf(0x09);
+    const header = separator === -1 ? '' : record.subarray(0, separator).toString('ascii');
+    const match = /^(100644|100755) blob ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(header);
+    if (match === null) throw new Error('committed source tree contains an unsupported entry');
+    const pathBytes = record.subarray(separator + 1);
+    const sourcePath = pathBytes.toString('utf8');
+    if (
+      pathBytes.length === 0
+      || !Buffer.from(sourcePath, 'utf8').equals(pathBytes)
+      || path.posix.isAbsolute(sourcePath)
+      || path.posix.normalize(sourcePath) !== sourcePath
+      || sourcePath.split('/').some((part) => part === '' || part === '.' || part === '..')
+      || seen.has(sourcePath)
+    ) {
+      throw new Error('committed source tree contains an unsafe path');
+    }
+    seen.add(sourcePath);
+    entries.push({
+      mode: match[1] === '100755' ? 0o755 : 0o644,
+      object: match[2],
+      path: sourcePath,
+    });
+    if (entries.length > MAX_SOURCE_FILES) {
+      throw new Error('committed source tree contains too many files');
+    }
+    offset = end + 1;
+  }
+  if (entries.length === 0) throw new Error('committed source tree is empty');
+  return entries;
+}
+
+function toBuffer(value) {
+  return Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+}
+
+export async function assertCargoConfigurationIsolated(root = '/') {
+  const cargoDirectory = path.join(path.resolve(root), '.cargo');
+  let metadata;
+  try {
+    metadata = await fs.lstat(cargoDirectory);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`Cargo configuration root is untrusted: ${cargoDirectory}`);
+  }
+  for (const name of ['config', 'config.toml']) {
+    try {
+      await fs.lstat(path.join(cargoDirectory, name));
+      throw new Error(`Cargo configuration is not permitted: ${path.join(cargoDirectory, name)}`);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 function releaseSource(entry, roots) {
@@ -502,6 +615,32 @@ async function normaliseAndSyncBundleDirectories(root) {
   for (const directory of directories.toSorted((left, right) => depth(right) - depth(left))) {
     await fs.chmod(directory, directory === root ? 0o700 : 0o755);
     await syncDirectory(directory);
+  }
+}
+
+export async function resyncBundle(root, manifest) {
+  for (const entry of manifest.files) {
+    await syncRegularFile(path.join(root, bundlePayloadPath(entry.path)));
+  }
+  await syncRegularFile(path.join(root, MANIFEST_NAME));
+  const directories = await collectDirectories(root);
+  for (const directory of directories.toSorted((left, right) => depth(right) - depth(left))) {
+    await syncDirectory(directory);
+  }
+}
+
+async function syncRegularFile(file) {
+  const handle = await fs.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    if (!before.isFile()) throw new Error(`release bundle sync target is not a file: ${file}`);
+    await handle.sync();
+    assertStableMetadata(before, await handle.stat(), file);
+  } finally {
+    await handle.close();
   }
 }
 
