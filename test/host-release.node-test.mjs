@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
+import { deflateSync } from 'node:zlib';
 
 import {
   accountSourceBlobBytes,
@@ -39,6 +40,7 @@ import {
   parseArgs as parseInstallArgs,
   publishCandidate,
   resyncInstalledRelease,
+  usage as installUsage,
   validateBundle,
 } from '../scripts/install-host-release.mjs';
 
@@ -114,6 +116,11 @@ describe('host release bootstrap', () => {
     );
     assert.throws(() => parseInstallArgs(['--apply', '--dry-run']), /exactly one install mode/);
     assert.throws(() => parseInstallArgs(['--bundle', '/tmp/x']), /unknown argument/);
+    assert.match(
+      installUsage(),
+      /^Usage: \/usr\/local\/libexec\/webex-host-release\/install-host-release /,
+    );
+    assert.doesNotMatch(installUsage(), /\/usr\/bin\/node/);
   });
 
   it('requires the deployment host Node.js runtime contract', () => {
@@ -601,6 +608,118 @@ describe('host release bootstrap', () => {
         ),
         sourceContents(`code/${sourcePath}`),
       );
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a forged loose blob that does not match its advertised object ID', async () => {
+    const fixture = await createFixture();
+    const sourcePath = 'scripts/provision-host.mjs';
+    const git = (args) => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+      const blob = (await git(['rev-parse', `HEAD:${sourcePath}`])).stdout.trim();
+      const objectPath = path.join(
+        fixture.repoRoot,
+        '.git',
+        'objects',
+        blob.slice(0, 2),
+        blob.slice(2),
+      );
+      const forged = Buffer.from(await fs.readFile(path.join(fixture.repoRoot, sourcePath)));
+      forged[0] ^= 0x20;
+      const forgedObject = Buffer.concat([
+        Buffer.from(`blob ${forged.length}\0`, 'ascii'),
+        forged,
+      ]);
+      await fs.rm(objectPath);
+      await fs.writeFile(objectPath, deflateSync(forgedObject));
+
+      assert.equal((await git(['cat-file', 'blob', blob])).stdout, forged.toString('utf8'));
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, { revision: undefined }),
+        /committed source blob object ID mismatch/,
+      );
+      await assertMissing(fixture.bundle);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects forged loose commit and tree objects', async () => {
+    const fixture = await createFixture();
+    const git = (args, encoding = 'utf8') => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      encoding,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+      const revision = (await git(['rev-parse', 'HEAD^{commit}'])).stdout.trim();
+      const commitPath = looseObjectPath(fixture.repoRoot, revision);
+      const storedCommit = await fs.readFile(commitPath);
+      const forgedCommit = Buffer.from((await git(['cat-file', 'commit', revision], 'buffer')).stdout);
+      const messageOffset = forgedCommit.indexOf(Buffer.from('fixture', 'ascii'));
+      assert.notEqual(messageOffset, -1);
+      forgedCommit[messageOffset] ^= 0x20;
+      await replaceLooseObject(commitPath, 'commit', forgedCommit);
+      assert.deepEqual(
+        (await git(['cat-file', 'commit', revision], 'buffer')).stdout,
+        forgedCommit,
+      );
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, { revision: undefined }),
+        /hash mismatch|committed source commit object ID mismatch/,
+      );
+      await assertMissing(fixture.bundle);
+
+      await fs.rm(commitPath);
+      await fs.writeFile(commitPath, storedCommit);
+      const tree = (await git(['rev-parse', 'HEAD^{tree}'])).stdout.trim();
+      const treePath = looseObjectPath(fixture.repoRoot, tree);
+      const forgedTree = Buffer.from((await git(['cat-file', 'tree', tree], 'buffer')).stdout);
+      const directoryOffset = forgedTree.indexOf(Buffer.from('scripts', 'ascii'));
+      assert.notEqual(directoryOffset, -1);
+      forgedTree[directoryOffset] ^= 0x20;
+      await replaceLooseObject(treePath, 'tree', forgedTree);
+      assert.deepEqual((await git(['cat-file', 'tree', tree], 'buffer')).stdout, forgedTree);
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, { revision: undefined }),
+        /hash mismatch|committed source tree object ID mismatch/,
+      );
+      await assertMissing(fixture.bundle);
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
@@ -1127,6 +1246,21 @@ function expectedInstalledContents(installPath) {
     variant: 'codex',
     version: CODEX_VERSION,
   })}\n`;
+}
+
+function looseObjectPath(repoRoot, objectId) {
+  return path.join(repoRoot, '.git', 'objects', objectId.slice(0, 2), objectId.slice(2));
+}
+
+async function replaceLooseObject(objectPath, type, bytes) {
+  await fs.rm(objectPath);
+  await fs.writeFile(
+    objectPath,
+    deflateSync(Buffer.concat([
+      Buffer.from(`${type} ${bytes.length}\0`, 'ascii'),
+      bytes,
+    ])),
+  );
 }
 
 async function trustedFixtureDigests(fixture) {

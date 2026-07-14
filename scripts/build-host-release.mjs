@@ -206,6 +206,7 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
   const sourceRoot = path.join(scratch, 'source');
   await fs.mkdir(sourceRoot, { mode: 0o700 });
   const environment = gitEnvironment();
+  const expectedTree = await readVerifiedCommitTree(repoRoot, revision, run, environment);
   const listing = await run('/usr/bin/git', gitArguments([
     'ls-tree',
     '-rz',
@@ -218,6 +219,9 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
     maxBuffer: MAX_SOURCE_TREE_BYTES,
   });
   const entries = parseGitTree(listing.stdout);
+  if (sourceTreeObjectId(entries, expectedTree) !== expectedTree) {
+    throw new Error('committed source tree object ID mismatch');
+  }
   let totalBytes = 0;
   for (const entry of entries) {
     const sizeResult = await run('/usr/bin/git', gitArguments([
@@ -251,11 +255,112 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
     if (bytes.length !== entry.size) {
       throw new Error(`committed source blob size changed: ${entry.path}`);
     }
+    if (gitObjectId('blob', bytes, entry.object) !== entry.object) {
+      throw new Error(`committed source blob object ID mismatch: ${entry.path}`);
+    }
     const destination = path.join(sourceRoot, ...entry.path.split('/'));
     await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
     await writeBytesFile(destination, bytes, entry.mode);
   }
   return sourceRoot;
+}
+
+async function readVerifiedCommitTree(repoRoot, revision, run, environment) {
+  const result = await run('/usr/bin/git', gitArguments([
+    'cat-file',
+    'commit',
+    revision,
+  ]), {
+    cwd: repoRoot,
+    env: environment,
+    encoding: 'buffer',
+    maxBuffer: MAX_SOURCE_TREE_BYTES,
+  });
+  const bytes = toBuffer(result.stdout);
+  if (gitObjectId('commit', bytes, revision) !== revision) {
+    throw new Error('committed source commit object ID mismatch');
+  }
+  const firstLineEnd = bytes.indexOf(0x0a);
+  const firstLine = firstLineEnd === -1
+    ? ''
+    : bytes.subarray(0, firstLineEnd).toString('ascii');
+  const match = /^tree ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(firstLine);
+  if (match === null || match[1].length !== revision.length) {
+    throw new Error('committed source commit is malformed');
+  }
+  return match[1];
+}
+
+function sourceTreeObjectId(entries, expectedTree) {
+  const root = { directories: new Map(), files: new Map() };
+  for (const entry of entries) {
+    if (entry.object.length !== expectedTree.length) {
+      throw new Error('committed source tree mixes object formats');
+    }
+    const parts = entry.path.split('/');
+    let node = root;
+    for (let index = 0; index < parts.length; index += 1) {
+      const name = parts[index];
+      if (index === parts.length - 1) {
+        if (node.files.has(name) || node.directories.has(name)) {
+          throw new Error('committed source tree contains conflicting paths');
+        }
+        node.files.set(name, entry);
+      } else {
+        if (node.files.has(name)) {
+          throw new Error('committed source tree contains conflicting paths');
+        }
+        if (!node.directories.has(name)) {
+          node.directories.set(name, { directories: new Map(), files: new Map() });
+        }
+        node = node.directories.get(name);
+      }
+    }
+  }
+  return treeNodeObjectId(root, expectedTree);
+}
+
+function treeNodeObjectId(node, expectedTree) {
+  const records = [];
+  for (const [name, entry] of node.files) {
+    records.push({
+      mode: entry.mode === 0o755 ? '100755' : '100644',
+      name: Buffer.from(name, 'utf8'),
+      object: entry.object,
+      tree: false,
+    });
+  }
+  for (const [name, child] of node.directories) {
+    records.push({
+      mode: '40000',
+      name: Buffer.from(name, 'utf8'),
+      object: treeNodeObjectId(child, expectedTree),
+      tree: true,
+    });
+  }
+  records.sort(compareGitTreeRecords);
+  const body = Buffer.concat(records.map((record) => Buffer.concat([
+    Buffer.from(`${record.mode} `, 'ascii'),
+    record.name,
+    Buffer.from([0]),
+    Buffer.from(record.object, 'hex'),
+  ])));
+  return gitObjectId('tree', body, expectedTree);
+}
+
+function compareGitTreeRecords(left, right) {
+  const leftKey = Buffer.concat([left.name, Buffer.from([left.tree ? 0x2f : 0])]);
+  const rightKey = Buffer.concat([right.name, Buffer.from([right.tree ? 0x2f : 0])]);
+  return Buffer.compare(leftKey, rightKey);
+}
+
+function gitObjectId(type, bytes, expectedObjectId) {
+  let algorithm;
+  if (/^[a-f0-9]{40}$/.test(expectedObjectId)) algorithm = 'sha1';
+  else if (/^[a-f0-9]{64}$/.test(expectedObjectId)) algorithm = 'sha256';
+  else throw new Error('committed source object ID is malformed');
+  const header = Buffer.from(`${type} ${bytes.length}\0`, 'ascii');
+  return crypto.createHash(algorithm).update(header).update(bytes).digest('hex');
 }
 
 export function accountSourceBlobBytes(

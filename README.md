@@ -269,7 +269,11 @@ The builder materialises the exact `HEAD` commit into an isolated source
 snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
 Cargo home and home directory. Tracked worktree edits, untracked files, ignored
 local caches, and files never enter that object-only snapshot; the printed full
-commit SHA is the source identity presented for approval. It
+commit SHA is the source identity presented for approval. The builder
+independently recomputes the commit object ID, reconstructs the complete root
+tree object ID from the listed paths, and recomputes every blob object ID before
+writing it, so a forged or concurrently replaced object-store entry fails
+closed. It
 does not use `git archive`, so unreviewed local/global/info attributes cannot
 omit or substitute committed files. Every Git subprocess disables
 system/global configuration, local fsmonitor execution, hooks, external
@@ -347,6 +351,10 @@ sudo -- /usr/local/libexec/webex-host-release/install-host-release \
   --expected-bot-revision "$REVIEWED_BOT_REVISION" \
   --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
+
+Root automation and sudo policy must invoke only this environment-clearing
+wrapper without preserved or injected environment variables; invoking
+`install-host-release.mjs` through Node directly is not a supported entrypoint.
 
 The installer rejects path overrides, additional or missing entries, symlinks,
 special files, hard links, mutable ownership/modes, digest drift, stale install

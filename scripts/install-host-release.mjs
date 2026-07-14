@@ -49,9 +49,9 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    `Usage: /usr/bin/node ${PRODUCTION_INSTALLER_PATH} [--dry-run] [--json]`,
+    `Usage: ${PRODUCTION_WRAPPER_PATH} [--dry-run] [--json]`,
     '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
-    `       /usr/bin/node ${PRODUCTION_INSTALLER_PATH} --apply [--json]`,
+    `       ${PRODUCTION_WRAPPER_PATH} --apply [--json]`,
     '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
     '',
     'Dry-run is the default. Trust, bundle, and install paths are fixed.',

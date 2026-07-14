@@ -48,6 +48,8 @@ superseded_by:
   The builder is now a root-owned read-only trust-anchor member that accepts an
   explicit repository path while refusing root execution. Committed source is
   size-preflighted and capped at 1 GiB in aggregate before materialisation.
+  Commit, reconstructed root-tree, and blob object IDs are independently
+  rehashed so forged or concurrently replaced Git object storage fails closed.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
