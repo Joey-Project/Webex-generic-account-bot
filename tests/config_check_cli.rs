@@ -57,8 +57,11 @@ fn config_check_modes_are_mutually_exclusive() {
     let stderr = stderr(&output);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("--check-config"));
-    assert!(stderr.contains("--check-config-structure"));
+    assert!(
+        stderr.contains(
+            "the argument '--check-config' cannot be used with '--check-config-structure'"
+        )
+    );
 }
 
 fn run_bot(config: &Path, args: &[&str]) -> std::process::Output {
