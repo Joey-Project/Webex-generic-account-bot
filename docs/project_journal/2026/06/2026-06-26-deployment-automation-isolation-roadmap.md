@@ -32,6 +32,9 @@ superseded_by:
   no-clobber operation. Complete interrupted builder outputs and installer
   candidates are revalidated and re-synced before recovery. Host policy,
   secrets, runtime image, and service state remain separate gates.
+  The host release entrypoints require and explicitly verify Node.js 24 or newer;
+  deployment must install that root-owned runtime at `/usr/bin/node` before the
+  trust anchor.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR

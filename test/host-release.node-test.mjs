@@ -20,6 +20,7 @@ import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
   CARGO_VERSION,
   CODEX_VERSION,
+  MINIMUM_NODE_MAJOR,
   RELEASE_FILES,
   RELEASE_PATHS,
   RUSTC_VERSION,
@@ -27,6 +28,7 @@ import {
   bundlePayloadPath,
 } from '../scripts/host-release-contract.mjs';
 import {
+  assertSupportedNodeVersion,
   consumeExactFile,
   installHostRelease,
   parseArgs as parseInstallArgs,
@@ -93,6 +95,14 @@ describe('host release bootstrap', () => {
     );
     assert.throws(() => parseInstallArgs(['--apply', '--dry-run']), /exactly one install mode/);
     assert.throws(() => parseInstallArgs(['--bundle', '/tmp/x']), /unknown argument/);
+  });
+
+  it('requires the deployment host Node.js runtime contract', () => {
+    assert.equal(MINIMUM_NODE_MAJOR, 24);
+    assert.doesNotThrow(() => assertSupportedNodeVersion('24.0.0'));
+    assert.doesNotThrow(() => assertSupportedNodeVersion('26.3.0'));
+    assert.throws(() => assertSupportedNodeVersion('23.11.1'), /Node\.js 24 or newer/);
+    assert.throws(() => assertSupportedNodeVersion('invalid'), /Node\.js 24 or newer/);
   });
 
   it('remaps private build paths and fixes reproducibility inputs', () => {

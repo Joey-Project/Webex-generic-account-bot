@@ -229,7 +229,8 @@ a caller-controlled `PATH`, and the caller's working directory cannot select
 root-loaded code.
 
 The initial root-owned host release is a separate first-install boundary. The
-unprivileged builder uses the fixed Rust `1.96.0` toolchain to rebuild the host
+unprivileged builder requires Node.js 24 or newer and uses the fixed Rust
+`1.96.0` toolchain to rebuild the host
 and static runtime binaries from the clean reviewed commit, then creates a
 content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
 
@@ -299,6 +300,9 @@ service state.
 
 The installer, contract, and environment-clearing wrapper are a separate trust
 anchor and are never loaded from the bundle. A reviewed release-delivery step
+must first install a root-owned Node.js 24 or newer runtime at `/usr/bin/node`;
+the builder and installer reject older runtimes explicitly before using modern
+JavaScript APIs or loading the dynamic release contract. It then
 must install the wrapper as root-owned mode `0555` and the two JavaScript files
 as root-owned mode `0444` under `/usr/local/libexec/webex-host-release`, then
 stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
@@ -1256,8 +1260,9 @@ unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
 does not add the bot to it or provide the privileged sealing broker.
 
-The minimum host contract is systemd 255, Linux 5.9 or newer, cgroup v2,
-SquashFS/loop support, mount and PID namespaces, `close_range(2)`, and a host
+The minimum host contract is Node.js 24 or newer at `/usr/bin/node`, systemd
+255, Linux 5.9 or newer, cgroup v2, SquashFS/loop support, mount and PID
+namespaces, `close_range(2)`, and a host
 policy that permits the bundled `bwrap` to create its inner sandbox. These are
 not inferred from version strings alone. PR 4c2 must run the real image and
 permission canaries on the deployment host and mint the boot-scoped activation

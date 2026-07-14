@@ -1,4 +1,5 @@
 export const RELEASE_VERSION = 1;
+export const MINIMUM_NODE_MAJOR = 24;
 export const CODEX_VERSION = '0.142.3';
 export const CARGO_VERSION = 'cargo 1.96.0 (30a34c682 2026-05-25)';
 export const RUSTC_VERSION = 'rustc 1.96.0 (ac68faa20 2026-05-25)';
@@ -95,7 +96,7 @@ export const RELEASE_FILES = Object.freeze([
 ]);
 
 export const RELEASE_PATHS = Object.freeze(
-  RELEASE_FILES.map(({ installPath }) => installPath).toSorted(),
+  RELEASE_FILES.map(({ installPath }) => installPath).sort(),
 );
 
 export const TRUSTED_SOURCE_SHA256 = Object.freeze({

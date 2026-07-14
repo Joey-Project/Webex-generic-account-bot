@@ -19,6 +19,7 @@ const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract
 const MANIFEST_NAME = 'manifest.json';
 const MANIFEST_MAX_BYTES = 1024 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
+const REQUIRED_NODE_MAJOR = 24;
 const COPY_BUFFER_BYTES = 1024 * 1024;
 const CANDIDATE_PREFIX = '.webex-generic-account-bot-install-';
 
@@ -57,6 +58,7 @@ export function usage() {
 }
 
 export async function installHostRelease(options, injected = {}) {
+  assertSupportedNodeVersion();
   const contract = assertReleaseContract(injected.contract);
   const bundleRoot = path.resolve(injected.bundleRoot ?? PRODUCTION_BUNDLE_ROOT);
   const installRoot = path.resolve(injected.installRoot ?? PRODUCTION_INSTALL_ROOT);
@@ -695,6 +697,7 @@ function assertReleaseContract(contract) {
     contract === null
     || typeof contract !== 'object'
     || !Number.isSafeInteger(contract.RELEASE_VERSION)
+    || contract.MINIMUM_NODE_MAJOR !== REQUIRED_NODE_MAJOR
     || typeof contract.CODEX_VERSION !== 'string'
     || typeof contract.CARGO_VERSION !== 'string'
     || typeof contract.RUSTC_VERSION !== 'string'
@@ -706,6 +709,13 @@ function assertReleaseContract(contract) {
     throw new Error('trusted host release contract is invalid');
   }
   return contract;
+}
+
+export function assertSupportedNodeVersion(version = process.versions.node) {
+  const match = /^([0-9]+)\./.exec(version ?? '');
+  if (match === null || Number(match[1]) < REQUIRED_NODE_MAJOR) {
+    throw new Error(`host release requires Node.js ${REQUIRED_NODE_MAJOR} or newer`);
+  }
 }
 
 async function findCandidates(parent, expectedUid, expectedGid) {
@@ -837,6 +847,7 @@ async function assertProductionTrustAnchor() {
 }
 
 async function main() {
+  assertSupportedNodeVersion();
   await assertProductionTrustAnchor();
   const contract = await import(pathToFileURL(PRODUCTION_CONTRACT_PATH).href);
   const options = parseArgs(process.argv.slice(2));

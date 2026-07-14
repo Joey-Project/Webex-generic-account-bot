@@ -21,7 +21,11 @@ import {
   bundlePayloadPath,
 } from './host-release-contract.mjs';
 import * as releaseContract from './host-release-contract.mjs';
-import { consumeExactFile, validateBundle } from './install-host-release.mjs';
+import {
+  assertSupportedNodeVersion,
+  consumeExactFile,
+  validateBundle,
+} from './install-host-release.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -54,6 +58,7 @@ export function usage() {
 }
 
 export async function buildHostRelease(options, injected = {}) {
+  assertSupportedNodeVersion();
   const repoRoot = path.resolve(injected.repoRoot ?? REPO_ROOT);
   const output = requireAbsolutePath(options.output, '--output');
   const inputRoot = requireAbsolutePath(options.inputRoot, '--input-root');
