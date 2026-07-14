@@ -587,6 +587,64 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('fails on a missing promisor blob without executing a lazy-fetch helper', async () => {
+    const fixture = await createFixture();
+    const sourcePath = 'scripts/provision-host.mjs';
+    const helper = path.join(fixture.root, 'promisor-helper');
+    const marker = path.join(fixture.root, 'promisor-helper-ran');
+    const git = (args) => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+      const blob = (await git(['rev-parse', `HEAD:${sourcePath}`])).stdout.trim();
+      const objectPath = path.join(
+        fixture.repoRoot,
+        '.git',
+        'objects',
+        blob.slice(0, 2),
+        blob.slice(2),
+      );
+      await fs.writeFile(
+        helper,
+        `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\nexit 1\n`,
+        { mode: 0o755 },
+      );
+      await git(['config', 'remote.origin.promisor', 'true']);
+      await git(['config', 'remote.origin.partialclonefilter', 'blob:none']);
+      await git(['config', 'remote.origin.url', `ext::${helper}`]);
+      await git(['config', 'protocol.ext.allow', 'always']);
+      await fs.rm(objectPath);
+
+      await assert.rejects(git(['cat-file', 'blob', blob]));
+      assert.equal(await fs.readFile(marker, 'utf8'), 'ran');
+      await fs.rm(marker);
+
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, { revision: undefined }),
+      );
+      await assertMissing(marker);
+      await assertMissing(fixture.bundle);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('does not execute local Git behaviour or apply unreviewed archive attributes', async () => {
     const fixture = await createFixture();
     const sourcePath = 'scripts/provision-host.mjs';

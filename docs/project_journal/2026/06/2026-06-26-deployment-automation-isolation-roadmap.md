@@ -43,6 +43,8 @@ superseded_by:
   `/usr/bin/node`; object-only source materialisation no longer executes a
   worktree cleanliness command, and Cargo binds trusted root-directory
   identities across compilation.
+  Git promisor lazy fetching is disabled so a missing committed object fails
+  without running a repository-configured remote helper.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR

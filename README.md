@@ -266,9 +266,10 @@ commit SHA is the source identity presented for approval. It
 does not use `git archive`, so unreviewed local/global/info attributes cannot
 omit or substitute committed files. Every Git subprocess disables
 system/global configuration, local fsmonitor execution, hooks, external
-attribute files, and replacement objects, so repository-local behaviour and
-`refs/replace` cannot change the objects exported under the approved commit
-SHA. The Rust toolchain must be an
+attribute files, replacement objects, and promisor lazy fetching. Missing Git
+objects therefore fail closed instead of invoking a repository-configured
+remote helper, and repository-local behaviour or `refs/replace` cannot change
+the objects exported under the approved commit SHA. The Rust toolchain must be an
 independently reviewed SquashFS
 image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
