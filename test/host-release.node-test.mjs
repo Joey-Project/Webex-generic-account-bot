@@ -11,8 +11,10 @@ import {
   buildEnvironment,
   buildHostRelease,
   cargoBuildInvocation,
+  copyMeasuredFile,
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
+  readBoundedRegularFile,
 } from '../scripts/build-host-release.mjs';
 import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
@@ -44,7 +46,16 @@ describe('host release bootstrap', () => {
       assert.equal(path.posix.normalize(entry.installPath), entry.installPath);
       assert.equal(path.posix.isAbsolute(entry.installPath), false);
       assert.equal(entry.installPath.split('/').includes('..'), false);
-      assert.ok(entry.mode === 0o444 || entry.mode === 0o555);
+      assert.ok(entry.mode === 0o444 || entry.mode === 0o555 || entry.mode === 0o644);
+    }
+    assert.equal(
+      RELEASE_FILES.find(({ installPath }) => installPath === 'code/scripts/provision-host.mjs').mode,
+      0o644,
+    );
+    for (const entry of RELEASE_FILES.filter(({ installPath }) => (
+      installPath.startsWith('code/deploy/systemd/')
+    ))) {
+      assert.equal(entry.mode, 0o644);
     }
   });
 
@@ -52,11 +63,13 @@ describe('host release bootstrap', () => {
     assert.deepEqual(
       parseBuildArgs([
         '--output', '/tmp/release',
+        '--input-root', '/tmp/release-inputs',
         '--codex-package-root', '/tmp/codex',
         '--rust-toolchain-image', '/tmp/rust-toolchain.squashfs',
       ]),
       {
         output: '/tmp/release',
+        inputRoot: '/tmp/release-inputs',
         codexPackageRoot: '/tmp/codex',
         rustToolchainImage: '/tmp/rust-toolchain.squashfs',
       },
@@ -414,6 +427,7 @@ describe('host release bootstrap', () => {
       buildHostRelease(
         {
           output: '/tmp/unused-host-release-output',
+          inputRoot: '/tmp/unused-host-release-inputs',
           codexPackageRoot: '/tmp/unused-codex-root',
           rustToolchainImage: '/tmp/unused-rust-toolchain.squashfs',
         },
@@ -468,6 +482,59 @@ describe('host release bootstrap', () => {
         await fs.chmod(fixture.root, 0o700).catch(() => {});
         await fs.rm(fixture.root, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('rejects shared, writable, symlinked, missing, and escaped input roots', async () => {
+    for (const mutation of ['shared', 'writable', 'symlink', 'missing', 'escaped']) {
+      const fixture = await createFixture();
+      try {
+        if (mutation === 'shared') {
+          fixture.inputRoot = os.tmpdir();
+        } else if (mutation === 'writable') {
+          await fs.chmod(fixture.inputRoot, 0o777);
+        } else if (mutation === 'symlink') {
+          const realInputRoot = path.join(fixture.root, 'real-inputs');
+          await fs.rename(fixture.inputRoot, realInputRoot);
+          await fs.symlink(realInputRoot, fixture.inputRoot);
+        } else if (mutation === 'missing') {
+          fixture.inputRoot = path.join(fixture.root, 'missing-inputs');
+        } else {
+          const escaped = path.join(fixture.root, 'escaped-toolchain.squashfs');
+          await fs.rename(fixture.rustToolchainImage, escaped);
+          fixture.rustToolchainImage = escaped;
+        }
+        await assert.rejects(
+          buildFixtureResult(fixture),
+          /untrusted release (?:build ancestor|input root)|release input is outside input root|ENOENT/,
+        );
+        await assertMissing(fixture.bundle);
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects FIFO inputs without waiting for a writer', async () => {
+    const fixture = await createFixture();
+    const metadata = path.join(fixture.codexRoot, 'codex-package.json');
+    const destination = path.join(fixture.root, 'copied-toolchain');
+    try {
+      await fs.rm(metadata);
+      await execFileAsync('/usr/bin/mkfifo', [metadata]);
+      await assert.rejects(
+        readBoundedRegularFile(metadata, 64 * 1024),
+        /outside the permitted size/,
+      );
+      await fs.rm(fixture.rustToolchainImage);
+      await execFileAsync('/usr/bin/mkfifo', [fixture.rustToolchainImage]);
+      await assert.rejects(
+        copyMeasuredFile(fixture.rustToolchainImage, destination, 0o400),
+        /not a bounded regular file/,
+      );
+      await assertMissing(destination);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
     }
   });
 
@@ -642,21 +709,27 @@ describe('host release bootstrap', () => {
 
 async function createFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-host-release-test-'));
+  const inputRoot = path.join(root, 'inputs');
   const repoRoot = path.join(root, 'repo');
   const hostBinDir = path.join(root, 'host-bin');
   const staticBinDir = path.join(root, 'static-bin');
-  const codexRoot = path.join(root, 'codex');
+  const codexRoot = path.join(inputRoot, 'codex');
   const busybox = path.join(root, 'busybox');
-  const rustToolchainImage = path.join(root, 'rust-toolchain.squashfs');
+  const rustToolchainImage = path.join(inputRoot, 'rust-toolchain.squashfs');
   const bundle = path.join(root, 'bundle');
   const installParent = path.join(root, 'install-parent');
   const installRoot = path.join(installParent, 'webex-generic-account-bot');
   await fs.mkdir(repoRoot, { recursive: true });
+  await fs.mkdir(inputRoot, { mode: 0o700 });
   await fs.mkdir(hostBinDir, { recursive: true });
   await fs.mkdir(staticBinDir, { recursive: true });
-  await fs.mkdir(codexRoot, { recursive: true });
+  await fs.mkdir(codexRoot, { recursive: true, mode: 0o755 });
   await fs.mkdir(installParent, { recursive: true });
-  await fs.writeFile(rustToolchainImage, 'unused fixture Rust toolchain image');
+  await fs.writeFile(
+    rustToolchainImage,
+    'unused fixture Rust toolchain image',
+    { mode: 0o600 },
+  );
 
   for (const entry of RELEASE_FILES) {
     let source;
@@ -665,7 +738,7 @@ async function createFixture() {
     else if (entry.kind === 'static-binary') source = path.join(staticBinDir, entry.source);
     else if (entry.kind === 'busybox') source = busybox;
     else source = path.join(codexRoot, entry.source.slice('codex/'.length));
-    await fs.mkdir(path.dirname(source), { recursive: true });
+    await fs.mkdir(path.dirname(source), { recursive: true, mode: 0o755 });
     await fs.writeFile(source, sourceContents(entry.installPath), { mode: 0o700 });
   }
   await fs.writeFile(
@@ -682,6 +755,7 @@ async function createFixture() {
   );
   return {
     root,
+    inputRoot,
     repoRoot,
     hostBinDir,
     staticBinDir,
@@ -703,6 +777,7 @@ async function buildFixtureResult(fixture, trustedSourceSha256, injected = {}) {
   const result = await buildHostRelease(
     {
       output: fixture.bundle,
+      inputRoot: fixture.inputRoot,
       codexPackageRoot: fixture.codexRoot,
       rustToolchainImage: fixture.rustToolchainImage,
     },

@@ -234,17 +234,24 @@ and static runtime binaries from the clean reviewed commit, then creates a
 content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
 
 ```bash
+input_root="$(/usr/bin/mktemp -d /tmp/webex-host-release-inputs.XXXXXXXXXX)"
+codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
+# Materialise the separately reviewed Codex package at "$codex_package_root".
+
 /usr/bin/mksquashfs \
   /home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu \
-  /tmp/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs \
+  "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs" \
   -noappend -no-xattrs -no-progress -all-root \
   -mkfs-time 0 -all-time 0 -comp xz
+/usr/bin/chmod -R go-w "$input_root"
 
 release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
 node scripts/build-host-release.mjs \
   --output "$release_parent/bundle" \
-  --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl \
-  --rust-toolchain-image /tmp/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs
+  --input-root "$input_root" \
+  --codex-package-root "$codex_package_root" \
+  --rust-toolchain-image \
+    "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
 The builder rejects tracked and untracked worktree changes, exports the exact
@@ -268,6 +275,12 @@ documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned
 sticky directories. The builder revalidates that chain and its private `0700`
 staging tree immediately before no-clobber publication.
+The Codex package and toolchain image must likewise be materialised directly
+below a separate unpredictable current-UID/GID mode `0700` input root. Every
+selected input must be a regular file reached only through current-user-owned,
+non-group/world-writable directories below that root. Retained input file
+descriptors use non-blocking, no-follow opens before type, size, digest, and
+metadata-stability checks, so a FIFO or special file cannot stall the builder.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the

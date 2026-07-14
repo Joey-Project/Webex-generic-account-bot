@@ -72,7 +72,7 @@ export const RELEASE_FILES = Object.freeze([
     kind: 'code',
     source,
     installPath: `code/${source}`,
-    mode: EXECUTABLE_CODE_FILES.has(source) ? 0o555 : 0o444,
+    mode: EXECUTABLE_CODE_FILES.has(source) ? 0o555 : 0o644,
   })),
   ...HOST_BINARIES.map((source) => Object.freeze({
     kind: 'host-binary',

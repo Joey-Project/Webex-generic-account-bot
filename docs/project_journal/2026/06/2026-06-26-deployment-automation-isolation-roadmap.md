@@ -20,7 +20,11 @@ superseded_by:
 - First-install host release bootstrap packages the fixed runtime allowlist with
   content metadata, fixed third-party digests, and Rust binaries rebuilt from an
   exact commit export using a content-pinned SquashFS toolchain and isolated
-  Cargo home. A separately staged,
+  Cargo home. Caller-provided Codex and toolchain inputs must live below an
+  unpredictable current-user mode `0700` root; non-blocking retained-FD reads
+  reject links, FIFOs, special files, mutable metadata, and unbounded content.
+  Root-installed non-executable policy sources use the downstream-required
+  mode `0644`. A separately staged,
   environment-clearing root-owned trust anchor requires out-of-band release
   evidence and publishes `/opt/webex-generic-account-bot` with an atomic
   no-clobber operation. Complete interrupted builder outputs and installer

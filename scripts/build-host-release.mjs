@@ -33,6 +33,7 @@ export function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--output') options.output = requireValue(argv, ++index, arg);
+    else if (arg === '--input-root') options.inputRoot = requireValue(argv, ++index, arg);
     else if (arg === '--codex-package-root') {
       options.codexPackageRoot = requireValue(argv, ++index, arg);
     } else if (arg === '--rust-toolchain-image') {
@@ -45,7 +46,7 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: node scripts/build-host-release.mjs --output <directory>',
+    'Usage: node scripts/build-host-release.mjs --output <directory> --input-root <directory>',
     '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
@@ -55,6 +56,7 @@ export function usage() {
 export async function buildHostRelease(options, injected = {}) {
   const repoRoot = path.resolve(injected.repoRoot ?? REPO_ROOT);
   const output = requireAbsolutePath(options.output, '--output');
+  const inputRoot = requireAbsolutePath(options.inputRoot, '--input-root');
   const codexPackageRoot = requireAbsolutePath(
     options.codexPackageRoot,
     '--codex-package-root',
@@ -69,6 +71,10 @@ export async function buildHostRelease(options, injected = {}) {
   const revision = injected.revision ?? await readCleanRevision(repoRoot, run);
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('bot revision must be a full Git SHA');
 
+  const codexInputFiles = RELEASE_FILES
+    .filter(({ kind }) => kind === 'codex-runtime')
+    .map((entry) => releaseSource(entry, { codexPackageRoot }));
+  await assertTrustedBuildInputs(inputRoot, [rustToolchainImage, ...codexInputFiles]);
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
   await assertTrustedBuildParent(parent);
@@ -90,6 +96,7 @@ export async function buildHostRelease(options, injected = {}) {
     const artifacts = injected.buildArtifacts
       ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
       : await buildRustArtifacts(sourceRoot, scratch, rustToolchainImage, run);
+    await assertTrustedBuildInputs(inputRoot, codexInputFiles);
     await assertTrustedBuildAncestors(parent);
     await assertPrivateBuildDirectory(scratch);
     await fs.mkdir(temporary, { mode: 0o700 });
@@ -381,10 +388,13 @@ async function validateCodexPackage(root) {
   }
 }
 
-async function copyMeasuredFile(source, destination, mode) {
+export async function copyMeasuredFile(source, destination, mode) {
   const input = await fs.open(
     source,
-    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDONLY
+      | fsConstants.O_CLOEXEC
+      | fsConstants.O_NOFOLLOW
+      | fsConstants.O_NONBLOCK,
   );
   let output;
   try {
@@ -437,10 +447,13 @@ async function writeBytesFile(file, bytes, mode) {
   }
 }
 
-async function readBoundedRegularFile(file, limit) {
+export async function readBoundedRegularFile(file, limit) {
   const handle = await fs.open(
     file,
-    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDONLY
+      | fsConstants.O_CLOEXEC
+      | fsConstants.O_NOFOLLOW
+      | fsConstants.O_NONBLOCK,
   );
   try {
     const metadata = await handle.stat();
@@ -510,6 +523,59 @@ async function assertTrustedBuildParent(parent) {
   }
 }
 
+async function assertTrustedBuildInputs(inputRoot, files) {
+  await assertTrustedBuildAncestors(inputRoot);
+  await assertPrivateBuildDirectory(inputRoot, 'release input root');
+  for (const file of files) {
+    assertStrictDescendant(inputRoot, file, 'release input');
+    await assertTrustedInputDirectoryChain(inputRoot, path.dirname(file));
+    const metadata = await fs.lstat(file);
+    if (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== process.getuid()
+      || metadata.gid !== process.getgid()
+      || (metadata.mode & 0o022) !== 0
+      || metadata.size <= 0
+      || metadata.size > MAX_FILE_BYTES
+    ) {
+      throw new Error(`untrusted release input file: ${file}`);
+    }
+  }
+}
+
+async function assertTrustedInputDirectoryChain(root, directory) {
+  let current = path.resolve(directory);
+  while (true) {
+    const metadata = await fs.lstat(current);
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== process.getuid()
+      || metadata.gid !== process.getgid()
+      || (metadata.mode & 0o022) !== 0
+    ) {
+      throw new Error(`untrusted release input directory: ${current}`);
+    }
+    if (current === root) return;
+    const ancestor = path.dirname(current);
+    if (ancestor === current) throw new Error(`release input is outside input root: ${directory}`);
+    current = ancestor;
+  }
+}
+
+function assertStrictDescendant(root, target, label) {
+  const relative = path.relative(root, target);
+  if (
+    relative === ''
+    || relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  ) {
+    throw new Error(`${label} is outside input root: ${target}`);
+  }
+}
+
 async function assertTrustedBuildAncestors(start) {
   let current = path.resolve(start);
   while (true) {
@@ -532,7 +598,7 @@ async function assertTrustedBuildAncestors(start) {
   }
 }
 
-async function assertPrivateBuildDirectory(directory) {
+async function assertPrivateBuildDirectory(directory, label = 'release build directory') {
   const metadata = await fs.lstat(directory);
   if (
     !metadata.isDirectory()
@@ -541,7 +607,7 @@ async function assertPrivateBuildDirectory(directory) {
     || metadata.gid !== process.getgid()
     || (metadata.mode & 0o7777) !== 0o700
   ) {
-    throw new Error(`untrusted release build directory: ${directory}`);
+    throw new Error(`untrusted ${label}: ${directory}`);
   }
 }
 
