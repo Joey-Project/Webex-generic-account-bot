@@ -71,7 +71,7 @@ export async function buildHostRelease(options, injected = {}) {
 
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
-  await ensureTrustedBuildParent(parent);
+  await assertTrustedBuildParent(parent);
   await assertNoStaleBuildState(parent, output);
   const scratch = path.join(
     parent,
@@ -498,27 +498,16 @@ async function collectDirectories(root, current = root, result = []) {
   return result;
 }
 
-async function ensureTrustedBuildParent(parent) {
-  const missing = [];
-  let current = path.resolve(parent);
-  while (true) {
-    try {
-      await fs.lstat(current);
-      break;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-      missing.push(current);
-      const ancestor = path.dirname(current);
-      if (ancestor === current) throw new Error(`release build parent is unavailable: ${parent}`);
-      current = ancestor;
+async function assertTrustedBuildParent(parent) {
+  try {
+    await assertTrustedBuildAncestors(parent);
+    await assertPrivateBuildDirectory(parent);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw new Error(`release build parent must already exist: ${parent}`);
     }
+    throw error;
   }
-  await assertTrustedBuildAncestors(current);
-  for (const directory of missing.toReversed()) {
-    await fs.mkdir(directory, { mode: 0o700 });
-    await assertPrivateBuildDirectory(directory);
-  }
-  await assertTrustedBuildAncestors(parent);
 }
 
 async function assertTrustedBuildAncestors(start) {

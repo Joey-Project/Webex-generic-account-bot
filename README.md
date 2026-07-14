@@ -240,8 +240,9 @@ content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
   -noappend -no-xattrs -no-progress -all-root \
   -mkfs-time 0 -all-time 0 -comp xz
 
+release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
 node scripts/build-host-release.mjs \
-  --output /tmp/webex-host-release \
+  --output "$release_parent/bundle" \
   --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl \
   --rust-toolchain-image /tmp/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs
 ```
@@ -262,10 +263,11 @@ sysroot remain an explicit build-host trust base; the builder selects their
 absolute paths and never substitutes caller-controlled native tools. Cargo runs
 from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
 files beside or above the caller-selected output directory are not loaded.
-The builder creates missing output ancestors one component at a time and accepts
-only non-writable root/current-user ancestors or a root-owned sticky directory
-such as `/tmp`; it revalidates that chain and its private `0700` staging tree
-immediately before no-clobber publication.
+The output parent must already be a current-UID/GID mode `0700` directory; the
+documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
+ancestors must be non-writable root/current-user directories or root-owned
+sticky directories. The builder revalidates that chain and its private `0700`
+staging tree immediately before no-clobber publication.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the

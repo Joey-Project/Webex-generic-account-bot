@@ -442,22 +442,26 @@ describe('host release bootstrap', () => {
     }
   });
 
-  it('rejects writable and symlinked build parents', async () => {
-    for (const mutation of ['writable', 'symlink']) {
+  it('rejects shared, writable, symlinked, and missing build parents', async () => {
+    for (const mutation of ['shared', 'writable', 'symlink', 'missing']) {
       const fixture = await createFixture();
       try {
-        if (mutation === 'writable') {
+        if (mutation === 'shared') {
+          fixture.bundle = path.join(os.tmpdir(), `webex-host-release-${crypto.randomUUID()}`);
+        } else if (mutation === 'writable') {
           await fs.chmod(fixture.root, 0o777);
-        } else {
+        } else if (mutation === 'symlink') {
           const realParent = path.join(fixture.root, 'real-output');
           const linkParent = path.join(fixture.root, 'output-link');
           await fs.mkdir(realParent, { mode: 0o700 });
           await fs.symlink(realParent, linkParent);
           fixture.bundle = path.join(linkParent, 'bundle');
+        } else {
+          fixture.bundle = path.join(fixture.root, 'missing-output', 'bundle');
         }
         await assert.rejects(
           buildFixtureResult(fixture),
-          /untrusted release build ancestor/,
+          /untrusted release build (?:ancestor|directory)|release build parent must already exist/,
         );
         await assertMissing(fixture.bundle);
       } finally {
