@@ -205,15 +205,54 @@ describe('host release bootstrap', () => {
   it('rejects Cargo configuration at the fixed build working-directory root', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-root-config-test-'));
     try {
-      await assert.doesNotReject(assertCargoConfigurationIsolated(root));
-      await fs.mkdir(path.join(root, '.cargo'));
+      const absent = await assertCargoConfigurationIsolated(
+        undefined,
+        root,
+        process.getuid(),
+      );
+      await assert.doesNotReject(assertCargoConfigurationIsolated(
+        absent,
+        root,
+        process.getuid(),
+      ));
+      await fs.mkdir(path.join(root, '.cargo'), { mode: 0o700 });
       await fs.writeFile(
         path.join(root, '.cargo', 'config.toml'),
         '[build]\nrustc-wrapper = "/unreviewed/rustc-wrapper"\n',
       );
       await assert.rejects(
-        assertCargoConfigurationIsolated(root),
+        assertCargoConfigurationIsolated(undefined, root, process.getuid()),
         /Cargo configuration is not permitted/,
+      );
+      await fs.rm(path.join(root, '.cargo'), { recursive: true });
+      await fs.mkdir(path.join(root, '.cargo'), { mode: 0o777 });
+      await fs.chmod(path.join(root, '.cargo'), 0o777);
+      await assert.rejects(
+        assertCargoConfigurationIsolated(undefined, root, process.getuid()),
+        /Cargo configuration root is untrusted/,
+      );
+      await fs.chmod(path.join(root, '.cargo'), 0o700);
+      const present = await assertCargoConfigurationIsolated(
+        undefined,
+        root,
+        process.getuid(),
+      );
+      const transient = path.join(root, '.cargo', 'config.toml');
+      await fs.writeFile(transient, '[build]\nrustc-wrapper = "/transient/wrapper"\n');
+      await fs.rm(transient);
+      await assert.rejects(
+        assertCargoConfigurationIsolated(present, root, process.getuid()),
+        /Cargo configuration root changed during release build/,
+      );
+      const stable = await assertCargoConfigurationIsolated(
+        undefined,
+        root,
+        process.getuid(),
+      );
+      await fs.chmod(path.join(root, '.cargo'), 0o755);
+      await assert.rejects(
+        assertCargoConfigurationIsolated(stable, root, process.getuid()),
+        /Cargo configuration root changed during release build/,
       );
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -315,6 +354,45 @@ describe('host release bootstrap', () => {
       '  "$@"',
       '',
     ].join('\n'));
+  });
+
+  it('starts the release builder with a fixed Node runtime and cleared environment', async () => {
+    const builderPath = new URL('../scripts/build-host-release.mjs', import.meta.url);
+    const builder = await fs.readFile(builderPath, 'utf8');
+    const metadata = await fs.lstat(builderPath);
+    assert.equal(metadata.mode & 0o111, 0o111);
+    assert.equal(
+      builder.split('\n', 1)[0],
+      '#!/usr/bin/env -S -i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/node',
+    );
+
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-builder-env-test-'));
+    const marker = path.join(root, 'preload-ran');
+    const preload = path.join(root, 'preload.cjs');
+    try {
+      await fs.writeFile(
+        preload,
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran');\n`,
+      );
+      const { stdout } = await execFileAsync('/usr/bin/env', [
+        '-S',
+        `-i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin ${process.execPath}`,
+        '-e',
+        'process.stdout.write(JSON.stringify(process.env))',
+      ], {
+        env: { ...process.env, NODE_OPTIONS: `--require=${preload}` },
+        maxBuffer: 1024 * 1024,
+      });
+      assert.deepEqual(JSON.parse(stdout), {
+        HOME: '/',
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+      });
+      await assertMissing(marker);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it('rejects tampering, extra files, links, and an existing install', async () => {
@@ -465,24 +543,6 @@ describe('host release bootstrap', () => {
     }
   });
 
-  it('rejects untracked source inputs before materialising the commit snapshot', async () => {
-    await assert.rejects(
-      buildHostRelease(
-        {
-          output: '/tmp/unused-host-release-output',
-          inputRoot: '/tmp/unused-host-release-inputs',
-          codexPackageRoot: '/tmp/unused-codex-root',
-          rustToolchainImage: '/tmp/unused-rust-toolchain.squashfs',
-        },
-        {
-          repoRoot: '/tmp/unused-repo',
-          execFileAsync: async () => ({ stdout: '?? build.rs\n', stderr: '' }),
-        },
-      ),
-      /no tracked or untracked changes/,
-    );
-  });
-
   it('exports committed blobs instead of repository replacement objects', async () => {
     const fixture = await createFixture();
     const sourcePath = 'scripts/provision-host.mjs';
@@ -555,16 +615,19 @@ describe('host release bootstrap', () => {
       ]);
       await fs.writeFile(
         fsmonitor,
-        `#!/bin/sh\nprintf ran > "${fsmonitorMarker}"\n`,
+        `#!/bin/sh\nprintf ran > "${fsmonitorMarker}"\n/bin/cat\n`,
         { mode: 0o755 },
       );
-      await fs.writeFile(attributes, `${sourcePath} export-ignore\n`);
+      await fs.writeFile(attributes, `${sourcePath} filter=host-release-test export-ignore\n`);
       await fs.writeFile(
         path.join(fixture.repoRoot, '.git', 'info', 'attributes'),
-        `${sourcePath} export-ignore\n`,
+        `${sourcePath} filter=host-release-test export-ignore\n`,
       );
       await git(['config', 'core.fsmonitor', fsmonitor]);
       await git(['config', 'core.attributesFile', attributes]);
+      await git(['config', 'filter.host-release-test.clean', fsmonitor]);
+      await git(['config', 'filter.host-release-test.required', 'true']);
+      await fs.writeFile(path.join(fixture.repoRoot, sourcePath), 'worktree-only source\n');
 
       const result = await buildFixtureResult(fixture, undefined, { revision: undefined });
       assert.notEqual(result.manifest.bot_revision, REVISION);

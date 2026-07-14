@@ -247,7 +247,7 @@ codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
 /usr/bin/chmod -R go-w "$input_root"
 
 release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
-node scripts/build-host-release.mjs \
+scripts/build-host-release.mjs \
   --output "$release_parent/bundle" \
   --input-root "$input_root" \
   --codex-package-root "$codex_package_root" \
@@ -255,11 +255,14 @@ node scripts/build-host-release.mjs \
     "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
-The builder rejects tracked and non-ignored untracked worktree changes,
-materialises the exact commit into an isolated source snapshot from bounded
-`ls-tree` and `cat-file` results, and uses a build-local Cargo home and home
-directory. Ignored local caches and files never enter that object-only
-snapshot. It
+The executable builder clears the complete caller environment in its shebang
+and starts the root-owned `/usr/bin/node` directly, so caller `PATH`,
+`NODE_OPTIONS`, loaders, and preloads cannot run before the builder's checks.
+The builder materialises the exact `HEAD` commit into an isolated source
+snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
+Cargo home and home directory. Tracked worktree edits, untracked files, ignored
+local caches, and files never enter that object-only snapshot; the printed full
+commit SHA is the source identity presented for approval. It
 does not use `git archive`, so unreviewed local/global/info attributes cannot
 omit or substitute committed files. Every Git subprocess disables
 system/global configuration, local fsmonitor execution, hooks, external
@@ -280,8 +283,11 @@ sysroot remain an explicit build-host trust base; the builder selects their
 absolute paths and never substitutes caller-controlled native tools. Cargo runs
 from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
 files beside or above the caller-selected output directory are not loaded. The
-builder rejects `/.cargo/config` and `/.cargo/config.toml` before and after the
-Cargo work, closing the remaining fixed-working-directory configuration path.
+builder requires `/` and any existing `/.cargo` to be root-owned and
+non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
+and binds both directory identities across the Cargo work. This closes the
+remaining fixed-working-directory configuration path and its create/remove
+race.
 The output parent must already be a current-UID/GID mode `0700` directory; the
 documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned

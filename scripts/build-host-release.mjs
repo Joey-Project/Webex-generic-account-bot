@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S -i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/node
 
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -54,7 +54,7 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: node scripts/build-host-release.mjs --output <directory> --input-root <directory>',
+    'Usage: scripts/build-host-release.mjs --output <directory> --input-root <directory>',
     '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
@@ -78,7 +78,7 @@ export async function buildHostRelease(options, injected = {}) {
   const run = injected.execFileAsync ?? execFileAsync;
   const sync = injected.syncDirectory ?? syncDirectory;
   const resync = injected.resyncBundle ?? resyncBundle;
-  const revision = injected.revision ?? await readCleanRevision(repoRoot, run);
+  const revision = injected.revision ?? await readRevision(repoRoot, run);
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('bot revision must be a full Git SHA');
 
   const codexInputFiles = RELEASE_FILES
@@ -263,7 +263,7 @@ async function buildRustArtifacts(
   await fs.mkdir(path.join(scratch, 'home'), { mode: 0o700 });
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');
-  await assertCargoConfiguration();
+  const cargoConfigurationIdentity = await assertCargoConfiguration();
   try {
     const cargoVersion = (await run(cargoBin, ['--version'], {
       cwd: '/',
@@ -323,7 +323,7 @@ async function buildRustArtifacts(
       toolchainSha256: measuredToolchain.sha256,
     };
   } finally {
-    await assertCargoConfiguration();
+    await assertCargoConfiguration(cargoConfigurationIdentity);
   }
 }
 
@@ -363,19 +363,13 @@ export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalR
   };
 }
 
-async function readCleanRevision(repoRoot, run = execFileAsync) {
+async function readRevision(repoRoot, run = execFileAsync) {
   const environment = gitEnvironment();
-  const status = await run('/usr/bin/git', gitArguments([
-    'status',
-    '--porcelain',
-    '--untracked-files=all',
+  const revision = await run('/usr/bin/git', gitArguments([
+    'rev-parse',
+    '--verify',
+    'HEAD^{commit}',
   ]), {
-    cwd: repoRoot,
-    env: environment,
-    maxBuffer: 1024 * 1024,
-  });
-  if (status.stdout !== '') throw new Error('worktree must contain no tracked or untracked changes');
-  const revision = await run('/usr/bin/git', gitArguments(['rev-parse', 'HEAD']), {
     cwd: repoRoot,
     env: environment,
     maxBuffer: 1024 * 1024,
@@ -449,18 +443,30 @@ function toBuffer(value) {
   return Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
 }
 
-export async function assertCargoConfigurationIsolated(root = '/') {
-  const cargoDirectory = path.join(path.resolve(root), '.cargo');
+export async function assertCargoConfigurationIsolated(
+  expectedIdentity,
+  root = '/',
+  expectedUid = 0,
+) {
+  const resolvedRoot = path.resolve(root);
+  const rootMetadata = await fs.lstat(resolvedRoot);
+  assertTrustedCargoDirectory(rootMetadata, resolvedRoot, expectedUid);
+  const cargoDirectory = path.join(resolvedRoot, '.cargo');
   let metadata;
   try {
     metadata = await fs.lstat(cargoDirectory);
   } catch (error) {
-    if (error?.code === 'ENOENT') return;
+    if (error?.code === 'ENOENT') {
+      const identity = Object.freeze({
+        cargo: null,
+        root: directoryIdentity(rootMetadata),
+      });
+      assertCargoIdentityMatches(identity, expectedIdentity);
+      return identity;
+    }
     throw error;
   }
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new Error(`Cargo configuration root is untrusted: ${cargoDirectory}`);
-  }
+  assertTrustedCargoDirectory(metadata, cargoDirectory, expectedUid);
   for (const name of ['config', 'config.toml']) {
     try {
       await fs.lstat(path.join(cargoDirectory, name));
@@ -468,6 +474,43 @@ export async function assertCargoConfigurationIsolated(root = '/') {
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
+  }
+  const identity = Object.freeze({
+    cargo: directoryIdentity(metadata),
+    root: directoryIdentity(rootMetadata),
+  });
+  assertCargoIdentityMatches(identity, expectedIdentity);
+  return identity;
+}
+
+function assertTrustedCargoDirectory(metadata, directory, expectedUid) {
+  if (
+    !metadata.isDirectory()
+    || metadata.isSymbolicLink()
+    || metadata.uid !== expectedUid
+    || (metadata.mode & 0o022) !== 0
+  ) {
+    throw new Error(`Cargo configuration root is untrusted: ${directory}`);
+  }
+}
+
+function directoryIdentity(metadata) {
+  return Object.freeze({
+    ctimeMs: metadata.ctimeMs,
+    dev: metadata.dev,
+    gid: metadata.gid,
+    ino: metadata.ino,
+    mode: metadata.mode,
+    uid: metadata.uid,
+  });
+}
+
+function assertCargoIdentityMatches(identity, expectedIdentity) {
+  if (
+    expectedIdentity !== undefined
+    && JSON.stringify(identity) !== JSON.stringify(expectedIdentity)
+  ) {
+    throw new Error('Cargo configuration root changed during release build');
   }
 }
 

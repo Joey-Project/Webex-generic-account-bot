@@ -39,6 +39,10 @@ superseded_by:
   with local Git behaviour disabled instead of attribute-sensitive archives.
   Cargo rejects fixed-root configuration, manifest ordering is locale
   independent, and recovered bundles are fully re-synced before acceptance.
+  The production builder entrypoint clears its startup environment and pins
+  `/usr/bin/node`; object-only source materialisation no longer executes a
+  worktree cleanliness command, and Cargo binds trusted root-directory
+  identities across compilation.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
