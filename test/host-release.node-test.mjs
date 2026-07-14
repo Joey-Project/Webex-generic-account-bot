@@ -6,6 +6,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
+  buildEnvironment,
   buildHostRelease,
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
@@ -74,6 +75,26 @@ describe('host release bootstrap', () => {
     );
     assert.throws(() => parseInstallArgs(['--apply', '--dry-run']), /exactly one install mode/);
     assert.throws(() => parseInstallArgs(['--bundle', '/tmp/x']), /unknown argument/);
+  });
+
+  it('remaps private build paths and fixes reproducibility inputs', () => {
+    const environment = buildEnvironment(
+      '/tmp/release scratch',
+      '/tmp/release scratch/rust-toolchain',
+      { CARGO_TARGET_DIR: '/tmp/release scratch/target' },
+      ['-Ctarget-feature=+crt-static'],
+    );
+    assert.equal(environment.HOME, '/tmp/release scratch/home');
+    assert.equal(environment.CARGO_HOME, '/tmp/release scratch/cargo-home');
+    assert.equal(environment.SOURCE_DATE_EPOCH, '0');
+    assert.equal(
+      environment.CARGO_ENCODED_RUSTFLAGS,
+      [
+        '--remap-path-prefix=/tmp/release scratch=/build',
+        '-Ctarget-feature=+crt-static',
+      ].join('\u001f'),
+    );
+    assert.equal('RUSTUP_HOME' in environment, false);
   });
 
   it('builds, validates, and atomically installs the exact first-release tree', async () => {

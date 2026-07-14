@@ -261,10 +261,12 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
     'webex-codex-canary-probe',
   ], {
     cwd: repoRoot,
-    env: buildEnvironment(scratch, toolchainRoot, {
-      CARGO_TARGET_DIR: staticTarget,
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-Ctarget-feature=+crt-static',
-    }),
+    env: buildEnvironment(
+      scratch,
+      toolchainRoot,
+      { CARGO_TARGET_DIR: staticTarget },
+      ['-Ctarget-feature=+crt-static'],
+    ),
     maxBuffer: 16 * 1024 * 1024,
   });
   return {
@@ -276,7 +278,7 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
   };
 }
 
-function buildEnvironment(scratch, toolchainRoot, extra = {}) {
+export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalRustFlags = []) {
   return {
     HOME: path.join(scratch, 'home'),
     CARGO_HOME: path.join(scratch, 'cargo-home'),
@@ -286,6 +288,11 @@ function buildEnvironment(scratch, toolchainRoot, extra = {}) {
     RUSTC: path.join(toolchainRoot, 'bin/rustc'),
     RUSTDOC: path.join(toolchainRoot, 'bin/rustdoc'),
     CARGO_INCREMENTAL: '0',
+    CARGO_ENCODED_RUSTFLAGS: [
+      `--remap-path-prefix=${scratch}=/build`,
+      ...additionalRustFlags,
+    ].join('\u001f'),
+    SOURCE_DATE_EPOCH: '0',
     ...extra,
   };
 }

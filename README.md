@@ -255,6 +255,8 @@ The generation source is not itself a trust decision; review and approve the
 resulting immutable image before using the pinned size and digest.
 The builder copies and verifies that image before extracting it into private
 scratch space; it never executes the caller's mutable Rustup shims or toolchain.
+Rust compiler paths are remapped to `/build`, and reproducibility inputs are
+fixed so a retry can compare a newly built manifest with a completed output.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
