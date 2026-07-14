@@ -88,8 +88,10 @@ fn event_hydration_not_found_retry() -> Duration {
 struct Cli {
     #[arg(long, default_value = "config/example.toml")]
     config: PathBuf,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "check_config_structure")]
     check_config: bool,
+    #[arg(long, conflicts_with = "check_config")]
+    check_config_structure: bool,
 }
 
 #[tokio::main]
@@ -103,6 +105,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Arc::new(BotConfig::load(&cli.config)?);
+    if cli.check_config_structure {
+        println!("config_structure_ok=true");
+        return Ok(());
+    }
     if cli.check_config {
         if config.uses_ephemeral_linux_user() {
             #[cfg(target_os = "linux")]
