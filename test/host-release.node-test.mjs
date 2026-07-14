@@ -17,12 +17,14 @@ import {
   RELEASE_FILES,
   RELEASE_PATHS,
   RUSTC_VERSION,
+  RUST_TOOLCHAIN_IMAGE_SHA256,
   bundlePayloadPath,
 } from '../scripts/host-release-contract.mjs';
 import {
   installHostRelease,
   parseArgs as parseInstallArgs,
   publishCandidate,
+  resyncInstalledRelease,
   validateBundle,
 } from '../scripts/install-host-release.mjs';
 
@@ -45,10 +47,12 @@ describe('host release bootstrap', () => {
       parseBuildArgs([
         '--output', '/tmp/release',
         '--codex-package-root', '/tmp/codex',
+        '--rust-toolchain-image', '/tmp/rust-toolchain.squashfs',
       ]),
       {
         output: '/tmp/release',
         codexPackageRoot: '/tmp/codex',
+        rustToolchainImage: '/tmp/rust-toolchain.squashfs',
       },
     );
     assert.deepEqual(parseInstallArgs([]), { apply: false, json: false });
@@ -84,6 +88,11 @@ describe('host release bootstrap', () => {
       }
       assert.equal(manifest.bot_revision, REVISION);
       assert.equal(manifest.codex_version, CODEX_VERSION);
+      assert.deepEqual(manifest.build, {
+        cargo_version: CARGO_VERSION,
+        rustc_version: RUSTC_VERSION,
+        toolchain_sha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+      });
       assert.deepEqual(manifest.files.map(({ path: file }) => file), RELEASE_PATHS);
 
       const validated = await validateBundle(
@@ -222,6 +231,35 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('rejects untrusted Rust toolchain provenance in the bundle manifest', async () => {
+    const fixture = await createFixture();
+    try {
+      await buildFixtureBundle(fixture);
+      const manifestPath = path.join(fixture.bundle, 'manifest.json');
+      const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+      manifest.build.toolchain_sha256 = '0'.repeat(64);
+      const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+      await fs.chmod(manifestPath, 0o600);
+      await fs.writeFile(manifestPath, bytes);
+      await fs.chmod(manifestPath, 0o444);
+      const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+
+      await assert.rejects(
+        validateBundle(
+          fixture.bundle,
+          process.getuid(),
+          process.getgid(),
+          digest,
+          REVISION,
+          releaseContract,
+        ),
+        /Rust toolchain provenance is invalid/,
+      );
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('publishes without clobbering a destination that appears concurrently', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-host-publish-test-'));
     const candidate = path.join(root, 'candidate');
@@ -268,6 +306,7 @@ describe('host release bootstrap', () => {
         {
           output: '/tmp/unused-host-release-output',
           codexPackageRoot: '/tmp/unused-codex-root',
+          rustToolchainImage: '/tmp/unused-rust-toolchain.squashfs',
         },
         {
           repoRoot: '/tmp/unused-repo',
@@ -276,6 +315,47 @@ describe('host release bootstrap', () => {
       ),
       /no tracked or untracked changes/,
     );
+  });
+
+  it('recovers a matching bundle output after parent sync failure', async () => {
+    const fixture = await createFixture();
+    try {
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, {
+          syncDirectory: async () => {
+            throw new Error('simulated bundle parent sync failure');
+          },
+        }),
+        /simulated bundle parent sync failure/,
+      );
+      assert.equal((await fs.lstat(fixture.bundle)).isDirectory(), true);
+
+      const recovered = await buildFixtureResult(fixture);
+      assert.equal(recovered.status, 'recovered');
+      assert.equal(recovered.manifest.bot_revision, REVISION);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not recover a mismatching pre-existing bundle output', async () => {
+    const fixture = await createFixture();
+    try {
+      const manifest = await buildFixtureBundle(fixture);
+      const target = path.join(fixture.bundle, bundlePayloadPath(manifest.files[0].path));
+      const mode = (await fs.lstat(target)).mode & 0o7777;
+      await fs.chmod(target, 0o600);
+      await fs.writeFile(target, 'x'.repeat(manifest.files[0].size));
+      await fs.chmod(target, mode);
+
+      await assert.rejects(
+        buildFixtureResult(fixture),
+        /release output appeared during publish/,
+      );
+      assert.equal(await fs.readFile(target, 'utf8'), 'x'.repeat(manifest.files[0].size));
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('recovers a fully published release after parent sync failure', async () => {
@@ -318,8 +398,21 @@ describe('host release bootstrap', () => {
           await fs.rename(fixture.installRoot, candidate);
           const dryRun = await installFixture(fixture, false);
           assert.equal(dryRun.status, 'recoverable_candidate');
-          const recovered = await installFixture(fixture, true);
+          const events = [];
+          const recovered = await installFixture(fixture, true, {
+            resyncInstalledRelease: async (root, manifest) => {
+              assert.equal(root, candidate);
+              assert.equal(manifest.bot_revision, REVISION);
+              events.push('resync');
+              await resyncInstalledRelease(root, manifest);
+            },
+            publishCandidate: async (source, destination) => {
+              events.push('publish');
+              await publishCandidate(source, destination);
+            },
+          });
           assert.equal(recovered.status, 'recovered');
+          assert.deepEqual(events, ['resync', 'publish']);
           assert.equal(await fs.lstat(fixture.installRoot).then((value) => value.isDirectory()), true);
         } else {
           await fs.mkdir(candidate, { mode: 0o755 });
@@ -375,6 +468,7 @@ async function createFixture() {
   const staticBinDir = path.join(root, 'static-bin');
   const codexRoot = path.join(root, 'codex');
   const busybox = path.join(root, 'busybox');
+  const rustToolchainImage = path.join(root, 'rust-toolchain.squashfs');
   const bundle = path.join(root, 'bundle');
   const installParent = path.join(root, 'install-parent');
   const installRoot = path.join(installParent, 'webex-generic-account-bot');
@@ -383,6 +477,7 @@ async function createFixture() {
   await fs.mkdir(staticBinDir, { recursive: true });
   await fs.mkdir(codexRoot, { recursive: true });
   await fs.mkdir(installParent, { recursive: true });
+  await fs.writeFile(rustToolchainImage, 'unused fixture Rust toolchain image');
 
   for (const entry of RELEASE_FILES) {
     let source;
@@ -413,16 +508,24 @@ async function createFixture() {
     staticBinDir,
     codexRoot,
     busybox,
+    rustToolchainImage,
     bundle,
     installRoot,
   };
 }
 
 async function buildFixtureBundle(fixture, trustedSourceSha256) {
+  const result = await buildFixtureResult(fixture, trustedSourceSha256);
+  fixture.manifestSha256 = result.manifestSha256;
+  return result.manifest;
+}
+
+async function buildFixtureResult(fixture, trustedSourceSha256, injected = {}) {
   const result = await buildHostRelease(
     {
       output: fixture.bundle,
       codexPackageRoot: fixture.codexRoot,
+      rustToolchainImage: fixture.rustToolchainImage,
     },
     {
       repoRoot: fixture.repoRoot,
@@ -434,12 +537,14 @@ async function buildFixtureBundle(fixture, trustedSourceSha256) {
         staticBinDir: fixture.staticBinDir,
         cargoVersion: CARGO_VERSION,
         rustcVersion: RUSTC_VERSION,
+        toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
       }),
       trustedSourceSha256: trustedSourceSha256 ?? await trustedFixtureDigests(fixture),
+      ...injected,
     },
   );
   fixture.manifestSha256 = result.manifestSha256;
-  return result.manifest;
+  return result;
 }
 
 function installFixture(fixture, apply, injected = {}) {

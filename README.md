@@ -234,20 +234,36 @@ and static runtime binaries from the clean reviewed commit, then creates a
 content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
 
 ```bash
+/usr/bin/mksquashfs \
+  /home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu \
+  /tmp/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs \
+  -noappend -no-xattrs -no-progress -all-root \
+  -mkfs-time 0 -all-time 0 -comp xz
+
 node scripts/build-host-release.mjs \
   --output /tmp/webex-host-release \
-  --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl
+  --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl \
+  --rust-toolchain-image /tmp/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs
 ```
 
 The builder rejects tracked and untracked worktree changes, exports the exact
-commit to an isolated source snapshot, and uses a build-local Cargo home. It
-records the full Git SHA, fixed target and Rust/Codex versions, exact allowlisted
-paths, modes, sizes, and SHA-256 digests. Fixed trusted digests cover the Codex
-executable, metadata, `rg`, `bwrap`, and the deployment-host BusyBox. The
-builder normalises and syncs every bundle directory, publishes without
-clobbering, and prints the complete manifest digest for independent release
-approval. It includes no tokens, environment files, deploy keys, rendered
-config, runtime image, systemd installation, or service state.
+commit to an isolated source snapshot, and uses a build-local Cargo home and
+home directory. The Rust toolchain must be an independently reviewed SquashFS
+image of exactly `259895296` bytes with SHA-256
+`9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
+The generation source is not itself a trust decision; review and approve the
+resulting immutable image before using the pinned size and digest.
+The builder copies and verifies that image before extracting it into private
+scratch space; it never executes the caller's mutable Rustup shims or toolchain.
+It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
+digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
+trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
+deployment-host BusyBox. The builder normalises and syncs every bundle
+directory, publishes without clobbering, and prints the complete manifest
+digest for independent release approval. Retrying after a parent-directory
+sync interruption accepts only the exact completed output and syncs the parent
+again. It includes no tokens, environment files, deploy keys, rendered config,
+runtime image, systemd installation, or service state.
 
 The installer, contract, and environment-clearing wrapper are a separate trust
 anchor and are never loaded from the bundle. A reviewed release-delivery step

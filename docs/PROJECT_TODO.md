@@ -30,7 +30,8 @@
 - [completed] Add a guarded host provisioner before production activation;
   real host apply remains an explicit operational step.
 - [completed] Add a content-manifested, fixed-path, first-install host release
-  bootstrap with a commit-exported Rust build, digest-pinned third-party sources,
+  bootstrap with a commit-exported Rust build, content-pinned Rust toolchain,
+  digest-pinned third-party sources,
   a separate environment-clearing root-owned trust anchor, and recoverable
   no-clobber publish without installing secrets, policy, or service state.
 - [completed] Add a structural config-check CLI mode for unprivileged CI while

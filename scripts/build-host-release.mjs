@@ -10,16 +10,18 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
-  CARGO_BIN,
   CARGO_VERSION,
   CODEX_VERSION,
   RELEASE_FILES,
   RELEASE_VERSION,
-  RUSTC_BIN,
   RUSTC_VERSION,
+  RUST_TOOLCHAIN_IMAGE_SHA256,
+  RUST_TOOLCHAIN_IMAGE_SIZE,
   TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
 } from './host-release-contract.mjs';
+import * as releaseContract from './host-release-contract.mjs';
+import { validateBundle } from './install-host-release.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -34,6 +36,8 @@ export function parseArgs(argv) {
     if (arg === '--output') options.output = requireValue(argv, ++index, arg);
     else if (arg === '--codex-package-root') {
       options.codexPackageRoot = requireValue(argv, ++index, arg);
+    } else if (arg === '--rust-toolchain-image') {
+      options.rustToolchainImage = requireValue(argv, ++index, arg);
     } else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -43,7 +47,7 @@ export function parseArgs(argv) {
 export function usage() {
   return [
     'Usage: node scripts/build-host-release.mjs --output <directory>',
-    '       --codex-package-root <vendor-root>',
+    '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
   ].join('\n');
@@ -56,15 +60,19 @@ export async function buildHostRelease(options, injected = {}) {
     options.codexPackageRoot,
     '--codex-package-root',
   );
+  const rustToolchainImage = requireAbsolutePath(
+    options.rustToolchainImage,
+    '--rust-toolchain-image',
+  );
   const busybox = path.resolve(injected.busybox ?? '/usr/bin/busybox');
   const run = injected.execFileAsync ?? execFileAsync;
+  const sync = injected.syncDirectory ?? syncDirectory;
   const revision = injected.revision ?? await readCleanRevision(repoRoot, run);
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('bot revision must be a full Git SHA');
 
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-  await assertOutputAbsent(output);
   const scratch = path.join(
     parent,
     `.${path.basename(output)}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.build`,
@@ -80,7 +88,7 @@ export async function buildHostRelease(options, injected = {}) {
       : await materializeRevision(repoRoot, scratch, revision, run);
     const artifacts = injected.buildArtifacts
       ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
-      : await buildRustArtifacts(sourceRoot, scratch, run);
+      : await buildRustArtifacts(sourceRoot, scratch, rustToolchainImage, run);
     await fs.mkdir(temporary, { mode: 0o700 });
     const files = [];
     for (const entry of RELEASE_FILES) {
@@ -120,6 +128,7 @@ export async function buildHostRelease(options, injected = {}) {
       build: {
         cargo_version: artifacts.cargoVersion,
         rustc_version: artifacts.rustcVersion,
+        toolchain_sha256: artifacts.toolchainSha256,
       },
       files,
     };
@@ -127,9 +136,27 @@ export async function buildHostRelease(options, injected = {}) {
     const manifestSha256 = crypto.createHash('sha256').update(manifestBytes).digest('hex');
     await writeBytesFile(path.join(temporary, MANIFEST_NAME), manifestBytes, 0o444);
     await normaliseAndSyncBundleDirectories(temporary);
-    await (injected.publishOutput ?? publishDirectoryNoReplace)(temporary, output);
-    await syncDirectory(parent);
-    return { manifest, manifestSha256 };
+    let status = 'built';
+    try {
+      await (injected.publishOutput ?? publishDirectoryNoReplace)(temporary, output);
+    } catch (publishError) {
+      try {
+        await validateBundle(
+          output,
+          process.getuid(),
+          process.getgid(),
+          manifestSha256,
+          revision,
+          releaseContract,
+        );
+      } catch {
+        throw publishError;
+      }
+      await fs.rm(temporary, { recursive: true, force: true });
+      status = 'recovered';
+    }
+    await sync(parent);
+    return { manifest, manifestSha256, status };
   } catch (error) {
     await fs.rm(temporary, { recursive: true, force: true });
     throw error;
@@ -168,16 +195,38 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
   return sourceRoot;
 }
 
-async function buildRustArtifacts(repoRoot, scratch, run) {
+async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
+  const toolchainImage = path.join(scratch, 'rust-toolchain.squashfs');
+  const measuredToolchain = await copyMeasuredFile(rustToolchainImage, toolchainImage, 0o400);
+  if (
+    measuredToolchain.size !== RUST_TOOLCHAIN_IMAGE_SIZE
+    || measuredToolchain.sha256 !== RUST_TOOLCHAIN_IMAGE_SHA256
+  ) {
+    throw new Error('Rust toolchain image does not match the trusted release digest');
+  }
+  const toolchainRoot = path.join(scratch, 'rust-toolchain');
+  await run('/usr/bin/unsquashfs', [
+    '-no-progress',
+    '-dest',
+    toolchainRoot,
+    toolchainImage,
+  ], {
+    cwd: '/',
+    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+    maxBuffer: 16 * 1024 * 1024,
+  });
   await fs.mkdir(path.join(scratch, 'cargo-home'), { mode: 0o700 });
-  const cargoVersion = (await run(CARGO_BIN, ['--version'], {
+  await fs.mkdir(path.join(scratch, 'home'), { mode: 0o700 });
+  const cargoBin = path.join(toolchainRoot, 'bin/cargo');
+  const rustcBin = path.join(toolchainRoot, 'bin/rustc');
+  const cargoVersion = (await run(cargoBin, ['--version'], {
     cwd: repoRoot,
-    env: buildEnvironment(scratch),
+    env: buildEnvironment(scratch, toolchainRoot),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
-  const rustcVersion = (await run(RUSTC_BIN, ['--version'], {
+  const rustcVersion = (await run(rustcBin, ['--version'], {
     cwd: repoRoot,
-    env: buildEnvironment(scratch),
+    env: buildEnvironment(scratch, toolchainRoot),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
   if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
@@ -186,7 +235,7 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
 
   const hostTarget = path.join(scratch, 'host-target');
   const staticTarget = path.join(scratch, 'static-target');
-  await run(CARGO_BIN, [
+  await run(cargoBin, [
     'build',
     '--locked',
     '--release',
@@ -196,10 +245,10 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
     '--bins',
   ], {
     cwd: repoRoot,
-    env: buildEnvironment(scratch, { CARGO_TARGET_DIR: hostTarget }),
+    env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
     maxBuffer: 16 * 1024 * 1024,
   });
-  await run(CARGO_BIN, [
+  await run(cargoBin, [
     'build',
     '--locked',
     '--release',
@@ -212,7 +261,7 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
     'webex-codex-canary-probe',
   ], {
     cwd: repoRoot,
-    env: buildEnvironment(scratch, {
+    env: buildEnvironment(scratch, toolchainRoot, {
       CARGO_TARGET_DIR: staticTarget,
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-Ctarget-feature=+crt-static',
     }),
@@ -223,17 +272,19 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
     staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
     cargoVersion,
     rustcVersion,
+    toolchainSha256: measuredToolchain.sha256,
   };
 }
 
-function buildEnvironment(scratch, extra = {}) {
+function buildEnvironment(scratch, toolchainRoot, extra = {}) {
   return {
-    HOME: '/home/codex',
+    HOME: path.join(scratch, 'home'),
     CARGO_HOME: path.join(scratch, 'cargo-home'),
-    RUSTUP_HOME: '/home/codex/.rustup',
     LANG: 'C',
     LC_ALL: 'C',
-    PATH: '/home/codex/.cargo/bin:/usr/bin:/bin',
+    PATH: `${path.join(toolchainRoot, 'bin')}:/usr/bin:/bin`,
+    RUSTC: path.join(toolchainRoot, 'bin/rustc'),
+    RUSTDOC: path.join(toolchainRoot, 'bin/rustdoc'),
     CARGO_INCREMENTAL: '0',
     ...extra,
   };
@@ -453,15 +504,6 @@ async function pathExists(file) {
   }
 }
 
-async function assertOutputAbsent(output) {
-  try {
-    await fs.lstat(output);
-    throw new Error(`release output already exists: ${output}`);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-}
-
 async function syncDirectory(directory) {
   const handle = await fs.open(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
   try {
@@ -500,7 +542,7 @@ async function main() {
     return;
   }
   const result = await buildHostRelease(options);
-  process.stdout.write(`status=built\n`);
+  process.stdout.write(`status=${result.status}\n`);
   process.stdout.write(`bot_revision=${result.manifest.bot_revision}\n`);
   process.stdout.write(`codex_version=${result.manifest.codex_version}\n`);
   process.stdout.write(`manifest_sha256=${result.manifestSha256}\n`);
