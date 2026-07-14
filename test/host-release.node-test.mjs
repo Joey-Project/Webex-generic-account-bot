@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,14 +7,17 @@ import { describe, it } from 'node:test';
 
 import { buildHostRelease, parseArgs as parseBuildArgs } from '../scripts/build-host-release.mjs';
 import {
+  CARGO_VERSION,
   CODEX_VERSION,
   RELEASE_FILES,
   RELEASE_PATHS,
+  RUSTC_VERSION,
   bundlePayloadPath,
 } from '../scripts/host-release-contract.mjs';
 import {
   installHostRelease,
   parseArgs as parseInstallArgs,
+  publishCandidate,
   validateBundle,
 } from '../scripts/install-host-release.mjs';
 
@@ -36,16 +40,29 @@ describe('host release bootstrap', () => {
       parseBuildArgs([
         '--output', '/tmp/release',
         '--codex-package-root', '/tmp/codex',
-        '--static-bin-dir', '/tmp/static',
       ]),
       {
         output: '/tmp/release',
         codexPackageRoot: '/tmp/codex',
-        staticBinDir: '/tmp/static',
       },
     );
     assert.deepEqual(parseInstallArgs([]), { apply: false, json: false });
-    assert.deepEqual(parseInstallArgs(['--apply', '--json']), { apply: true, json: true });
+    assert.deepEqual(
+      parseInstallArgs([
+        '--apply',
+        '--json',
+        '--expected-bot-revision',
+        REVISION,
+        '--expected-manifest-sha256',
+        'b'.repeat(64),
+      ]),
+      {
+        apply: true,
+        json: true,
+        expectedBotRevision: REVISION,
+        expectedManifestSha256: 'b'.repeat(64),
+      },
+    );
     assert.throws(() => parseInstallArgs(['--apply', '--dry-run']), /exactly one install mode/);
     assert.throws(() => parseInstallArgs(['--bundle', '/tmp/x']), /unknown argument/);
   });
@@ -58,7 +75,13 @@ describe('host release bootstrap', () => {
       assert.equal(manifest.codex_version, CODEX_VERSION);
       assert.deepEqual(manifest.files.map(({ path: file }) => file), RELEASE_PATHS);
 
-      const validated = await validateBundle(fixture.bundle, process.getuid(), process.getgid());
+      const validated = await validateBundle(
+        fixture.bundle,
+        process.getuid(),
+        process.getgid(),
+        fixture.manifestSha256,
+        REVISION,
+      );
       assert.equal(validated.files.length, RELEASE_FILES.length);
       const dryRun = await installFixture(fixture, false);
       assert.equal(dryRun.status, 'dry_run');
@@ -114,11 +137,94 @@ describe('host release bootstrap', () => {
               ? /missing or unexpected entries/
               : mutation === 'symlink'
                 ? /special file/
-                : /install root already exists/,
+                : /existing host release does not match|directory metadata is invalid/,
         );
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('requires out-of-band release evidence and fixed third-party digests', async () => {
+    const fixture = await createFixture();
+    try {
+      const trustedDigests = await trustedFixtureDigests(fixture);
+      await fs.writeFile(fixture.busybox, 'replacement busybox');
+      await assert.rejects(
+        buildFixtureBundle(fixture, trustedDigests),
+        /trusted release source digest mismatch/,
+      );
+      await assertMissing(fixture.bundle);
+
+      await fs.writeFile(fixture.busybox, sourceContents('runtime-sources/busybox'));
+      await buildFixtureBundle(fixture);
+      await assert.rejects(
+        validateBundle(
+          fixture.bundle,
+          process.getuid(),
+          process.getgid(),
+          'b'.repeat(64),
+          REVISION,
+        ),
+        /trusted digest/,
+      );
+      await assert.rejects(
+        installHostRelease(
+          { apply: false, json: false },
+          {
+            bundleRoot: fixture.bundle,
+            installRoot: fixture.installRoot,
+            expectedUid: process.getuid(),
+            expectedGid: process.getgid(),
+            requireRoot: false,
+            trustAncestors: false,
+          },
+        ),
+        /expected-bot-revision/,
+      );
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes without clobbering a destination that appears concurrently', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-host-publish-test-'));
+    const candidate = path.join(root, 'candidate');
+    const installRoot = path.join(root, 'installed');
+    try {
+      await fs.mkdir(candidate);
+      await fs.writeFile(path.join(candidate, 'candidate'), 'candidate');
+      await fs.mkdir(installRoot);
+      await fs.writeFile(path.join(installRoot, 'existing'), 'existing');
+      await assert.rejects(
+        publishCandidate(candidate, installRoot),
+        /appeared during publish/,
+      );
+      assert.equal(await fs.readFile(path.join(installRoot, 'existing'), 'utf8'), 'existing');
+      assert.equal(await fs.readFile(path.join(candidate, 'candidate'), 'utf8'), 'candidate');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a fully published release after parent sync failure', async () => {
+    const fixture = await createFixture();
+    try {
+      await buildFixtureBundle(fixture);
+      await assert.rejects(
+        installFixture(fixture, true, {
+          syncDirectory: async (directory) => {
+            if (directory === path.dirname(fixture.installRoot)) {
+              throw new Error('simulated parent sync failure');
+            }
+          },
+        }),
+        /simulated parent sync failure/,
+      );
+      const recovered = await installFixture(fixture, true);
+      assert.equal(recovered.status, 'recovered');
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
     }
   });
 
@@ -187,25 +293,38 @@ async function createFixture() {
   };
 }
 
-function buildFixtureBundle(fixture) {
-  return buildHostRelease(
+async function buildFixtureBundle(fixture, trustedSourceSha256) {
+  const result = await buildHostRelease(
     {
       output: fixture.bundle,
       codexPackageRoot: fixture.codexRoot,
-      staticBinDir: fixture.staticBinDir,
     },
     {
       repoRoot: fixture.repoRoot,
       hostBinDir: fixture.hostBinDir,
       busybox: fixture.busybox,
       revision: REVISION,
+      buildArtifacts: async () => ({
+        hostBinDir: fixture.hostBinDir,
+        staticBinDir: fixture.staticBinDir,
+        cargoVersion: CARGO_VERSION,
+        rustcVersion: RUSTC_VERSION,
+      }),
+      trustedSourceSha256: trustedSourceSha256 ?? await trustedFixtureDigests(fixture),
     },
   );
+  fixture.manifestSha256 = result.manifestSha256;
+  return result.manifest;
 }
 
-function installFixture(fixture, apply) {
+function installFixture(fixture, apply, injected = {}) {
   return installHostRelease(
-    { apply, json: false },
+    {
+      apply,
+      json: false,
+      expectedBotRevision: REVISION,
+      expectedManifestSha256: fixture.manifestSha256,
+    },
     {
       bundleRoot: fixture.bundle,
       installRoot: fixture.installRoot,
@@ -213,6 +332,7 @@ function installFixture(fixture, apply) {
       expectedGid: process.getgid(),
       requireRoot: false,
       trustAncestors: false,
+      ...injected,
     },
   );
 }
@@ -234,6 +354,22 @@ function expectedInstalledContents(installPath) {
     variant: 'codex',
     version: CODEX_VERSION,
   })}\n`;
+}
+
+async function trustedFixtureDigests(fixture) {
+  const result = {};
+  for (const entry of RELEASE_FILES) {
+    let source;
+    if (entry.kind === 'busybox') source = fixture.busybox;
+    else if (entry.kind === 'codex-runtime') {
+      source = path.join(fixture.codexRoot, entry.source.slice('codex/'.length));
+    } else continue;
+    result[entry.installPath] = crypto
+      .createHash('sha256')
+      .update(await fs.readFile(source))
+      .digest('hex');
+  }
+  return result;
 }
 
 async function assertMissing(file) {

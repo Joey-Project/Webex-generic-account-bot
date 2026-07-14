@@ -1,7 +1,14 @@
 export const RELEASE_VERSION = 1;
 export const CODEX_VERSION = '0.142.3';
+export const CARGO_VERSION = 'cargo 1.96.0 (30a34c682 2026-05-25)';
+export const RUSTC_VERSION = 'rustc 1.96.0 (ac68faa20 2026-05-25)';
+export const CARGO_BIN = '/home/codex/.cargo/bin/cargo';
+export const RUSTC_BIN = '/home/codex/.cargo/bin/rustc';
 export const PRODUCTION_BUNDLE_ROOT = '/var/lib/webex-host-release/bundle';
 export const PRODUCTION_INSTALL_ROOT = '/opt/webex-generic-account-bot';
+export const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+export const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
+export const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
 
 const CODE_FILES = [
   'deploy/systemd/webex-codex-activation-renew.service',
@@ -27,8 +34,6 @@ const CODE_FILES = [
   'scripts/config-policy/validate-config.sh',
   'scripts/config-pull-worker.mjs',
   'scripts/deploy-config.mjs',
-  'scripts/host-release-contract.mjs',
-  'scripts/install-host-release.mjs',
   'scripts/jenkins-readonly.mjs',
   'scripts/provision-host',
   'scripts/provision-host.mjs',
@@ -91,6 +96,14 @@ export const RELEASE_FILES = Object.freeze([
 export const RELEASE_PATHS = Object.freeze(
   RELEASE_FILES.map(({ installPath }) => installPath).toSorted(),
 );
+
+export const TRUSTED_SOURCE_SHA256 = Object.freeze({
+  'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',
+  'runtime-sources/codex/bin/codex': 'cb1670c25b6e17fd82866a80e55df58bc10f5d18e44d25ec2c6f7c2ab98077cd',
+  'runtime-sources/codex/codex-package.json': 'b27002210921372fa043e8e49f6c543cf4cddc0d35bd01a32ecfbc699efd5e2a',
+  'runtime-sources/codex/codex-path/rg': 'ebeaf56f8a25e102e9419933423738b3a2a613a444fd749d695e15eba53f71f2',
+  'runtime-sources/codex/codex-resources/bwrap': '77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c',
+});
 
 export function bundlePayloadPath(installPath) {
   return `payload/${installPath}`;

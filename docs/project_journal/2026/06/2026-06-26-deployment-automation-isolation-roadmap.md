@@ -18,9 +18,11 @@ superseded_by:
 ## Current Progress
 - Trusted deployment entrypoint merged in bot PR #8.
 - First-install host release bootstrap packages the fixed runtime allowlist with
-  content metadata and publishes `/opt/webex-generic-account-bot` atomically
-  only from a root-owned fixed staging tree. Host policy, secrets, runtime image,
-  and service state remain separate gates.
+  content metadata, fixed third-party digests, and freshly rebuilt Rust
+  binaries. A separately staged root-owned trust anchor requires out-of-band
+  release evidence and publishes `/opt/webex-generic-account-bot` with an
+  atomic no-clobber operation. Host policy, secrets, runtime image, and service
+  state remain separate gates.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
@@ -300,14 +302,15 @@ superseded_by:
 
 ### PR 4d3: Root-Owned Host Release Bootstrap
 - Repository: `Joey-Project/Webex-generic-account-bot`.
-- Build a non-secret bundle without root from a clean reviewed commit, the six
-  fixed host/runtime binaries, static BusyBox, and the reviewed Codex `0.142.3`
-  Linux x64 package layout.
-- Require an administrator-staged root-owned fixed bundle tree; validate exact
-  topology, modes, ownership, link counts, sizes, and SHA-256 digests before a
-  one-rename first installation under `/opt`.
-- Refuse upgrades, stale candidates, path overrides, secrets, systemd policy,
-  runtime-image creation, and service mutation in this slice.
+- Build a non-secret bundle without root from a clean reviewed commit, rebuilding
+  all six Rust binaries with the fixed toolchain and checking fixed BusyBox and
+  Codex `0.142.3` Linux x64 artifact digests.
+- Keep the installer and contract outside the data-only bundle in a separate
+  root-owned trust anchor. Require approved commit and manifest digests, exact
+  topology and metadata, and atomic no-clobber publication under `/opt`.
+- Recover a fully matching install after a publish/fsync interruption; refuse
+  mismatching installs, stale candidates, path overrides, secrets, systemd
+  policy, runtime-image creation, and service mutation in this slice.
 
 ### PR 4d1: Base Bot Host Contract
 - Repository: `Joey-Project/Webex-generic-account-bot`.

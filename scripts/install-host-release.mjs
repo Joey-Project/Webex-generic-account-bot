@@ -1,22 +1,30 @@
 #!/usr/bin/env node
 
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
+  CARGO_VERSION,
   CODEX_VERSION,
   PRODUCTION_BUNDLE_ROOT,
+  PRODUCTION_CONTRACT_PATH,
+  PRODUCTION_INSTALLER_PATH,
   PRODUCTION_INSTALL_ROOT,
+  PRODUCTION_TRUST_ROOT,
   RELEASE_FILES,
   RELEASE_PATHS,
   RELEASE_VERSION,
+  RUSTC_VERSION,
   bundlePayloadPath,
 } from './host-release-contract.mjs';
 
+const execFileAsync = promisify(execFile);
 const MANIFEST_NAME = 'manifest.json';
 const MANIFEST_MAX_BYTES = 1024 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
@@ -26,7 +34,8 @@ const CANDIDATE_PREFIX = '.webex-generic-account-bot-install-';
 export function parseArgs(argv) {
   const options = { apply: false, json: false };
   let selectedMode = null;
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
     if (arg === '--apply') {
       if (selectedMode !== null) throw new Error('select exactly one install mode');
       selectedMode = 'apply';
@@ -34,6 +43,10 @@ export function parseArgs(argv) {
     } else if (arg === '--dry-run') {
       if (selectedMode !== null) throw new Error('select exactly one install mode');
       selectedMode = 'dry-run';
+    } else if (arg === '--expected-bot-revision') {
+      options.expectedBotRevision = requireValue(argv, ++index, arg);
+    } else if (arg === '--expected-manifest-sha256') {
+      options.expectedManifestSha256 = requireValue(argv, ++index, arg);
     } else if (arg === '--json') options.json = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`unknown argument: ${arg}`);
@@ -43,10 +56,12 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    'Usage: /usr/bin/node /var/lib/webex-host-release/bundle/payload/code/scripts/install-host-release.mjs [--dry-run] [--json]',
-    '       /usr/bin/node /var/lib/webex-host-release/bundle/payload/code/scripts/install-host-release.mjs --apply [--json]',
+    `Usage: /usr/bin/node ${PRODUCTION_INSTALLER_PATH} [--dry-run] [--json]`,
+    '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
+    `       /usr/bin/node ${PRODUCTION_INSTALLER_PATH} --apply [--json]`,
+    '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
     '',
-    'Dry-run is the default. Bundle and install paths are fixed.',
+    'Dry-run is the default. Trust, bundle, and install paths are fixed.',
   ].join('\n');
 }
 
@@ -57,6 +72,9 @@ export async function installHostRelease(options, injected = {}) {
   const expectedGid = injected.expectedGid ?? 0;
   const requireRoot = injected.requireRoot ?? true;
   const trustAncestors = injected.trustAncestors ?? true;
+  const publish = injected.publishCandidate ?? publishCandidate;
+  const sync = injected.syncDirectory ?? syncDirectory;
+  assertExpectedRelease(options);
   if (requireRoot && process.geteuid() !== 0) {
     throw new Error('host release installation requires root, including dry-run');
   }
@@ -64,9 +82,25 @@ export async function installHostRelease(options, injected = {}) {
     await assertTrustedAncestors(bundleRoot, expectedUid);
     await assertTrustedAncestors(path.dirname(installRoot), expectedUid);
   }
-  await assertInstallRootAbsent(installRoot);
   await assertNoStaleCandidates(path.dirname(installRoot), expectedUid);
-  const manifest = await validateBundle(bundleRoot, expectedUid, expectedGid);
+  const manifest = await validateBundle(
+    bundleRoot,
+    expectedUid,
+    expectedGid,
+    options.expectedManifestSha256,
+    options.expectedBotRevision,
+  );
+  if (await pathExists(installRoot)) {
+    await validateInstalledRelease(installRoot, manifest, expectedUid, expectedGid);
+    await sync(path.dirname(installRoot));
+    return {
+      status: options.apply ? 'recovered' : 'already_installed',
+      bot_revision: manifest.bot_revision,
+      codex_version: manifest.codex_version,
+      file_count: manifest.files.length,
+      install_root: installRoot,
+    };
+  }
   const result = {
     status: options.apply ? 'installed' : 'dry_run',
     bot_revision: manifest.bot_revision,
@@ -81,6 +115,7 @@ export async function installHostRelease(options, injected = {}) {
     `${CANDIDATE_PREFIX}${crypto.randomUUID()}`,
   );
   await fs.mkdir(candidate, { mode: 0o755 });
+  let published = false;
   try {
     for (const entry of manifest.files) {
       const source = path.join(bundleRoot, bundlePayloadPath(entry.path));
@@ -98,18 +133,25 @@ export async function installHostRelease(options, injected = {}) {
     for (const directory of directories.toSorted((left, right) => depth(right) - depth(left))) {
       await fs.chmod(directory, 0o755);
       await fs.chown(directory, expectedUid, expectedGid);
-      await syncDirectory(directory);
+      await sync(directory);
     }
-    await fs.rename(candidate, installRoot);
-    await syncDirectory(path.dirname(installRoot));
+    await publish(candidate, installRoot);
+    published = true;
+    await sync(path.dirname(installRoot));
     return result;
   } catch (error) {
-    await fs.rm(candidate, { recursive: true, force: true });
+    if (!published) await fs.rm(candidate, { recursive: true, force: true });
     throw error;
   }
 }
 
-export async function validateBundle(bundleRoot, expectedUid = 0, expectedGid = 0) {
+export async function validateBundle(
+  bundleRoot,
+  expectedUid = 0,
+  expectedGid = 0,
+  expectedManifestSha256,
+  expectedBotRevision,
+) {
   const rootMetadata = await fs.lstat(bundleRoot);
   assertDirectoryMetadata(rootMetadata, bundleRoot, expectedUid, expectedGid, 0o700);
   const manifestPath = path.join(bundleRoot, MANIFEST_NAME);
@@ -118,7 +160,15 @@ export async function validateBundle(bundleRoot, expectedUid = 0, expectedGid = 
   if (manifestMetadata.size <= 0 || manifestMetadata.size > MANIFEST_MAX_BYTES) {
     throw new Error('host release manifest is outside the permitted size');
   }
-  const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')));
+  const manifestBytes = await readStableFile(manifestPath, manifestMetadata);
+  const manifestSha256 = crypto.createHash('sha256').update(manifestBytes).digest('hex');
+  if (manifestSha256 !== expectedManifestSha256) {
+    throw new Error('host release manifest does not match the trusted digest');
+  }
+  const manifest = parseManifest(JSON.parse(manifestBytes.toString('utf8')));
+  if (manifest.bot_revision !== expectedBotRevision) {
+    throw new Error('host release manifest does not match the trusted bot revision');
+  }
   const expectedTree = expectedBundleTree(manifest);
   const actualTree = await readBundleTree(bundleRoot, expectedUid, expectedGid);
   if (
@@ -149,7 +199,10 @@ export function parseManifest(value) {
     throw new Error('host release manifest must be an object');
   }
   const keys = Object.keys(value).toSorted();
-  if (JSON.stringify(keys) !== JSON.stringify(['bot_revision', 'codex_version', 'files', 'version'])) {
+  if (
+    JSON.stringify(keys)
+    !== JSON.stringify(['bot_revision', 'build', 'codex_version', 'files', 'version'])
+  ) {
     throw new Error('host release manifest fields are invalid');
   }
   if (value.version !== RELEASE_VERSION) throw new Error('host release version is unsupported');
@@ -158,6 +211,17 @@ export function parseManifest(value) {
   }
   if (value.codex_version !== CODEX_VERSION) {
     throw new Error(`host release Codex version must be ${CODEX_VERSION}`);
+  }
+  if (
+    value.build === null
+    || typeof value.build !== 'object'
+    || Array.isArray(value.build)
+    || JSON.stringify(Object.keys(value.build).toSorted())
+      !== JSON.stringify(['cargo_version', 'rustc_version'])
+    || value.build.cargo_version !== CARGO_VERSION
+    || value.build.rustc_version !== RUSTC_VERSION
+  ) {
+    throw new Error('host release Rust toolchain provenance is invalid');
   }
   if (!Array.isArray(value.files) || value.files.length !== RELEASE_FILES.length) {
     throw new Error('host release file list is invalid');
@@ -198,6 +262,7 @@ export function parseManifest(value) {
     version: value.version,
     bot_revision: value.bot_revision,
     codex_version: value.codex_version,
+    build: Object.freeze({ ...value.build }),
     files: Object.freeze(files.toSorted((left, right) => left.path.localeCompare(right.path))),
   });
 }
@@ -208,7 +273,11 @@ async function readBundleTree(root, expectedUid, expectedGid, current = root, re
     const relative = path.relative(root, full).split(path.sep).join('/');
     const metadata = await fs.lstat(full);
     if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
-      if (metadata.uid !== expectedUid || metadata.gid !== expectedGid || (metadata.mode & 0o022) !== 0) {
+      if (
+        metadata.uid !== expectedUid
+        || metadata.gid !== expectedGid
+        || (metadata.mode & 0o7777) !== 0o755
+      ) {
         throw new Error(`host release directory metadata is invalid: ${relative}`);
       }
       result.set(relative, 'directory');
@@ -217,6 +286,75 @@ async function readBundleTree(root, expectedUid, expectedGid, current = root, re
       result.set(relative, 'file');
     } else {
       throw new Error(`host release bundle contains a special file: ${relative}`);
+    }
+  }
+  return result;
+}
+
+async function validateInstalledRelease(root, manifest, expectedUid, expectedGid) {
+  const rootMetadata = await fs.lstat(root);
+  assertDirectoryMetadata(rootMetadata, root, expectedUid, expectedGid, 0o755);
+  const expectedTree = expectedInstalledTree(manifest);
+  const actualTree = await readInstalledTree(root, expectedUid, expectedGid);
+  if (
+    actualTree.size !== expectedTree.size
+    || [...expectedTree].some(([entry, kind]) => actualTree.get(entry) !== kind)
+  ) {
+    throw new Error('existing host release does not match the trusted release tree');
+  }
+  for (const entry of manifest.files) {
+    const file = path.join(root, entry.path);
+    const metadata = await fs.lstat(file);
+    assertFileMetadata(
+      metadata,
+      file,
+      expectedUid,
+      expectedGid,
+      Number.parseInt(entry.mode, 8),
+    );
+    if (metadata.size !== entry.size || await hashStableFile(file, metadata) !== entry.sha256) {
+      throw new Error(`existing host release file does not match: ${entry.path}`);
+    }
+  }
+  const releasePath = path.join(root, 'release.json');
+  const releaseMetadata = await fs.lstat(releasePath);
+  assertFileMetadata(releaseMetadata, releasePath, expectedUid, expectedGid, 0o444);
+  const expectedRelease = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  const releaseBytes = await readStableFile(releasePath, releaseMetadata);
+  if (!releaseBytes.equals(expectedRelease)) {
+    throw new Error('existing host release metadata does not match the trusted manifest');
+  }
+}
+
+async function readInstalledTree(root, expectedUid, expectedGid, current = root, result = new Map()) {
+  for (const name of await fs.readdir(current)) {
+    const full = path.join(current, name);
+    const relative = path.relative(root, full).split(path.sep).join('/');
+    const metadata = await fs.lstat(full);
+    if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+      assertDirectoryMetadata(metadata, full, expectedUid, expectedGid, 0o755);
+      result.set(relative, 'directory');
+      await readInstalledTree(root, expectedUid, expectedGid, full, result);
+    } else if (metadata.isFile() && !metadata.isSymbolicLink()) {
+      result.set(relative, 'file');
+    } else {
+      throw new Error(`existing host release contains a special file: ${relative}`);
+    }
+  }
+  return result;
+}
+
+function expectedInstalledTree(manifest) {
+  const result = new Map([
+    ['release.json', 'file'],
+    ['runtime', 'directory'],
+  ]);
+  for (const entry of manifest.files) {
+    result.set(entry.path, 'file');
+    let directory = path.posix.dirname(entry.path);
+    while (directory !== '.') {
+      result.set(directory, 'directory');
+      directory = path.posix.dirname(directory);
     }
   }
   return result;
@@ -301,6 +439,22 @@ async function hashStableFile(file, before) {
   }
 }
 
+async function readStableFile(file, expectedMetadata) {
+  const handle = await fs.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    assertStableMetadata(expectedMetadata, before, file);
+    const bytes = await handle.readFile();
+    assertStableMetadata(before, await handle.stat(), file);
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function writeReleaseMetadata(file, manifest, expectedUid, expectedGid) {
   const handle = await fs.open(
     file,
@@ -351,12 +505,49 @@ async function assertTrustedAncestors(start, expectedUid) {
   }
 }
 
-async function assertInstallRootAbsent(installRoot) {
+async function pathExists(file) {
   try {
-    await fs.lstat(installRoot);
-    throw new Error(`host release install root already exists: ${installRoot}`);
+    await fs.lstat(file);
+    return true;
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+export async function publishCandidate(candidate, installRoot, run = execFileAsync) {
+  try {
+    await run('/usr/bin/mv', [
+      '--no-copy',
+      '--no-clobber',
+      '--no-target-directory',
+      candidate,
+      installRoot,
+    ], {
+      cwd: '/',
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    if (await pathExists(candidate) && await pathExists(installRoot)) {
+      throw new Error(`host release install root appeared during publish: ${installRoot}`);
+    }
+    throw error;
+  }
+  if (await pathExists(candidate)) {
+    throw new Error(`host release install root appeared during publish: ${installRoot}`);
+  }
+  if (!await pathExists(installRoot)) {
+    throw new Error('host release publish did not create the install root');
+  }
+}
+
+function assertExpectedRelease(options) {
+  if (!/^[a-f0-9]{40}$/.test(options.expectedBotRevision ?? '')) {
+    throw new Error('--expected-bot-revision must be a full trusted Git SHA');
+  }
+  if (!/^[a-f0-9]{64}$/.test(options.expectedManifestSha256 ?? '')) {
+    throw new Error('--expected-manifest-sha256 must be a trusted SHA-256 digest');
   }
 }
 
@@ -434,7 +625,44 @@ function depth(value) {
   return value.split(path.sep).length;
 }
 
+function requireValue(argv, index, flag) {
+  if (index >= argv.length || argv[index].startsWith('-')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return argv[index];
+}
+
+async function assertProductionTrustAnchor() {
+  const currentScript = fileURLToPath(import.meta.url);
+  if (currentScript !== PRODUCTION_INSTALLER_PATH) {
+    throw new Error(`production installer must run from ${PRODUCTION_INSTALLER_PATH}`);
+  }
+  await assertTrustedAncestors(PRODUCTION_TRUST_ROOT, 0);
+  assertDirectoryMetadata(
+    await fs.lstat(PRODUCTION_TRUST_ROOT),
+    PRODUCTION_TRUST_ROOT,
+    0,
+    0,
+    0o755,
+  );
+  assertFileMetadata(
+    await fs.lstat(PRODUCTION_INSTALLER_PATH),
+    PRODUCTION_INSTALLER_PATH,
+    0,
+    0,
+    0o444,
+  );
+  assertFileMetadata(
+    await fs.lstat(PRODUCTION_CONTRACT_PATH),
+    PRODUCTION_CONTRACT_PATH,
+    0,
+    0,
+    0o444,
+  );
+}
+
 async function main() {
+  await assertProductionTrustAnchor();
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     process.stdout.write(`${usage()}\n`);

@@ -228,50 +228,54 @@ environment before starting the fixed system Node and script, so `NODE_OPTIONS`,
 a caller-controlled `PATH`, and the caller's working directory cannot select
 root-loaded code.
 
-The initial root-owned host release is a separate first-install boundary. Build
-the ordinary host binaries and the two static runtime binaries without root,
-then create a content-manifested bundle from the exact reviewed commit and
-Codex `0.142.3` Linux x64 package root:
+The initial root-owned host release is a separate first-install boundary. The
+unprivileged builder uses the fixed Rust `1.96.0` toolchain to rebuild the host
+and static runtime binaries from the clean reviewed commit, then creates a
+content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
 
 ```bash
-cargo build --release --locked --all-features
-CARGO_TARGET_DIR=target/static-release \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static \
-  cargo build --release --target x86_64-unknown-linux-gnu \
-  --bin webex-codex-runtime --bin webex-codex-canary-probe
 node scripts/build-host-release.mjs \
   --output /tmp/webex-host-release \
-  --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl \
-  --static-bin-dir target/static-release/x86_64-unknown-linux-gnu/release
+  --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl
 ```
 
 The builder requires a clean tracked worktree and records the full Git SHA,
-fixed Codex version, exact allowlisted paths, modes, sizes, and SHA-256 digests.
-It includes no tokens, environment files, deploy keys, rendered config, runtime
-image, systemd installation, or service state.
+fixed Rust and Codex versions, exact allowlisted paths, modes, sizes, and
+SHA-256 digests. Fixed trusted digests cover the Codex executable, metadata,
+`rg`, `bwrap`, and the deployment-host BusyBox. The builder prints the complete
+manifest digest for independent release approval. It includes no tokens,
+environment files, deploy keys, rendered config, runtime image, systemd
+installation, or service state.
 
-After an administrator verifies the manifest revision and stages the bundle at
-`/var/lib/webex-host-release/bundle` as a root-owned mode `0700` tree, run the
-installer from that fixed root-owned copy:
+The installer and its contract are a separate trust anchor and are never loaded
+from the bundle. A reviewed release-delivery step must first install them as
+root-owned mode `0444` files under `/usr/local/libexec/webex-host-release`, then
+stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a
+root-owned mode `0700` tree. Carry the approved commit and manifest digest over
+an independent trusted channel and require both on dry-run and apply:
 
 ```bash
 sudo -- /usr/bin/node \
-  /var/lib/webex-host-release/bundle/payload/code/scripts/install-host-release.mjs \
-  --dry-run
+  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+  --dry-run \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 sudo -- /usr/bin/node \
-  /var/lib/webex-host-release/bundle/payload/code/scripts/install-host-release.mjs \
-  --apply
+  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+  --apply \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
 
 The installer rejects path overrides, additional or missing entries, symlinks,
 special files, hard links, mutable ownership/modes, digest drift, stale install
-candidates, and any existing `/opt/webex-generic-account-bot`. It builds a
-same-parent candidate and publishes the complete `code`, `bin`, and
-`runtime-sources` tree plus verified `release.json` evidence with one rename. It
-creates an empty trusted `runtime` directory but does not run the provisioner
-or runtime-image builder. A stale
-candidate after an uncatchable host crash requires explicit administrator
-inspection; the installer never removes an unknown root-owned tree.
+candidates, unapproved release evidence, and mismatching existing installs. It
+builds a same-parent candidate and uses an atomic no-clobber publish for the
+complete `code`, `bin`, and `runtime-sources` tree plus verified `release.json`
+evidence. It creates an empty trusted `runtime` directory but does not run the
+provisioner or runtime-image builder. A retry verifies and recovers a complete
+matching install after a publish/fsync interruption; stale candidates and
+mismatching installs require explicit administrator inspection.
 
 Only after this bootstrap succeeds should the guarded provisioner create host
 identities and policy paths. Then the root-owned runtime builder can write the

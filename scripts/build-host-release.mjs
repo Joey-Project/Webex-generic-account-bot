@@ -10,9 +10,14 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
+  CARGO_BIN,
+  CARGO_VERSION,
   CODEX_VERSION,
   RELEASE_FILES,
   RELEASE_VERSION,
+  RUSTC_BIN,
+  RUSTC_VERSION,
+  TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
 } from './host-release-contract.mjs';
 
@@ -29,8 +34,6 @@ export function parseArgs(argv) {
     if (arg === '--output') options.output = requireValue(argv, ++index, arg);
     else if (arg === '--codex-package-root') {
       options.codexPackageRoot = requireValue(argv, ++index, arg);
-    } else if (arg === '--static-bin-dir') {
-      options.staticBinDir = requireValue(argv, ++index, arg);
     } else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -40,7 +43,7 @@ export function parseArgs(argv) {
 export function usage() {
   return [
     'Usage: node scripts/build-host-release.mjs --output <directory>',
-    '       --codex-package-root <vendor-root> --static-bin-dir <directory>',
+    '       --codex-package-root <vendor-root>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
   ].join('\n');
@@ -53,33 +56,56 @@ export async function buildHostRelease(options, injected = {}) {
     options.codexPackageRoot,
     '--codex-package-root',
   );
-  const staticBinDir = requireAbsolutePath(options.staticBinDir, '--static-bin-dir');
-  const hostBinDir = path.resolve(injected.hostBinDir ?? path.join(repoRoot, 'target/release'));
   const busybox = path.resolve(injected.busybox ?? '/usr/bin/busybox');
-  const revision = injected.revision ?? await readCleanRevision(repoRoot, injected.execFileAsync);
+  const run = injected.execFileAsync ?? execFileAsync;
+  const revision = injected.revision ?? await readCleanRevision(repoRoot, run);
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('bot revision must be a full Git SHA');
 
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
   await assertOutputAbsent(output);
+  const scratch = path.join(
+    parent,
+    `.${path.basename(output)}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.build`,
+  );
   const temporary = path.join(
     parent,
     `.${path.basename(output)}-${process.pid}-${crypto.randomBytes(12).toString('hex')}.tmp`,
   );
-  await fs.mkdir(temporary, { mode: 0o700 });
+  await fs.mkdir(scratch, { mode: 0o700 });
   try {
+    const artifacts = injected.buildArtifacts
+      ? await injected.buildArtifacts({ repoRoot, scratch, revision })
+      : await buildRustArtifacts(repoRoot, scratch, run);
+    if (!injected.revision) {
+      const revisionAfterBuild = await readCleanRevision(repoRoot, run);
+      if (revisionAfterBuild !== revision) throw new Error('bot revision changed during release build');
+    }
+    await fs.mkdir(temporary, { mode: 0o700 });
     const files = [];
     for (const entry of RELEASE_FILES) {
       const source = releaseSource(entry, {
         repoRoot,
-        hostBinDir,
-        staticBinDir,
+        hostBinDir: artifacts.hostBinDir,
+        staticBinDir: artifacts.staticBinDir,
         busybox,
         codexPackageRoot,
       });
       const destination = path.join(temporary, bundlePayloadPath(entry.installPath));
       const measured = await copyMeasuredFile(source, destination, entry.mode);
+      const trustedDigest = (injected.trustedSourceSha256 ?? TRUSTED_SOURCE_SHA256)[
+        entry.installPath
+      ];
+      if (
+        (entry.kind === 'busybox' || entry.kind === 'codex-runtime')
+        && trustedDigest === undefined
+      ) {
+        throw new Error(`trusted release source digest is missing: ${entry.installPath}`);
+      }
+      if (trustedDigest !== undefined && measured.sha256 !== trustedDigest) {
+        throw new Error(`trusted release source digest mismatch: ${entry.installPath}`);
+      }
       files.push({
         path: entry.installPath,
         mode: modeString(entry.mode),
@@ -92,16 +118,86 @@ export async function buildHostRelease(options, injected = {}) {
       version: RELEASE_VERSION,
       bot_revision: revision,
       codex_version: CODEX_VERSION,
+      build: {
+        cargo_version: artifacts.cargoVersion,
+        rustc_version: artifacts.rustcVersion,
+      },
       files,
     };
-    await writeJsonFile(path.join(temporary, MANIFEST_NAME), manifest, 0o444);
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const manifestSha256 = crypto.createHash('sha256').update(manifestBytes).digest('hex');
+    await writeBytesFile(path.join(temporary, MANIFEST_NAME), manifestBytes, 0o444);
     await fs.rename(temporary, output);
     await syncDirectory(parent);
-    return manifest;
+    return { manifest, manifestSha256 };
   } catch (error) {
     await fs.rm(temporary, { recursive: true, force: true });
     throw error;
+  } finally {
+    await fs.rm(scratch, { recursive: true, force: true });
   }
+}
+
+async function buildRustArtifacts(repoRoot, scratch, run) {
+  const cargoVersion = (await run(CARGO_BIN, ['--version'], {
+    cwd: repoRoot,
+    env: buildEnvironment(),
+    maxBuffer: 1024 * 1024,
+  })).stdout.trim();
+  const rustcVersion = (await run(RUSTC_BIN, ['--version'], {
+    cwd: repoRoot,
+    env: buildEnvironment(),
+    maxBuffer: 1024 * 1024,
+  })).stdout.trim();
+  if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
+    throw new Error(`release build requires ${CARGO_VERSION} and ${RUSTC_VERSION}`);
+  }
+
+  const hostTarget = path.join(scratch, 'host-target');
+  const staticTarget = path.join(scratch, 'static-target');
+  await run(CARGO_BIN, ['build', '--locked', '--release', '--all-features', '--bins'], {
+    cwd: repoRoot,
+    env: buildEnvironment({ CARGO_TARGET_DIR: hostTarget }),
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  await run(CARGO_BIN, [
+    'build',
+    '--locked',
+    '--release',
+    '--all-features',
+    '--target',
+    'x86_64-unknown-linux-gnu',
+    '--bin',
+    'webex-codex-runtime',
+    '--bin',
+    'webex-codex-canary-probe',
+  ], {
+    cwd: repoRoot,
+    env: buildEnvironment({
+      CARGO_TARGET_DIR: staticTarget,
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-Ctarget-feature=+crt-static',
+    }),
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return {
+    hostBinDir: path.join(hostTarget, 'release'),
+    staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
+    cargoVersion,
+    rustcVersion,
+  };
+}
+
+function buildEnvironment(extra = {}) {
+  return {
+    HOME: '/home/codex',
+    CARGO_HOME: '/home/codex/.cargo',
+    RUSTUP_HOME: '/home/codex/.rustup',
+    LANG: 'C',
+    LC_ALL: 'C',
+    PATH: '/home/codex/.cargo/bin:/usr/bin:/bin',
+    CARGO_INCREMENTAL: '0',
+    ...extra,
+  };
 }
 
 async function readCleanRevision(repoRoot, run = execFileAsync) {
@@ -204,7 +300,7 @@ async function copyMeasuredFile(source, destination, mode) {
   }
 }
 
-async function writeJsonFile(file, value, mode) {
+async function writeBytesFile(file, bytes, mode) {
   const handle = await fs.open(
     file,
     fsConstants.O_WRONLY
@@ -215,7 +311,7 @@ async function writeJsonFile(file, value, mode) {
     mode,
   );
   try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await handle.writeFile(bytes);
     await handle.chmod(mode);
     await handle.sync();
   } finally {
@@ -301,8 +397,13 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
-  const manifest = await buildHostRelease(options);
-  process.stdout.write(`${JSON.stringify(manifest)}\n`);
+  const result = await buildHostRelease(options);
+  process.stdout.write(`status=built\n`);
+  process.stdout.write(`bot_revision=${result.manifest.bot_revision}\n`);
+  process.stdout.write(`codex_version=${result.manifest.codex_version}\n`);
+  process.stdout.write(`manifest_sha256=${result.manifestSha256}\n`);
+  process.stdout.write(`file_count=${result.manifest.files.length}\n`);
+  process.stdout.write(`output=${options.output}\n`);
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
