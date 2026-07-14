@@ -255,9 +255,11 @@ node scripts/build-host-release.mjs \
     "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
-The builder rejects tracked and untracked worktree changes, materialises the
-exact commit into an isolated source snapshot from bounded `ls-tree` and
-`cat-file` results, and uses a build-local Cargo home and home directory. It
+The builder rejects tracked and non-ignored untracked worktree changes,
+materialises the exact commit into an isolated source snapshot from bounded
+`ls-tree` and `cat-file` results, and uses a build-local Cargo home and home
+directory. Ignored local caches and files never enter that object-only
+snapshot. It
 does not use `git archive`, so unreviewed local/global/info attributes cannot
 omit or substitute committed files. Every Git subprocess disables
 system/global configuration, local fsmonitor execution, hooks, external

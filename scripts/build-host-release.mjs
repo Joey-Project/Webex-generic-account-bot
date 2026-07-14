@@ -369,7 +369,6 @@ async function readCleanRevision(repoRoot, run = execFileAsync) {
     'status',
     '--porcelain',
     '--untracked-files=all',
-    '--ignored=matching',
   ]), {
     cwd: repoRoot,
     env: environment,
