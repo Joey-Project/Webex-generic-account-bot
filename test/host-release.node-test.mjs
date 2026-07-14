@@ -440,6 +440,50 @@ describe('host release bootstrap', () => {
     );
   });
 
+  it('exports committed blobs instead of repository replacement objects', async () => {
+    const fixture = await createFixture();
+    const sourcePath = 'scripts/provision-host.mjs';
+    const replacementPath = path.join(fixture.root, 'replacement-provision-host.mjs');
+    const git = (args) => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+      const original = (await git(['rev-parse', `HEAD:${sourcePath}`])).stdout.trim();
+      await fs.writeFile(replacementPath, 'replacement source\n');
+      const replacement = (await git(['hash-object', '-w', replacementPath])).stdout.trim();
+      await git(['replace', original, replacement]);
+      assert.equal((await git(['cat-file', 'blob', original])).stdout, 'replacement source\n');
+
+      const result = await buildFixtureResult(fixture, undefined, { revision: undefined });
+      assert.notEqual(result.manifest.bot_revision, REVISION);
+      assert.equal(
+        await fs.readFile(
+          path.join(fixture.bundle, bundlePayloadPath(`code/${sourcePath}`)),
+          'utf8',
+        ),
+        sourceContents(`code/${sourcePath}`),
+      );
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('refuses to compound interrupted staging trees', async () => {
     const fixture = await createFixture();
     const stale = path.join(fixture.root, `.bundle-123-${'a'.repeat(24)}.build`);

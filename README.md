@@ -256,7 +256,10 @@ node scripts/build-host-release.mjs \
 
 The builder rejects tracked and untracked worktree changes, exports the exact
 commit to an isolated source snapshot, and uses a build-local Cargo home and
-home directory. The Rust toolchain must be an independently reviewed SquashFS
+home directory. Every Git subprocess disables system/global configuration and
+replacement objects, so repository-local `refs/replace` cannot change the
+objects exported under the approved commit SHA. The Rust toolchain must be an
+independently reviewed SquashFS
 image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
 The generation source is not itself a trust decision; review and approve the
