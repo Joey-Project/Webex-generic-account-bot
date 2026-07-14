@@ -6,25 +6,16 @@ import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-import {
-  CARGO_VERSION,
-  CODEX_VERSION,
-  PRODUCTION_BUNDLE_ROOT,
-  PRODUCTION_CONTRACT_PATH,
-  PRODUCTION_INSTALLER_PATH,
-  PRODUCTION_INSTALL_ROOT,
-  PRODUCTION_TRUST_ROOT,
-  RELEASE_FILES,
-  RELEASE_PATHS,
-  RELEASE_VERSION,
-  RUSTC_VERSION,
-  bundlePayloadPath,
-} from './host-release-contract.mjs';
-
 const execFileAsync = promisify(execFile);
+const PRODUCTION_BUNDLE_ROOT = '/var/lib/webex-host-release/bundle';
+const PRODUCTION_INSTALL_ROOT = '/opt/webex-generic-account-bot';
+const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+const PRODUCTION_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
+const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
+const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
 const MANIFEST_NAME = 'manifest.json';
 const MANIFEST_MAX_BYTES = 1024 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
@@ -66,6 +57,7 @@ export function usage() {
 }
 
 export async function installHostRelease(options, injected = {}) {
+  const contract = assertReleaseContract(injected.contract);
   const bundleRoot = path.resolve(injected.bundleRoot ?? PRODUCTION_BUNDLE_ROOT);
   const installRoot = path.resolve(injected.installRoot ?? PRODUCTION_INSTALL_ROOT);
   const expectedUid = injected.expectedUid ?? 0;
@@ -82,19 +74,51 @@ export async function installHostRelease(options, injected = {}) {
     await assertTrustedAncestors(bundleRoot, expectedUid);
     await assertTrustedAncestors(path.dirname(installRoot), expectedUid);
   }
-  await assertNoStaleCandidates(path.dirname(installRoot), expectedUid);
   const manifest = await validateBundle(
     bundleRoot,
     expectedUid,
     expectedGid,
     options.expectedManifestSha256,
     options.expectedBotRevision,
+    contract,
   );
+  const candidates = await findCandidates(path.dirname(installRoot), expectedUid, expectedGid);
   if (await pathExists(installRoot)) {
+    if (candidates.length !== 0) {
+      throw new Error('installed release and stale candidate require manual inspection');
+    }
     await validateInstalledRelease(installRoot, manifest, expectedUid, expectedGid);
     await sync(path.dirname(installRoot));
     return {
       status: options.apply ? 'recovered' : 'already_installed',
+      bot_revision: manifest.bot_revision,
+      codex_version: manifest.codex_version,
+      file_count: manifest.files.length,
+      install_root: installRoot,
+    };
+  }
+  if (candidates.length === 1) {
+    const candidate = candidates[0];
+    try {
+      await validateInstalledRelease(candidate, manifest, expectedUid, expectedGid);
+    } catch (error) {
+      throw new Error(
+        `stale host release candidate requires manual inspection: ${candidate}: ${error.message}`,
+      );
+    }
+    if (!options.apply) {
+      return {
+        status: 'recoverable_candidate',
+        bot_revision: manifest.bot_revision,
+        codex_version: manifest.codex_version,
+        file_count: manifest.files.length,
+        install_root: installRoot,
+      };
+    }
+    await publish(candidate, installRoot);
+    await sync(path.dirname(installRoot));
+    return {
+      status: 'recovered',
       bot_revision: manifest.bot_revision,
       codex_version: manifest.codex_version,
       file_count: manifest.files.length,
@@ -117,8 +141,9 @@ export async function installHostRelease(options, injected = {}) {
   await fs.mkdir(candidate, { mode: 0o755 });
   let published = false;
   try {
+    await sync(path.dirname(installRoot));
     for (const entry of manifest.files) {
-      const source = path.join(bundleRoot, bundlePayloadPath(entry.path));
+      const source = path.join(bundleRoot, contract.bundlePayloadPath(entry.path));
       const destination = path.join(candidate, entry.path);
       await copyVerifiedFile(source, destination, entry, expectedUid, expectedGid);
     }
@@ -140,7 +165,10 @@ export async function installHostRelease(options, injected = {}) {
     await sync(path.dirname(installRoot));
     return result;
   } catch (error) {
-    if (!published) await fs.rm(candidate, { recursive: true, force: true });
+    if (!published) {
+      await fs.rm(candidate, { recursive: true, force: true });
+      await sync(path.dirname(installRoot));
+    }
     throw error;
   }
 }
@@ -151,7 +179,9 @@ export async function validateBundle(
   expectedGid = 0,
   expectedManifestSha256,
   expectedBotRevision,
+  contract,
 ) {
+  assertReleaseContract(contract);
   const rootMetadata = await fs.lstat(bundleRoot);
   assertDirectoryMetadata(rootMetadata, bundleRoot, expectedUid, expectedGid, 0o700);
   const manifestPath = path.join(bundleRoot, MANIFEST_NAME);
@@ -165,11 +195,11 @@ export async function validateBundle(
   if (manifestSha256 !== expectedManifestSha256) {
     throw new Error('host release manifest does not match the trusted digest');
   }
-  const manifest = parseManifest(JSON.parse(manifestBytes.toString('utf8')));
+  const manifest = parseManifest(JSON.parse(manifestBytes.toString('utf8')), contract);
   if (manifest.bot_revision !== expectedBotRevision) {
     throw new Error('host release manifest does not match the trusted bot revision');
   }
-  const expectedTree = expectedBundleTree(manifest);
+  const expectedTree = expectedBundleTree(manifest, contract.bundlePayloadPath);
   const actualTree = await readBundleTree(bundleRoot, expectedUid, expectedGid);
   if (
     actualTree.size !== expectedTree.size
@@ -178,7 +208,7 @@ export async function validateBundle(
     throw new Error('host release bundle contains missing or unexpected entries');
   }
   for (const entry of manifest.files) {
-    const file = path.join(bundleRoot, bundlePayloadPath(entry.path));
+    const file = path.join(bundleRoot, contract.bundlePayloadPath(entry.path));
     const metadata = await fs.lstat(file);
     assertFileMetadata(
       metadata,
@@ -194,7 +224,15 @@ export async function validateBundle(
   return manifest;
 }
 
-export function parseManifest(value) {
+export function parseManifest(value, contract) {
+  const {
+    CARGO_VERSION,
+    CODEX_VERSION,
+    RELEASE_FILES,
+    RELEASE_PATHS,
+    RELEASE_VERSION,
+    RUSTC_VERSION,
+  } = assertReleaseContract(contract);
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('host release manifest must be an object');
   }
@@ -360,7 +398,7 @@ function expectedInstalledTree(manifest) {
   return result;
 }
 
-function expectedBundleTree(manifest) {
+function expectedBundleTree(manifest, bundlePayloadPath) {
   const result = new Map([[MANIFEST_NAME, 'file']]);
   for (const entry of manifest.files) {
     const file = bundlePayloadPath(entry.path);
@@ -551,16 +589,44 @@ function assertExpectedRelease(options) {
   }
 }
 
-async function assertNoStaleCandidates(parent, expectedUid) {
+function assertReleaseContract(contract) {
+  if (
+    contract === null
+    || typeof contract !== 'object'
+    || !Number.isSafeInteger(contract.RELEASE_VERSION)
+    || typeof contract.CODEX_VERSION !== 'string'
+    || typeof contract.CARGO_VERSION !== 'string'
+    || typeof contract.RUSTC_VERSION !== 'string'
+    || !Array.isArray(contract.RELEASE_FILES)
+    || !Array.isArray(contract.RELEASE_PATHS)
+    || typeof contract.bundlePayloadPath !== 'function'
+  ) {
+    throw new Error('trusted host release contract is invalid');
+  }
+  return contract;
+}
+
+async function findCandidates(parent, expectedUid, expectedGid) {
+  const candidates = [];
   for (const name of await fs.readdir(parent)) {
     if (!name.startsWith(CANDIDATE_PREFIX)) continue;
     const candidate = path.join(parent, name);
     const metadata = await fs.lstat(candidate);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== expectedUid) {
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== expectedUid
+      || metadata.gid !== expectedGid
+      || (metadata.mode & 0o7777) !== 0o755
+    ) {
       throw new Error(`untrusted host release candidate exists: ${candidate}`);
     }
-    throw new Error(`stale host release candidate requires manual inspection: ${candidate}`);
+    candidates.push(candidate);
   }
+  if (candidates.length > 1) {
+    throw new Error('multiple stale host release candidates require manual inspection');
+  }
+  return candidates;
 }
 
 function assertDirectoryMetadata(metadata, file, uid, gid, mode) {
@@ -646,6 +712,13 @@ async function assertProductionTrustAnchor() {
     0o755,
   );
   assertFileMetadata(
+    await fs.lstat(PRODUCTION_WRAPPER_PATH),
+    PRODUCTION_WRAPPER_PATH,
+    0,
+    0,
+    0o555,
+  );
+  assertFileMetadata(
     await fs.lstat(PRODUCTION_INSTALLER_PATH),
     PRODUCTION_INSTALLER_PATH,
     0,
@@ -663,12 +736,13 @@ async function assertProductionTrustAnchor() {
 
 async function main() {
   await assertProductionTrustAnchor();
+  const contract = await import(pathToFileURL(PRODUCTION_CONTRACT_PATH).href);
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     process.stdout.write(`${usage()}\n`);
     return;
   }
-  const result = await installHostRelease(options);
+  const result = await installHostRelease(options, { contract });
   if (options.json) process.stdout.write(`${JSON.stringify(result)}\n`);
   else {
     process.stdout.write(`status=${result.status}\n`);

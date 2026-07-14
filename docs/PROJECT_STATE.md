@@ -202,13 +202,14 @@
   remains explicit before runner activation and companion config enablement.
 
 - Initial host release bootstrap is content-manifested and first-install only.
-  An unprivileged builder rebuilds the Rust binaries from a clean reviewed
-  commit with the fixed toolchain and packages a digest-pinned runtime
-  allowlist. A separately delivered root-owned trust anchor requires an
-  out-of-band approved commit and manifest digest before atomically publishing
-  the complete `/opt/webex-generic-account-bot` tree without clobbering an
-  existing target. Matching interrupted publishes are recoverable. It installs
-  no secrets, policy files, runtime image, or service state.
+  An unprivileged builder exports the exact clean reviewed commit, rebuilds the
+  Rust binaries with a fixed target/toolchain and isolated Cargo home, and
+  packages a digest-pinned runtime allowlist. A separately delivered root-owned
+  environment-clearing trust anchor requires an out-of-band approved commit and
+  manifest digest before atomically publishing the complete
+  `/opt/webex-generic-account-bot` tree without clobbering an existing target.
+  Matching complete candidates and interrupted publishes are recoverable. It
+  installs no secrets, policy files, runtime image, or service state.
 - The CLI separates unprivileged `--check-config-structure` validation from
   full deployment-host `--check-config` preflight. Structural mode validates
   the complete `BotConfig` contract without reading activation or launcher

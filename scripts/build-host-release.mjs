@@ -75,18 +75,17 @@ export async function buildHostRelease(options, injected = {}) {
   );
   await fs.mkdir(scratch, { mode: 0o700 });
   try {
+    const sourceRoot = injected.revision
+      ? repoRoot
+      : await materializeRevision(repoRoot, scratch, revision, run);
     const artifacts = injected.buildArtifacts
-      ? await injected.buildArtifacts({ repoRoot, scratch, revision })
-      : await buildRustArtifacts(repoRoot, scratch, run);
-    if (!injected.revision) {
-      const revisionAfterBuild = await readCleanRevision(repoRoot, run);
-      if (revisionAfterBuild !== revision) throw new Error('bot revision changed during release build');
-    }
+      ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
+      : await buildRustArtifacts(sourceRoot, scratch, run);
     await fs.mkdir(temporary, { mode: 0o700 });
     const files = [];
     for (const entry of RELEASE_FILES) {
       const source = releaseSource(entry, {
-        repoRoot,
+        repoRoot: sourceRoot,
         hostBinDir: artifacts.hostBinDir,
         staticBinDir: artifacts.staticBinDir,
         busybox,
@@ -127,7 +126,8 @@ export async function buildHostRelease(options, injected = {}) {
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     const manifestSha256 = crypto.createHash('sha256').update(manifestBytes).digest('hex');
     await writeBytesFile(path.join(temporary, MANIFEST_NAME), manifestBytes, 0o444);
-    await fs.rename(temporary, output);
+    await normaliseAndSyncBundleDirectories(temporary);
+    await (injected.publishOutput ?? publishDirectoryNoReplace)(temporary, output);
     await syncDirectory(parent);
     return { manifest, manifestSha256 };
   } catch (error) {
@@ -138,15 +138,46 @@ export async function buildHostRelease(options, injected = {}) {
   }
 }
 
+async function materializeRevision(repoRoot, scratch, revision, run) {
+  const sourceRoot = path.join(scratch, 'source');
+  const archive = path.join(scratch, 'source.tar');
+  await fs.mkdir(sourceRoot, { mode: 0o700 });
+  const environment = gitEnvironment();
+  await run('/usr/bin/git', [
+    'archive',
+    '--format=tar',
+    `--output=${archive}`,
+    revision,
+  ], {
+    cwd: repoRoot,
+    env: environment,
+    maxBuffer: 1024 * 1024,
+  });
+  await run('/usr/bin/tar', [
+    '--extract',
+    `--file=${archive}`,
+    `--directory=${sourceRoot}`,
+    '--no-same-owner',
+    '--no-same-permissions',
+  ], {
+    cwd: '/',
+    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+    maxBuffer: 1024 * 1024,
+  });
+  await fs.rm(archive);
+  return sourceRoot;
+}
+
 async function buildRustArtifacts(repoRoot, scratch, run) {
+  await fs.mkdir(path.join(scratch, 'cargo-home'), { mode: 0o700 });
   const cargoVersion = (await run(CARGO_BIN, ['--version'], {
     cwd: repoRoot,
-    env: buildEnvironment(),
+    env: buildEnvironment(scratch),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
   const rustcVersion = (await run(RUSTC_BIN, ['--version'], {
     cwd: repoRoot,
-    env: buildEnvironment(),
+    env: buildEnvironment(scratch),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
   if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
@@ -155,9 +186,17 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
 
   const hostTarget = path.join(scratch, 'host-target');
   const staticTarget = path.join(scratch, 'static-target');
-  await run(CARGO_BIN, ['build', '--locked', '--release', '--all-features', '--bins'], {
+  await run(CARGO_BIN, [
+    'build',
+    '--locked',
+    '--release',
+    '--all-features',
+    '--target',
+    'x86_64-unknown-linux-gnu',
+    '--bins',
+  ], {
     cwd: repoRoot,
-    env: buildEnvironment({ CARGO_TARGET_DIR: hostTarget }),
+    env: buildEnvironment(scratch, { CARGO_TARGET_DIR: hostTarget }),
     maxBuffer: 16 * 1024 * 1024,
   });
   await run(CARGO_BIN, [
@@ -173,24 +212,24 @@ async function buildRustArtifacts(repoRoot, scratch, run) {
     'webex-codex-canary-probe',
   ], {
     cwd: repoRoot,
-    env: buildEnvironment({
+    env: buildEnvironment(scratch, {
       CARGO_TARGET_DIR: staticTarget,
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-Ctarget-feature=+crt-static',
     }),
     maxBuffer: 16 * 1024 * 1024,
   });
   return {
-    hostBinDir: path.join(hostTarget, 'release'),
+    hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
     staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
     cargoVersion,
     rustcVersion,
   };
 }
 
-function buildEnvironment(extra = {}) {
+function buildEnvironment(scratch, extra = {}) {
   return {
     HOME: '/home/codex',
-    CARGO_HOME: '/home/codex/.cargo',
+    CARGO_HOME: path.join(scratch, 'cargo-home'),
     RUSTUP_HOME: '/home/codex/.rustup',
     LANG: 'C',
     LC_ALL: 'C',
@@ -201,25 +240,29 @@ function buildEnvironment(extra = {}) {
 }
 
 async function readCleanRevision(repoRoot, run = execFileAsync) {
-  const environment = {
-    LANG: 'C',
-    LC_ALL: 'C',
-    PATH: '/usr/bin:/bin',
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: '/dev/null',
-  };
-  const status = await run('/usr/bin/git', ['status', '--porcelain', '--untracked-files=no'], {
+  const environment = gitEnvironment();
+  const status = await run('/usr/bin/git', ['status', '--porcelain', '--untracked-files=all'], {
     cwd: repoRoot,
     env: environment,
     maxBuffer: 1024 * 1024,
   });
-  if (status.stdout !== '') throw new Error('tracked worktree must be clean');
+  if (status.stdout !== '') throw new Error('worktree must contain no tracked or untracked changes');
   const revision = await run('/usr/bin/git', ['rev-parse', 'HEAD'], {
     cwd: repoRoot,
     env: environment,
     maxBuffer: 1024 * 1024,
   });
   return revision.stdout.trim();
+}
+
+function gitEnvironment() {
+  return {
+    LANG: 'C',
+    LC_ALL: 'C',
+    PATH: '/usr/bin:/bin',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+  };
 }
 
 function releaseSource(entry, roots) {
@@ -355,6 +398,61 @@ function assertStableMetadata(before, after, file) {
   }
 }
 
+async function normaliseAndSyncBundleDirectories(root) {
+  const directories = await collectDirectories(root);
+  for (const directory of directories.toSorted((left, right) => depth(right) - depth(left))) {
+    await fs.chmod(directory, directory === root ? 0o700 : 0o755);
+    await syncDirectory(directory);
+  }
+}
+
+async function collectDirectories(root, current = root, result = []) {
+  result.push(current);
+  for (const name of await fs.readdir(current)) {
+    const full = path.join(current, name);
+    const metadata = await fs.lstat(full);
+    if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+      await collectDirectories(root, full, result);
+    }
+  }
+  return result;
+}
+
+export async function publishDirectoryNoReplace(source, destination, run = execFileAsync) {
+  try {
+    await run('/usr/bin/mv', [
+      '--no-copy',
+      '--no-clobber',
+      '--no-target-directory',
+      source,
+      destination,
+    ], {
+      cwd: '/',
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    if (await pathExists(source) && await pathExists(destination)) {
+      throw new Error(`release output appeared during publish: ${destination}`);
+    }
+    throw error;
+  }
+  if (await pathExists(source)) {
+    throw new Error(`release output appeared during publish: ${destination}`);
+  }
+  if (!await pathExists(destination)) throw new Error('release publish did not create output');
+}
+
+async function pathExists(file) {
+  try {
+    await fs.lstat(file);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 async function assertOutputAbsent(output) {
   try {
     await fs.lstat(output);
@@ -375,6 +473,10 @@ async function syncDirectory(directory) {
 
 function modeString(mode) {
   return `0${mode.toString(8).padStart(3, '0')}`;
+}
+
+function depth(value) {
+  return value.split(path.sep).length;
 }
 
 function requireAbsolutePath(value, flag) {

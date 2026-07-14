@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+exec /usr/bin/env -i \
+  HOME=/root \
+  LANG=C \
+  LC_ALL=C \
+  PATH=/usr/bin:/bin \
+  /usr/bin/node \
+  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+  "$@"

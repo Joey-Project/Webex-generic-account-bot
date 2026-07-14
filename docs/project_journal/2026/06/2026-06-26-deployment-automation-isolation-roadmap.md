@@ -18,11 +18,12 @@ superseded_by:
 ## Current Progress
 - Trusted deployment entrypoint merged in bot PR #8.
 - First-install host release bootstrap packages the fixed runtime allowlist with
-  content metadata, fixed third-party digests, and freshly rebuilt Rust
-  binaries. A separately staged root-owned trust anchor requires out-of-band
-  release evidence and publishes `/opt/webex-generic-account-bot` with an
-  atomic no-clobber operation. Host policy, secrets, runtime image, and service
-  state remain separate gates.
+  content metadata, fixed third-party digests, and Rust binaries rebuilt from an
+  exact commit export with an isolated Cargo home. A separately staged,
+  environment-clearing root-owned trust anchor requires out-of-band release
+  evidence and publishes `/opt/webex-generic-account-bot` with an atomic
+  no-clobber operation. Host policy, secrets, runtime image, and service state
+  remain separate gates.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
@@ -302,12 +303,13 @@ superseded_by:
 
 ### PR 4d3: Root-Owned Host Release Bootstrap
 - Repository: `Joey-Project/Webex-generic-account-bot`.
-- Build a non-secret bundle without root from a clean reviewed commit, rebuilding
-  all six Rust binaries with the fixed toolchain and checking fixed BusyBox and
-  Codex `0.142.3` Linux x64 artifact digests.
-- Keep the installer and contract outside the data-only bundle in a separate
-  root-owned trust anchor. Require approved commit and manifest digests, exact
-  topology and metadata, and atomic no-clobber publication under `/opt`.
+- Build a non-secret bundle without root from an exact reviewed commit export,
+  rebuilding all six Rust binaries with a fixed target/toolchain and isolated
+  Cargo home, then check fixed BusyBox and Codex `0.142.3` artifact digests.
+- Keep the environment-clearing wrapper, installer, and contract outside the
+  data-only bundle in a separate root-owned trust anchor. Require approved
+  commit and manifest digests, exact topology and metadata, and atomic
+  no-clobber publication under `/opt`.
 - Recover a fully matching install after a publish/fsync interruption; refuse
   mismatching installs, stale candidates, path overrides, secrets, systemd
   policy, runtime-image creation, and service mutation in this slice.

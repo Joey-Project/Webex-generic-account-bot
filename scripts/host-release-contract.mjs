@@ -7,6 +7,7 @@ export const RUSTC_BIN = '/home/codex/.cargo/bin/rustc';
 export const PRODUCTION_BUNDLE_ROOT = '/var/lib/webex-host-release/bundle';
 export const PRODUCTION_INSTALL_ROOT = '/opt/webex-generic-account-bot';
 export const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+export const PRODUCTION_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
 export const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
 export const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
 

@@ -30,9 +30,9 @@
 - [completed] Add a guarded host provisioner before production activation;
   real host apply remains an explicit operational step.
 - [completed] Add a content-manifested, fixed-path, first-install host release
-  bootstrap with rebuilt Rust binaries, digest-pinned third-party sources, a
-  separate root-owned installer trust anchor, and recoverable no-clobber publish
-  without installing secrets, policy, or service state.
+  bootstrap with a commit-exported Rust build, digest-pinned third-party sources,
+  a separate environment-clearing root-owned trust anchor, and recoverable
+  no-clobber publish without installing secrets, policy, or service state.
 - [completed] Add a structural config-check CLI mode for unprivileged CI while
   preserving full activation and launcher preflight in `--check-config`.
 - [pending] Update both config-repository CI lanes to use

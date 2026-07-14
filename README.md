@@ -239,29 +239,30 @@ node scripts/build-host-release.mjs \
   --codex-package-root /tmp/codex-0.142.3/vendor/x86_64-unknown-linux-musl
 ```
 
-The builder requires a clean tracked worktree and records the full Git SHA,
-fixed Rust and Codex versions, exact allowlisted paths, modes, sizes, and
-SHA-256 digests. Fixed trusted digests cover the Codex executable, metadata,
-`rg`, `bwrap`, and the deployment-host BusyBox. The builder prints the complete
-manifest digest for independent release approval. It includes no tokens,
-environment files, deploy keys, rendered config, runtime image, systemd
-installation, or service state.
+The builder rejects tracked and untracked worktree changes, exports the exact
+commit to an isolated source snapshot, and uses a build-local Cargo home. It
+records the full Git SHA, fixed target and Rust/Codex versions, exact allowlisted
+paths, modes, sizes, and SHA-256 digests. Fixed trusted digests cover the Codex
+executable, metadata, `rg`, `bwrap`, and the deployment-host BusyBox. The
+builder normalises and syncs every bundle directory, publishes without
+clobbering, and prints the complete manifest digest for independent release
+approval. It includes no tokens, environment files, deploy keys, rendered
+config, runtime image, systemd installation, or service state.
 
-The installer and its contract are a separate trust anchor and are never loaded
-from the bundle. A reviewed release-delivery step must first install them as
-root-owned mode `0444` files under `/usr/local/libexec/webex-host-release`, then
-stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a
-root-owned mode `0700` tree. Carry the approved commit and manifest digest over
-an independent trusted channel and require both on dry-run and apply:
+The installer, contract, and environment-clearing wrapper are a separate trust
+anchor and are never loaded from the bundle. A reviewed release-delivery step
+must install the wrapper as root-owned mode `0555` and the two JavaScript files
+as root-owned mode `0444` under `/usr/local/libexec/webex-host-release`, then
+stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
+mode `0700` tree. Carry the approved commit and manifest digest over an
+independent trusted channel and require both on dry-run and apply:
 
 ```bash
-sudo -- /usr/bin/node \
-  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+sudo -- /usr/local/libexec/webex-host-release/install-host-release \
   --dry-run \
   --expected-bot-revision "$REVIEWED_BOT_REVISION" \
   --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
-sudo -- /usr/bin/node \
-  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+sudo -- /usr/local/libexec/webex-host-release/install-host-release \
   --apply \
   --expected-bot-revision "$REVIEWED_BOT_REVISION" \
   --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
@@ -273,9 +274,10 @@ candidates, unapproved release evidence, and mismatching existing installs. It
 builds a same-parent candidate and uses an atomic no-clobber publish for the
 complete `code`, `bin`, and `runtime-sources` tree plus verified `release.json`
 evidence. It creates an empty trusted `runtime` directory but does not run the
-provisioner or runtime-image builder. A retry verifies and recovers a complete
-matching install after a publish/fsync interruption; stale candidates and
-mismatching installs require explicit administrator inspection.
+provisioner or runtime-image builder. A retry verifies and publishes one
+complete matching candidate or recovers a matching install after a
+publish/fsync interruption; incomplete or multiple candidates and mismatching
+installs require explicit administrator inspection.
 
 Only after this bootstrap succeeds should the guarded provisioner create host
 identities and policy paths. Then the root-owned runtime builder can write the

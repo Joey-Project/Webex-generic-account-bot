@@ -5,7 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { buildHostRelease, parseArgs as parseBuildArgs } from '../scripts/build-host-release.mjs';
+import {
+  buildHostRelease,
+  parseArgs as parseBuildArgs,
+  publishDirectoryNoReplace,
+} from '../scripts/build-host-release.mjs';
+import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
   CARGO_VERSION,
   CODEX_VERSION,
@@ -70,7 +75,13 @@ describe('host release bootstrap', () => {
   it('builds, validates, and atomically installs the exact first-release tree', async () => {
     const fixture = await createFixture();
     try {
-      const manifest = await buildFixtureBundle(fixture);
+      const priorUmask = process.umask(0o077);
+      let manifest;
+      try {
+        manifest = await buildFixtureBundle(fixture);
+      } finally {
+        process.umask(priorUmask);
+      }
       assert.equal(manifest.bot_revision, REVISION);
       assert.equal(manifest.codex_version, CODEX_VERSION);
       assert.deepEqual(manifest.files.map(({ path: file }) => file), RELEASE_PATHS);
@@ -81,6 +92,7 @@ describe('host release bootstrap', () => {
         process.getgid(),
         fixture.manifestSha256,
         REVISION,
+        releaseContract,
       );
       assert.equal(validated.files.length, RELEASE_FILES.length);
       const dryRun = await installFixture(fixture, false);
@@ -108,6 +120,27 @@ describe('host release bootstrap', () => {
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
+  });
+
+  it('starts the trusted installer through an exact environment-clearing wrapper', async () => {
+    const wrapperPath = new URL('../scripts/install-host-release', import.meta.url);
+    const wrapper = await fs.readFile(wrapperPath, 'utf8');
+    const metadata = await fs.lstat(wrapperPath);
+    assert.equal(metadata.mode & 0o111, 0o111);
+    assert.equal(wrapper, [
+      '#!/bin/sh',
+      'set -eu',
+      '',
+      'exec /usr/bin/env -i \\',
+      '  HOME=/root \\',
+      '  LANG=C \\',
+      '  LC_ALL=C \\',
+      '  PATH=/usr/bin:/bin \\',
+      '  /usr/bin/node \\',
+      '  /usr/local/libexec/webex-host-release/install-host-release.mjs \\',
+      '  "$@"',
+      '',
+    ].join('\n'));
   });
 
   it('rejects tampering, extra files, links, and an existing install', async () => {
@@ -165,6 +198,7 @@ describe('host release bootstrap', () => {
           process.getgid(),
           'b'.repeat(64),
           REVISION,
+          releaseContract,
         ),
         /trusted digest/,
       );
@@ -178,6 +212,7 @@ describe('host release bootstrap', () => {
             expectedGid: process.getgid(),
             requireRoot: false,
             trustAncestors: false,
+            contract: releaseContract,
           },
         ),
         /expected-bot-revision/,
@@ -207,6 +242,42 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('does not replace a release output that appears during a build', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-bundle-publish-test-'));
+    const candidate = path.join(root, 'candidate');
+    const output = path.join(root, 'output');
+    try {
+      await fs.mkdir(candidate);
+      await fs.writeFile(path.join(candidate, 'candidate'), 'candidate');
+      await fs.mkdir(output);
+      await fs.writeFile(path.join(output, 'existing'), 'existing');
+      await assert.rejects(
+        publishDirectoryNoReplace(candidate, output),
+        /appeared during publish/,
+      );
+      assert.equal(await fs.readFile(path.join(output, 'existing'), 'utf8'), 'existing');
+      assert.equal(await fs.readFile(path.join(candidate, 'candidate'), 'utf8'), 'candidate');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects untracked source inputs before materialising the commit snapshot', async () => {
+    await assert.rejects(
+      buildHostRelease(
+        {
+          output: '/tmp/unused-host-release-output',
+          codexPackageRoot: '/tmp/unused-codex-root',
+        },
+        {
+          repoRoot: '/tmp/unused-repo',
+          execFileAsync: async () => ({ stdout: '?? build.rs\n', stderr: '' }),
+        },
+      ),
+      /no tracked or untracked changes/,
+    );
+  });
+
   it('recovers a fully published release after parent sync failure', async () => {
     const fixture = await createFixture();
     try {
@@ -215,7 +286,12 @@ describe('host release bootstrap', () => {
         installFixture(fixture, true, {
           syncDirectory: async (directory) => {
             if (directory === path.dirname(fixture.installRoot)) {
-              throw new Error('simulated parent sync failure');
+              try {
+                await fs.lstat(fixture.installRoot);
+                throw new Error('simulated parent sync failure');
+              } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+              }
             }
           },
         }),
@@ -223,6 +299,55 @@ describe('host release bootstrap', () => {
       );
       const recovered = await installFixture(fixture, true);
       assert.equal(recovered.status, 'recovered');
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers one complete pre-publish candidate and rejects an incomplete one', async () => {
+    for (const state of ['complete', 'incomplete']) {
+      const fixture = await createFixture();
+      try {
+        await buildFixtureBundle(fixture);
+        const candidate = path.join(
+          path.dirname(fixture.installRoot),
+          `.webex-generic-account-bot-install-${state}`,
+        );
+        if (state === 'complete') {
+          await installFixture(fixture, true);
+          await fs.rename(fixture.installRoot, candidate);
+          const dryRun = await installFixture(fixture, false);
+          assert.equal(dryRun.status, 'recoverable_candidate');
+          const recovered = await installFixture(fixture, true);
+          assert.equal(recovered.status, 'recovered');
+          assert.equal(await fs.lstat(fixture.installRoot).then((value) => value.isDirectory()), true);
+        } else {
+          await fs.mkdir(candidate, { mode: 0o755 });
+          await assert.rejects(
+            installFixture(fixture, true),
+            /stale host release candidate requires manual inspection/,
+          );
+        }
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects content drift in a correctly shaped installed release', async () => {
+    const fixture = await createFixture();
+    try {
+      const manifest = await buildFixtureBundle(fixture);
+      await installFixture(fixture, true);
+      const target = path.join(fixture.installRoot, manifest.files[0].path);
+      const mode = (await fs.lstat(target)).mode & 0o7777;
+      await fs.chmod(target, 0o600);
+      await fs.writeFile(target, 'x'.repeat(manifest.files[0].size));
+      await fs.chmod(target, mode);
+      await assert.rejects(
+        installFixture(fixture, false),
+        /existing host release file does not match/,
+      );
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
@@ -332,6 +457,7 @@ function installFixture(fixture, apply, injected = {}) {
       expectedGid: process.getgid(),
       requireRoot: false,
       trustAncestors: false,
+      contract: releaseContract,
       ...injected,
     },
   );
