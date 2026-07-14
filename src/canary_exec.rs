@@ -677,7 +677,7 @@ mod tests {
         assert!(parse_runtime_canary_exec_jsonl(&with_cr, NONCE, &fixture_inputs()).is_err());
 
         let mut empty_line = encode(&success_events());
-        empty_line.splice(0..0, [b'\n']);
+        empty_line.splice(0..0, *b"\n");
         assert!(parse_runtime_canary_exec_jsonl(&empty_line, NONCE, &fixture_inputs()).is_err());
 
         let long_line = format!(

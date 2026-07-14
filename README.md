@@ -137,11 +137,26 @@ export WEBEX_SIDECAR_TOKEN='<local-forwarding-token>'
 export WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token
 ```
 
-Check config without calling Webex:
+Check config structure without calling Webex or inspecting deployment-host
+activation state:
+
+```bash
+cargo run -- --config config/example.toml --check-config-structure
+```
+
+This mode is for unprivileged CI. It validates parsing, cross-field invariants,
+isolation policy, and execution budgets, but it does not prove that the target
+host has a valid activation receipt or launcher socket. Do not use it as a
+deployment acceptance check.
+
+Check config and deployment-host prerequisites without calling Webex:
 
 ```bash
 cargo run -- --config config/example.toml --check-config
 ```
+
+For an ephemeral runner, this full mode verifies the current boot-scoped
+activation receipt and fixed launcher socket installation.
 
 Run the bot:
 

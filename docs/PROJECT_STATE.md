@@ -201,6 +201,11 @@
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before runner activation and companion config enablement.
 
+- The CLI separates unprivileged `--check-config-structure` validation from
+  full deployment-host `--check-config` preflight. Structural mode validates
+  the complete `BotConfig` contract without reading activation or launcher
+  state; full mode remains the required deployment acceptance check.
+
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
 - Deployment automation and isolation roadmap: `docs/project_journal/2026/06/2026-06-26-deployment-automation-isolation-roadmap.md`
@@ -214,6 +219,8 @@
   evidence are not substitutes for that deployment-host gate.
 - Production config does not enable `ephemeral-linux-user`, `/config pull`,
   `/config reload`, or `/config sync` before PR 4c2 activation.
+- The config repository must update both CI validation lanes to use
+  `--check-config-structure` before its all-ephemeral target profile can merge.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

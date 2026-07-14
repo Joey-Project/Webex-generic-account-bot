@@ -276,6 +276,14 @@ superseded_by:
   state, and post-reload verification. Real host apply remains an
   explicit operational gate.
 
+- Config enablement validation exposed that GitHub-hosted CI cannot satisfy the
+  intentionally live activation and launcher checks in `--check-config`.
+  The bot therefore adds a separate `--check-config-structure` mode that still
+  loads and validates the complete `BotConfig` contract but never treats CI as
+  deployment-host evidence. The config repository must adopt this mode in both
+  CI lanes before switching to the all-ephemeral profile; trusted deployment
+  continues to require full `--check-config`.
+
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
 - After each PR merges, refresh the target branch locally before creating the next worktree.
