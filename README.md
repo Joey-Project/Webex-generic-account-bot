@@ -259,7 +259,9 @@ Rust compiler paths are remapped to `/build`, and reproducibility inputs are
 fixed so a same-host retry can compare a newly built manifest with a completed
 output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
 sysroot remain an explicit build-host trust base; the builder selects their
-absolute paths and never substitutes caller-controlled native tools.
+absolute paths and never substitutes caller-controlled native tools. Cargo runs
+from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
+files beside or above the caller-selected output directory are not loaded.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
 digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the

@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { promisify } from 'node:util';
 
 import {
   buildEnvironment,
   buildHostRelease,
+  cargoBuildInvocation,
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
 } from '../scripts/build-host-release.mjs';
@@ -31,6 +34,7 @@ import {
 } from '../scripts/install-host-release.mjs';
 
 const REVISION = 'a'.repeat(40);
+const execFileAsync = promisify(execFile);
 
 describe('host release bootstrap', () => {
   it('keeps the release contract unique and path confined', () => {
@@ -101,6 +105,63 @@ describe('host release bootstrap', () => {
       ].join('\u001f'),
     );
     assert.equal('RUSTUP_HOME' in environment, false);
+  });
+
+  it('keeps caller Cargo configuration outside the build search path', () => {
+    const invocation = cargoBuildInvocation('/tmp/caller-controlled/release/source', [
+      '--locked',
+      '--release',
+    ]);
+    assert.deepEqual(invocation, {
+      args: [
+        'build',
+        '--manifest-path',
+        '/tmp/caller-controlled/release/source/Cargo.toml',
+        '--locked',
+        '--release',
+      ],
+      cwd: '/',
+    });
+  });
+
+  it('does not load Cargo configuration above the frozen source snapshot', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-config-test-'));
+    const source = path.join(root, 'source');
+    try {
+      await fs.mkdir(path.join(root, '.cargo'));
+      await fs.mkdir(path.join(source, 'src'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, '.cargo', 'config.toml'),
+        '[build]\nrustc-wrapper = "/caller-controlled/rustc-wrapper"\n',
+      );
+      await fs.writeFile(
+        path.join(source, 'Cargo.toml'),
+        '[package]\nname = "cargo-config-isolation"\nversion = "0.0.0"\nedition = "2024"\n',
+      );
+      await fs.writeFile(path.join(source, 'src', 'main.rs'), 'fn main() {}\n');
+      const invocation = cargoBuildInvocation(source, [
+        '--offline',
+        '--target-dir',
+        path.join(root, 'target'),
+      ]);
+      const cargo = process.env.CARGO ?? path.join(os.homedir(), '.cargo', 'bin', 'cargo');
+      await execFileAsync(cargo, invocation.args, {
+        cwd: invocation.cwd,
+        env: {
+          CARGO_HOME: path.join(root, 'cargo-home'),
+          HOME: process.env.HOME,
+          LANG: 'C',
+          LC_ALL: 'C',
+          PATH: `${path.dirname(cargo)}:${process.env.PATH}`,
+          ...(process.env.RUSTUP_HOME === undefined
+            ? {}
+            : { RUSTUP_HOME: process.env.RUSTUP_HOME }),
+        },
+        maxBuffer: 1024 * 1024,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it('stops exact reads at the trusted size and probes EOF once', async () => {

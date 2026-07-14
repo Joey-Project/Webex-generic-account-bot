@@ -220,12 +220,12 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');
   const cargoVersion = (await run(cargoBin, ['--version'], {
-    cwd: repoRoot,
+    cwd: '/',
     env: buildEnvironment(scratch, toolchainRoot),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
   const rustcVersion = (await run(rustcBin, ['--version'], {
-    cwd: repoRoot,
+    cwd: '/',
     env: buildEnvironment(scratch, toolchainRoot),
     maxBuffer: 1024 * 1024,
   })).stdout.trim();
@@ -235,21 +235,20 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
 
   const hostTarget = path.join(scratch, 'host-target');
   const staticTarget = path.join(scratch, 'static-target');
-  await run(cargoBin, [
-    'build',
+  const hostBuild = cargoBuildInvocation(repoRoot, [
     '--locked',
     '--release',
     '--all-features',
     '--target',
     'x86_64-unknown-linux-gnu',
     '--bins',
-  ], {
-    cwd: repoRoot,
+  ]);
+  await run(cargoBin, hostBuild.args, {
+    cwd: hostBuild.cwd,
     env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
     maxBuffer: 16 * 1024 * 1024,
   });
-  await run(cargoBin, [
-    'build',
+  const staticBuild = cargoBuildInvocation(repoRoot, [
     '--locked',
     '--release',
     '--all-features',
@@ -259,8 +258,9 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
     'webex-codex-runtime',
     '--bin',
     'webex-codex-canary-probe',
-  ], {
-    cwd: repoRoot,
+  ]);
+  await run(cargoBin, staticBuild.args, {
+    cwd: staticBuild.cwd,
     env: buildEnvironment(
       scratch,
       toolchainRoot,
@@ -276,6 +276,18 @@ async function buildRustArtifacts(repoRoot, scratch, rustToolchainImage, run) {
     rustcVersion,
     toolchainSha256: measuredToolchain.sha256,
   };
+}
+
+export function cargoBuildInvocation(repoRoot, args) {
+  return Object.freeze({
+    args: Object.freeze([
+      'build',
+      '--manifest-path',
+      path.join(path.resolve(repoRoot), 'Cargo.toml'),
+      ...args,
+    ]),
+    cwd: '/',
+  });
 }
 
 export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalRustFlags = []) {
