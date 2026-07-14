@@ -3,8 +3,8 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-07-01
-branch: codex/roadmap-deploy-isolation
+updated: 2026-07-14
+branch: codex/host-release-bootstrap
 pr:
 supersedes: []
 superseded_by:
@@ -17,6 +17,10 @@ superseded_by:
 
 ## Current Progress
 - Trusted deployment entrypoint merged in bot PR #8.
+- First-install host release bootstrap packages the fixed runtime allowlist with
+  content metadata and publishes `/opt/webex-generic-account-bot` atomically
+  only from a root-owned fixed staging tree. Host policy, secrets, runtime image,
+  and service state remain separate gates.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
@@ -293,6 +297,17 @@ superseded_by:
 - Do not use admin bypass or forced checks unless Joey explicitly authorises that exact exception.
 
 ## Planned PRs
+
+### PR 4d3: Root-Owned Host Release Bootstrap
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Build a non-secret bundle without root from a clean reviewed commit, the six
+  fixed host/runtime binaries, static BusyBox, and the reviewed Codex `0.142.3`
+  Linux x64 package layout.
+- Require an administrator-staged root-owned fixed bundle tree; validate exact
+  topology, modes, ownership, link counts, sizes, and SHA-256 digests before a
+  one-rename first installation under `/opt`.
+- Refuse upgrades, stale candidates, path overrides, secrets, systemd policy,
+  runtime-image creation, and service mutation in this slice.
 
 ### PR 4d1: Base Bot Host Contract
 - Repository: `Joey-Project/Webex-generic-account-bot`.

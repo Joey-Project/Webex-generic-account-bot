@@ -201,6 +201,12 @@
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before runner activation and companion config enablement.
 
+- Initial host release bootstrap is content-manifested and first-install only.
+  An unprivileged builder packages a fixed runtime allowlist from a clean
+  reviewed commit; a fixed-path root installer verifies ownership, modes,
+  topology, sizes, and SHA-256 digests before atomically publishing the complete
+  `/opt/webex-generic-account-bot` tree. It installs no secrets, policy files,
+  runtime image, or service state.
 - The CLI separates unprivileged `--check-config-structure` validation from
   full deployment-host `--check-config` preflight. Structural mode validates
   the complete `BotConfig` contract without reading activation or launcher
@@ -217,10 +223,11 @@
   installed production image and host kernel, satisfy the real-reboot
   challenge, and activate a matching ephemeral-only config. Code and unit-test
   evidence are not substitutes for that deployment-host gate.
-- Production config does not enable `ephemeral-linux-user`, `/config pull`,
-  `/config reload`, or `/config sync` before PR 4c2 activation.
-- The config repository must update both CI validation lanes to use
-  `--check-config-structure` before its all-ephemeral target profile can merge.
+- The config repository now pins the all-ephemeral `status`/`pull` profile and
+  uses structural bot validation in both CI lanes. The deployment host must
+  stage and apply the reviewed root-owned release bundle before guarded
+  provisioning and activation can run; `/config reload` and `/config sync`
+  remain disabled.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

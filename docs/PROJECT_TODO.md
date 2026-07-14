@@ -29,6 +29,9 @@
 - [completed] Add the base bot systemd identity, service, and filesystem layout.
 - [completed] Add a guarded host provisioner before production activation;
   real host apply remains an explicit operational step.
+- [completed] Add a content-manifested, fixed-path, first-install host release
+  bootstrap for runtime code, binaries, and Codex `0.142.3` sources without
+  installing secrets, policy, or service state.
 - [completed] Add a structural config-check CLI mode for unprivileged CI while
   preserving full activation and launcher preflight in `--check-config`.
 - [pending] Update both config-repository CI lanes to use
