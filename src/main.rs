@@ -8138,10 +8138,10 @@ mod tests {
         .expect("helper timeout path must remain bounded");
 
         let error = result.unwrap_err();
-        if let Ok(value) = fs::read_to_string(&escaped_pid_file)
-            && let Ok(pid) = value.trim().parse::<i32>()
-        {
-            terminate_jenkins_helper_process_group(Some(-pid), SIGKILL);
+        if let Ok(value) = fs::read_to_string(&escaped_pid_file) {
+            if let Ok(pid) = value.trim().parse::<i32>() {
+                terminate_jenkins_helper_process_group(Some(-pid), SIGKILL);
+            }
         }
         fs::remove_dir_all(helper_dir).unwrap();
         assert!(error.to_string().contains("timed out after 1 seconds"));

@@ -26,6 +26,10 @@ superseded_by:
   launcher, and runtime executable digests plus the Codex version and model.
   Same-boot retries are idempotent. Binding drift, invalid state, an already
   validated challenge, or a crossed boot boundary fails closed.
+- Exact legacy-v1 state is identified separately and remains fail closed. The
+  runbook requires the complete preflight before archiving the fixed persistent
+  challenge, re-arming v2, and crossing a new real reboot; old `/run` evidence
+  is never reused.
 - The host entrypoint reuses reviewed release, policy, runtime, and secret
   readiness checks. Apply serialises with config deployment, requires the
   receipt, runner permission, and deployment transaction to remain absent,
@@ -46,3 +50,5 @@ superseded_by:
 - Activation helper: `src/bin/webex-codex-activation.rs`
 - State machine: `src/activation_canary.rs`
 - Tests: `test/prepare-activation-reboot-challenge.node-test.mjs`
+- Rust disk-state tests cover v2 arm/retry, boot crossing, marker survival,
+  binding drift, renewal validation, and legacy-v1 identification.

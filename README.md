@@ -596,6 +596,24 @@ artifact drift, a crossed boot boundary, malformed challenge state, a receipt,
 a runner drop-in, a deployment recovery transaction, or any active managed
 unit fails closed.
 
+An exact `legacy reboot challenge schema version 1 requires operator recovery`
+error means an older release armed a challenge that is intentionally not valid
+for the current artifact binding. Do not treat it as reboot evidence or delete
+it before the command's release, policy, runtime, secret, transaction, and
+inactive-unit preflight has reached that error. Preserve the legacy state by
+moving only the fixed persistent challenge out of the active path:
+
+```bash
+sudo -- /usr/bin/mv --no-clobber \
+  /var/lib/webex-generic-account-bot/canary-fixtures/reboot-challenge.json \
+  /var/lib/webex-generic-account-bot/canary-fixtures/reboot-challenge.legacy-v1.json
+```
+
+Then rerun dry-run and explicit apply to arm a v2 challenge, and perform a new
+real reboot. Leave any old boot-scoped marker untouched; `/run` cleanup at that
+reboot removes it. If the archive target already exists or any preflight fails,
+stop for operator investigation instead of replacing recovery evidence.
+
 Successful apply reports `status=reboot_required` while proving the receipt
 and runner permission remain absent, the deployment transaction remains clean,
 and the bot, activation renewal, launcher socket, and config worker units
