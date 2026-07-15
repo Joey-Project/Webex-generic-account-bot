@@ -515,8 +515,10 @@ with the same shared deployment lock used by config deployment. The
 preactivation target then reacquires the lock, revalidates dormant and unchanged
 host policy under it, requires a clean receipt/drop-in/reboot-challenge boundary
 and complete secret readiness, then invokes only the fixed runtime builder
-paths. If a later readiness gate fails, the converged host policy remains in the
-safe, rerunnable `provisioned` state.
+paths. It rechecks both the activation boundary and secret metadata after the
+runtime build before reporting success. `--require-secrets` enforces the same
+readiness contract for either target. If a later readiness gate fails, the
+converged host policy remains in the safe, rerunnable `provisioned` state.
 
 The entrypoint does not install or parse secret contents, enable or start a
 unit, install the runner permission drop-in, mint an activation receipt, or
@@ -529,7 +531,9 @@ of acting as an upgrade mechanism. A missing, corrupt, or inconsistent active
 image also fails closed: preserve `active.json` and use a separately reviewed
 runtime recovery procedure rather than deleting deployment evidence in this
 entrypoint. Every report states that service state is unchanged and activation
-was not attempted.
+was not attempted. Shared-lock contention preserves exit status `75` so an
+operator or deployment scheduler can retry it separately from a permanent
+preflight failure.
 
 Install secrets through a separate administrator-controlled channel after
 provisioning. The readiness check uses `lstat` metadata only and never opens or

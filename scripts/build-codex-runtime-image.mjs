@@ -290,7 +290,7 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
     ? await inspectFirstDeploymentRuntimeState(
       settings.outputRoot,
       firstDeploymentContract,
-      { expectedUid, expectedGid },
+      { expectedUid, expectedGid, trustDirectory },
     )
     : null;
   if (existingActive?.status === 'conflict') {
@@ -460,9 +460,15 @@ export async function inspectRuntimeSources(injected = {}) {
 export async function inspectFirstDeploymentRuntimeState(
   outputRoot,
   expectedContract,
-  { expectedUid = 0, expectedGid = 0, fsApi = fs } = {},
+  {
+    expectedUid = 0,
+    expectedGid = 0,
+    fsApi = fs,
+    trustDirectory = assertTrustedDirectory,
+  } = {},
 ) {
   validateFirstDeploymentContract(expectedContract);
+  await trustDirectory(outputRoot, expectedUid);
   const activePath = path.join(outputRoot, 'active.json');
   let handle;
   try {

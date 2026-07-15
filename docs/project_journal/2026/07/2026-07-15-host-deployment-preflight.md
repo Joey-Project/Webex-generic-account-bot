@@ -31,13 +31,14 @@ superseded_by:
   remains intact for a separate recovery workflow.
 - The provisioner uses the shared deployment lock for policy convergence. The
   preactivation phase reacquires it for policy revalidation and runtime
-  preparation. A later readiness failure leaves the host safely provisioned
-  and rerunnable.
+  preparation, then rechecks activation and secret metadata after the build. A
+  later readiness failure leaves the host safely provisioned and rerunnable.
 - Secret readiness checks fixed parent and file metadata with `lstat`; secret
   files are never opened or read. Missing secrets are reported as incomplete
   readiness unless the operator selects `--require-secrets`.
 - Child processes receive a fixed scrubbed environment. Failure output excludes
-  child stdout and stderr.
+  child stdout and stderr. Shared-lock contention retains retryable exit status
+  `75` through the top-level launcher.
 - The entrypoint never enables or starts units, installs activation permission,
   mints a receipt, or contacts Webex. A preactivation apply also requires the
   receipt, permission drop-in, and reboot challenge to remain absent.

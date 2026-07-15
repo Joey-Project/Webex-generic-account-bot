@@ -7,7 +7,10 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { withSharedDeploymentLock } from './deploy-config.mjs';
+import {
+  DEPLOY_EXIT_LOCK_BUSY,
+  withSharedDeploymentLock,
+} from './deploy-config.mjs';
 import { assertNoExtendedPosixAcl } from './provision-host.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -178,15 +181,8 @@ export async function prepareHostDeployment(options, injected = {}) {
     validateActivationBoundary(boundary);
     secrets = await inspectSecrets();
     validateSecretReport(secrets);
-    if (
-      (options.requireSecrets || (options.apply && requestedState === 'preactivation-ready'))
-      && !secrets.ready
-    ) {
-      const incomplete = secrets.files
-        .filter(({ status }) => status !== 'ready')
-        .map(({ name }) => name)
-        .join(', ');
-      throw new Error(`deployment secrets are not ready: ${incomplete}`);
+    if (options.requireSecrets || (options.apply && requestedState === 'preactivation-ready')) {
+      requireSecretReadiness(secrets, 'deployment secrets are not ready');
     }
     if (options.apply && requestedState === 'preactivation-ready' && !boundary.clean) {
       throw new Error('activation boundary is not clean; use the activation recovery workflow');
@@ -220,6 +216,12 @@ export async function prepareHostDeployment(options, injected = {}) {
         if (!boundary.clean) {
           throw new Error('activation boundary changed while preparing the runtime');
         }
+        secrets = await inspectSecrets();
+        validateSecretReport(secrets);
+        requireSecretReadiness(
+          secrets,
+          'deployment secrets changed while preparing the runtime',
+        );
         runtime = Object.freeze({
           status: 'prepared',
           codex_version: active.codex_version,
@@ -242,6 +244,9 @@ export async function prepareHostDeployment(options, injected = {}) {
     validateActivationBoundary(boundary);
     secrets = await inspectSecrets();
     validateSecretReport(secrets);
+    if (options.requireSecrets) {
+      requireSecretReadiness(secrets, 'deployment secrets are not ready');
+    }
     runtime = Object.freeze({ status: 'not_requested' });
   }
 
@@ -394,7 +399,9 @@ export async function runJsonCommand(command, args, label, injected = {}) {
     });
   } catch (error) {
     const status = Number.isSafeInteger(error?.code) ? `exit ${error.code}` : 'execution error';
-    throw new Error(`${label} failed (${status})`);
+    const failure = new Error(`${label} failed (${status})`);
+    if (error?.code === DEPLOY_EXIT_LOCK_BUSY) failure.exitStatus = DEPLOY_EXIT_LOCK_BUSY;
+    throw failure;
   }
   if (result.stderr !== '') throw new Error(`${label} emitted unexpected diagnostics`);
   try {
@@ -598,6 +605,15 @@ function validateSecretReport(value) {
   if (value.ready !== value.files.every(({ status }) => status === 'ready')) {
     throw new Error('deployment secret report readiness is inconsistent');
   }
+}
+
+function requireSecretReadiness(report, label) {
+  if (report.ready) return;
+  const incomplete = report.files
+    .filter(({ status }) => status !== 'ready')
+    .map(({ name }) => name)
+    .join(', ');
+  throw new Error(`${label}: ${incomplete}`);
 }
 
 function validateActivationBoundary(value) {

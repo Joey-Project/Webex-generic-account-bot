@@ -181,6 +181,20 @@ describe('host deployment preparation', () => {
       /deployment secrets are not ready: webex_access_token/,
     );
     await assert.rejects(
+      prepareHostDeployment(options({
+        requireSecrets: true,
+        through: 'provisioned',
+      }), {
+        euid: 0,
+        runJson: async (command) => (
+          command === DEFAULTS.releaseInstaller ? releaseReport() : provisionReport('dry-run')
+        ),
+        inspectSecrets: async () => secretReport('missing'),
+        inspectBoundary: async () => activationBoundary(true),
+      }),
+      /deployment secrets are not ready: webex_access_token/,
+    );
+    await assert.rejects(
       prepareHostDeployment(options(), {
         euid: 0,
         runJson: async (command) => (
@@ -303,6 +317,40 @@ describe('host deployment preparation', () => {
     );
     assert.equal(runtimeCommands, 2);
     assert.equal(boundaryInspections, 2);
+  });
+
+  it('rejects secret readiness drift after the runtime build', async () => {
+    let secretInspections = 0;
+    let runtimeCommands = 0;
+    await assert.rejects(
+      prepareHostDeployment(options({
+        apply: true,
+        through: 'preactivation-ready',
+      }), {
+        euid: 0,
+        runJson: async (command, args) => {
+          if (command === DEFAULTS.releaseInstaller) return releaseReport();
+          if (command === DEFAULTS.provisioner) {
+            return args[0] === '--apply'
+              ? provisionReport('applied')
+              : provisionReport('dry-run', 0);
+          }
+          runtimeCommands += 1;
+          return args.at(-1) === '--write-source-manifest'
+            ? sourceManifestReport()
+            : runtimeReport();
+        },
+        inspectSecrets: async () => {
+          secretInspections += 1;
+          return secretReport(secretInspections === 1 ? 'ready' : 'missing');
+        },
+        inspectBoundary: async () => activationBoundary(true),
+        withLock: async (operation) => operation(),
+      }),
+      /deployment secrets changed while preparing the runtime: webex_access_token/,
+    );
+    assert.equal(runtimeCommands, 2);
+    assert.equal(secretInspections, 2);
   });
 
   it('reports an existing upgrade runtime as a read-only conflict', async () => {
@@ -452,6 +500,17 @@ describe('host deployment preparation', () => {
         },
       }),
       (error) => error.message === 'fixed command failed (exit 9)',
+    );
+    await assert.rejects(
+      runJsonCommand('/fixed/tool', [], 'fixed command', {
+        run: async () => {
+          throw Object.assign(new Error('deployment lock busy'), { code: 75 });
+        },
+      }),
+      (error) => (
+        error.message === 'fixed command failed (exit 75)'
+        && error.exitStatus === 75
+      ),
     );
   });
 });

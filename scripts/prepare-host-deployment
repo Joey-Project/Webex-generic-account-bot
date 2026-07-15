@@ -9,5 +9,5 @@ import('./prepare-host-deployment.mjs')
   })
   .catch((error) => {
     process.stderr.write(`prepare-host-deployment: ${error.message}\n`);
-    process.exitCode = 1;
+    process.exitCode = error?.exitStatus === 75 ? 75 : 1;
   });
