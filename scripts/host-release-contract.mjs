@@ -116,11 +116,11 @@ export function compareReleasePaths(left, right) {
 }
 
 export const TRUSTED_SOURCE_SHA256 = Object.freeze({
-  'bin/webex-codex-activation': 'b2b663f01b546664b3cf7c9d87ee2b6e1c6a62752512b1a9ed4c405d572f7217',
-  'bin/webex-codex-canary-probe': '181a2e18c86c96d595b1e91885ff19adeb9ff54fafacf10084c27b32e1977639',
-  'bin/webex-codex-launcher': '9009acb0fae60d9a1bb4dc3162dcd4395c7688d5ca1a8d68ac605c1d8aeb2b63',
-  'bin/webex-codex-runtime': '7636a8bb9db4b28b7d85580d14c336758c9df400dc4ba3f3f4125527c5607134',
-  'bin/webex-generic-account-bot': '47214dc908302c05c5e033167e78eb4b6d9ccd16e682b8bf033fa7fd1cd8d7c4',
+  'bin/webex-codex-activation': '5eb70d07aa51584848bc9cb7f9590088f36fbf6a74b795378d6c243334ec849d',
+  'bin/webex-codex-canary-probe': '660ada27939656cadded3e1f8c44a56ccede4276de0ad93527790d13efe22d61',
+  'bin/webex-codex-launcher': 'ba6f795a1c02678db2477fc1b8eb87e187af38195851fe47fb8936d386552c96',
+  'bin/webex-codex-runtime': '3c9ea7df7794654ce5e30b9a73d139f7a961034d16423b2200365f4c33c2fbf8',
+  'bin/webex-generic-account-bot': '76a52b1e45fa7e9f4a02b492a6cf524624192694a410aaf7bc2bac57a5d1eda3',
   'bin/webex-host-identity-lock': 'db915799ac37672b2812e0c296d4e5417b16b248e3b8dea0ecd67baf2290d0f8',
   'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',
   'runtime-sources/codex/bin/codex': 'cb1670c25b6e17fd82866a80e55df58bc10f5d18e44d25ec2c6f7c2ab98077cd',
