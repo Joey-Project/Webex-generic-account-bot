@@ -331,10 +331,14 @@ mod tests {
     use std::{
         fs::OpenOptions,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static LOCK_INHERITANCE_TEST_MUTEX: Mutex<()> = Mutex::new(());
     const EXEC_LOCK_STAGE_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_STAGE";
     const EXEC_LOCK_PATH_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_PATH";
     const EXEC_LOCK_FD_ENV: &str = "WEBEX_TEST_IDENTITY_LOCK_EXEC_FD";
@@ -405,6 +409,10 @@ mod tests {
 
     #[test]
     fn inherited_deployment_lock_retains_the_same_open_file_description() {
+        // The exec-boundary test deliberately inherits every non-CLOEXEC fd.
+        let _serial = LOCK_INHERITANCE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = env::temp_dir().join(format!(
             "webex-host-identity-lock-{}-{}",
             std::process::id(),
@@ -458,6 +466,9 @@ mod tests {
             run_exec_lock_stage(&stage);
             return;
         }
+        let _serial = LOCK_INHERITANCE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = env::temp_dir().join(format!(
             "webex-password-lock-exec-{}-{}",
             std::process::id(),
