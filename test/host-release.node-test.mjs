@@ -23,6 +23,7 @@ import {
   resolveBusyboxPath,
   resyncBundle,
   snapshotToolchainTree,
+  snapshotCargoHomeTree,
   snapshotCargoVendorTree,
   verifyCargoVendorTree,
   verifyToolchainTree,
@@ -287,6 +288,22 @@ describe('host release bootstrap', () => {
       await assert.rejects(
         snapshotCargoVendorTree(root),
         /contains an untrusted file/,
+      );
+    } finally {
+      await fs.chmod(root, 0o700).catch(() => {});
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('binds the Cargo home baseline to the fixed source replacement', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-home-tree-test-'));
+    const config = path.join(root, 'config.toml');
+    try {
+      const expected = Buffer.from(cargoVendorConfiguration('/tmp/cargo-vendor'), 'utf8');
+      await fs.writeFile(config, '[build]\nrustc-wrapper = "/tmp/attacker"\n', { mode: 0o400 });
+      await assert.rejects(
+        snapshotCargoHomeTree(root, expected),
+        /private Cargo home does not match the trusted tree digest/,
       );
     } finally {
       await fs.chmod(root, 0o700).catch(() => {});

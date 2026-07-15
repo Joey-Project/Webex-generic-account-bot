@@ -706,6 +706,14 @@ export function snapshotCargoVendorTree(root, expectedSha256) {
   return snapshotReadOnlyTree(root, expectedSha256, CARGO_VENDOR_TREE_POLICY);
 }
 
+export function snapshotCargoHomeTree(root, configBytes) {
+  return snapshotReadOnlyTree(
+    root,
+    cargoHomeTreeSha256(configBytes),
+    CARGO_HOME_TREE_POLICY,
+  );
+}
+
 async function snapshotReadOnlyTree(root, expectedSha256, policy) {
   await normaliseReadOnlyTree(root, policy);
   const directories = [];
@@ -761,11 +769,8 @@ async function snapshotReadOnlyTree(root, expectedSha256, policy) {
       size: entry.size,
       type: 'file',
     })),
-  ].sort((left, right) => compareReleasePaths(left.path, right.path));
-  const sha256 = crypto
-    .createHash('sha256')
-    .update(`${JSON.stringify(records)}\n`, 'utf8')
-    .digest('hex');
+  ];
+  const sha256 = readOnlyTreeSha256(records);
   if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
     throw new Error(`${policy.digestLabel} does not match the trusted tree digest`);
   }
@@ -778,6 +783,28 @@ async function snapshotReadOnlyTree(root, expectedSha256, policy) {
   });
   await verifyReadOnlyTree(snapshot);
   return snapshot;
+}
+
+function cargoHomeTreeSha256(configBytes) {
+  const bytes = Buffer.from(configBytes);
+  return readOnlyTreeSha256([
+    { mode: '0500', path: '', type: 'directory' },
+    {
+      mode: '0400',
+      path: 'config.toml',
+      sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      size: bytes.length,
+      type: 'file',
+    },
+  ]);
+}
+
+function readOnlyTreeSha256(records) {
+  const ordered = [...records].sort((left, right) => compareReleasePaths(left.path, right.path));
+  return crypto
+    .createHash('sha256')
+    .update(`${JSON.stringify(ordered)}\n`, 'utf8')
+    .digest('hex');
 }
 
 export function verifyToolchainTree(snapshot) {
@@ -1100,11 +1127,7 @@ async function buildRustArtifacts(
   await fs.mkdir(staticTarget, { mode: 0o700 });
   const cargoConfig = Buffer.from(cargoVendorConfiguration(cargoVendorRoot), 'utf8');
   await writeBytesFile(path.join(cargoHome, 'config.toml'), cargoConfig, 0o400);
-  const cargoHomeSnapshot = await snapshotReadOnlyTree(
-    cargoHome,
-    undefined,
-    CARGO_HOME_TREE_POLICY,
-  );
+  const cargoHomeSnapshot = await snapshotCargoHomeTree(cargoHome, cargoConfig);
   const scratchIdentity = await snapshotPrivateDirectory(scratch, 'release build scratch');
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');

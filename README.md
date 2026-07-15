@@ -388,16 +388,20 @@ from silently accumulating full build trees. It includes no tokens, environment
 files, deploy keys, rendered config, runtime image, systemd installation, or
 service state.
 
-The pinned static BusyBox, two wrappers, JavaScript implementations, and contract
-are a separate trust anchor and are never loaded from the bundle. A reviewed
+The pinned static BusyBox, fixed Node runtime, two wrappers, JavaScript
+implementations, and contract are a separate trust anchor and are never loaded
+from the bundle. A reviewed
 release-delivery step must independently verify these files before their first
 invocation and install them atomically into the root-owned, non-writable trust
 path. The wrapper's BusyBox self-check can detect later drift but cannot
 authenticate the interpreter that is already executing; malicious initial
 delivery or an already-compromised root account remains outside this in-band
-check. The delivery step must install a root-owned Node.js 24 or newer runtime
-at `/usr/bin/node` as a single-link mode `0555` regular file and verify the
-BusyBox copy against SHA-256
+check. The delivery step must authenticate the Node executable through an
+approved package/repository signature or a fixed digest carried over an
+independent trusted channel. The wrapper's Node version output is only a
+compatibility check, not provenance. The delivery step must install that
+authenticated Node.js 24 or newer runtime at `/usr/bin/node` as a root-owned,
+single-link mode `0555` regular file and verify the BusyBox copy against SHA-256
 `dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14`;
 the builder and installer reject older runtimes explicitly before using modern
 JavaScript APIs or loading the dynamic release contract. It then
