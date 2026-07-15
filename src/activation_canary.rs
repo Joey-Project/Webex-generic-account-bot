@@ -52,8 +52,46 @@ const CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEPENDENCY_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(60);
-const REBOOT_CHALLENGE_VERSION: u16 = 1;
+const REBOOT_CHALLENGE_VERSION: u16 = 2;
 const REBOOT_MARKER_CONTENTS: &[u8] = b"webex-runtime-reboot-canary-v1\n";
+
+#[derive(Clone, Copy, Debug)]
+struct PrivateFileOwner {
+    uid: u32,
+    gid: u32,
+}
+
+const ROOT_FILE_OWNER: PrivateFileOwner = PrivateFileOwner { uid: 0, gid: 0 };
+
+#[derive(Debug, Serialize)]
+pub struct RebootChallengePreparationReport {
+    version: u16,
+    mode: &'static str,
+    status: &'static str,
+    writes_performed: u8,
+    activation_binding: ActivationBindingReport,
+    challenge: RebootChallengeReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationBindingReport {
+    active_manifest_sha256: String,
+    runtime_image_sha256: String,
+    bot_executable_sha256: String,
+    launcher_executable_sha256: String,
+    runtime_executable_sha256: String,
+    codex_version: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RebootChallengeReport {
+    state: &'static str,
+    current_boot_matches: bool,
+    validated: bool,
+    marker_valid: bool,
+}
 
 pub async fn ensure_activation_receipt() -> Result<VerifiedActivation> {
     ensure_root()?;
@@ -88,7 +126,7 @@ pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
     let _lock = RenewalLock::acquire()?;
     let candidate = activation::begin_activation_renewal()?;
     let result = async {
-        verify_reboot_cleanup_challenge()?;
+        verify_reboot_cleanup_challenge(&candidate)?;
         let runtime = run_runtime_boundary_canary(&candidate).await?;
         run_timeout_cleanup_canary(&runtime.nonce).await?;
         run_owner_crash_cleanup_canary(&runtime.nonce, "launcher").await?;
@@ -105,6 +143,43 @@ pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
                 "{error:#}; failed to preserve the invalid activation state: {abort_error:#}"
             )),
         },
+    }
+}
+
+pub fn prepare_activation_reboot_challenge(
+    apply: bool,
+) -> Result<RebootChallengePreparationReport> {
+    ensure_root()?;
+    let _lock = if apply {
+        Some(RenewalLock::acquire()?)
+    } else {
+        None
+    };
+    let binding = activation::verify_preactivation_candidate()?;
+    let expected_binding = ActivationBindingReport::from(&binding);
+    let (status, writes_performed, challenge) =
+        prepare_reboot_cleanup_challenge(apply, &expected_binding)?;
+    Ok(RebootChallengePreparationReport {
+        version: REBOOT_CHALLENGE_VERSION,
+        mode: if apply { "applied" } else { "dry-run" },
+        status,
+        writes_performed,
+        activation_binding: expected_binding,
+        challenge,
+    })
+}
+
+impl From<&VerifiedActivation> for ActivationBindingReport {
+    fn from(binding: &VerifiedActivation) -> Self {
+        Self {
+            active_manifest_sha256: binding.active_manifest_sha256.clone(),
+            runtime_image_sha256: binding.runtime_image_sha256.clone(),
+            bot_executable_sha256: binding.bot_executable_sha256.clone(),
+            launcher_executable_sha256: binding.launcher_executable_sha256.clone(),
+            runtime_executable_sha256: binding.runtime_executable_sha256.clone(),
+            codex_version: binding.codex_version.clone(),
+            model: binding.model.clone(),
+        }
     }
 }
 
@@ -464,10 +539,10 @@ impl FixtureSetupGuard {
 
 impl Drop for FixtureSetupGuard {
     fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.cleanup()
-        {
-            tracing::error!(error = %error, "runtime canary setup requires manual cleanup");
+        if self.armed {
+            if let Err(error) = self.cleanup() {
+                tracing::error!(error = %error, "runtime canary setup requires manual cleanup");
+            }
         }
     }
 }
@@ -499,6 +574,14 @@ fn create_private_directory(path: &Path) -> Result<()> {
 }
 
 fn create_private_fixture(path: &Path, contents: &[u8]) -> Result<()> {
+    create_private_fixture_with_owner(path, contents, ROOT_FILE_OWNER)
+}
+
+fn create_private_fixture_with_owner(
+    path: &Path,
+    contents: &[u8],
+    owner: PrivateFileOwner,
+) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -509,7 +592,7 @@ fn create_private_fixture(path: &Path, contents: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
-        validate_private_root_file(&file.metadata()?, "canary fixture")
+        validate_private_file(&file.metadata()?, "canary fixture", owner)
     })();
     drop(file);
     match result {
@@ -537,10 +620,18 @@ fn failed_creation_error(
 }
 
 fn validate_private_root_file(metadata: &fs::Metadata, description: &str) -> Result<()> {
+    validate_private_file(metadata, description, ROOT_FILE_OWNER)
+}
+
+fn validate_private_file(
+    metadata: &fs::Metadata,
+    description: &str,
+    owner: PrivateFileOwner,
+) -> Result<()> {
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
+        || metadata.uid() != owner.uid
+        || metadata.gid() != owner.gid
         || metadata.nlink() != 1
         || metadata.mode() & 0o7777 != 0o600
     {
@@ -550,12 +641,21 @@ fn validate_private_root_file(metadata: &fs::Metadata, description: &str) -> Res
 }
 
 fn validate_root_directory(path: &Path, mode: u32, description: &str) -> Result<()> {
+    validate_directory_owner(path, mode, description, ROOT_FILE_OWNER)
+}
+
+fn validate_directory_owner(
+    path: &Path,
+    mode: u32,
+    description: &str,
+    owner: PrivateFileOwner,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("{description} is unavailable: {}", path.display()))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
+        || metadata.uid() != owner.uid
+        || metadata.gid() != owner.gid
         || metadata.mode() & 0o7777 != mode
     {
         bail!("{description} metadata is invalid");
@@ -994,62 +1094,247 @@ struct RebootChallenge {
     challenge_boot_id: String,
     marker_nonce: String,
     validated_boot_id: Option<String>,
+    activation_binding: ActivationBindingReport,
 }
 
-fn verify_reboot_cleanup_challenge() -> Result<()> {
-    let current_boot = read_boot_id()?;
-    let challenge = read_reboot_challenge()?;
-    match challenge {
-        None => {
-            write_new_reboot_challenge(&current_boot, None)?;
-            bail!("runtime activation requires one real reboot to validate cleanup");
-        }
-        Some(challenge) if challenge.challenge_boot_id == current_boot => {
-            if challenge.validated_boot_id.as_deref() != Some(&current_boot) {
-                bail!("runtime activation reboot challenge has not crossed a real boot");
-            }
-            validate_reboot_marker(&reboot_marker_path(&challenge.marker_nonce)?)
-        }
-        Some(challenge) => {
-            let marker = reboot_marker_path(&challenge.marker_nonce)?;
-            ensure!(
-                path_is_absent(&marker)?,
-                "pre-reboot runtime marker survived the boot boundary"
-            );
-            write_new_reboot_challenge(&current_boot, Some(current_boot.clone()))
+#[derive(Debug)]
+struct RebootChallengePaths {
+    challenge: PathBuf,
+    boot_id: PathBuf,
+    marker_root: PathBuf,
+    owner: PrivateFileOwner,
+}
+
+impl RebootChallengePaths {
+    fn production() -> Self {
+        Self {
+            challenge: PathBuf::from(REBOOT_CHALLENGE_PATH),
+            boot_id: PathBuf::from(BOOT_ID_PATH),
+            marker_root: PathBuf::from(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT),
+            owner: ROOT_FILE_OWNER,
         }
     }
 }
 
-fn write_new_reboot_challenge(boot_id: &str, validated_boot_id: Option<String>) -> Result<()> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRebootChallengeV1 {
+    version: u16,
+    challenge_boot_id: String,
+    marker_nonce: String,
+    validated_boot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebootChallengeState {
+    Absent,
+    PendingCurrentBoot,
+    ValidatedCurrentBoot,
+    CrossedBootBoundary,
+}
+
+fn prepare_reboot_cleanup_challenge(
+    apply: bool,
+    expected_binding: &ActivationBindingReport,
+) -> Result<(&'static str, u8, RebootChallengeReport)> {
+    prepare_reboot_cleanup_challenge_with(
+        &RebootChallengePaths::production(),
+        apply,
+        expected_binding,
+    )
+}
+
+fn prepare_reboot_cleanup_challenge_with(
+    paths: &RebootChallengePaths,
+    apply: bool,
+    expected_binding: &ActivationBindingReport,
+) -> Result<(&'static str, u8, RebootChallengeReport)> {
+    validate_reboot_marker_root(paths)?;
+    let current_boot = read_boot_id_with(&paths.boot_id)?;
+    let existing = read_reboot_challenge_with(paths)?;
+    match classify_reboot_challenge(&current_boot, existing.as_ref(), expected_binding)? {
+        RebootChallengeState::Absent if !apply => Ok((
+            "ready",
+            0,
+            RebootChallengeReport {
+                state: "absent",
+                current_boot_matches: false,
+                validated: false,
+                marker_valid: false,
+            },
+        )),
+        RebootChallengeState::Absent => {
+            write_new_reboot_challenge_with(paths, &current_boot, None, expected_binding)?;
+            let challenge = read_reboot_challenge_with(paths)?
+                .ok_or_else(|| anyhow!("prepared reboot challenge is missing"))?;
+            ensure!(
+                classify_reboot_challenge(&current_boot, Some(&challenge), expected_binding)?
+                    == RebootChallengeState::PendingCurrentBoot,
+                "prepared reboot challenge is not pending for the current boot"
+            );
+            validate_reboot_marker_with(paths, &challenge.marker_nonce)?;
+            Ok(("reboot_required", 2, pending_reboot_challenge_report()))
+        }
+        RebootChallengeState::PendingCurrentBoot => {
+            let challenge = existing.expect("classified challenge must exist");
+            validate_reboot_marker_with(paths, &challenge.marker_nonce)?;
+            Ok(("reboot_required", 0, pending_reboot_challenge_report()))
+        }
+        RebootChallengeState::ValidatedCurrentBoot => {
+            bail!("runtime activation reboot challenge is already validated for this boot")
+        }
+        RebootChallengeState::CrossedBootBoundary => {
+            let challenge = existing.expect("classified challenge must exist");
+            ensure!(
+                path_is_absent(&reboot_marker_path_with(paths, &challenge.marker_nonce)?)?,
+                "pre-reboot runtime marker survived the boot boundary"
+            );
+            bail!(
+                "runtime activation reboot challenge has crossed a real boot; continue activation instead"
+            )
+        }
+    }
+}
+
+fn classify_reboot_challenge(
+    current_boot: &str,
+    challenge: Option<&RebootChallenge>,
+    expected_binding: &ActivationBindingReport,
+) -> Result<RebootChallengeState> {
+    let Some(challenge) = challenge else {
+        return Ok(RebootChallengeState::Absent);
+    };
+    ensure!(
+        &challenge.activation_binding == expected_binding,
+        "reboot challenge does not match the active runtime binding"
+    );
+    if let Some(validated_boot) = challenge.validated_boot_id.as_deref() {
+        if validated_boot != challenge.challenge_boot_id {
+            bail!("reboot challenge validated boot ID is invalid");
+        }
+    }
+    if challenge.challenge_boot_id != current_boot {
+        return Ok(RebootChallengeState::CrossedBootBoundary);
+    }
+    if challenge.validated_boot_id.is_some() {
+        Ok(RebootChallengeState::ValidatedCurrentBoot)
+    } else {
+        Ok(RebootChallengeState::PendingCurrentBoot)
+    }
+}
+
+fn pending_reboot_challenge_report() -> RebootChallengeReport {
+    RebootChallengeReport {
+        state: "pending_current_boot",
+        current_boot_matches: true,
+        validated: false,
+        marker_valid: true,
+    }
+}
+
+fn verify_reboot_cleanup_challenge(binding: &VerifiedActivation) -> Result<()> {
+    verify_reboot_cleanup_challenge_with(&RebootChallengePaths::production(), binding)
+}
+
+fn verify_reboot_cleanup_challenge_with(
+    paths: &RebootChallengePaths,
+    binding: &VerifiedActivation,
+) -> Result<()> {
+    validate_reboot_marker_root(paths)?;
+    let current_boot = read_boot_id_with(&paths.boot_id)?;
+    let challenge = read_reboot_challenge_with(paths)?;
+    let expected_binding = ActivationBindingReport::from(binding);
+    match challenge {
+        None => {
+            write_new_reboot_challenge_with(paths, &current_boot, None, &expected_binding)?;
+            bail!("runtime activation requires one real reboot to validate cleanup");
+        }
+        Some(challenge) if challenge.challenge_boot_id == current_boot => {
+            ensure!(
+                challenge.activation_binding == expected_binding,
+                "reboot challenge does not match the active runtime binding"
+            );
+            if challenge.validated_boot_id.as_deref() != Some(&current_boot) {
+                bail!("runtime activation reboot challenge has not crossed a real boot");
+            }
+            validate_reboot_marker_with(paths, &challenge.marker_nonce)
+        }
+        Some(challenge) => {
+            ensure!(
+                challenge.activation_binding == expected_binding,
+                "reboot challenge does not match the active runtime binding"
+            );
+            let marker = reboot_marker_path_with(paths, &challenge.marker_nonce)?;
+            ensure!(
+                path_is_absent(&marker)?,
+                "pre-reboot runtime marker survived the boot boundary"
+            );
+            write_new_reboot_challenge_with(
+                paths,
+                &current_boot,
+                Some(current_boot.clone()),
+                &expected_binding,
+            )
+        }
+    }
+}
+
+fn write_new_reboot_challenge_with(
+    paths: &RebootChallengePaths,
+    boot_id: &str,
+    validated_boot_id: Option<String>,
+    activation_binding: &ActivationBindingReport,
+) -> Result<()> {
     let marker_nonce = random_nonce()?;
-    let marker = reboot_marker_path(&marker_nonce)?;
-    create_private_fixture(&marker, REBOOT_MARKER_CONTENTS)?;
+    let marker = reboot_marker_path_with(paths, &marker_nonce)?;
+    create_private_fixture_with_owner(&marker, REBOOT_MARKER_CONTENTS, paths.owner)?;
     let challenge = RebootChallenge {
         version: REBOOT_CHALLENGE_VERSION,
         challenge_boot_id: boot_id.to_owned(),
         marker_nonce,
         validated_boot_id,
+        activation_binding: activation_binding.clone(),
     };
     let mut payload = serde_json::to_vec(&challenge)?;
     payload.push(b'\n');
     ensure!(payload.len() as u64 <= CHALLENGE_MAX_BYTES);
-    let result = atomic_write_private(Path::new(REBOOT_CHALLENGE_PATH), &payload);
+    let result = atomic_write_private(&paths.challenge, &payload, paths.owner);
     if result.is_err() {
-        let _ = remove_private_root_file(&marker, "reboot marker");
+        let _ = remove_private_file(&marker, "reboot marker", paths.owner);
     }
     result
 }
 
-fn read_reboot_challenge() -> Result<Option<RebootChallenge>> {
-    let path = Path::new(REBOOT_CHALLENGE_PATH);
-    if path_is_absent(path)? {
+fn read_reboot_challenge_with(paths: &RebootChallengePaths) -> Result<Option<RebootChallenge>> {
+    if path_is_absent(&paths.challenge)? {
         return Ok(None);
     }
-    let payload = read_private_root_file(path, CHALLENGE_MAX_BYTES, "reboot challenge")?;
-    let challenge: RebootChallenge = serde_json::from_slice(&payload)?;
+    let payload = read_private_file(
+        &paths.challenge,
+        CHALLENGE_MAX_BYTES,
+        "reboot challenge",
+        paths.owner,
+    )?;
+    let challenge: RebootChallenge = match serde_json::from_slice(&payload) {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            if is_legacy_reboot_challenge_v1(&payload) {
+                bail!("legacy reboot challenge schema version 1 requires operator recovery");
+            }
+            return Err(error.into());
+        }
+    };
     if challenge.version != REBOOT_CHALLENGE_VERSION
-        || challenge.challenge_boot_id.trim().is_empty()
+        || !activation::parse_boot_id(challenge.challenge_boot_id.as_bytes())
+            .is_ok_and(|boot_id| boot_id == challenge.challenge_boot_id)
+        || challenge
+            .validated_boot_id
+            .as_deref()
+            .is_some_and(|validated_boot_id| {
+                !activation::parse_boot_id(validated_boot_id.as_bytes())
+                    .is_ok_and(|boot_id| boot_id == validated_boot_id)
+                    || validated_boot_id != challenge.challenge_boot_id
+            })
         || validate_runtime_canary_nonce(&challenge.marker_nonce).is_err()
     {
         bail!("reboot challenge is invalid");
@@ -1057,11 +1342,25 @@ fn read_reboot_challenge() -> Result<Option<RebootChallenge>> {
     Ok(Some(challenge))
 }
 
-fn validate_reboot_marker(path: &Path) -> Result<()> {
-    let payload = read_private_root_file(
-        path,
+fn is_legacy_reboot_challenge_v1(payload: &[u8]) -> bool {
+    let Ok(challenge) = serde_json::from_slice::<LegacyRebootChallengeV1>(payload) else {
+        return false;
+    };
+    challenge.version == 1
+        && !challenge.challenge_boot_id.trim().is_empty()
+        && validate_runtime_canary_nonce(&challenge.marker_nonce).is_ok()
+        && challenge
+            .validated_boot_id
+            .as_deref()
+            .is_none_or(|boot_id| !boot_id.trim().is_empty())
+}
+
+fn validate_reboot_marker_with(paths: &RebootChallengePaths, nonce: &str) -> Result<()> {
+    let payload = read_private_file(
+        &reboot_marker_path_with(paths, nonce)?,
         REBOOT_MARKER_CONTENTS.len() as u64,
         "current-boot reboot marker",
+        paths.owner,
     )?;
     ensure!(
         payload == REBOOT_MARKER_CONTENTS,
@@ -1070,19 +1369,23 @@ fn validate_reboot_marker(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write_private(path: &Path, payload: &[u8]) -> Result<()> {
+fn validate_reboot_marker_root(paths: &RebootChallengePaths) -> Result<()> {
+    validate_directory_owner(&paths.marker_root, 0o700, "reboot marker root", paths.owner)
+}
+
+fn atomic_write_private(path: &Path, payload: &[u8], owner: PrivateFileOwner) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private file has no parent"))?;
-    validate_root_directory(parent, 0o700, "private file parent")?;
+    validate_directory_owner(parent, 0o700, "private file parent", owner)?;
     if !path_is_absent(path)? {
         let metadata = fs::symlink_metadata(path)?;
-        validate_private_root_file(&metadata, "existing private file")?;
+        validate_private_file(&metadata, "existing private file", owner)?;
     }
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name().unwrap().to_string_lossy(),
-        std::process::id()
+        random_nonce()?
     ));
     let mut file = OpenOptions::new()
         .write(true)
@@ -1093,13 +1396,14 @@ fn atomic_write_private(path: &Path, payload: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(payload)?;
         file.sync_all()?;
-        validate_private_root_file(&file.metadata()?, "temporary private file")?;
+        validate_private_file(&file.metadata()?, "temporary private file", owner)?;
         fs::rename(&temporary, path)?;
         ensure!(
-            read_private_root_file(path, payload.len() as u64, "written private file")? == payload,
+            read_private_file(path, payload.len() as u64, "written private file", owner)?
+                == payload,
             "written private file contents are invalid"
         );
-        validate_root_directory(parent, 0o700, "private file parent")?;
+        validate_directory_owner(parent, 0o700, "private file parent", owner)?;
         let directory = File::open(parent)?;
         directory.sync_all()?;
         Ok(())
@@ -1122,8 +1426,13 @@ struct PrivateFileIdentity {
 }
 
 impl PrivateFileIdentity {
-    fn capture(metadata: &fs::Metadata, max_bytes: u64, description: &str) -> Result<Self> {
-        validate_private_root_file(metadata, description)?;
+    fn capture(
+        metadata: &fs::Metadata,
+        max_bytes: u64,
+        description: &str,
+        owner: PrivateFileOwner,
+    ) -> Result<Self> {
+        validate_private_file(metadata, description, owner)?;
         ensure!(
             metadata.len() <= max_bytes,
             "{description} exceeds its size limit"
@@ -1140,15 +1449,20 @@ impl PrivateFileIdentity {
     }
 }
 
-fn read_private_root_file(path: &Path, max_bytes: u64, description: &str) -> Result<Vec<u8>> {
+fn read_private_file(
+    path: &Path,
+    max_bytes: u64,
+    description: &str,
+    owner: PrivateFileOwner,
+) -> Result<Vec<u8>> {
     let expected =
-        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description)?;
+        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description, owner)?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     ensure!(
-        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description)? == expected,
+        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description, owner)? == expected,
         "{description} identity changed while opening"
     );
     let mut payload = Vec::new();
@@ -1161,27 +1475,32 @@ fn read_private_root_file(path: &Path, max_bytes: u64, description: &str) -> Res
         "{description} size changed while reading"
     );
     ensure!(
-        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description)? == expected,
+        PrivateFileIdentity::capture(&file.metadata()?, max_bytes, description, owner)? == expected,
         "{description} identity changed while reading"
     );
     ensure!(
-        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description)?
+        PrivateFileIdentity::capture(&fs::symlink_metadata(path)?, max_bytes, description, owner,)?
             == expected,
         "{description} path changed while reading"
     );
     Ok(payload)
 }
 
-fn remove_private_root_file(path: &Path, description: &str) -> Result<()> {
+fn remove_private_file(path: &Path, description: &str, owner: PrivateFileOwner) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    validate_private_root_file(&metadata, description)?;
+    validate_private_file(&metadata, description, owner)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn reboot_marker_path(nonce: &str) -> Result<PathBuf> {
+    reboot_marker_path_with(&RebootChallengePaths::production(), nonce)
+}
+
+fn reboot_marker_path_with(paths: &RebootChallengePaths, nonce: &str) -> Result<PathBuf> {
     validate_runtime_canary_nonce(nonce)?;
-    Ok(Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("reboot-{nonce}.marker")))
+    Ok(paths.marker_root.join(format!("reboot-{nonce}.marker")))
 }
 
 fn path_is_absent(path: &Path) -> Result<bool> {
@@ -1192,8 +1511,8 @@ fn path_is_absent(path: &Path) -> Result<bool> {
     }
 }
 
-fn read_boot_id() -> Result<String> {
-    let value = fs::read_to_string(BOOT_ID_PATH)?;
+fn read_boot_id_with(path: &Path) -> Result<String> {
+    let value = fs::read_to_string(path)?;
     let value = value.trim();
     if value.len() != 36
         || !value.bytes().enumerate().all(|(index, byte)| {
@@ -1264,6 +1583,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
 
@@ -1275,6 +1595,52 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RebootChallengeFixture {
+        _root: TestDirectory,
+        paths: RebootChallengePaths,
+    }
+
+    impl RebootChallengeFixture {
+        fn new(boot_id: &str) -> Self {
+            let root = TestDirectory::new("reboot-challenge");
+            let challenge_root = root.join("persistent");
+            let marker_root = root.join("run");
+            for directory in [&challenge_root, &marker_root] {
+                fs::create_dir(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let boot_id_path = root.join("boot-id");
+            fs::write(&boot_id_path, format!("{boot_id}\n")).unwrap();
+            Self {
+                _root: root,
+                paths: RebootChallengePaths {
+                    challenge: challenge_root.join("reboot-challenge.json"),
+                    boot_id: boot_id_path,
+                    marker_root,
+                    owner: PrivateFileOwner {
+                        // SAFETY: these calls have no arguments or side effects.
+                        uid: unsafe { libc::geteuid() },
+                        gid: unsafe { libc::getegid() },
+                    },
+                },
+            }
+        }
+
+        fn set_boot_id(&self, boot_id: &str) {
+            fs::write(&self.paths.boot_id, format!("{boot_id}\n")).unwrap();
+        }
+
+        fn challenge(&self) -> RebootChallenge {
+            read_reboot_challenge_with(&self.paths)
+                .unwrap()
+                .expect("challenge is present")
+        }
+
+        fn marker(&self, nonce: &str) -> PathBuf {
+            reboot_marker_path_with(&self.paths, nonce).unwrap()
         }
     }
 
@@ -1420,6 +1786,237 @@ mod tests {
             Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("reboot-{nonce}.marker"))
         );
         assert!(reboot_marker_path("../outside").is_err());
+    }
+
+    #[test]
+    fn reboot_challenge_state_is_bound_to_boot_and_runtime() {
+        let current_boot = "11111111-2222-3333-4444-555555555555";
+        let previous_boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let binding = ActivationBindingReport::from(&verified_activation(current_boot));
+        assert_eq!(
+            classify_reboot_challenge(current_boot, None, &binding).unwrap(),
+            RebootChallengeState::Absent
+        );
+
+        let mut challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: current_boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: None,
+            activation_binding: binding.clone(),
+        };
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::PendingCurrentBoot
+        );
+        challenge.validated_boot_id = Some(current_boot.to_owned());
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::ValidatedCurrentBoot
+        );
+        challenge.challenge_boot_id = previous_boot.to_owned();
+        challenge.validated_boot_id = None;
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::CrossedBootBoundary
+        );
+
+        let mut other = binding.clone();
+        other.runtime_image_sha256 = "f".repeat(64);
+        assert!(classify_reboot_challenge(current_boot, Some(&challenge), &other).is_err());
+        challenge.validated_boot_id = Some(current_boot.to_owned());
+        assert!(classify_reboot_challenge(current_boot, Some(&challenge), &binding).is_err());
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_arms_and_retries_without_changing_evidence() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let fixture = RebootChallengeFixture::new(boot);
+        let binding = ActivationBindingReport::from(&verified_activation(boot));
+
+        let (status, writes, report) =
+            prepare_reboot_cleanup_challenge_with(&fixture.paths, false, &binding).unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(writes, 0);
+        assert_eq!(report.state, "absent");
+        assert!(!fixture.paths.challenge.exists());
+
+        let (status, writes, report) =
+            prepare_reboot_cleanup_challenge_with(&fixture.paths, true, &binding).unwrap();
+        assert_eq!(status, "reboot_required");
+        assert_eq!(writes, 2);
+        assert_eq!(report.state, "pending_current_boot");
+        let challenge = fixture.challenge();
+        let marker = fixture.marker(&challenge.marker_nonce);
+        validate_reboot_marker_with(&fixture.paths, &challenge.marker_nonce).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&fixture.paths.challenge)
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::symlink_metadata(&marker).unwrap().mode() & 0o7777,
+            0o600
+        );
+
+        let original_nonce = challenge.marker_nonce;
+        let (_, writes, _) =
+            prepare_reboot_cleanup_challenge_with(&fixture.paths, true, &binding).unwrap();
+        assert_eq!(writes, 0);
+        assert_eq!(fixture.challenge().marker_nonce, original_nonce);
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_an_untrusted_marker_root() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let fixture = RebootChallengeFixture::new(boot);
+        let activation = verified_activation(boot);
+        let binding = ActivationBindingReport::from(&activation);
+        fs::set_permissions(
+            &fixture.paths.marker_root,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let error = prepare_reboot_cleanup_challenge_with(&fixture.paths, false, &binding)
+            .expect_err("reject an unsafe marker root before challenge preparation");
+        assert!(error.to_string().contains("reboot marker root metadata"));
+        assert!(!fixture.paths.challenge.exists());
+
+        let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+            .expect_err("reject an unsafe marker root before activation renewal");
+        assert!(error.to_string().contains("reboot marker root metadata"));
+        assert!(!fixture.paths.challenge.exists());
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_requires_marker_cleanup_across_a_real_boot() {
+        let first_boot = "11111111-2222-3333-4444-555555555555";
+        let next_boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let fixture = RebootChallengeFixture::new(first_boot);
+        let activation = verified_activation(first_boot);
+        let binding = ActivationBindingReport::from(&activation);
+        prepare_reboot_cleanup_challenge_with(&fixture.paths, true, &binding).unwrap();
+        let first = fixture.challenge();
+        let first_marker = fixture.marker(&first.marker_nonce);
+
+        fixture.set_boot_id(next_boot);
+        let error = prepare_reboot_cleanup_challenge_with(&fixture.paths, false, &binding)
+            .expect_err("reject a marker that survived the boot boundary");
+        assert!(error.to_string().contains("marker survived"));
+
+        fs::remove_file(&first_marker).unwrap();
+        let error = prepare_reboot_cleanup_challenge_with(&fixture.paths, false, &binding)
+            .expect_err("require the post-reboot activation path");
+        assert!(error.to_string().contains("continue activation instead"));
+
+        let mut drifted = activation.clone();
+        drifted.runtime_image_sha256 = "f".repeat(64);
+        let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &drifted)
+            .expect_err("reject runtime binding drift");
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(fixture.challenge().challenge_boot_id, first_boot);
+
+        verify_reboot_cleanup_challenge_with(&fixture.paths, &activation).unwrap();
+        let validated = fixture.challenge();
+        assert_eq!(validated.challenge_boot_id, next_boot);
+        assert_eq!(validated.validated_boot_id.as_deref(), Some(next_boot));
+        assert_eq!(validated.activation_binding, binding);
+        validate_reboot_marker_with(&fixture.paths, &validated.marker_nonce).unwrap();
+
+        fs::remove_file(fixture.marker(&validated.marker_nonce)).unwrap();
+        verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+            .expect_err("require current-boot marker evidence");
+    }
+
+    #[test]
+    fn reboot_challenge_schema_rejects_legacy_and_unknown_fields() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: None,
+            activation_binding: ActivationBindingReport::from(&verified_activation(boot)),
+        };
+        let mut value = serde_json::to_value(&challenge).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RebootChallenge>(value).is_err());
+
+        let mut legacy = serde_json::to_value(&challenge).unwrap();
+        legacy.as_object_mut().unwrap().remove("activation_binding");
+        legacy["version"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RebootChallenge>(legacy.clone()).is_err());
+
+        let fixture = RebootChallengeFixture::new(boot);
+        let payload = serde_json::to_vec(&legacy).unwrap();
+        create_private_fixture_with_owner(&fixture.paths.challenge, &payload, fixture.paths.owner)
+            .unwrap();
+        let error = read_reboot_challenge_with(&fixture.paths)
+            .expect_err("identify an exact legacy challenge");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy reboot challenge schema version 1")
+        );
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_noncanonical_boot_ids() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        for (challenge_boot_id, validated_boot_id) in [
+            ("not-a-boot-id", None),
+            (boot, Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")),
+        ] {
+            let fixture = RebootChallengeFixture::new(boot);
+            let activation = verified_activation(boot);
+            let challenge = RebootChallenge {
+                version: REBOOT_CHALLENGE_VERSION,
+                challenge_boot_id: challenge_boot_id.to_owned(),
+                marker_nonce: "0".repeat(64),
+                validated_boot_id: validated_boot_id.map(str::to_owned),
+                activation_binding: ActivationBindingReport::from(&activation),
+            };
+            let payload = serde_json::to_vec(&challenge).unwrap();
+            create_private_fixture_with_owner(
+                &fixture.paths.challenge,
+                &payload,
+                fixture.paths.owner,
+            )
+            .unwrap();
+
+            let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+                .expect_err("reject a noncanonical persisted boot identifier");
+            assert!(error.to_string().contains("reboot challenge is invalid"));
+            assert_eq!(fs::read(&fixture.paths.challenge).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_inconsistent_validated_boot_id() {
+        let current_boot = "11111111-2222-3333-4444-555555555555";
+        let challenge_boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let validated_boot = "99999999-8888-7777-6666-555555555555";
+        let fixture = RebootChallengeFixture::new(current_boot);
+        let activation = verified_activation(current_boot);
+        let challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: challenge_boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: Some(validated_boot.to_owned()),
+            activation_binding: ActivationBindingReport::from(&activation),
+        };
+        let payload = serde_json::to_vec(&challenge).unwrap();
+        create_private_fixture_with_owner(&fixture.paths.challenge, &payload, fixture.paths.owner)
+            .unwrap();
+
+        let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+            .expect_err("reject an inconsistent persisted validated boot identifier");
+        assert!(error.to_string().contains("reboot challenge is invalid"));
+        assert_eq!(fs::read(&fixture.paths.challenge).unwrap(), payload);
+        assert!(!fixture.marker(&challenge.marker_nonce).exists());
     }
 
     #[test]

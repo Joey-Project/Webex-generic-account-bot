@@ -41,6 +41,8 @@ const CODE_FILES = [
   'scripts/config-pull-worker.mjs',
   'scripts/deploy-config.mjs',
   'scripts/jenkins-readonly.mjs',
+  'scripts/prepare-activation-reboot-challenge',
+  'scripts/prepare-activation-reboot-challenge.mjs',
   'scripts/prepare-host-deployment',
   'scripts/prepare-host-deployment.mjs',
   'scripts/provision-host',
@@ -51,6 +53,7 @@ const EXECUTABLE_CODE_FILES = new Set([
   'scripts/config-policy/install-rendered-config.py',
   'scripts/config-policy/static-config-check.py',
   'scripts/config-policy/validate-config.sh',
+  'scripts/prepare-activation-reboot-challenge',
   'scripts/prepare-host-deployment',
   'scripts/provision-host',
 ]);
@@ -113,12 +116,12 @@ export function compareReleasePaths(left, right) {
 }
 
 export const TRUSTED_SOURCE_SHA256 = Object.freeze({
-  'bin/webex-codex-activation': '8b118499759e21d256dad41eec968fdf3f68f6d326cb75cfb6d8d0c648f6a465',
-  'bin/webex-codex-canary-probe': '7633e85f8c7e04bf8deff1ac68f56e6db108d926b8dc82f1ca6795bac37ce2da',
-  'bin/webex-codex-launcher': 'b983fcb93f06aab006efb01c6fa1aa1595bc9ca89e5566dc77931db51fef0487',
-  'bin/webex-codex-runtime': '2fde7a5f7886422708ed3533516caf382456b21469f930f7da4446026897ed3a',
-  'bin/webex-generic-account-bot': '0fd8e1c7ed93720a5202803e43488cbf6f166ec8697db5bb6c84bfd4df946679',
-  'bin/webex-host-identity-lock': '484c99c075ca53a18b623efeedd1deffc5723db7d20bb71b2f57387f2ecdea73',
+  'bin/webex-codex-activation': 'fc562a32c66200b2f04e76f10265052f2e7c4cb143a95dc1bf8dd00d462bc520',
+  'bin/webex-codex-canary-probe': 'bdf6f953e8a0a5079ead0aad8f6957026fce734438afae6a50056dabc0632c0c',
+  'bin/webex-codex-launcher': '6e92d232ebbb96401b5a3ee3c3be3f3213a569a653c2a44446b3882f9166f14b',
+  'bin/webex-codex-runtime': 'c8537ab2c5b97d68cff94181f3342c2bfc093dd9939ea859ac1c31d62b743eef',
+  'bin/webex-generic-account-bot': '9040c2f0587fa022ad42f67ba1ffc1de9f62d6c752dab8ee79daf67dda9cd8e7',
+  'bin/webex-host-identity-lock': 'db915799ac37672b2812e0c296d4e5417b16b248e3b8dea0ecd67baf2290d0f8',
   'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',
   'runtime-sources/codex/bin/codex': 'cb1670c25b6e17fd82866a80e55df58bc10f5d18e44d25ec2c6f7c2ab98077cd',
   'runtime-sources/codex/codex-package.json': 'b27002210921372fa043e8e49f6c543cf4cddc0d35bd01a32ecfbc699efd5e2a',
