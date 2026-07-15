@@ -36,11 +36,10 @@
   no-clobber publish without installing secrets, policy, or service state.
 - [completed] Add a structural config-check CLI mode for unprivileged CI while
   preserving full activation and launcher preflight in `--check-config`.
-- [pending] Update both config-repository CI lanes to use
-  `--check-config-structure` before switching production config to the
-  all-ephemeral profile.
-- [pending] Pin the reviewed Configuration Space and enable `/config pull` in
-  the production config repository, then run deployment and Webex E2E.
+- [completed] Update both config-repository CI lanes to use
+  `--check-config-structure` and pin the all-ephemeral `status`/`pull` profile.
+- [pending] Stage and apply the reviewed host release, complete activation, and
+  run deployment and Webex E2E before relying on production `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
   service work inside the Webex request handler.

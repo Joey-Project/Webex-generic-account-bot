@@ -315,9 +315,9 @@ superseded_by:
   intentionally live activation and launcher checks in `--check-config`.
   The bot therefore adds a separate `--check-config-structure` mode that still
   loads and validates the complete `BotConfig` contract but never treats CI as
-  deployment-host evidence. The config repository must adopt this mode in both
-  CI lanes before switching to the all-ephemeral profile; trusted deployment
-  continues to require full `--check-config`.
+  deployment-host evidence. The config repository now uses this mode in both
+  CI lanes and pins the all-ephemeral `status`/`pull` profile; trusted host
+  deployment still requires full `--check-config`, activation, and Webex E2E.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
