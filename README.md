@@ -11,6 +11,11 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 
 - Receives `SidecarEvent` JSON from the Webex JS SDK sidecar over loopback HTTP.
 - Authenticates local forwarding with `WEBEX_SIDECAR_TOKEN`.
+- Persists only a minimal message-ID envelope for each supported message-created
+  event to a private, bounded job spool before returning `202 Accepted`, then
+  performs Webex hydration, Codex work, and reply delivery in background
+  workers. Message bodies, people, and room hints are never written to the
+  spool.
 - Uses `JsonlStateStore` leases to avoid concurrent duplicate Codex runs for the
   same Webex message.
 - Matches behavior by Webex `roomId`.
@@ -23,7 +28,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 - Reconciles ambiguous Webex reply creation failures with a stable reply marker
   before retrying, using the same bounded marker-page budget as the initial
   reconciliation.
-- Bounds concurrent request processing with `server.max_concurrent_requests`.
+- Bounds both concurrent ingress persistence and background message processing
+  with separate `server.max_concurrent_requests` semaphore pools.
 - Scrubs Webex token variables from the Codex subprocess environment.
 - Hydrates every sidecar message ID through Webex before making room, sender,
   body, thread, Codex, or reply-routing decisions. Sidecar message fields are
@@ -33,10 +39,54 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   durable `/config pull` only when every effective Codex runner is isolated as
   `ephemeral-linux-user`; `reload` and `sync` remain invalid.
 
-The first implementation is synchronous per sidecar request: the HTTP request
-returns after Codex finishes and the Webex reply is accepted. For this slice,
-set the JS sidecar forwarding timeout higher than the configured Codex timeout.
-Durable background job recovery is the next reliability layer.
+The HTTP event endpoint acknowledges a supported message only after its job
+file and containing directory have been synced. The job spool is derived from
+`state_file` by appending `.jobs` to its filename, is mode `0700`, stores
+mode-`0600` records, and admits at most 4096 pending messages. Atomic
+no-clobber publication preserves the first accepted message ID without storing
+the rest of the sidecar payload; authoritative Webex hydration controls every
+security and routing decision. Reads require the raw record bytes to match the
+single canonical serialization, so duplicate JSON keys and other noncanonical
+disk records fail closed. File and recovery-candidate enumeration stops as soon
+as the fixed bound is exceeded. Startup validates the complete spool and
+reschedules every pending job through a worker set bounded by
+`server.max_concurrent_requests`; queued ID envelopes are loaded only after a
+worker obtains an execution permit.
+Startup builds a lightweight ID/timestamp index, and periodic rescans select
+only enough non-active, non-deferred IDs to fill available worker slots. A full
+valid backlog therefore does not create thousands of tasks or retain every
+event in memory. Retryable failures remain queued in a bounded deferred map,
+honour the existing retry delay up to a 24-hour scheduler bound, and release
+worker capacity for unrelated messages. Scheduler-state failures latch health
+unhealthy until restart.
+
+Ingress permits move into the blocking persistence worker before the HTTP
+future awaits it. A disconnected or cancelled request therefore cannot release
+capacity while its worker still retains the event, and non-capacity worker
+errors or panics latch health even when no async caller remains. A stale
+process-local scheduler snapshot whose indexed job was already removed by a
+successful completion is skipped without poisoning health; a file missing
+while its index entry still exists remains an integrity failure.
+
+An unclean restart can leave a non-expired `JsonlStateStore` attempt lease.
+Recovery waits for that lease to expire before rerunning the durable job, which
+favours duplicate prevention over immediate takeover. Hidden reply/source
+markers reconcile any Webex write accepted immediately before a crash. A later
+supervised handoff slice will own cross-process drain and immediate lease
+transfer; this job-spool slice does not enable `/config reload` or `/config
+sync`.
+
+Authenticated `/healthz` output includes `messageJobDirectory`,
+`pendingMessageJobs`, and `activeMessageJobs`. Startup exits fail-closed before
+binding the listener when a queued record is invalid. At runtime, health
+validates the private spool topology and file metadata and returns `503` when
+that state is unreadable or unsafe. One dedicated single-slot gate bounds these
+blocking scans; the permit moves into the scan worker, so request cancellation
+cannot release it early. A concurrent scan receives `503` instead of occupying
+another blocking worker. A worker likewise retains and reports a record that
+becomes unreadable instead of silently skipping accepted work. Runtime spool
+failures are latched unhealthy until restart, while deferred selection lets
+later valid records continue to run.
 
 ## Configuration
 
