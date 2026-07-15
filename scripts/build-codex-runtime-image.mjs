@@ -277,6 +277,16 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
     sourceDefinitions,
   );
   const sourceManifestSha256 = sha256(sourceBytes);
+  const existingActive = options.firstDeployment
+    ? await inspectFirstDeploymentRuntimeState(
+      settings.outputRoot,
+      sourceManifestSha256,
+      { expectedUid, expectedGid },
+    )
+    : null;
+  if (existingActive?.status === 'conflict') {
+    throw new Error('existing active runtime does not match first-deployment sources');
+  }
   const stagingRoot = await fs.mkdtemp(path.join(settings.outputRoot, '.runtime-build-'));
   const imageTemporary = path.join(
     settings.outputRoot,
@@ -295,6 +305,17 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
       settings.mksquashfs,
       64 * 1024 * 1024,
     );
+    if (
+      existingActive?.status === 'matching'
+      && (
+        existingActive.active.mksquashfs_sha256 !== mksquashfsSha256
+        || existingActive.active.mksquashfs_argv_sha256 !== sha256(
+          Buffer.from(JSON.stringify(mksquashfsArgs('/staging', '/image')), 'utf8'),
+        )
+      )
+    ) {
+      throw new Error('existing active runtime uses different first-deployment build inputs');
+    }
     await fs.chmod(stagingRoot, 0o700);
     await stageManifest(stagingRoot, manifest, expectedUid, trustFile);
     await verifyStagedTree(stagingRoot, manifest);
@@ -333,6 +354,12 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
         Buffer.from(JSON.stringify(mksquashfsArgs('/staging', '/image')), 'utf8'),
       ),
     });
+    if (
+      existingActive?.status === 'matching'
+      && JSON.stringify(existingActive.active) !== JSON.stringify(active)
+    ) {
+      throw new Error('existing active runtime does not match the reproducible first deployment');
+    }
     await installActiveManifest(settings.outputRoot, active, expectedUid, expectedGid);
     return active;
   } finally {
@@ -343,19 +370,17 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
   }
 }
 
-export async function writeSourceManifest(injected = {}) {
+export async function inspectRuntimeSources(injected = {}) {
   const expectedUid = injected.expectedUid ?? 0;
-  const expectedGid = injected.expectedGid ?? 0;
   const requireRoot = injected.requireRoot ?? true;
   const trustFile = injected.assertTrustedFile ?? assertTrustedFile;
-  const trustDirectory = injected.assertTrustedDirectory ?? assertTrustedDirectory;
   const definitions = injected.sourceDefinitions ?? SOURCE_DEFINITIONS;
   const packageMetadata = injected.packageMetadata ?? CODEX_PACKAGE_METADATA;
-  const output = injected.output ?? DEFAULTS.manifest;
+  const mksquashfs = injected.mksquashfs ?? DEFAULTS.mksquashfs;
   if (requireRoot && process.geteuid() !== 0) {
-    throw new Error('runtime source manifest writer must run as root');
+    throw new Error('runtime source inspection must run as root');
   }
-  await trustDirectory(path.dirname(output), expectedUid);
+  await trustFile(mksquashfs, expectedUid, { executable: true });
   await trustFile(packageMetadata, expectedUid, { executable: false });
   const packageBytes = await readBoundedFile(packageMetadata, 64 * 1024);
   const packageValue = JSON.parse(packageBytes.toString('utf8'));
@@ -417,6 +442,120 @@ export async function writeSourceManifest(injected = {}) {
     },
     definitions,
   );
+  const payload = `${JSON.stringify(manifest, null, 2)}\n`;
+  return Object.freeze({
+    manifest,
+    source_manifest_sha256: sha256(Buffer.from(payload, 'utf8')),
+  });
+}
+
+export async function inspectFirstDeploymentRuntimeState(
+  outputRoot,
+  sourceManifestSha256,
+  { expectedUid = 0, expectedGid = 0, fsApi = fs } = {},
+) {
+  const activePath = path.join(outputRoot, 'active.json');
+  let handle;
+  try {
+    handle = await fsApi.open(
+      activePath,
+      fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if (error?.code === 'ENOENT') return Object.freeze({ status: 'absent' });
+    throw error;
+  }
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || before.uid !== expectedUid
+      || before.gid !== expectedGid
+      || (before.mode & 0o7777) !== 0o444
+      || before.size <= 0
+      || before.size > 64 * 1024
+    ) {
+      throw new Error('existing runtime active manifest metadata is invalid');
+    }
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (bytesRead === 0) throw new Error('existing runtime active manifest changed');
+      offset += bytesRead;
+    }
+    const after = await handle.stat();
+    assertUnchangedMetadata(before, after, activePath);
+    const active = parseActiveManifest(JSON.parse(bytes.toString('utf8')));
+    const imagePath = path.join(outputRoot, active.image);
+    const image = await inspectImage(
+      imagePath,
+      { uid: expectedUid, gid: expectedGid },
+      fsApi,
+    );
+    if (image.sha256 !== active.image_sha256 || image.size !== active.image_size) {
+      throw new Error('existing runtime image does not match the active manifest');
+    }
+    return Object.freeze({
+      status: active.source_manifest_sha256 === sourceManifestSha256 ? 'matching' : 'conflict',
+      active,
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
+export function parseActiveManifest(value) {
+  assertPlainObject(value, 'runtime active manifest');
+  expectExactKeys(
+    value,
+    [
+      'builder_version',
+      'codex_layout_version',
+      'codex_target',
+      'codex_version',
+      'image',
+      'image_sha256',
+      'image_size',
+      'mksquashfs_argv_sha256',
+      'mksquashfs_sha256',
+      'source_manifest_sha256',
+      'version',
+    ],
+    'runtime active manifest',
+  );
+  if (
+    value.version !== ACTIVE_MANIFEST_VERSION
+    || value.builder_version !== BUILDER_VERSION
+    || value.codex_version !== SUPPORTED_CODEX_VERSION
+    || value.codex_target !== SUPPORTED_CODEX_TARGET
+    || value.codex_layout_version !== SUPPORTED_CODEX_LAYOUT_VERSION
+    || !SHA256_PATTERN.test(value.image_sha256 ?? '')
+    || value.image !== `images/${value.image_sha256}.squashfs`
+    || !Number.isSafeInteger(value.image_size)
+    || value.image_size <= SQUASHFS_MAGIC.length
+    || value.image_size > IMAGE_MAX_BYTES
+    || !SHA256_PATTERN.test(value.source_manifest_sha256 ?? '')
+    || !SHA256_PATTERN.test(value.mksquashfs_sha256 ?? '')
+    || !SHA256_PATTERN.test(value.mksquashfs_argv_sha256 ?? '')
+  ) {
+    throw new Error('runtime active manifest is invalid');
+  }
+  return Object.freeze({ ...value });
+}
+
+export async function writeSourceManifest(injected = {}) {
+  const expectedUid = injected.expectedUid ?? 0;
+  const expectedGid = injected.expectedGid ?? 0;
+  const trustDirectory = injected.assertTrustedDirectory ?? assertTrustedDirectory;
+  const output = injected.output ?? DEFAULTS.manifest;
+  if ((injected.requireRoot ?? true) && process.geteuid() !== 0) {
+    throw new Error('runtime source manifest writer must run as root');
+  }
+  await trustDirectory(path.dirname(output), expectedUid);
+  const inspected = await inspectRuntimeSources(injected);
+  const { manifest } = inspected;
   await atomicWriteJson(output, manifest, expectedUid, expectedGid);
   return manifest;
 }
@@ -579,8 +718,11 @@ async function listTree(root, current = root, result = new Map()) {
   return result;
 }
 
-async function inspectImage(file, expectedOwnership = null) {
-  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW);
+async function inspectImage(file, expectedOwnership = null, fsApi = fs) {
+  const handle = await fsApi.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+  );
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.size <= SQUASHFS_MAGIC.length || before.size > IMAGE_MAX_BYTES) {
@@ -1004,23 +1146,74 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-async function main() {
-  if (process.argv.length === 3 && process.argv[2] === '--write-source-manifest') {
-    const manifest = await writeSourceManifest();
-    process.stdout.write(`${JSON.stringify(manifest)}\n`);
-    return;
+export function parseArgs(argv) {
+  if (argv.length === 0) return Object.freeze({ mode: 'build', json: true });
+  if (argv.length === 1 && argv[0] === '--write-source-manifest') {
+    return Object.freeze({ mode: 'write-source-manifest', json: true });
   }
-  if (process.argv.length !== 2) {
-    throw new Error('build-codex-runtime-image does not accept path or policy overrides');
+  if (argv.length === 1 && argv[0] === '--first-deployment') {
+    return Object.freeze({ mode: 'first-deployment', json: true });
   }
-  const active = await buildRuntimeImage();
-  process.stdout.write(`${JSON.stringify(active)}\n`);
+  if (
+    argv.includes('--dry-run')
+    && argv.every((arg) => arg === '--dry-run' || arg === '--json')
+    && new Set(argv).size === argv.length
+  ) {
+    return Object.freeze({ mode: 'dry-run', json: argv.includes('--json') });
+  }
+  throw new Error('build-codex-runtime-image does not accept path or policy overrides');
+}
+
+export async function runCli({
+  argv = process.argv.slice(2),
+  stdout = process.stdout,
+  inspectSources = inspectRuntimeSources,
+  inspectState = inspectFirstDeploymentRuntimeState,
+  writeManifest = writeSourceManifest,
+  buildImage = buildRuntimeImage,
+} = {}) {
+  const options = parseArgs(argv);
+  if (options.mode === 'dry-run') {
+    const inspected = await inspectSources();
+    const runtimeState = await inspectState(DEFAULTS.outputRoot, inspected.source_manifest_sha256);
+    if (runtimeState.status === 'conflict') {
+      throw new Error('existing active runtime does not match first-deployment sources');
+    }
+    const report = {
+      version: 1,
+      status: 'inspected',
+      codex_version: inspected.manifest.codex_version,
+      codex_target: inspected.manifest.codex_target,
+      source_file_count: inspected.manifest.files.length,
+      source_manifest_sha256: inspected.source_manifest_sha256,
+      active_runtime: runtimeState.status,
+      writes_performed: 0,
+    };
+    if (options.json) stdout.write(`${JSON.stringify(report)}\n`);
+    else {
+      stdout.write('status=inspected\n');
+      stdout.write(`codex_version=${report.codex_version}\n`);
+      stdout.write(`source_manifest_sha256=${report.source_manifest_sha256}\n`);
+      stdout.write('writes_performed=0\n');
+    }
+    return 0;
+  }
+  if (options.mode === 'write-source-manifest') {
+    stdout.write(`${JSON.stringify(await writeManifest())}\n`);
+    return 0;
+  }
+  if (options.mode === 'first-deployment') {
+    stdout.write(`${JSON.stringify(await buildImage({ firstDeployment: true }))}\n`);
+    return 0;
+  }
+  stdout.write(`${JSON.stringify(await buildImage())}\n`);
+  return 0;
 }
 
 const isMain = process.argv[1]
   && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  main().catch((error) => {
+  runCli().catch((error) => {
     process.stderr.write(`build-codex-runtime-image: ${error.message}\n`);
     process.exitCode = 1;
   });

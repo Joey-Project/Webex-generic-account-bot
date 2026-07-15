@@ -41,6 +41,8 @@ const CODE_FILES = [
   'scripts/config-pull-worker.mjs',
   'scripts/deploy-config.mjs',
   'scripts/jenkins-readonly.mjs',
+  'scripts/prepare-host-deployment',
+  'scripts/prepare-host-deployment.mjs',
   'scripts/provision-host',
   'scripts/provision-host.mjs',
 ];
@@ -49,6 +51,7 @@ const EXECUTABLE_CODE_FILES = new Set([
   'scripts/config-policy/install-rendered-config.py',
   'scripts/config-policy/static-config-check.py',
   'scripts/config-policy/validate-config.sh',
+  'scripts/prepare-host-deployment',
   'scripts/provision-host',
 ]);
 

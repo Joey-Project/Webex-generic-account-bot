@@ -7,8 +7,12 @@ import { describe, it } from 'node:test';
 
 import {
   buildRuntimeImage,
+  inspectFirstDeploymentRuntimeState,
+  inspectRuntimeSources,
   mksquashfsArgs,
+  parseArgs as parseRuntimeArgs,
   parseSourceManifest,
+  runCli as runRuntimeCli,
   writeSourceManifest,
 } from '../scripts/build-codex-runtime-image.mjs';
 
@@ -32,6 +36,48 @@ const REQUIRED_SYMLINKS = [
 ];
 
 describe('Codex runtime image contract', () => {
+  it('keeps runtime dry-run separate from all mutating modes', async () => {
+    assert.deepEqual(parseRuntimeArgs([]), { mode: 'build', json: true });
+    assert.deepEqual(
+      parseRuntimeArgs(['--dry-run', '--json']),
+      { mode: 'dry-run', json: true },
+    );
+    assert.deepEqual(
+      parseRuntimeArgs(['--first-deployment']),
+      { mode: 'first-deployment', json: true },
+    );
+    assert.throws(() => parseRuntimeArgs(['--output', '/tmp/image']), /does not accept/);
+
+    let output = '';
+    let mutationReached = false;
+    await runRuntimeCli({
+      argv: ['--dry-run', '--json'],
+      stdout: { write: (value) => { output += value; } },
+      inspectSources: async () => ({
+        manifest: {
+          codex_version: '0.142.3',
+          codex_target: 'x86_64-unknown-linux-musl',
+          files: Array(7).fill({}),
+        },
+        source_manifest_sha256: 'a'.repeat(64),
+      }),
+      inspectState: async () => ({ status: 'absent' }),
+      writeManifest: async () => { mutationReached = true; },
+      buildImage: async () => { mutationReached = true; },
+    });
+    assert.equal(mutationReached, false);
+    assert.deepEqual(JSON.parse(output), {
+      version: 1,
+      status: 'inspected',
+      codex_version: '0.142.3',
+      codex_target: 'x86_64-unknown-linux-musl',
+      source_file_count: 7,
+      source_manifest_sha256: 'a'.repeat(64),
+      active_runtime: 'absent',
+      writes_performed: 0,
+    });
+  });
+
   it('accepts only the exact mandatory runtime source schema', () => {
     const manifest = sourceManifest('/trusted');
     const definitions = sourceDefinitions('/trusted');
@@ -236,6 +282,19 @@ describe('Codex runtime image contract', () => {
       const image = path.join(outputRoot, active.image);
       assert.equal((await fs.stat(image)).mode & 0o777, 0o444);
       assert.equal((await fs.readFile(image)).subarray(0, 4).toString('ascii'), 'hsqs');
+      const matching = await inspectFirstDeploymentRuntimeState(
+        outputRoot,
+        active.source_manifest_sha256,
+        { expectedUid: process.geteuid(), expectedGid: process.getegid() },
+      );
+      assert.equal(matching.status, 'matching');
+      assert.deepEqual(matching.active, active);
+      const conflict = await inspectFirstDeploymentRuntimeState(
+        outputRoot,
+        'f'.repeat(64),
+        { expectedUid: process.geteuid(), expectedGid: process.getegid() },
+      );
+      assert.equal(conflict.status, 'conflict');
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -269,6 +328,17 @@ describe('Codex runtime image contract', () => {
         definitions.push({ source, destination, mode });
       }
 
+      const inspection = await inspectRuntimeSources({
+        requireRoot: false,
+        expectedUid: process.geteuid(),
+        assertTrustedFile: async () => {},
+        sourceDefinitions: definitions,
+        packageMetadata: metadataFile,
+      });
+      await assert.rejects(fs.lstat(output), { code: 'ENOENT' });
+      assert.equal(inspection.manifest.files.length, REQUIRED_FILE_DESTINATIONS.length);
+      assert.match(inspection.source_manifest_sha256, /^[a-f0-9]{64}$/);
+
       const manifest = await writeSourceManifest({
         requireRoot: false,
         expectedUid: process.geteuid(),
@@ -286,6 +356,7 @@ describe('Codex runtime image contract', () => {
       assert.deepEqual(manifest.symlinks, REQUIRED_SYMLINKS);
       assert.equal((await fs.stat(output)).mode & 0o777, 0o444);
       assert.deepEqual(JSON.parse(await fs.readFile(output, 'utf8')), manifest);
+      assert.equal(digest(await fs.readFile(output)), inspection.source_manifest_sha256);
       for (const entry of manifest.files) {
         assert.equal(entry.sha256, digest(await fs.readFile(entry.source)));
         assert.equal(entry.size, (await fs.stat(entry.source)).size);
