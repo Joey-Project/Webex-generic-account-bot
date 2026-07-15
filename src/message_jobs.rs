@@ -96,7 +96,7 @@ impl DurableMessageJobs {
     fn open_with_limit(state_file: &Path, max_pending: usize) -> Result<Self> {
         let root = message_job_root(state_file)?;
         ensure_private_job_root(&root)?;
-        recover_candidates(&root)?;
+        recover_candidates(&root, max_pending)?;
         let index = load_message_job_index(&root, max_pending)?;
         Ok(Self {
             root,
@@ -417,20 +417,14 @@ impl DurableMessageJobs {
 
     fn prepare_root_sync(&self, index: &mut MessageJobIndex) -> Result<()> {
         ensure_private_job_root(&self.root)?;
-        for record in recover_candidates(&self.root)? {
+        for record in recover_candidates(&self.root, self.max_pending)? {
             register_index_record(index, &record)?;
         }
         Ok(())
     }
 
     fn checked_job_files_sync(&self, index: &MessageJobIndex) -> Result<Vec<PathBuf>> {
-        let paths = list_job_files(&self.root)?;
-        if paths.len() > self.max_pending {
-            return Err(anyhow!(
-                "message job backlog exceeds the fixed limit of {}",
-                self.max_pending
-            ));
-        }
+        let paths = list_job_files(&self.root, self.max_pending)?;
         let expected = index
             .entries
             .keys()
@@ -478,12 +472,7 @@ fn message_job_path(root: &Path, message_id: &str) -> PathBuf {
 }
 
 fn load_message_job_index(root: &Path, max_pending: usize) -> Result<MessageJobIndex> {
-    let paths = list_job_files(root)?;
-    if paths.len() > max_pending {
-        return Err(anyhow!(
-            "message job backlog exceeds the fixed limit of {max_pending}"
-        ));
-    }
+    let paths = list_job_files(root, max_pending)?;
     let mut index = MessageJobIndex::default();
     for path in paths {
         let record = read_job_file(&path)?;
@@ -735,7 +724,7 @@ fn same_file_snapshot(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     }
 }
 
-fn list_job_files(root: &Path) -> Result<Vec<PathBuf>> {
+fn list_job_files(root: &Path, max_pending: usize) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(root)
         .with_context(|| format!("failed to read message job root {}", root.display()))?
@@ -746,6 +735,11 @@ fn list_job_files(root: &Path) -> Result<Vec<PathBuf>> {
             .to_str()
             .ok_or_else(|| anyhow!("message job filename is not UTF-8"))?;
         if is_job_filename(name) {
+            if files.len() >= max_pending {
+                return Err(anyhow!(
+                    "message job backlog exceeds the fixed limit of {max_pending}"
+                ));
+            }
             let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
                 format!("failed to stat message job {}", entry.path().display())
             })?;
@@ -778,9 +772,11 @@ fn is_job_filename(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn recover_candidates(root: &Path) -> Result<Vec<MessageJobRecord>> {
+fn recover_candidates(root: &Path, max_pending: usize) -> Result<Vec<MessageJobRecord>> {
     let mut removed = false;
     let mut published = Vec::new();
+    let mut job_count = 0usize;
+    let mut candidate_count = 0usize;
     for entry in fs::read_dir(root)
         .with_context(|| format!("failed to read message job root {}", root.display()))?
     {
@@ -789,8 +785,26 @@ fn recover_candidates(root: &Path) -> Result<Vec<MessageJobRecord>> {
         let Some(name) = name.to_str() else {
             return Err(anyhow!("message job candidate filename is not UTF-8"));
         };
-        if !name.starts_with(MESSAGE_JOB_CANDIDATE_PREFIX) {
+        if is_job_filename(name) {
+            job_count = job_count.saturating_add(1);
+            if job_count > max_pending {
+                return Err(anyhow!(
+                    "message job backlog exceeds the fixed limit of {max_pending}"
+                ));
+            }
             continue;
+        }
+        if !name.starts_with(MESSAGE_JOB_CANDIDATE_PREFIX) {
+            return Err(anyhow!(
+                "unexpected entry in message job root: {}",
+                entry.path().display()
+            ));
+        }
+        candidate_count = candidate_count.saturating_add(1);
+        if candidate_count > max_pending {
+            return Err(anyhow!(
+                "message job candidate backlog exceeds the fixed limit of {max_pending}"
+            ));
         }
         let candidate_path = entry.path();
         let metadata = fs::symlink_metadata(&candidate_path).with_context(|| {
@@ -983,6 +997,31 @@ mod tests {
         assert_eq!(jobs.list_sync().unwrap().len(), 1);
     }
 
+    #[test]
+    fn filesystem_enumeration_stops_at_job_and_candidate_limits() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        let root = jobs.root().to_path_buf();
+        drop(jobs);
+        let first = root.join(format!("{}{}", "a".repeat(64), MESSAGE_JOB_FILE_SUFFIX));
+        let second = root.join(format!("{}{}", "b".repeat(64), MESSAGE_JOB_FILE_SUFFIX));
+        write_private_file(&first, b"not-read");
+        write_private_file(&second, b"not-read");
+
+        let error = list_job_files(&root, 1).unwrap_err();
+
+        assert!(error.to_string().contains("fixed limit of 1"));
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+
+        let candidate = root.join(".pending-over-limit");
+        write_private_file(&candidate, b"not-read");
+        let error = recover_candidates(&root, 0).unwrap_err();
+
+        assert!(error.to_string().contains("fixed limit of 0"));
+        assert!(candidate.exists());
+    }
+
     #[tokio::test]
     async fn backlog_capacity_is_retryable_without_latching_spool_health() {
         let fixture = Fixture::new();
@@ -1171,6 +1210,12 @@ mod tests {
             "roomId": "room-1",
             "text": text,
         }))
+    }
+
+    fn write_private_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     }
 
     struct Fixture {

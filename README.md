@@ -45,16 +45,18 @@ file and containing directory have been synced. The job spool is derived from
 mode-`0600` records, and admits at most 4096 pending messages. Atomic
 no-clobber publication preserves the first accepted message ID without storing
 the rest of the sidecar payload; authoritative Webex hydration controls every
-security and routing decision. Startup validates the complete spool and
-reschedules every pending job through a worker set bounded by
+security and routing decision. File and recovery-candidate enumeration stops
+as soon as the fixed bound is exceeded. Startup validates the complete spool
+and reschedules every pending job through a worker set bounded by
 `server.max_concurrent_requests`; queued ID envelopes are loaded only after a
 worker obtains an execution permit.
 Startup builds a lightweight ID/timestamp index, and periodic rescans select
 only enough non-active, non-deferred IDs to fill available worker slots. A full
 valid backlog therefore does not create thousands of tasks or retain every
 event in memory. Retryable failures remain queued in a bounded deferred map,
-honour the existing retry delay, and release worker capacity for unrelated
-messages.
+honour the existing retry delay up to a 24-hour scheduler bound, and release
+worker capacity for unrelated messages. Scheduler-state failures latch health
+unhealthy until restart.
 
 An unclean restart can leave a non-expired `JsonlStateStore` attempt lease.
 Recovery waits for that lease to expire before rerunning the durable job, which
@@ -68,10 +70,12 @@ Authenticated `/healthz` output includes `messageJobDirectory`,
 `pendingMessageJobs`, and `activeMessageJobs`. Startup exits fail-closed before
 binding the listener when a queued record is invalid. At runtime, health
 validates the private spool topology and file metadata and returns `503` when
-that state is unreadable or unsafe; a worker likewise retains and reports a
-record that becomes unreadable instead of silently skipping accepted work.
-Runtime spool failures are latched unhealthy until restart, while deferred
-selection lets later valid records continue to run.
+that state is unreadable or unsafe. One dedicated single-slot gate bounds these
+blocking scans; a concurrent scan receives `503` instead of occupying another
+blocking worker. A worker likewise retains and reports a record that becomes
+unreadable instead of silently skipping accepted work. Runtime spool failures
+are latched unhealthy until restart, while deferred selection lets later valid
+records continue to run.
 
 ## Configuration
 

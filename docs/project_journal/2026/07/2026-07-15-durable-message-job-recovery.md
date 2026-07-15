@@ -29,6 +29,13 @@ superseded_by:
   non-active and non-deferred backlog selection, automatic retry that releases
   worker capacity, startup rescheduling, duplicate in-process scheduling
   suppression, and lightweight health counts for pending and active jobs.
+- Capped deferred retry scheduling at 24 hours, used checked deadline
+  arithmetic before taking the scheduler lock, and latched scheduler-state
+  failures into health.
+- Bounded job and recovery-candidate enumeration at the fixed spool limit and
+  serialized blocking health scans behind a dedicated single-slot gate;
+  concurrent health scans return `503` without consuming another blocking
+  worker.
 - Latched runtime spool failures into authenticated health while allowing
   unrelated indexed jobs to continue; a corrupt event no longer blocks later
   records or leaves `/healthz` falsely healthy.
@@ -44,7 +51,9 @@ superseded_by:
   canonical ID-only persistence, same-UID payload non-disclosure,
   acknowledgement before Codex completion, duplicate sidecar delivery,
   non-starving deferred retry, runtime-corruption health latching, transient
-  retry, and restart recovery after an old lease expires.
+  retry, retry-delay bounding, scheduler-state health latching, health-scan
+  admission, bounded filesystem enumeration, and restart recovery after an old
+  lease expires.
 
 ## Boundaries
 - This slice does not provide cross-process lease transfer, immediate takeover,
