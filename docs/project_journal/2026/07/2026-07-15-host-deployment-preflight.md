@@ -31,8 +31,10 @@ superseded_by:
   remains intact for a separate recovery workflow.
 - The provisioner uses the shared deployment lock for policy convergence. The
   preactivation phase reacquires it for policy revalidation and runtime
-  preparation, then rechecks activation and secret metadata after the build. A
-  later readiness failure leaves the host safely provisioned and rerunnable.
+  preparation. It rejects an active runtime conflict through a read-only check
+  before rewriting the source manifest, then rechecks activation and secret
+  metadata after the build. A later readiness failure leaves the host safely
+  provisioned and rerunnable.
 - Secret readiness checks fixed parent and file metadata with `lstat`; secret
   files are never opened or read. Missing secrets are reported as incomplete
   readiness unless the operator selects `--require-secrets`.

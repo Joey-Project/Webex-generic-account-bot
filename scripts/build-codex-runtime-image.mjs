@@ -329,17 +329,6 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
     }
     const image = await inspectImage(imageTemporary);
     const imageRelativePath = `images/${image.sha256}.squashfs`;
-    const imagesRoot = path.join(settings.outputRoot, 'images');
-    await ensureTrustedInstallDirectory(imagesRoot, expectedUid, expectedGid, trustDirectory);
-    const imageFinal = path.join(settings.outputRoot, imageRelativePath);
-    await installContentAddressedImage(
-      imageTemporary,
-      imageFinal,
-      image,
-      expectedUid,
-      expectedGid,
-    );
-
     const active = Object.freeze({
       version: ACTIVE_MANIFEST_VERSION,
       builder_version: BUILDER_VERSION,
@@ -361,6 +350,16 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
     ) {
       throw new Error('existing active runtime does not match the reproducible first deployment');
     }
+    const imagesRoot = path.join(settings.outputRoot, 'images');
+    await ensureTrustedInstallDirectory(imagesRoot, expectedUid, expectedGid, trustDirectory);
+    const imageFinal = path.join(settings.outputRoot, imageRelativePath);
+    await installContentAddressedImage(
+      imageTemporary,
+      imageFinal,
+      image,
+      expectedUid,
+      expectedGid,
+    );
     await installActiveManifest(settings.outputRoot, active, expectedUid, expectedGid);
     return active;
   } finally {

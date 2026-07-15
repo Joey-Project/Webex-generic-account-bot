@@ -514,11 +514,14 @@ stops after host policy convergence. The provisioner serialises that mutation
 with the same shared deployment lock used by config deployment. The
 preactivation target then reacquires the lock, revalidates dormant and unchanged
 host policy under it, requires a clean receipt/drop-in/reboot-challenge boundary
-and complete secret readiness, then invokes only the fixed runtime builder
-paths. It rechecks both the activation boundary and secret metadata after the
-runtime build before reporting success. `--require-secrets` enforces the same
-readiness contract for either target. If a later readiness gate fails, the
-converged host policy remains in the safe, rerunnable `provisioned` state.
+and complete secret readiness, then runs the read-only runtime conflict check.
+A conflicting active runtime exits into the separate upgrade workflow before
+the source manifest is written. Only then does preparation invoke the fixed
+runtime write/build paths. It rechecks both the activation boundary and secret
+metadata after the runtime build before reporting success. `--require-secrets`
+enforces the same readiness contract for either target. If a later readiness
+gate fails, the converged host policy remains in the safe, rerunnable
+`provisioned` state.
 
 The entrypoint does not install or parse secret contents, enable or start a
 unit, install the runner permission drop-in, mint an activation receipt, or

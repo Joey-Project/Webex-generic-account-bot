@@ -348,6 +348,7 @@ describe('Codex runtime image contract', () => {
       );
       assert.deepEqual(repeated, active);
 
+      const imagesBeforeMismatch = await fs.readdir(path.join(outputRoot, 'images'));
       await assert.rejects(
         buildRuntimeImage(
           { ...settings, firstDeployment: true },
@@ -359,6 +360,10 @@ describe('Codex runtime image contract', () => {
           },
         ),
         /does not match the reproducible first deployment/,
+      );
+      assert.deepEqual(
+        await fs.readdir(path.join(outputRoot, 'images')),
+        imagesBeforeMismatch,
       );
 
       await fs.chmod(fakeMksquashfs, 0o755);

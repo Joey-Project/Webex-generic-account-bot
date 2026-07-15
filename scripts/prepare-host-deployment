@@ -1,13 +1,17 @@
 #!/usr/bin/env -S -i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 /usr/bin/node
 
 const process = require('node:process');
+let exitStatusForError = () => 1;
 
 import('./prepare-host-deployment.mjs')
-  .then(({ runCli }) => runCli())
+  .then((module) => {
+    exitStatusForError = module.exitStatusForError;
+    return module.runCli();
+  })
   .then((code) => {
     process.exitCode = code;
   })
   .catch((error) => {
     process.stderr.write(`prepare-host-deployment: ${error.message}\n`);
-    process.exitCode = error?.exitStatus === 75 ? 75 : 1;
+    process.exitCode = exitStatusForError(error);
   });

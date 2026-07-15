@@ -5,6 +5,7 @@ import {
   DEFAULTS,
   SECRET_FILES,
   SECRET_ROOTS,
+  exitStatusForError,
   inspectActivationBoundary,
   inspectDeploymentSecrets,
   parseArgs,
@@ -115,8 +116,7 @@ describe('host deployment preparation', () => {
         if (command === DEFAULTS.provisioner) {
           return provisionReport(args[0] === '--apply' ? 'applied' : 'dry-run', 0);
         }
-        if (args.at(-1) === '--write-source-manifest') return sourceManifestReport();
-        return runtimeReport();
+        return runtimeCommandReport(args);
       },
       inspectSecrets: async () => secretReport('ready'),
       inspectBoundary: async () => activationBoundary(true),
@@ -136,6 +136,11 @@ describe('host deployment preparation', () => {
         command: DEFAULTS.provisioner,
         args: ['--dry-run', '--json'],
         label: 'locked host policy revalidation',
+      },
+      {
+        command: DEFAULTS.node,
+        args: [DEFAULTS.runtimeBuilder, '--dry-run', '--json'],
+        label: 'locked runtime conflict inspection',
       },
       {
         command: DEFAULTS.node,
@@ -302,9 +307,7 @@ describe('host deployment preparation', () => {
               : provisionReport('dry-run', 0);
           }
           runtimeCommands += 1;
-          return args.at(-1) === '--write-source-manifest'
-            ? sourceManifestReport()
-            : runtimeReport();
+          return runtimeCommandReport(args);
         },
         inspectSecrets: async () => secretReport('ready'),
         inspectBoundary: async () => {
@@ -315,7 +318,7 @@ describe('host deployment preparation', () => {
       }),
       /activation boundary changed while preparing the runtime/,
     );
-    assert.equal(runtimeCommands, 2);
+    assert.equal(runtimeCommands, 3);
     assert.equal(boundaryInspections, 2);
   });
 
@@ -336,9 +339,7 @@ describe('host deployment preparation', () => {
               : provisionReport('dry-run', 0);
           }
           runtimeCommands += 1;
-          return args.at(-1) === '--write-source-manifest'
-            ? sourceManifestReport()
-            : runtimeReport();
+          return runtimeCommandReport(args);
         },
         inspectSecrets: async () => {
           secretInspections += 1;
@@ -349,7 +350,7 @@ describe('host deployment preparation', () => {
       }),
       /deployment secrets changed while preparing the runtime: webex_access_token/,
     );
-    assert.equal(runtimeCommands, 2);
+    assert.equal(runtimeCommands, 3);
     assert.equal(secretInspections, 2);
   });
 
@@ -366,6 +367,35 @@ describe('host deployment preparation', () => {
     });
     assert.equal(report.runtime.active_runtime, 'conflict');
     assert.equal(report.runtime.writes_performed, 0);
+  });
+
+  it('rejects an apply conflict before writing the runtime source manifest', async () => {
+    const runtimeArgs = [];
+    await assert.rejects(
+      prepareHostDeployment(options({
+        apply: true,
+        through: 'preactivation-ready',
+      }), {
+        euid: 0,
+        runJson: async (command, args) => {
+          if (command === DEFAULTS.releaseInstaller) return releaseReport();
+          if (command === DEFAULTS.provisioner) {
+            return args[0] === '--apply'
+              ? provisionReport('applied')
+              : provisionReport('dry-run', 0);
+          }
+          runtimeArgs.push(args);
+          return runtimeInspectionReport('conflict');
+        },
+        inspectSecrets: async () => secretReport('ready'),
+        inspectBoundary: async () => activationBoundary(true),
+        withLock: async (operation) => operation(),
+      }),
+      /existing active runtime requires the runtime upgrade workflow/,
+    );
+    assert.deepEqual(runtimeArgs, [
+      [DEFAULTS.runtimeBuilder, '--dry-run', '--json'],
+    ]);
   });
 
   it('reports only absence or presence for activation boundary artifacts', async () => {
@@ -512,6 +542,8 @@ describe('host deployment preparation', () => {
         && error.exitStatus === 75
       ),
     );
+    assert.equal(exitStatusForError({ exitStatus: 75 }), 75);
+    assert.equal(exitStatusForError({ exitStatus: 70 }), 1);
   });
 });
 
@@ -590,6 +622,12 @@ function runtimeReport() {
     mksquashfs_sha256: DIGEST,
     image_size: 1024,
   };
+}
+
+function runtimeCommandReport(args) {
+  if (args.includes('--dry-run')) return runtimeInspectionReport();
+  if (args.at(-1) === '--write-source-manifest') return sourceManifestReport();
+  return runtimeReport();
 }
 
 function secretReport(status) {

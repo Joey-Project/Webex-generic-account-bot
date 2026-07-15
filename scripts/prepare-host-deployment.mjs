@@ -201,6 +201,14 @@ export async function prepareHostDeployment(options, injected = {}) {
           throw new Error('host policy changed before runtime preparation');
         }
         await inspectReadiness();
+        const runtimeInspection = validateRuntimeInspectionReport(await runJson(
+          settings.node,
+          [settings.runtimeBuilder, '--dry-run', '--json'],
+          'locked runtime conflict inspection',
+        ));
+        if (runtimeInspection.active_runtime === 'conflict') {
+          throw new Error('existing active runtime requires the runtime upgrade workflow');
+        }
         const sourceManifest = validateSourceManifestReport(await runJson(
           settings.node,
           [settings.runtimeBuilder, '--write-source-manifest'],
@@ -683,11 +691,15 @@ export async function runCli({
   return 0;
 }
 
+export function exitStatusForError(error) {
+  return error?.exitStatus === DEPLOY_EXIT_LOCK_BUSY ? DEPLOY_EXIT_LOCK_BUSY : 1;
+}
+
 const isMain = process.argv[1]
   && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
   runCli().catch((error) => {
     process.stderr.write(`prepare-host-deployment: ${error.message}\n`);
-    process.exitCode = 1;
+    process.exitCode = exitStatusForError(error);
   });
 }
