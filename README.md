@@ -11,9 +11,11 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 
 - Receives `SidecarEvent` JSON from the Webex JS SDK sidecar over loopback HTTP.
 - Authenticates local forwarding with `WEBEX_SIDECAR_TOKEN`.
-- Persists each supported message-created event to a private, bounded job spool
-  before returning `202 Accepted`, then performs Webex hydration, Codex work,
-  and reply delivery in background workers.
+- Persists only a minimal message-ID envelope for each supported message-created
+  event to a private, bounded job spool before returning `202 Accepted`, then
+  performs Webex hydration, Codex work, and reply delivery in background
+  workers. Message bodies, people, and room hints are never written to the
+  spool.
 - Uses `JsonlStateStore` leases to avoid concurrent duplicate Codex runs for the
   same Webex message.
 - Matches behavior by Webex `roomId`.
@@ -41,11 +43,12 @@ The HTTP event endpoint acknowledges a supported message only after its job
 file and containing directory have been synced. The job spool is derived from
 `state_file` by appending `.jobs` to its filename, is mode `0700`, stores
 mode-`0600` records, and admits at most 4096 pending messages. Atomic
-no-clobber publication preserves the first accepted sidecar hint for a message
-ID; authoritative Webex hydration still controls every security and routing
-decision. Startup validates the complete spool and reschedules every pending
-job through a worker set bounded by `server.max_concurrent_requests`; queued
-event payloads are loaded only after a worker obtains an execution permit.
+no-clobber publication preserves the first accepted message ID without storing
+the rest of the sidecar payload; authoritative Webex hydration controls every
+security and routing decision. Startup validates the complete spool and
+reschedules every pending job through a worker set bounded by
+`server.max_concurrent_requests`; queued ID envelopes are loaded only after a
+worker obtains an execution permit.
 Startup builds a lightweight ID/timestamp index, and periodic rescans select
 only enough non-active, non-deferred IDs to fill available worker slots. A full
 valid backlog therefore does not create thousands of tasks or retain every

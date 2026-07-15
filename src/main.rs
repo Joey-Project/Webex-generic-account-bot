@@ -4218,6 +4218,9 @@ mod tests {
     async fn handler_acknowledges_only_after_durable_enqueue_then_completes_in_background() {
         let harness = TestHarness::new();
         let state = harness.app_state();
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-background", "please inspect")));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
@@ -4262,6 +4265,9 @@ mod tests {
     async fn duplicate_sidecar_delivery_reuses_one_durable_background_job() {
         let harness = TestHarness::new();
         let state = harness.app_state();
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-duplicate", "please inspect")));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
@@ -4312,6 +4318,12 @@ mod tests {
         let harness = TestHarness::new();
         let mut state = harness.app_state();
         state.max_active_message_jobs = 1;
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-bounded-1", "first")));
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-bounded-2", "second")));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
@@ -4358,6 +4370,12 @@ mod tests {
         let harness = TestHarness::new();
         let mut state = harness.app_state();
         state.max_active_message_jobs = 1;
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-deferred", "retry later")));
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-unrelated", "run now")));
         harness
             .webex
             .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
@@ -4446,6 +4464,9 @@ mod tests {
             )
             .await
             .unwrap();
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-after-corrupt", "still run")));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
@@ -4481,6 +4502,9 @@ mod tests {
             .await
             .unwrap();
         drop(persisted);
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-recovery", "recover me")));
         harness.webex.push_reply_search(Ok(Vec::new()));
         harness
             .webex
@@ -4513,6 +4537,12 @@ mod tests {
         let harness = TestHarness::new();
         let state = harness.app_state();
         let rescan = tokio::spawn(rescan_message_jobs(state.clone()));
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-retry", "retry me")));
+        harness
+            .webex
+            .push_event_message(Ok(inbound_message("message-retry", "retry me")));
         harness
             .webex
             .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
@@ -4559,6 +4589,12 @@ mod tests {
                 .contains(&state.message_jobs.root().display().to_string())
         );
         assert!(harness.runner.calls().is_empty());
+        assert_eq!(
+            handle_health(State(state.clone()), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

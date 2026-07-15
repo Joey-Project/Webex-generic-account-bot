@@ -29,6 +29,23 @@ pub const MAX_PENDING_MESSAGE_JOBS: usize = 4096;
 
 static NEXT_CANDIDATE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug)]
+struct MessageJobBacklogFull {
+    limit: usize,
+}
+
+impl std::fmt::Display for MessageJobBacklogFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "message job backlog reached the fixed limit of {}",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for MessageJobBacklogFull {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageJobEnqueueStatus {
     Queued,
@@ -107,10 +124,17 @@ impl DurableMessageJobs {
         event: SidecarEvent,
     ) -> Result<MessageJobEnqueueStatus> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.enqueue_sync(&message_id, event))
+        let result = task::spawn_blocking(move || jobs.enqueue_sync(&message_id, event))
             .await
             .context("message job enqueue worker panicked")
-            .and_then(|result| result)
+            .and_then(|result| result);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<MessageJobBacklogFull>().is_none())
+        {
+            self.mark_unhealthy();
+        }
+        result
     }
 
     pub async fn load(
@@ -191,12 +215,13 @@ impl DurableMessageJobs {
             return Ok(MessageJobEnqueueStatus::Existing);
         }
         if self.checked_job_files_sync(&index)?.len() >= self.max_pending {
-            return Err(anyhow!(
-                "message job backlog reached the fixed limit of {}",
-                self.max_pending
-            ));
+            return Err(MessageJobBacklogFull {
+                limit: self.max_pending,
+            }
+            .into());
         }
 
+        let event = persisted_message_event(message_id);
         let record = MessageJobRecord {
             version: MESSAGE_JOB_RECORD_VERSION,
             message_id: message_id.to_owned(),
@@ -512,6 +537,16 @@ fn validate_message_event(message_id: &str, event: &SidecarEvent) -> Result<()> 
     Ok(())
 }
 
+fn persisted_message_event(message_id: &str) -> SidecarEvent {
+    SidecarEvent {
+        version: 1,
+        resource: "messages".to_owned(),
+        event: "created".to_owned(),
+        received_at: None,
+        data: serde_json::json!({ "id": message_id }),
+    }
+}
+
 fn validate_record(record: &MessageJobRecord) -> Result<()> {
     if record.version != MESSAGE_JOB_RECORD_VERSION {
         return Err(anyhow!(
@@ -520,7 +555,13 @@ fn validate_record(record: &MessageJobRecord) -> Result<()> {
         ));
     }
     validate_message_id(&record.message_id)?;
-    validate_message_event(&record.message_id, &record.event)
+    validate_message_event(&record.message_id, &record.event)?;
+    if record.event != persisted_message_event(&record.message_id) {
+        return Err(anyhow!(
+            "persisted message job must contain only its message ID envelope"
+        ));
+    }
+    Ok(())
 }
 
 fn message_id_digest(message_id: &str) -> String {
@@ -891,7 +932,7 @@ mod tests {
         let records = reopened.list_sync().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].message_id(), "message-1");
-        assert_eq!(records[0].event(), &event);
+        assert_eq!(records[0].event(), &persisted_message_event("message-1"));
         assert!(reopened.remove_sync("message-1").unwrap());
         assert!(!reopened.remove_sync("message-1").unwrap());
         assert!(
@@ -904,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_enqueue_preserves_the_first_event() {
+    fn persisted_jobs_discard_sidecar_content_and_duplicate_hints() {
         let fixture = Fixture::new();
         let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
 
@@ -920,7 +961,11 @@ mod tests {
         );
 
         let record = jobs.load_sync("message-1").unwrap().unwrap();
-        assert_eq!(record.event.data["text"], "first");
+        assert_eq!(record.event, persisted_message_event("message-1"));
+        let bytes = fs::read(jobs.job_path("message-1")).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("first"));
+        assert!(!text.contains("second"));
     }
 
     #[test]
@@ -936,6 +981,25 @@ mod tests {
 
         assert!(error.to_string().contains("fixed limit of 1"));
         assert_eq!(jobs.list_sync().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backlog_capacity_is_retryable_without_latching_spool_health() {
+        let fixture = Fixture::new();
+        let jobs = std::sync::Arc::new(
+            DurableMessageJobs::open_with_limit(&fixture.state_file, 1).unwrap(),
+        );
+        jobs.enqueue("message-1".to_owned(), message_event("message-1", "first"))
+            .await
+            .unwrap();
+
+        let error = jobs
+            .enqueue("message-2".to_owned(), message_event("message-2", "second"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("fixed limit of 1"));
+        assert!(jobs.is_healthy());
     }
 
     #[test]
@@ -969,7 +1033,7 @@ mod tests {
             version: MESSAGE_JOB_RECORD_VERSION,
             message_id: "message-published".to_owned(),
             enqueued_at_unix_nanos: 1,
-            event: message_event("message-published", "body"),
+            event: persisted_message_event("message-published"),
         };
         let mut bytes = serde_json::to_vec(&record).unwrap();
         bytes.push(b'\n');
@@ -1022,6 +1086,31 @@ mod tests {
         .unwrap();
         let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
         assert!(error.to_string().contains("invalid message job JSON"));
+    }
+
+    #[test]
+    fn startup_rejects_records_that_persist_sidecar_content() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        let root = jobs.root().to_path_buf();
+        let path = jobs.job_path("message-sensitive");
+        drop(jobs);
+        let record = MessageJobRecord {
+            version: MESSAGE_JOB_RECORD_VERSION,
+            message_id: "message-sensitive".to_owned(),
+            enqueued_at_unix_nanos: 1,
+            event: message_event("message-sensitive", "must not persist"),
+        };
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+
+        let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
+
+        assert!(format!("{error:#}").contains("only its message ID envelope"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

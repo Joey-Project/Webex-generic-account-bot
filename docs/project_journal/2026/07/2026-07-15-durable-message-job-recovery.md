@@ -20,9 +20,10 @@ superseded_by:
 - Added a mode-`0700` job spool derived from `state_file`, with mode-`0600`
   records, strict topology and metadata validation, a fixed 4096-job bound, and
   atomic no-clobber publication backed by file and directory syncs.
-- Preserved the first sidecar hint for duplicate message IDs while retaining
-  authoritative Webex hydration for all room, sender, body, thread, execution,
-  and write decisions.
+- Persisted only a canonical message-ID envelope, never sidecar body, person,
+  or room hints that a same-UID current-user runner could read. Authoritative
+  Webex hydration supplies all room, sender, body, thread, execution, and write
+  decisions.
 - Added background execution bounded by `server.max_concurrent_requests`,
   permit-before-load event handling, a lightweight startup index, bounded
   non-active and non-deferred backlog selection, automatic retry that releases
@@ -31,12 +32,16 @@ superseded_by:
 - Latched runtime spool failures into authenticated health while allowing
   unrelated indexed jobs to continue; a corrupt event no longer blocks later
   records or leaves `/healthz` falsely healthy.
+- Classified fixed backlog-capacity responses separately from spool I/O and
+  integrity failures, so ordinary backpressure remains retryable without
+  poisoning health while persistence failures latch `503` until restart.
 - Kept the existing `JsonlStateStore` attempt lease as the crash boundary: an
   unclean restart waits for a surviving lease to expire, then resumes the
   durable job. Existing hidden Webex markers reconcile ambiguous writes.
 - Added tests for durable reopen/removal, duplicate enqueue, backlog and active
   task limits, both interrupted publication states, corrupt or unsafe spool
   entries including non-blocking FIFO rejection, terminal invalid-ID handling,
+  canonical ID-only persistence, same-UID payload non-disclosure,
   acknowledgement before Codex completion, duplicate sidecar delivery,
   non-starving deferred retry, runtime-corruption health latching, transient
   retry, and restart recovery after an old lease expires.
