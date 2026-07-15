@@ -287,7 +287,11 @@ objects therefore fail closed instead of invoking a repository-configured
 remote helper, and repository-local behaviour or `refs/replace` cannot change
 the objects exported under the approved commit SHA. Source materialisation is
 preflighted per blob and capped at 1 GiB in aggregate before any committed file
-is written. The Rust toolchain must be an
+is written. The builder revalidates the snapshot's complete file and directory
+topology, ownership, modes, sizes, stable metadata, and blob object IDs after
+each Cargo build and again before assembling the bundle. Bundle `code/*`
+payloads are read afresh from their committed blobs and rehashed rather than
+copied from the writable compilation snapshot. The Rust toolchain must be an
 independently reviewed SquashFS
 image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.

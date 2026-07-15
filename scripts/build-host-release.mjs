@@ -109,18 +109,29 @@ export async function buildHostRelease(options, injected = {}) {
   await fs.mkdir(scratch, { mode: 0o700 });
   await assertPrivateBuildDirectory(scratch);
   try {
-    const sourceRoot = injected.revision
-      ? repoRoot
+    const sourceSnapshot = injected.revision
+      ? null
       : await materializeRevision(repoRoot, scratch, revision, run);
+    const sourceRoot = sourceSnapshot?.root ?? repoRoot;
+    const verifySourceSnapshot = sourceSnapshot === null
+      ? async () => {}
+      : async () => verifyMaterializedRevision(sourceSnapshot);
     const artifacts = injected.buildArtifacts
-      ? await injected.buildArtifacts({ repoRoot: sourceRoot, scratch, revision })
+      ? await injected.buildArtifacts({
+        repoRoot: sourceRoot,
+        scratch,
+        revision,
+        verifySourceSnapshot,
+      })
       : await buildRustArtifacts(
         sourceRoot,
         scratch,
         rustToolchainImage,
         run,
         injected.assertCargoConfiguration ?? assertCargoConfigurationIsolated,
+        verifySourceSnapshot,
       );
+    await verifySourceSnapshot();
     await assertTrustedBuildInputs(inputRoot, codexInputFiles);
     await assertTrustedBuildAncestors(parent);
     await assertPrivateBuildDirectory(scratch);
@@ -128,15 +139,20 @@ export async function buildHostRelease(options, injected = {}) {
     await assertPrivateBuildDirectory(temporary);
     const files = [];
     for (const entry of RELEASE_FILES) {
-      const source = releaseSource(entry, {
-        repoRoot: sourceRoot,
-        hostBinDir: artifacts.hostBinDir,
-        staticBinDir: artifacts.staticBinDir,
-        busybox,
-        codexPackageRoot,
-      });
       const destination = path.join(temporary, bundlePayloadPath(entry.installPath));
-      const measured = await copyMeasuredFile(source, destination, entry.mode);
+      const measured = entry.kind === 'code' && sourceSnapshot !== null
+        ? await copyCommittedSource(sourceSnapshot, entry.source, destination, entry.mode)
+        : await copyMeasuredFile(
+          releaseSource(entry, {
+            repoRoot: sourceRoot,
+            hostBinDir: artifacts.hostBinDir,
+            staticBinDir: artifacts.staticBinDir,
+            busybox,
+            codexPackageRoot,
+          }),
+          destination,
+          entry.mode,
+        );
       const trustedDigest = (injected.trustedSourceSha256 ?? TRUSTED_SOURCE_SHA256)[
         entry.installPath
       ];
@@ -268,7 +284,161 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
     await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
     await writeBytesFile(destination, bytes, entry.mode);
   }
-  return sourceRoot;
+  return Object.freeze({
+    entries: Object.freeze(entries.map((entry) => Object.freeze({ ...entry }))),
+    environment: Object.freeze({ ...environment }),
+    repoRoot,
+    revision,
+    root: sourceRoot,
+    run,
+  });
+}
+
+async function verifyMaterializedRevision(snapshot) {
+  const expectedFiles = snapshot.entries.map((entry) => entry.path).toSorted();
+  const expectedDirectories = sourceDirectories(snapshot.entries);
+  await assertSourceTopology(snapshot.root, expectedDirectories, expectedFiles);
+  for (const entry of snapshot.entries) {
+    await verifyMaterializedSourceFile(snapshot.root, entry);
+  }
+  await assertSourceTopology(snapshot.root, expectedDirectories, expectedFiles);
+}
+
+function sourceDirectories(entries) {
+  const directories = new Set(['']);
+  for (const entry of entries) {
+    let current = path.posix.dirname(entry.path);
+    while (current !== '.') {
+      directories.add(current);
+      current = path.posix.dirname(current);
+    }
+  }
+  return [...directories].toSorted();
+}
+
+async function assertSourceTopology(root, expectedDirectories, expectedFiles) {
+  const actual = await scanMaterializedSourceTree(root);
+  if (
+    JSON.stringify(actual.directories) !== JSON.stringify(expectedDirectories)
+    || JSON.stringify(actual.files) !== JSON.stringify(expectedFiles)
+  ) {
+    throw new Error('committed source snapshot changed: unexpected topology');
+  }
+}
+
+async function scanMaterializedSourceTree(root) {
+  const directories = [];
+  const files = [];
+  let entries = 0;
+  async function visit(directory, relative) {
+    const metadata = await fs.lstat(directory);
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== process.getuid()
+      || metadata.gid !== process.getgid()
+      || (metadata.mode & 0o022) !== 0
+    ) {
+      throw new Error(`committed source snapshot changed: ${relative || '.'}`);
+    }
+    directories.push(relative);
+    const names = await fs.readdir(directory, { encoding: 'buffer' });
+    names.sort(Buffer.compare);
+    for (const nameBytes of names) {
+      const name = nameBytes.toString('utf8');
+      if (!Buffer.from(name, 'utf8').equals(nameBytes)) {
+        throw new Error('committed source snapshot changed: invalid path encoding');
+      }
+      entries += 1;
+      if (entries > MAX_SOURCE_FILES * 2) {
+        throw new Error('committed source snapshot changed: too many entries');
+      }
+      const childRelative = relative === '' ? name : `${relative}/${name}`;
+      const child = path.join(directory, name);
+      const childMetadata = await fs.lstat(child);
+      if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
+        await visit(child, childRelative);
+      } else if (childMetadata.isFile() && !childMetadata.isSymbolicLink()) {
+        files.push(childRelative);
+      } else {
+        throw new Error(`committed source snapshot changed: ${childRelative}`);
+      }
+    }
+  }
+  await visit(root, '');
+  return {
+    directories: directories.toSorted(),
+    files: files.toSorted(),
+  };
+}
+
+async function verifyMaterializedSourceFile(root, entry) {
+  const source = path.join(root, ...entry.path.split('/'));
+  const input = await fs.open(
+    source,
+    fsConstants.O_RDONLY
+      | fsConstants.O_CLOEXEC
+      | fsConstants.O_NOFOLLOW
+      | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const before = await input.stat({ bigint: true });
+    if (
+      !before.isFile()
+      || before.size !== BigInt(entry.size)
+      || (before.mode & 0o7777n) !== BigInt(entry.mode)
+      || before.uid !== BigInt(process.getuid())
+      || before.gid !== BigInt(process.getgid())
+    ) {
+      throw new Error(`committed source snapshot changed: ${entry.path}`);
+    }
+    const digest = gitObjectDigest('blob', entry.size, entry.object);
+    await consumeExactFile(input, entry.size, source, (chunk) => digest.update(chunk));
+    if (digest.digest('hex') !== entry.object) {
+      throw new Error(`committed source snapshot changed: ${entry.path}`);
+    }
+    assertStableSnapshotMetadata(before, await input.stat({ bigint: true }), entry.path);
+  } finally {
+    await input.close();
+  }
+}
+
+function assertStableSnapshotMetadata(before, after, sourcePath) {
+  for (const key of ['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'mtimeNs', 'ctimeNs']) {
+    if (before[key] !== after[key]) {
+      throw new Error(`committed source snapshot changed: ${sourcePath}`);
+    }
+  }
+}
+
+async function copyCommittedSource(snapshot, sourcePath, destination, mode) {
+  const entry = snapshot.entries.find((candidate) => candidate.path === sourcePath);
+  if (entry === undefined) {
+    throw new Error(`release source is absent from committed source tree: ${sourcePath}`);
+  }
+  const blob = await snapshot.run('/usr/bin/git', gitArguments([
+    'cat-file',
+    'blob',
+    entry.object,
+  ]), {
+    cwd: snapshot.repoRoot,
+    env: snapshot.environment,
+    encoding: 'buffer',
+    maxBuffer: MAX_SOURCE_BLOB_BYTES,
+  });
+  const bytes = toBuffer(blob.stdout);
+  if (
+    bytes.length !== entry.size
+    || gitObjectId('blob', bytes, entry.object) !== entry.object
+  ) {
+    throw new Error(`committed source blob changed: ${sourcePath}`);
+  }
+  await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o755 });
+  await writeBytesFile(destination, bytes, mode);
+  return {
+    sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    size: bytes.length,
+  };
 }
 
 async function readVerifiedCommitTree(repoRoot, revision, run, environment) {
@@ -361,12 +531,15 @@ function compareGitTreeRecords(left, right) {
 }
 
 function gitObjectId(type, bytes, expectedObjectId) {
+  return gitObjectDigest(type, bytes.length, expectedObjectId).update(bytes).digest('hex');
+}
+
+function gitObjectDigest(type, size, expectedObjectId) {
   let algorithm;
   if (/^[a-f0-9]{40}$/.test(expectedObjectId)) algorithm = 'sha1';
   else if (/^[a-f0-9]{64}$/.test(expectedObjectId)) algorithm = 'sha256';
   else throw new Error('committed source object ID is malformed');
-  const header = Buffer.from(`${type} ${bytes.length}\0`, 'ascii');
-  return crypto.createHash(algorithm).update(header).update(bytes).digest('hex');
+  return crypto.createHash(algorithm).update(Buffer.from(`${type} ${size}\0`, 'ascii'));
 }
 
 export function accountSourceBlobBytes(
@@ -400,6 +573,7 @@ async function buildRustArtifacts(
   rustToolchainImage,
   run,
   assertCargoConfiguration,
+  verifySourceSnapshot,
 ) {
   const toolchainImage = path.join(scratch, 'rust-toolchain.squashfs');
   const measuredToolchain = await copyMeasuredFile(rustToolchainImage, toolchainImage, 0o400);
@@ -450,11 +624,13 @@ async function buildRustArtifacts(
       'x86_64-unknown-linux-gnu',
       '--bins',
     ]);
+    await verifySourceSnapshot();
     await run(cargoBin, hostBuild.args, {
       cwd: hostBuild.cwd,
       env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
       maxBuffer: 16 * 1024 * 1024,
     });
+    await verifySourceSnapshot();
     const staticBuild = cargoBuildInvocation(repoRoot, [
       '--locked',
       '--release',
@@ -476,6 +652,7 @@ async function buildRustArtifacts(
       ),
       maxBuffer: 16 * 1024 * 1024,
     });
+    await verifySourceSnapshot();
     return {
       hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
       staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
