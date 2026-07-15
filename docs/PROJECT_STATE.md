@@ -201,6 +201,25 @@
   sysusers/tmpfiles application, and post-reload verification. Real host apply
   remains explicit before runner activation and companion config enablement.
 
+- Initial host release bootstrap is content-manifested and first-install only.
+  An unprivileged builder exports the exact clean reviewed commit, rebuilds the
+  Rust binaries with content-pinned SquashFS toolchain and Cargo vendor inputs,
+  a fixed target, and an offline isolated Cargo home. It pins both normalised
+  extracted trees, Cargo source-replacement configuration, scratch-root
+  identity, and all six final
+  executable digests; revalidates those boundaries plus the complete source
+  snapshot and its post-materialisation inode/ctime baseline around each Cargo
+  command; and
+  packages source payloads from freshly rehashed committed
+  blobs alongside a digest-pinned runtime allowlist. A
+  separately delivered root-owned environment-clearing trust anchor verifies
+  the JavaScript modules before import and requires
+  an out-of-band approved commit and manifest digest before publishing the
+  complete `/opt/webex-generic-account-bot` tree without clobbering an existing
+  target.
+  Matching complete candidates and interrupted bundle or install publishes are
+  revalidated, re-synced, and recoverable. It installs no secrets, policy
+  files, runtime image, or service state.
 - The CLI separates unprivileged `--check-config-structure` validation from
   full deployment-host `--check-config` preflight. Structural mode validates
   the complete `BotConfig` contract without reading activation or launcher
@@ -217,10 +236,11 @@
   installed production image and host kernel, satisfy the real-reboot
   challenge, and activate a matching ephemeral-only config. Code and unit-test
   evidence are not substitutes for that deployment-host gate.
-- Production config does not enable `ephemeral-linux-user`, `/config pull`,
-  `/config reload`, or `/config sync` before PR 4c2 activation.
-- The config repository must update both CI validation lanes to use
-  `--check-config-structure` before its all-ephemeral target profile can merge.
+- The config repository now pins the all-ephemeral `status`/`pull` profile and
+  uses structural bot validation in both CI lanes. The deployment host must
+  stage and apply the reviewed root-owned release bundle before guarded
+  provisioning and activation can run; `/config reload` and `/config sync`
+  remain disabled.
 
 ## Notes
 - Ordinary implementation state belongs in the active workstream journal.

@@ -3,8 +3,8 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-07-01
-branch: codex/roadmap-deploy-isolation
+updated: 2026-07-14
+branch: codex/host-release-bootstrap
 pr:
 supersedes: []
 superseded_by:
@@ -17,6 +17,60 @@ superseded_by:
 
 ## Current Progress
 - Trusted deployment entrypoint merged in bot PR #8.
+- First-install host release bootstrap packages the fixed runtime allowlist with
+  content metadata, fixed third-party digests, and Rust binaries rebuilt from an
+  exact commit export using a content-pinned SquashFS toolchain and isolated
+  Cargo home. Git replacement objects and system/global configuration are
+  disabled for every source-provenance query and export. Caller-provided Codex
+  and toolchain inputs must live below an
+  unpredictable current-user mode `0700` root; non-blocking retained-FD reads
+  reject links, FIFOs, special files, mutable metadata, and unbounded content.
+  Root-installed non-executable policy sources use the downstream-required
+  mode `0644`. A separately staged,
+  environment-clearing root-owned trust anchor requires out-of-band release
+  evidence and publishes `/opt/webex-generic-account-bot` with an atomic
+  no-clobber operation. Complete interrupted builder outputs and installer
+  candidates are revalidated and re-synced before recovery. Host policy,
+  secrets, runtime image, and service state remain separate gates.
+  The host release entrypoints require and explicitly verify Node.js 24 or newer;
+  deployment must install that root-owned runtime at `/usr/bin/node` before the
+  trust anchor.
+  Committed source materialisation now uses bounded `ls-tree`/`cat-file` reads
+  with local Git behaviour disabled instead of attribute-sensitive archives.
+  Cargo rejects fixed-root configuration, manifest ordering is locale
+  independent, nanosecond Cargo-directory identity detects transient config,
+  and recovered bundles are fully re-synced before acceptance.
+  Both production entrypoints start through a pinned root-owned static BusyBox
+  before clearing the environment and execing `/usr/bin/node`, so native loader
+  variables cannot run before the trust checks. Object-only source
+  materialisation no longer executes a worktree cleanliness command, and Cargo
+  binds trusted root-directory identities across compilation.
+  The builder uses that same verified BusyBox as its bundle payload source, and
+  both production entrypoints preflight GNU `mv --no-copy` before expensive
+  build or install work.
+  Caller-selected output paths cannot contain delimiters that would split
+  `PATH`, remap rules, or `CARGO_ENCODED_RUSTFLAGS`.
+  Git promisor lazy fetching is disabled so a missing committed object fails
+  without running a repository-configured remote helper.
+  The builder is now a root-owned read-only trust-anchor member that accepts an
+  explicit repository path while refusing root execution. Committed source is
+  size-preflighted and capped at 1 GiB in aggregate before materialisation.
+  Commit, reconstructed root-tree, and blob object IDs are independently
+  rehashed so forged or concurrently replaced Git object storage fails closed.
+  Complete source topology, every materialised blob, and every file/directory
+  inode plus nanosecond ctime are revalidated against their
+  post-materialisation baseline after each Cargo build and before bundle
+  assembly; bundled code is then reread from verified Git blobs instead of the
+  writable compilation snapshot.
+  The copied Rust image is selectively extracted to `bin` and `lib`, normalised
+  read-only, and checked against a fixed canonical tree digest. Every Cargo
+  boundary rechecks that tree, the copied image, empty read-only Cargo
+  configuration sentinels, the pre-created scratch-root identity, and the exact
+  source snapshot. Fixed out-of-band digests for all six Rust outputs close the
+  remaining post-Cargo target-directory substitution path, and both toolchain
+  image and tree digests are recorded in the installer-validated manifest.
+  The reviewed Cargo manifest is an explicit workspace root, preventing a
+  caller-owned output ancestor from injecting workspace patches or a lockfile.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
@@ -280,19 +334,34 @@ superseded_by:
   intentionally live activation and launcher checks in `--check-config`.
   The bot therefore adds a separate `--check-config-structure` mode that still
   loads and validates the complete `BotConfig` contract but never treats CI as
-  deployment-host evidence. The config repository must adopt this mode in both
-  CI lanes before switching to the all-ephemeral profile; trusted deployment
-  continues to require full `--check-config`.
+  deployment-host evidence. The config repository now uses this mode in both
+  CI lanes and pins the all-ephemeral `status`/`pull` profile; trusted host
+  deployment still requires full `--check-config`, activation, and Webex E2E.
 
 ## Delivery Rules
 - Each implementation PR uses its own worktree and branch.
 - After each PR merges, refresh the target branch locally before creating the next worktree.
 - Each PR must pass the complete local test/build gate, one local Codex review,
-  one Claude review, CI, and the remote PR Codex review/required gate.
+  one Claude review, and CI. GitHub `@codex review` is waived for all
+  `WebexServices-staging/*` repositories by explicit owner approval.
 - Before merge, all actionable PR conversations must be fixed or explicitly resolved.
 - Do not use admin bypass or forced checks unless Joey explicitly authorises that exact exception.
 
 ## Planned PRs
+
+### PR 4d3: Root-Owned Host Release Bootstrap
+- Repository: `Joey-Project/Webex-generic-account-bot`.
+- Build a non-secret bundle without root from an exact reviewed commit export,
+  rebuilding all six Rust binaries with a fixed target/toolchain and isolated
+  Cargo home, then check fixed BusyBox and Codex `0.142.3` artifact digests.
+- Keep the pinned static BusyBox, environment-clearing wrappers, JavaScript
+  implementations, and contract outside the data-only bundle in a separate
+  root-owned trust anchor. Require approved
+  commit and manifest digests, exact topology and metadata, and atomic
+  no-clobber publication under `/opt`.
+- Recover a fully matching install after a publish/fsync interruption; refuse
+  mismatching installs, stale candidates, path overrides, secrets, systemd
+  policy, runtime-image creation, and service mutation in this slice.
 
 ### PR 4d1: Base Bot Host Contract
 - Repository: `Joey-Project/Webex-generic-account-bot`.

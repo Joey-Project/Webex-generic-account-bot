@@ -1,0 +1,91 @@
+#!/usr/local/libexec/webex-host-release/busybox sh
+# shellcheck shell=dash
+set -eu
+
+# shellcheck disable=SC2016
+exec /usr/local/libexec/webex-host-release/busybox env -i \
+  HOME=/root \
+  LANG=C \
+  LC_ALL=C \
+  PATH=/usr/bin:/bin \
+  /usr/local/libexec/webex-host-release/busybox sh -eu -c '
+busybox=/usr/local/libexec/webex-host-release/busybox
+trust_root=/usr/local/libexec/webex-host-release
+
+fail() {
+  printf "%s\n" "install-host-release: pre-import trust check failed: $1" >&2
+  exit 1
+}
+
+check_directory() {
+  target=$1
+  [ ! -L "$target" ] || fail "$target is a symlink"
+  metadata=$("$busybox" stat -c "%u:%g:%a:%F" "$target") || fail "$target is missing"
+  case "$metadata" in
+    0:0:[0-7][0-7][0-7]:directory) ;;
+    *) fail "$target metadata is invalid" ;;
+  esac
+  mode=${metadata#0:0:}
+  mode=${mode%%:*}
+  case "$mode" in
+    [0-7][2367][0-7]|[0-7][0-7][2367]) fail "$target is group/world writable" ;;
+  esac
+}
+
+check_file() {
+  target=$1
+  mode=$2
+  [ ! -L "$target" ] || fail "$target is a symlink"
+  metadata=$("$busybox" stat -c "%u:%g:%a:%h:%F" "$target") || fail "$target is missing"
+  [ "$metadata" = "0:0:$mode:1:regular file" ] || fail "$target metadata is invalid"
+}
+
+check_sha256() {
+  target=$1
+  expected=$2
+  measured=$("$busybox" sha256sum "$target") || fail "$target cannot be hashed"
+  measured=${measured%% *}
+  [ "$measured" = "$expected" ] || fail "$target digest is invalid"
+}
+
+[ "$("$busybox" id -u)" -eq 0 ] || fail "effective UID must be root"
+
+for directory in / /usr /usr/bin /usr/local /usr/local/libexec "$trust_root"; do
+  check_directory "$directory"
+done
+[ "$("$busybox" stat -c "%a" "$trust_root")" = 755 ] || fail "$trust_root mode is invalid"
+
+running_inode=$("$busybox" stat -Lc "%d:%i" "/proc/$$/exe") || fail "running BusyBox is unavailable"
+trusted_inode=$("$busybox" stat -Lc "%d:%i" "$busybox") || fail "trusted BusyBox is unavailable"
+[ "$running_inode" = "$trusted_inode" ] || fail "running shell is not the trusted BusyBox"
+check_file "$busybox" 555
+[ "$("$busybox" stat -c "%s" "$busybox")" = 2124608 ] || fail "$busybox size is invalid"
+check_sha256 "$busybox" dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14
+
+check_file /usr/bin/node 555
+check_file "$trust_root/build-host-release" 555
+check_file "$trust_root/install-host-release" 555
+check_file "$trust_root/build-host-release.mjs" 444
+check_file "$trust_root/install-host-release.mjs" 444
+check_file "$trust_root/host-release-contract.mjs" 444
+check_sha256 "$trust_root/build-host-release.mjs" 566b7c82fe07a357429eb6eca68a6af6ecfd1dc55cc6a1abae1c684400652eb4
+check_sha256 "$trust_root/install-host-release.mjs" 648819c50b8157fd8fd0feb0cd07262d67897b546fad39b2f052fa4fd47992ee
+check_sha256 "$trust_root/host-release-contract.mjs" e5b2fa76c943ed9974fddbca813cc25c5ff4fbdc36eea12f94608540242f7465
+
+node_version=$(/usr/bin/node --version) || fail "/usr/bin/node cannot report its version"
+major=${node_version#v}
+major=${major%%.*}
+case "$major" in
+  ""|*[!0-9]*) fail "/usr/bin/node version is invalid" ;;
+esac
+[ "$major" -ge 24 ] || fail "host release requires Node.js 24 or newer"
+
+exec "$busybox" env -i \
+  HOME=/root \
+  LANG=C \
+  LC_ALL=C \
+  PATH=/usr/bin:/bin \
+  /usr/bin/node \
+  "$trust_root/install-host-release.mjs" \
+  "$@"
+' install-host-release "$@"

@@ -228,6 +228,233 @@ environment before starting the fixed system Node and script, so `NODE_OPTIONS`,
 a caller-controlled `PATH`, and the caller's working directory cannot select
 root-loaded code.
 
+The initial root-owned host release is a separate first-install boundary. A
+reviewed release-delivery step first installs Node.js 24 or newer at
+`/usr/bin/node` as a root-owned, single-link mode `0555` regular file and a
+verified copy of the pinned, statically linked BusyBox at
+`/usr/local/libexec/webex-host-release/busybox`. It then installs
+`build-host-release` and `install-host-release` as root-owned mode `0555`, plus
+their JavaScript implementations and `host-release-contract.mjs` as root-owned
+mode `0444` under `/usr/local/libexec/webex-host-release`. The
+builder refuses real or effective UID 0; an ordinary release user invokes this
+root-owned trust anchor to build from a separate repository checkout. It uses the fixed Rust
+`1.96.0` toolchain to rebuild the host
+and static runtime binaries from the clean reviewed commit, then creates a
+content-manifested bundle with the reviewed Codex `0.142.3` Linux x64 package:
+
+```bash
+repo_root=/path/to/reviewed/webex-generic-account-bot
+input_root="$(/usr/bin/mktemp -d /tmp/webex-host-release-inputs.XXXXXXXXXX)"
+codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
+# Materialise the separately reviewed Codex package at "$codex_package_root".
+cargo_bin=/home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo
+"$cargo_bin" vendor \
+  --locked \
+  --versioned-dirs \
+  --manifest-path "$repo_root/Cargo.toml" \
+  "$input_root/cargo-vendor"
+
+/usr/bin/mksquashfs \
+  /home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu \
+  "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs" \
+  -noappend -no-xattrs -no-progress -all-root \
+  -mkfs-time 0 -all-time 0 -comp xz
+/usr/bin/mksquashfs \
+  "$input_root/cargo-vendor" \
+  "$input_root/cargo-vendor.squashfs" \
+  -noappend -no-xattrs -no-progress -all-root \
+  -mkfs-time 0 -all-time 0 -comp xz
+/usr/bin/chmod -R go-w "$input_root"
+
+release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
+/usr/local/libexec/webex-host-release/build-host-release \
+  --repo "$repo_root" \
+  --output "$release_parent/bundle" \
+  --input-root "$input_root" \
+  --codex-package-root "$codex_package_root" \
+  --rust-toolchain-image \
+    "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs" \
+  --cargo-vendor-image "$input_root/cargo-vendor.squashfs"
+```
+
+The root-owned wrapper starts through the pinned static BusyBox and uses its
+static `env -i` applet before starting `/usr/bin/node`. This prevents native
+loader variables such as `LD_PRELOAD`, as well as caller `PATH`, `NODE_OPTIONS`,
+loaders, and preloads, from running before the builder's checks. Before Node
+loads either JavaScript entrypoint or its statically imported contract, the
+wrapper verifies the complete root-owned ancestor chain, fixed file metadata,
+the pinned BusyBox size and digest, and fixed SHA-256 digests for both
+JavaScript implementations and the contract.
+The builder materialises the exact `HEAD` commit into an isolated source
+snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
+Cargo home and home directory. Tracked worktree edits, untracked files, ignored
+local caches, and files never enter that object-only snapshot; the printed full
+commit SHA is the source identity presented for approval. The builder
+rejects output paths containing `:`, `=`, DEL, or control characters before
+they can be serialised into `PATH` or `CARGO_ENCODED_RUSTFLAGS`. It
+independently recomputes the commit object ID, reconstructs the complete root
+tree object ID from the listed paths, and recomputes every blob object ID before
+writing it, so a forged or concurrently replaced object-store entry fails
+closed. It
+does not use `git archive`, so unreviewed local/global/info attributes cannot
+omit or substitute committed files. Every Git subprocess disables
+system/global configuration, local fsmonitor execution, hooks, external
+attribute files, replacement objects, and promisor lazy fetching. Missing Git
+objects therefore fail closed instead of invoking a repository-configured
+remote helper, and repository-local behaviour or `refs/replace` cannot change
+the objects exported under the approved commit SHA. Source materialisation is
+preflighted per blob and capped at 1 GiB in aggregate before any committed file
+is written. The builder revalidates the snapshot's complete file and directory
+topology, ownership, modes, sizes, blob object IDs, and every file and
+directory's inode plus nanosecond ctime against the post-materialisation
+baseline after each Cargo build and again before assembling the bundle. Bundle `code/*`
+payloads are read afresh from their committed blobs and rehashed rather than
+copied from the writable compilation snapshot. The Rust toolchain must be an
+independently reviewed SquashFS
+image of exactly `259895296` bytes with SHA-256
+`9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
+The generation source is not itself a trust decision; review and approve the
+resulting immutable image before using the pinned size and digest.
+The builder copies and verifies that image before extracting only its `bin` and
+`lib` trees into private scratch space. It normalises the extracted directories
+to mode `0500`, executable files to `0500`, and data files to `0400`, then
+requires the canonical tree digest
+`e491986fc3f7e95f182946b2c52146d6a5be992101eb559b2307ce3870427a3f`.
+The image, extracted topology, and every extracted inode/ctime identity are
+bound before and after every compiler invocation; the builder never executes
+the caller's mutable Rustup shims or toolchain.
+Cargo dependencies come from a separate reviewed SquashFS image of exactly
+`30576640` bytes with SHA-256
+`2c48918c40f3b9ff015c53f8be81a7894636d8ba94e99656a02a34de173a5ec9`.
+The builder normalises every extracted directory to mode `0500` and every file
+to mode `0400`, rejects links and special files, and requires canonical tree
+SHA-256
+`5b0214751dcea9f0546f3948750ab799ffe403f34d97c36f717c19783f7e8cba`.
+Its private Cargo home contains only a bound read-only `config.toml` that
+replaces crates.io with that extracted tree and sets offline mode. Every Cargo
+build also receives `--locked --offline` and `CARGO_NET_OFFLINE=true`; dependency
+resolution therefore fails closed instead of contacting a registry. These
+Cargo controls do not sandbox arbitrary network clients in dependency build
+scripts. A release environment that requires process-wide network denial must
+also provide a network namespace or equivalent host policy.
+Rust compiler paths are remapped to `/build`, and reproducibility inputs are
+fixed so a same-host retry can compare a newly built manifest with a completed
+output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
+sysroot remain an explicit build-host trust base; the builder selects their
+absolute paths and never substitutes caller-controlled native tools. Cargo runs
+from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
+files beside or above the caller-selected output directory are not loaded. The
+reviewed `Cargo.toml` declares itself as a resolver-3 workspace root, so Cargo
+cannot adopt a caller-provided ancestor workspace manifest, lockfile, or patch. The
+builder requires `/` and any existing `/.cargo` to be root-owned and
+non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
+and binds both inode and nanosecond ctime identities across the Cargo work. This
+closes the remaining fixed-working-directory configuration path and its
+create/remove race. The private `CARGO_HOME` contains only a read-only
+`config.toml` source-replacement file whose tree identity is checked around
+every Cargo command. All top-level scratch directories are created before a
+scratch-root
+identity baseline is taken, so replacing a toolchain, Cargo home, or target
+directory is also detected.
+The output parent must already be a current-UID/GID mode `0700` directory; the
+documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
+ancestors must be non-writable root/current-user directories or root-owned
+sticky directories. The builder revalidates that chain and its private `0700`
+staging tree immediately before no-clobber publication.
+The Codex package, toolchain image, and Cargo vendor image must likewise be
+materialised directly below a separate unpredictable current-UID/GID mode
+`0700` input root. Every
+selected input must be a regular file reached only through current-user-owned,
+non-group/world-writable directories below that root. Retained input file
+descriptors use non-blocking, no-follow opens before type, size, digest, and
+metadata-stability checks, so a FIFO or special file cannot stall the builder.
+It records the full Git SHA, fixed target and Rust/Codex versions, toolchain and
+Cargo vendor image and extracted-tree digests, exact allowlisted paths, modes,
+sizes, and SHA-256 digests. Manifest
+paths use locale-independent code-point ordering, so caller locale and ICU
+defaults cannot change the trust-anchor digest. Fixed
+trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
+deployment-host BusyBox, plus all six rebuilt Rust executables. The final
+executable pins make compiler configuration or target-directory tampering fail
+closed even if it occurs between a Cargo return and bundle assembly. The
+builder normalises and syncs every bundle
+directory, publishes without clobbering, and prints the complete manifest
+digest for independent release approval. Retrying after a parent-directory
+sync interruption accepts only the exact completed output, re-syncs every
+payload file, manifest, and bundle directory, then syncs the parent again. A
+staging directory left by `SIGKILL`, power loss, or reboot blocks a
+later build for explicit inspection and cleanup, preventing repeated retries
+from silently accumulating full build trees. It includes no tokens, environment
+files, deploy keys, rendered config, runtime image, systemd installation, or
+service state.
+
+The pinned static BusyBox, fixed Node runtime, two wrappers, JavaScript
+implementations, and contract are a separate trust anchor and are never loaded
+from the bundle. A reviewed
+release-delivery step must independently verify these files before their first
+invocation and install them atomically into the root-owned, non-writable trust
+path. The wrapper's BusyBox self-check can detect later drift but cannot
+authenticate the interpreter that is already executing; malicious initial
+delivery or an already-compromised root account remains outside this in-band
+check. The delivery step must authenticate the Node executable through an
+approved package/repository signature or a fixed digest carried over an
+independent trusted channel. The wrapper's Node version output is only a
+compatibility check, not provenance. The delivery step must install that
+authenticated Node.js 24 or newer runtime at `/usr/bin/node` as a root-owned,
+single-link mode `0555` regular file and verify the BusyBox copy against SHA-256
+`dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14`;
+the builder and installer reject older runtimes explicitly before using modern
+JavaScript APIs or loading the dynamic release contract. It then
+must install both wrappers and BusyBox as root-owned, single-link mode `0555`
+regular files and both JavaScript implementations plus the contract as
+root-owned mode `0444` under
+`/usr/local/libexec/webex-host-release`, then
+stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
+mode `0700` tree. Carry the approved commit and manifest digest over an
+independent trusted channel and require both on dry-run and apply:
+
+```bash
+sudo -- /usr/local/libexec/webex-host-release/install-host-release \
+  --dry-run \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+sudo -- /usr/local/libexec/webex-host-release/install-host-release \
+  --apply \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+```
+
+Root automation and sudo policy must invoke only this environment-clearing
+wrapper without preserved or injected environment variables; invoking
+`install-host-release.mjs` through Node directly is not a supported entrypoint.
+
+The installer rejects path overrides, additional or missing entries, symlinks,
+special files, hard links, mutable ownership/modes, digest drift, stale install
+candidates, unapproved release evidence, and mismatching existing installs. It
+builds a same-parent candidate and uses an atomic no-clobber publish for the
+complete `code`, `bin`, and `runtime-sources` tree plus verified `release.json`
+evidence. It creates an empty trusted `runtime` directory but does not run the
+provisioner or runtime-image builder. A retry verifies and publishes one
+complete matching candidate or recovers a matching install after a
+publish/fsync interruption; incomplete or multiple candidates and mismatching
+installs require explicit administrator inspection.
+
+Only after this bootstrap succeeds should the guarded provisioner create host
+identities and policy paths. Then the root-owned runtime builder can write the
+source manifest and immutable SquashFS image:
+
+```bash
+sudo -- /opt/webex-generic-account-bot/code/scripts/provision-host --apply
+sudo -- /usr/bin/node \
+  /opt/webex-generic-account-bot/code/scripts/build-codex-runtime-image.mjs \
+  --write-source-manifest
+sudo -- /usr/bin/node \
+  /opt/webex-generic-account-bot/code/scripts/build-codex-runtime-image.mjs
+```
+
+Secrets, deploy credentials, service enablement, runner activation, and Webex
+E2E remain separate deployment gates.
+
 The production CLI has no source, target, or root override. It reads a fixed
 allowlist of four sysusers files, six tmpfiles files, and five systemd units
 from the root-owned repository deployment tree, then installs them as
@@ -1141,8 +1368,10 @@ unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
 does not add the bot to it or provide the privileged sealing broker.
 
-The minimum host contract is systemd 255, Linux 5.9 or newer, cgroup v2,
-SquashFS/loop support, mount and PID namespaces, `close_range(2)`, and a host
+The minimum host contract is Node.js 24 or newer at `/usr/bin/node`, GNU
+Coreutils `mv` with `--no-copy` support at `/usr/bin/mv`, systemd 255, Linux
+5.9 or newer, cgroup v2, SquashFS/loop support, mount and PID namespaces,
+`close_range(2)`, and a host
 policy that permits the bundled `bwrap` to create its inner sandbox. These are
 not inferred from version strings alone. PR 4c2 must run the real image and
 permission canaries on the deployment host and mint the boot-scoped activation

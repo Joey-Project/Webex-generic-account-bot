@@ -23,3 +23,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webex-headless-messenger = "0.1.0"
+
+[workspace]
+resolver = "3"
