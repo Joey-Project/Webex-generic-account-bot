@@ -70,7 +70,7 @@ check_file "$trust_root/install-host-release.mjs" 444
 check_file "$trust_root/host-release-contract.mjs" 444
 check_sha256 "$trust_root/build-host-release.mjs" 566b7c82fe07a357429eb6eca68a6af6ecfd1dc55cc6a1abae1c684400652eb4
 check_sha256 "$trust_root/install-host-release.mjs" 648819c50b8157fd8fd0feb0cd07262d67897b546fad39b2f052fa4fd47992ee
-check_sha256 "$trust_root/host-release-contract.mjs" 4c1a76d6db6dea2b252a6c2839a115eda8569b677a7b06b0a4c102eea119d1a7
+check_sha256 "$trust_root/host-release-contract.mjs" ef5817f741e1aaab5725fcab25461f310c81916f89249a562b8e9422c003ecc4
 
 node_version=$(/usr/bin/node --version) || fail "/usr/bin/node cannot report its version"
 major=${node_version#v}
