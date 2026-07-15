@@ -262,6 +262,7 @@ export function parseManifest(value, contract) {
     RELEASE_VERSION,
     RUSTC_VERSION,
     RUST_TOOLCHAIN_IMAGE_SHA256,
+    RUST_TOOLCHAIN_TREE_SHA256,
   } = assertReleaseContract(contract);
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('host release manifest must be an object');
@@ -285,10 +286,16 @@ export function parseManifest(value, contract) {
     || typeof value.build !== 'object'
     || Array.isArray(value.build)
     || JSON.stringify(Object.keys(value.build).toSorted())
-      !== JSON.stringify(['cargo_version', 'rustc_version', 'toolchain_sha256'])
+      !== JSON.stringify([
+        'cargo_version',
+        'rustc_version',
+        'toolchain_sha256',
+        'toolchain_tree_sha256',
+      ])
     || value.build.cargo_version !== CARGO_VERSION
     || value.build.rustc_version !== RUSTC_VERSION
     || value.build.toolchain_sha256 !== RUST_TOOLCHAIN_IMAGE_SHA256
+    || value.build.toolchain_tree_sha256 !== RUST_TOOLCHAIN_TREE_SHA256
   ) {
     throw new Error('host release Rust toolchain provenance is invalid');
   }
@@ -725,6 +732,7 @@ function assertReleaseContract(contract) {
     || typeof contract.CARGO_VERSION !== 'string'
     || typeof contract.RUSTC_VERSION !== 'string'
     || typeof contract.RUST_TOOLCHAIN_IMAGE_SHA256 !== 'string'
+    || typeof contract.RUST_TOOLCHAIN_TREE_SHA256 !== 'string'
     || !Array.isArray(contract.RELEASE_FILES)
     || !Array.isArray(contract.RELEASE_PATHS)
     || typeof contract.bundlePayloadPath !== 'function'

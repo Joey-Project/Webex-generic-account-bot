@@ -298,8 +298,14 @@ image of exactly `259895296` bytes with SHA-256
 `9a8b441be0ecfa337f86d9eeaaf36eb6008338f6c600d045e5d7769b80765535`.
 The generation source is not itself a trust decision; review and approve the
 resulting immutable image before using the pinned size and digest.
-The builder copies and verifies that image before extracting it into private
-scratch space; it never executes the caller's mutable Rustup shims or toolchain.
+The builder copies and verifies that image before extracting only its `bin` and
+`lib` trees into private scratch space. It normalises the extracted directories
+to mode `0500`, executable files to `0500`, and data files to `0400`, then
+requires the canonical tree digest
+`e491986fc3f7e95f182946b2c52146d6a5be992101eb559b2307ce3870427a3f`.
+The image, extracted topology, and every extracted inode/ctime identity are
+bound before and after every compiler invocation; the builder never executes
+the caller's mutable Rustup shims or toolchain.
 Rust compiler paths are remapped to `/build`, and reproducibility inputs are
 fixed so a same-host retry can compare a newly built manifest with a completed
 output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
@@ -313,7 +319,11 @@ builder requires `/` and any existing `/.cargo` to be root-owned and
 non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
 and binds both inode and nanosecond ctime identities across the Cargo work. This
 closes the remaining fixed-working-directory configuration path and its
-create/remove race.
+create/remove race. The private `CARGO_HOME` contains read-only empty `config`
+and `config.toml` sentinels whose identities are checked around every Cargo
+command. All top-level scratch directories are created before a scratch-root
+identity baseline is taken, so replacing a toolchain, Cargo home, or target
+directory is also detected.
 The output parent must already be a current-UID/GID mode `0700` directory; the
 documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned
@@ -326,11 +336,15 @@ non-group/world-writable directories below that root. Retained input file
 descriptors use non-blocking, no-follow opens before type, size, digest, and
 metadata-stability checks, so a FIFO or special file cannot stall the builder.
 It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
-digest, exact allowlisted paths, modes, sizes, and SHA-256 digests. Manifest
+image and extracted-tree digests, exact allowlisted paths, modes, sizes, and
+SHA-256 digests. Manifest
 paths use locale-independent code-point ordering, so caller locale and ICU
 defaults cannot change the trust-anchor digest. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
-deployment-host BusyBox. The builder normalises and syncs every bundle
+deployment-host BusyBox, plus all six rebuilt Rust executables. The final
+executable pins make compiler configuration or target-directory tampering fail
+closed even if it occurs between a Cargo return and bundle assembly. The
+builder normalises and syncs every bundle
 directory, publishes without clobbering, and prints the complete manifest
 digest for independent release approval. Retrying after a parent-directory
 sync interruption accepts only the exact completed output, re-syncs every

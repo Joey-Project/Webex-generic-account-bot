@@ -15,6 +15,7 @@ import {
   RUSTC_VERSION,
   RUST_TOOLCHAIN_IMAGE_SHA256,
   RUST_TOOLCHAIN_IMAGE_SIZE,
+  RUST_TOOLCHAIN_TREE_SHA256,
   TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
   compareReleasePaths,
@@ -157,7 +158,7 @@ export async function buildHostRelease(options, injected = {}) {
         entry.installPath
       ];
       if (
-        (entry.kind === 'busybox' || entry.kind === 'codex-runtime')
+        entry.kind !== 'code'
         && trustedDigest === undefined
       ) {
         throw new Error(`trusted release source digest is missing: ${entry.installPath}`);
@@ -181,6 +182,7 @@ export async function buildHostRelease(options, injected = {}) {
         cargo_version: artifacts.cargoVersion,
         rustc_version: artifacts.rustcVersion,
         toolchain_sha256: artifacts.toolchainSha256,
+        toolchain_tree_sha256: artifacts.toolchainTreeSha256,
       },
       files,
     };
@@ -216,6 +218,7 @@ export async function buildHostRelease(options, injected = {}) {
     await fs.rm(temporary, { recursive: true, force: true });
     throw error;
   } finally {
+    await makeDirectoriesOwnerWritable(scratch);
     await fs.rm(scratch, { recursive: true, force: true });
   }
 }
@@ -480,10 +483,15 @@ function sourceMetadataIdentity(metadata) {
   return Object.freeze(identity);
 }
 
-function assertSourceIdentity(expected, actual, sourcePath) {
+function assertSourceIdentity(
+  expected,
+  actual,
+  sourcePath,
+  message = 'committed source snapshot changed',
+) {
   for (const key of Object.keys(expected)) {
     if (expected[key] !== actual[key]) {
-      throw new Error(`committed source snapshot changed: ${sourcePath}`);
+      throw new Error(`${message}: ${sourcePath}`);
     }
   }
 }
@@ -644,6 +652,283 @@ export function assertUnprivilegedBuilder(
   }
 }
 
+export async function snapshotToolchainTree(root, expectedSha256) {
+  await normaliseToolchainTree(root);
+  const directories = [];
+  const files = [];
+  let totalBytes = 0;
+  async function visit(directory, relative) {
+    const metadata = await fs.lstat(directory, { bigint: true });
+    assertToolchainMetadata(metadata, relative || '.', true);
+    directories.push(Object.freeze({
+      identity: sourceMetadataIdentity(metadata),
+      path: relative,
+    }));
+    const names = await fs.readdir(directory, { encoding: 'buffer' });
+    names.sort(Buffer.compare);
+    for (const nameBytes of names) {
+      const name = trustedTreeName(nameBytes);
+      const childRelative = relative === '' ? name : `${relative}/${name}`;
+      const child = path.join(directory, name);
+      const childMetadata = await fs.lstat(child, { bigint: true });
+      if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
+        await visit(child, childRelative);
+        continue;
+      }
+      assertToolchainMetadata(childMetadata, childRelative, false);
+      const size = Number(childMetadata.size);
+      if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) {
+        throw new Error(`trusted Rust toolchain file is outside the size limit: ${childRelative}`);
+      }
+      totalBytes = accountToolchainBytes(totalBytes, size);
+      const measured = await measureRegularFile(child, size, childRelative);
+      files.push(Object.freeze({
+        identity: measured.identity,
+        mode: modeString(Number(childMetadata.mode & 0o7777n)),
+        path: childRelative,
+        sha256: measured.sha256,
+        size,
+      }));
+      if (files.length > 1_000) throw new Error('trusted Rust toolchain has too many files');
+    }
+  }
+  await visit(root, '');
+  const records = [
+    ...directories.map((entry) => ({ mode: '0500', path: entry.path, type: 'directory' })),
+    ...files.map((entry) => ({
+      mode: entry.mode,
+      path: entry.path,
+      sha256: entry.sha256,
+      size: entry.size,
+      type: 'file',
+    })),
+  ].sort((left, right) => compareReleasePaths(left.path, right.path));
+  const sha256 = crypto
+    .createHash('sha256')
+    .update(`${JSON.stringify(records)}\n`, 'utf8')
+    .digest('hex');
+  if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
+    throw new Error('extracted Rust toolchain does not match the trusted tree digest');
+  }
+  const snapshot = Object.freeze({
+    directories: Object.freeze(directories),
+    files: Object.freeze(files),
+    root,
+    sha256,
+  });
+  await verifyToolchainTree(snapshot);
+  return snapshot;
+}
+
+export async function verifyToolchainTree(snapshot) {
+  const topology = await readToolchainTopology(snapshot.root);
+  const expectedDirectories = snapshot.directories.map((entry) => entry.path);
+  const expectedFiles = snapshot.files.map((entry) => entry.path);
+  if (
+    JSON.stringify(topology.directories) !== JSON.stringify(expectedDirectories)
+    || JSON.stringify(topology.files) !== JSON.stringify(expectedFiles)
+  ) {
+    throw new Error('trusted Rust toolchain changed: unexpected topology');
+  }
+  for (const directory of snapshot.directories) {
+    const target = directory.path === ''
+      ? snapshot.root
+      : path.join(snapshot.root, ...directory.path.split('/'));
+    const metadata = await fs.lstat(target, { bigint: true });
+    assertToolchainMetadata(metadata, directory.path || '.', true);
+    assertSourceIdentity(
+      directory.identity,
+      sourceMetadataIdentity(metadata),
+      directory.path || '.',
+      'trusted Rust toolchain changed',
+    );
+  }
+  for (const file of snapshot.files) {
+    const target = path.join(snapshot.root, ...file.path.split('/'));
+    const metadata = await fs.lstat(target, { bigint: true });
+    assertToolchainMetadata(metadata, file.path, false);
+    assertSourceIdentity(
+      file.identity,
+      sourceMetadataIdentity(metadata),
+      file.path,
+      'trusted Rust toolchain changed',
+    );
+  }
+}
+
+async function normaliseToolchainTree(root) {
+  async function visit(directory) {
+    const metadata = await fs.lstat(directory, { bigint: true });
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== BigInt(process.getuid())
+      || metadata.gid !== BigInt(process.getgid())
+    ) {
+      throw new Error(`extracted Rust toolchain contains an untrusted directory: ${directory}`);
+    }
+    await fs.chmod(directory, 0o500);
+    const names = await fs.readdir(directory, { encoding: 'buffer' });
+    names.sort(Buffer.compare);
+    for (const nameBytes of names) {
+      const name = trustedTreeName(nameBytes);
+      const child = path.join(directory, name);
+      const childMetadata = await fs.lstat(child, { bigint: true });
+      if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
+        await visit(child);
+      } else {
+        if (
+          !childMetadata.isFile()
+          || childMetadata.isSymbolicLink()
+          || childMetadata.uid !== BigInt(process.getuid())
+          || childMetadata.gid !== BigInt(process.getgid())
+          || childMetadata.nlink !== 1n
+        ) {
+          throw new Error(`extracted Rust toolchain contains an untrusted file: ${child}`);
+        }
+        const mode = (childMetadata.mode & 0o111n) === 0n ? 0o400 : 0o500;
+        await fs.chmod(child, mode);
+      }
+    }
+  }
+  await visit(root);
+}
+
+async function readToolchainTopology(root) {
+  const directories = [];
+  const files = [];
+  async function visit(directory, relative) {
+    const metadata = await fs.lstat(directory, { bigint: true });
+    assertToolchainMetadata(metadata, relative || '.', true);
+    directories.push(relative);
+    const names = await fs.readdir(directory, { encoding: 'buffer' });
+    names.sort(Buffer.compare);
+    for (const nameBytes of names) {
+      const name = trustedTreeName(nameBytes);
+      const childRelative = relative === '' ? name : `${relative}/${name}`;
+      const child = path.join(directory, name);
+      const childMetadata = await fs.lstat(child, { bigint: true });
+      if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
+        await visit(child, childRelative);
+      } else {
+        assertToolchainMetadata(childMetadata, childRelative, false);
+        files.push(childRelative);
+      }
+    }
+  }
+  await visit(root, '');
+  return { directories, files };
+}
+
+function assertToolchainMetadata(metadata, relative, directory) {
+  const permittedModes = directory ? [0o500n] : [0o400n, 0o500n];
+  if (
+    (directory ? !metadata.isDirectory() : !metadata.isFile())
+    || metadata.isSymbolicLink()
+    || metadata.uid !== BigInt(process.getuid())
+    || metadata.gid !== BigInt(process.getgid())
+    || (!directory && metadata.nlink !== 1n)
+    || !permittedModes.includes(metadata.mode & 0o7777n)
+  ) {
+    throw new Error(`trusted Rust toolchain metadata changed: ${relative}`);
+  }
+}
+
+function trustedTreeName(bytes) {
+  const name = bytes.toString('utf8');
+  if (
+    bytes.length === 0
+    || !Buffer.from(name, 'utf8').equals(bytes)
+    || name === '.'
+    || name === '..'
+    || name.includes('/')
+  ) {
+    throw new Error('trusted Rust toolchain contains an unsafe path');
+  }
+  return name;
+}
+
+function accountToolchainBytes(total, size) {
+  const next = total + size;
+  if (!Number.isSafeInteger(next) || next > 1024 * 1024 * 1024) {
+    throw new Error('trusted Rust toolchain exceeds the aggregate byte limit');
+  }
+  return next;
+}
+
+async function measureRegularFile(file, expectedSize, label) {
+  const input = await fs.open(
+    file,
+    fsConstants.O_RDONLY
+      | fsConstants.O_CLOEXEC
+      | fsConstants.O_NOFOLLOW
+      | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const before = await input.stat({ bigint: true });
+    if (!before.isFile() || before.size !== BigInt(expectedSize)) {
+      throw new Error(`trusted regular file changed: ${label}`);
+    }
+    const identity = sourceMetadataIdentity(before);
+    const digest = crypto.createHash('sha256');
+    await consumeExactFile(input, expectedSize, file, (chunk) => digest.update(chunk));
+    assertSourceIdentity(
+      identity,
+      sourceMetadataIdentity(await input.stat({ bigint: true })),
+      label,
+    );
+    return Object.freeze({ identity, sha256: digest.digest('hex') });
+  } finally {
+    await input.close();
+  }
+}
+
+async function snapshotPinnedFile(file, expectedSize, expectedSha256, label) {
+  const measured = await measureRegularFile(file, expectedSize, label);
+  if (measured.sha256 !== expectedSha256) {
+    throw new Error(`trusted file digest mismatch: ${label}`);
+  }
+  return Object.freeze({ file, identity: measured.identity, label });
+}
+
+async function verifyPinnedFile(snapshot) {
+  const metadata = await fs.lstat(snapshot.file, { bigint: true });
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`trusted file changed: ${snapshot.label}`);
+  }
+  assertSourceIdentity(
+    snapshot.identity,
+    sourceMetadataIdentity(metadata),
+    snapshot.label,
+    'trusted file changed',
+  );
+}
+
+async function snapshotPrivateDirectory(directory, label, expectedIdentity) {
+  await assertPrivateBuildDirectory(directory, label);
+  const identity = sourceMetadataIdentity(await fs.lstat(directory, { bigint: true }));
+  if (expectedIdentity !== undefined) {
+    assertSourceIdentity(expectedIdentity, identity, label, 'private build directory changed');
+  }
+  return identity;
+}
+
+async function makeDirectoriesOwnerWritable(root) {
+  async function visit(directory) {
+    await fs.chmod(directory, 0o700);
+    for (const name of await fs.readdir(directory)) {
+      const child = path.join(directory, name);
+      const metadata = await fs.lstat(child);
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) await visit(child);
+    }
+  }
+  try {
+    await visit(root);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
 async function buildRustArtifacts(
   repoRoot,
   scratch,
@@ -660,39 +945,75 @@ async function buildRustArtifacts(
   ) {
     throw new Error('Rust toolchain image does not match the trusted release digest');
   }
+  const toolchainImageSnapshot = await snapshotPinnedFile(
+    toolchainImage,
+    measuredToolchain.size,
+    measuredToolchain.sha256,
+    'Rust toolchain SquashFS',
+  );
   const toolchainRoot = path.join(scratch, 'rust-toolchain');
   await run('/usr/bin/unsquashfs', [
     '-no-progress',
     '-dest',
     toolchainRoot,
     toolchainImage,
+    'bin',
+    'lib',
   ], {
     cwd: '/',
     env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
     maxBuffer: 16 * 1024 * 1024,
   });
-  await fs.mkdir(path.join(scratch, 'cargo-home'), { mode: 0o700 });
-  await fs.mkdir(path.join(scratch, 'home'), { mode: 0o700 });
+  await verifyPinnedFile(toolchainImageSnapshot);
+  const toolchainSnapshot = await snapshotToolchainTree(
+    toolchainRoot,
+    RUST_TOOLCHAIN_TREE_SHA256,
+  );
+  const cargoHome = path.join(scratch, 'cargo-home');
+  const home = path.join(scratch, 'home');
+  const hostTarget = path.join(scratch, 'host-target');
+  const staticTarget = path.join(scratch, 'static-target');
+  await fs.mkdir(cargoHome, { mode: 0o700 });
+  await fs.mkdir(home, { mode: 0o700 });
+  await fs.mkdir(hostTarget, { mode: 0o700 });
+  await fs.mkdir(staticTarget, { mode: 0o700 });
+  const emptyDigest = crypto.createHash('sha256').update('').digest('hex');
+  const cargoConfigSnapshots = [];
+  for (const name of ['config', 'config.toml']) {
+    const config = path.join(cargoHome, name);
+    await writeBytesFile(config, Buffer.alloc(0), 0o400);
+    cargoConfigSnapshots.push(await snapshotPinnedFile(config, 0, emptyDigest, `Cargo ${name}`));
+  }
+  const scratchIdentity = await snapshotPrivateDirectory(scratch, 'release build scratch');
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');
   const cargoConfigurationIdentity = await assertCargoConfiguration();
+  const verifyBuildBoundary = async () => {
+    await assertCargoConfiguration(cargoConfigurationIdentity);
+    await verifySourceSnapshot();
+    await verifyPinnedFile(toolchainImageSnapshot);
+    await verifyToolchainTree(toolchainSnapshot);
+    for (const config of cargoConfigSnapshots) await verifyPinnedFile(config);
+    await snapshotPrivateDirectory(scratch, 'release build scratch', scratchIdentity);
+  };
   try {
+    await verifyBuildBoundary();
     const cargoVersion = (await run(cargoBin, ['--version'], {
       cwd: '/',
       env: buildEnvironment(scratch, toolchainRoot),
       maxBuffer: 1024 * 1024,
     })).stdout.trim();
+    await verifyBuildBoundary();
     const rustcVersion = (await run(rustcBin, ['--version'], {
       cwd: '/',
       env: buildEnvironment(scratch, toolchainRoot),
       maxBuffer: 1024 * 1024,
     })).stdout.trim();
+    await verifyBuildBoundary();
     if (cargoVersion !== CARGO_VERSION || rustcVersion !== RUSTC_VERSION) {
       throw new Error(`release build requires ${CARGO_VERSION} and ${RUSTC_VERSION}`);
     }
 
-    const hostTarget = path.join(scratch, 'host-target');
-    const staticTarget = path.join(scratch, 'static-target');
     const hostBuild = cargoBuildInvocation(repoRoot, [
       '--locked',
       '--release',
@@ -701,13 +1022,13 @@ async function buildRustArtifacts(
       'x86_64-unknown-linux-gnu',
       '--bins',
     ]);
-    await verifySourceSnapshot();
+    await verifyBuildBoundary();
     await run(cargoBin, hostBuild.args, {
       cwd: hostBuild.cwd,
       env: buildEnvironment(scratch, toolchainRoot, { CARGO_TARGET_DIR: hostTarget }),
       maxBuffer: 16 * 1024 * 1024,
     });
-    await verifySourceSnapshot();
+    await verifyBuildBoundary();
     const staticBuild = cargoBuildInvocation(repoRoot, [
       '--locked',
       '--release',
@@ -729,16 +1050,17 @@ async function buildRustArtifacts(
       ),
       maxBuffer: 16 * 1024 * 1024,
     });
-    await verifySourceSnapshot();
+    await verifyBuildBoundary();
     return {
       hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
       staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
       cargoVersion,
       rustcVersion,
       toolchainSha256: measuredToolchain.sha256,
+      toolchainTreeSha256: toolchainSnapshot.sha256,
     };
   } finally {
-    await assertCargoConfiguration(cargoConfigurationIdentity);
+    await verifyBuildBoundary();
   }
 }
 

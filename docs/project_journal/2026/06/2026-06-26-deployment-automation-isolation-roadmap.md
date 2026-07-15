@@ -62,6 +62,13 @@ superseded_by:
   post-materialisation baseline after each Cargo build and before bundle
   assembly; bundled code is then reread from verified Git blobs instead of the
   writable compilation snapshot.
+  The copied Rust image is selectively extracted to `bin` and `lib`, normalised
+  read-only, and checked against a fixed canonical tree digest. Every Cargo
+  boundary rechecks that tree, the copied image, empty read-only Cargo
+  configuration sentinels, the pre-created scratch-root identity, and the exact
+  source snapshot. Fixed out-of-band digests for all six Rust outputs close the
+  remaining post-Cargo target-directory substitution path, and both toolchain
+  image and tree digests are recorded in the installer-validated manifest.
   The reviewed Cargo manifest is an explicit workspace root, preventing a
   caller-owned output ancestor from injecting workspace patches or a lockfile.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.

@@ -21,6 +21,8 @@ import {
   readBoundedRegularFile,
   resolveBusyboxPath,
   resyncBundle,
+  snapshotToolchainTree,
+  verifyToolchainTree,
 } from '../scripts/build-host-release.mjs';
 import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
@@ -31,6 +33,7 @@ import {
   RELEASE_PATHS,
   RUSTC_VERSION,
   RUST_TOOLCHAIN_IMAGE_SHA256,
+  RUST_TOOLCHAIN_TREE_SHA256,
   TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
   compareReleasePaths,
@@ -71,6 +74,11 @@ describe('host release bootstrap', () => {
       assert.equal(path.posix.isAbsolute(entry.installPath), false);
       assert.equal(entry.installPath.split('/').includes('..'), false);
       assert.ok(entry.mode === 0o444 || entry.mode === 0o555 || entry.mode === 0o644);
+      if (entry.kind === 'code') {
+        assert.equal(TRUSTED_SOURCE_SHA256[entry.installPath], undefined);
+      } else {
+        assert.match(TRUSTED_SOURCE_SHA256[entry.installPath], /^[a-f0-9]{64}$/);
+      }
     }
     assert.equal(
       RELEASE_FILES.find(({ installPath }) => installPath === 'code/scripts/provision-host.mjs').mode,
@@ -175,6 +183,68 @@ describe('host release bootstrap', () => {
       () => accountSourceBlobBytes(0, (64 * 1024 * 1024) + 1, 'source'),
       /blob is too large/,
     );
+  });
+
+  it('pins the normalised Rust toolchain tree and detects restored tampering', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-toolchain-tree-test-'));
+    const bin = path.join(root, 'bin');
+    const cargo = path.join(bin, 'cargo');
+    const library = path.join(root, 'libstd.rlib');
+    try {
+      await fs.mkdir(bin);
+      await fs.writeFile(cargo, 'cargo fixture\n', { mode: 0o755 });
+      await fs.writeFile(library, 'library fixture\n', { mode: 0o644 });
+      const snapshot = await snapshotToolchainTree(root);
+      assert.match(snapshot.sha256, /^[a-f0-9]{64}$/);
+      assert.equal((await fs.lstat(root)).mode & 0o7777, 0o500);
+      assert.equal((await fs.lstat(bin)).mode & 0o7777, 0o500);
+      assert.equal((await fs.lstat(cargo)).mode & 0o7777, 0o500);
+      assert.equal((await fs.lstat(library)).mode & 0o7777, 0o400);
+      await assert.doesNotReject(verifyToolchainTree(snapshot));
+
+      const original = await fs.readFile(library);
+      await fs.chmod(library, 0o600);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      await fs.writeFile(library, 'tampered library\n');
+      await fs.writeFile(library, original);
+      await fs.chmod(library, 0o400);
+      await assert.rejects(
+        verifyToolchainTree(snapshot),
+        /trusted Rust toolchain changed/,
+      );
+      await assert.rejects(
+        snapshotToolchainTree(root, '0'.repeat(64)),
+        /does not match the trusted tree digest/,
+      );
+
+      const topologySnapshot = await snapshotToolchainTree(root);
+      await fs.chmod(bin, 0o700);
+      await fs.writeFile(path.join(bin, 'transient'), 'transient\n');
+      await fs.chmod(path.join(bin, 'transient'), 0o400);
+      await fs.chmod(bin, 0o500);
+      await assert.rejects(
+        verifyToolchainTree(topologySnapshot),
+        /unexpected topology/,
+      );
+    } finally {
+      await fs.chmod(root, 0o700).catch(() => {});
+      await fs.chmod(bin, 0o700).catch(() => {});
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects special files in an extracted Rust toolchain', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-toolchain-link-test-'));
+    try {
+      await fs.symlink('/etc/passwd', path.join(root, 'rustc'));
+      await assert.rejects(
+        snapshotToolchainTree(root),
+        /contains an untrusted file/,
+      );
+    } finally {
+      await fs.chmod(root, 0o700).catch(() => {});
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it('rejects output paths that can inject build environment fields', async () => {
@@ -415,6 +485,7 @@ describe('host release bootstrap', () => {
         cargo_version: CARGO_VERSION,
         rustc_version: RUSTC_VERSION,
         toolchain_sha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+        toolchain_tree_sha256: RUST_TOOLCHAIN_TREE_SHA256,
       });
       assert.deepEqual(manifest.files.map(({ path: file }) => file), RELEASE_PATHS);
 
@@ -631,6 +702,15 @@ describe('host release bootstrap', () => {
     const fixture = await createFixture();
     try {
       const trustedDigests = await trustedFixtureDigests(fixture);
+      const hostBinary = RELEASE_FILES.find(({ kind }) => kind === 'host-binary');
+      const missingDigest = { ...trustedDigests };
+      delete missingDigest[hostBinary.installPath];
+      await assert.rejects(
+        buildFixtureBundle(fixture, missingDigest),
+        /trusted release source digest is missing/,
+      );
+      await assertMissing(fixture.bundle);
+
       await fs.writeFile(fixture.busybox, 'replacement busybox');
       await assert.rejects(
         buildFixtureBundle(fixture, trustedDigests),
@@ -639,6 +719,35 @@ describe('host release bootstrap', () => {
       await assertMissing(fixture.bundle);
 
       await fs.writeFile(fixture.busybox, sourceContents('runtime-sources/busybox'));
+      await fs.writeFile(
+        path.join(fixture.hostBinDir, hostBinary.source),
+        'replacement host binary',
+      );
+      await assert.rejects(
+        buildFixtureBundle(fixture, trustedDigests),
+        /trusted release source digest mismatch/,
+      );
+      await assertMissing(fixture.bundle);
+
+      await fs.writeFile(
+        path.join(fixture.hostBinDir, hostBinary.source),
+        sourceContents(hostBinary.installPath),
+      );
+      const staticBinary = RELEASE_FILES.find(({ kind }) => kind === 'static-binary');
+      await fs.writeFile(
+        path.join(fixture.staticBinDir, staticBinary.source),
+        'replacement static binary',
+      );
+      await assert.rejects(
+        buildFixtureBundle(fixture, trustedDigests),
+        /trusted release source digest mismatch/,
+      );
+      await assertMissing(fixture.bundle);
+
+      await fs.writeFile(
+        path.join(fixture.staticBinDir, staticBinary.source),
+        sourceContents(staticBinary.installPath),
+      );
       await buildFixtureBundle(fixture);
       await assert.rejects(
         validateBundle(
@@ -677,7 +786,7 @@ describe('host release bootstrap', () => {
       await buildFixtureBundle(fixture);
       const manifestPath = path.join(fixture.bundle, 'manifest.json');
       const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-      manifest.build.toolchain_sha256 = '0'.repeat(64);
+      manifest.build.toolchain_tree_sha256 = '0'.repeat(64);
       const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
       await fs.chmod(manifestPath, 0o600);
       await fs.writeFile(manifestPath, bytes);
@@ -826,6 +935,7 @@ describe('host release bootstrap', () => {
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+              toolchainTreeSha256: RUST_TOOLCHAIN_TREE_SHA256,
             };
           },
         }),
@@ -878,6 +988,7 @@ describe('host release bootstrap', () => {
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+              toolchainTreeSha256: RUST_TOOLCHAIN_TREE_SHA256,
             };
           },
         }),
@@ -1227,6 +1338,7 @@ describe('host release bootstrap', () => {
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+              toolchainTreeSha256: RUST_TOOLCHAIN_TREE_SHA256,
             };
           },
         }),
@@ -1477,6 +1589,7 @@ async function buildFixtureResult(fixture, trustedSourceSha256, injected = {}) {
         cargoVersion: CARGO_VERSION,
         rustcVersion: RUSTC_VERSION,
         toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+        toolchainTreeSha256: RUST_TOOLCHAIN_TREE_SHA256,
       }),
       trustedSourceSha256: trustedSourceSha256 ?? await trustedFixtureDigests(fixture),
       ...injected,
@@ -1545,7 +1658,10 @@ async function trustedFixtureDigests(fixture) {
   const result = {};
   for (const entry of RELEASE_FILES) {
     let source;
-    if (entry.kind === 'busybox') source = fixture.busybox;
+    if (entry.kind === 'host-binary') source = path.join(fixture.hostBinDir, entry.source);
+    else if (entry.kind === 'static-binary') {
+      source = path.join(fixture.staticBinDir, entry.source);
+    } else if (entry.kind === 'busybox') source = fixture.busybox;
     else if (entry.kind === 'codex-runtime') {
       source = path.join(fixture.codexRoot, entry.source.slice('codex/'.length));
     } else continue;
