@@ -221,6 +221,7 @@ node scripts/deploy-config.mjs --dry-run
 node scripts/deploy-config.mjs --prepare
 node scripts/deploy-config.mjs --apply
 node scripts/deploy-config.mjs --apply --activate-runner
+node scripts/prepare-activation-reboot-challenge.mjs --dry-run
 ```
 
 The base host service assets are:
@@ -572,8 +573,36 @@ sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
   --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
 
-Secret delivery, service enablement, runner activation, and Webex E2E remain
-separate deployment gates.
+Inspect and then explicitly establish the first-activation reboot challenge:
+
+```bash
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-activation-reboot-challenge \
+  --dry-run \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-activation-reboot-challenge \
+  --apply \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+```
+
+Dry-run performs no writes. Apply holds the shared deployment lock, re-runs
+the release, policy, runtime, and secret preflight, and invokes only the fixed
+root activation helper's `prepare-reboot-challenge --apply` operation. The
+helper cannot continue into runtime or Codex canaries. It atomically binds the
+challenge to the active manifest, runtime image, bot, launcher, and runtime
+executables plus the Codex version and model. A same-boot retry is idempotent;
+artifact drift, a crossed boot boundary, malformed challenge state, a receipt,
+a runner drop-in, a deployment recovery transaction, or any active managed
+unit fails closed.
+
+Successful apply reports `status=reboot_required` while proving the receipt
+and runner permission remain absent, the deployment transaction remains clean,
+and the bot, activation renewal, launcher socket, and config worker units
+remain inactive. It never starts or enables a unit, fetches config, runs Codex,
+reboots the host, or calls Webex. After one real reboot, use the separately
+reviewed post-reboot activation step; runner activation, service enablement,
+and Webex E2E remain separate deployment gates.
 
 The production CLI has no source, target, or root override. It reads a fixed
 allowlist of four sysusers files, six tmpfiles files, and five systemd units
@@ -1183,10 +1212,13 @@ requires it and orders bot startup after it, while `PartOf=` restarts the unit
 for every later bot restart. Its fixed `ensure` command reuses an already valid
 receipt without rerunning canaries and performs full renewal only when the
 receipt is missing or stale. A real boot therefore regenerates the boot-scoped
-receipt before an ephemeral bot starts. The first activation on a new host
-intentionally fails while preparing the reboot-cleanup challenge; perform one
-real host reboot and rerun the same activation command. A service restart is
-not reboot evidence. After activation, ordinary apply first ensures a valid
+receipt before an ephemeral bot starts. The first activation on a new host is
+split into a dedicated pre-reboot gate. The fixed challenge preparation
+entrypoint validates the installed activation binding and leaves config,
+receipt, runner permission, the bot, and managed systemd units unchanged while
+arming a persistent reboot-cleanup challenge. Perform one real host reboot
+before running the explicit runner activation. A service restart is not reboot
+evidence. After activation, ordinary apply first ensures a valid
 receipt, then detects the installed permission drop-in and rejects any
 candidate that would restore `current-user`, preventing inherited launcher
 access from becoming reachable. Before activation, ordinary apply applies the

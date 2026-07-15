@@ -43,9 +43,14 @@
   that verifies approved release evidence, provisions host policy, builds the
   immutable runtime, and checks secret metadata without reading secret content
   or changing service and activation state.
+- [completed] Add a fixed, default-dry-run first-activation reboot challenge
+  entrypoint that binds the challenge to the reviewed runtime artifacts without
+  starting units, running Codex canaries, changing config, or activating the
+  runner.
 - [pending] Stage and apply the reviewed host release, deliver secrets through
-  the separate operator channel, complete activation, and run deployment and
-  Webex E2E before relying on production `/config pull`.
+  the separate operator channel, establish the reboot challenge, perform one
+  real reboot, complete activation, and run deployment and Webex E2E before
+  relying on production `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
   service work inside the Webex request handler.

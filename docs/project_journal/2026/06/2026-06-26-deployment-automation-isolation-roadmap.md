@@ -705,9 +705,11 @@ superseded_by:
   Codex config away from current-user execution, mint or renew the receipt,
   restart and health-check the service, and roll all three states back
   together. Bot launcher permission must never land in an earlier slice.
-  This slice is implemented; host activation remains a separate deployment
-  operation because the first reboot-cleanup challenge intentionally fails
-  until a real reboot occurs.
+  This slice is implemented. The first host-activation operation is now a
+  separate default-dry-run entrypoint that establishes an artifact-bound
+  reboot challenge without creating a deployment transaction, starting units,
+  or running the remaining activation canaries. A real reboot and post-reboot
+  activation remain separate deployment operations.
 
 ## Current Open Decisions
 - Which deployment reload primitive can preserve old-service availability: in-process reload, supervised blue/green handoff, or another rollback-capable mechanism.

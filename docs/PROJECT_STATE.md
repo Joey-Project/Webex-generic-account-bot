@@ -95,8 +95,10 @@
   `hoteng@cisco.com`, and only `status`/`pull`; production config does not enable
   them until the companion all-ephemeral config PR. `reload` and `sync` remain
   invalid.
-  Production stays on `current-user` until the deployment host completes the
-  real-reboot challenge and activates a matching reviewed config.
+  The fixed first-activation entrypoint now establishes an artifact-bound
+  reboot challenge without starting units or entering the Codex canary path.
+  Production stays on `current-user` until the deployment host runs that gate,
+  crosses one real reboot, and activates a matching reviewed config.
 - Host deployment discovery found that the repository had privileged launcher,
   activation, and worker units but no base bot unit or reproducible host
   provisioner. The base contract now defines the unprivileged bot identity,
@@ -232,14 +234,15 @@
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/06/2026-06-18-generic-account-bot-mvp.md`
 - Deployment automation and isolation roadmap: `docs/project_journal/2026/06/2026-06-26-deployment-automation-isolation-roadmap.md`
+- First activation reboot challenge: `docs/project_journal/2026/07/2026-07-15-first-activation-reboot-challenge.md`
 - Configuration Space workstream: `docs/project_journal/2026/06/2026-06-27-configuration-space-commands.md`
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers
-- The deployment host must run PR 4c2b's explicit activation against the
-  installed production image and host kernel, satisfy the real-reboot
-  challenge, and activate a matching ephemeral-only config. Code and unit-test
-  evidence are not substitutes for that deployment-host gate.
+- The deployment host must establish the reviewed artifact-bound challenge,
+  cross one real reboot, run PR 4c2b's explicit activation against the installed
+  production image and host kernel, and activate a matching ephemeral-only
+  config. Code and unit-test evidence are not substitutes for that host gate.
 - The config repository now pins the all-ephemeral `status`/`pull` profile and
   uses structural bot validation in both CI lanes. The deployment host must
   stage and apply the reviewed root-owned release bundle before guarded

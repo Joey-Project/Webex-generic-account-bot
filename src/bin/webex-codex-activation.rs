@@ -21,6 +21,10 @@ struct Cli {
 enum Command {
     Ensure,
     Renew,
+    PrepareRebootChallenge {
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -33,6 +37,13 @@ async fn main() -> Result<()> {
         }
         Command::Renew => {
             webex_generic_account_bot::activation_canary::renew_activation_receipt().await?;
+        }
+        Command::PrepareRebootChallenge { apply } => {
+            let report =
+                webex_generic_account_bot::activation_canary::prepare_activation_reboot_challenge(
+                    apply,
+                )?;
+            println!("{}", serde_json::to_string(&report)?);
         }
     }
     Ok(())
@@ -78,9 +89,29 @@ mod tests {
     fn accepts_only_the_fixed_activation_subcommands() {
         assert!(Cli::try_parse_from(["webex-codex-activation", "ensure"]).is_ok());
         assert!(Cli::try_parse_from(["webex-codex-activation", "renew"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["webex-codex-activation", "prepare-reboot-challenge"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "webex-codex-activation",
+                "prepare-reboot-challenge",
+                "--apply",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["webex-codex-activation", "mint"]).is_err());
         assert!(
             Cli::try_parse_from(["webex-codex-activation", "renew", "--path", "/tmp/x"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "webex-codex-activation",
+                "prepare-reboot-challenge",
+                "--path",
+                "/tmp/x",
+            ])
+            .is_err()
         );
     }
 }

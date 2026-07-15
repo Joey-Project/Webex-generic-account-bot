@@ -52,8 +52,38 @@ const CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEPENDENCY_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(60);
-const REBOOT_CHALLENGE_VERSION: u16 = 1;
+const REBOOT_CHALLENGE_VERSION: u16 = 2;
 const REBOOT_MARKER_CONTENTS: &[u8] = b"webex-runtime-reboot-canary-v1\n";
+
+#[derive(Debug, Serialize)]
+pub struct RebootChallengePreparationReport {
+    version: u16,
+    mode: &'static str,
+    status: &'static str,
+    writes_performed: u8,
+    activation_binding: ActivationBindingReport,
+    challenge: RebootChallengeReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationBindingReport {
+    active_manifest_sha256: String,
+    runtime_image_sha256: String,
+    bot_executable_sha256: String,
+    launcher_executable_sha256: String,
+    runtime_executable_sha256: String,
+    codex_version: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RebootChallengeReport {
+    state: &'static str,
+    current_boot_matches: bool,
+    validated: bool,
+    marker_valid: bool,
+}
 
 pub async fn ensure_activation_receipt() -> Result<VerifiedActivation> {
     ensure_root()?;
@@ -88,7 +118,7 @@ pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
     let _lock = RenewalLock::acquire()?;
     let candidate = activation::begin_activation_renewal()?;
     let result = async {
-        verify_reboot_cleanup_challenge()?;
+        verify_reboot_cleanup_challenge(&candidate)?;
         let runtime = run_runtime_boundary_canary(&candidate).await?;
         run_timeout_cleanup_canary(&runtime.nonce).await?;
         run_owner_crash_cleanup_canary(&runtime.nonce, "launcher").await?;
@@ -105,6 +135,43 @@ pub async fn renew_activation_receipt() -> Result<VerifiedActivation> {
                 "{error:#}; failed to preserve the invalid activation state: {abort_error:#}"
             )),
         },
+    }
+}
+
+pub fn prepare_activation_reboot_challenge(
+    apply: bool,
+) -> Result<RebootChallengePreparationReport> {
+    ensure_root()?;
+    let _lock = if apply {
+        Some(RenewalLock::acquire()?)
+    } else {
+        None
+    };
+    let binding = activation::verify_preactivation_candidate()?;
+    let expected_binding = ActivationBindingReport::from(&binding);
+    let (status, writes_performed, challenge) =
+        prepare_reboot_cleanup_challenge(apply, &expected_binding)?;
+    Ok(RebootChallengePreparationReport {
+        version: REBOOT_CHALLENGE_VERSION,
+        mode: if apply { "applied" } else { "dry-run" },
+        status,
+        writes_performed,
+        activation_binding: expected_binding,
+        challenge,
+    })
+}
+
+impl From<&VerifiedActivation> for ActivationBindingReport {
+    fn from(binding: &VerifiedActivation) -> Self {
+        Self {
+            active_manifest_sha256: binding.active_manifest_sha256.clone(),
+            runtime_image_sha256: binding.runtime_image_sha256.clone(),
+            bot_executable_sha256: binding.bot_executable_sha256.clone(),
+            launcher_executable_sha256: binding.launcher_executable_sha256.clone(),
+            runtime_executable_sha256: binding.runtime_executable_sha256.clone(),
+            codex_version: binding.codex_version.clone(),
+            model: binding.model.clone(),
+        }
     }
 }
 
@@ -994,34 +1061,142 @@ struct RebootChallenge {
     challenge_boot_id: String,
     marker_nonce: String,
     validated_boot_id: Option<String>,
+    activation_binding: ActivationBindingReport,
 }
 
-fn verify_reboot_cleanup_challenge() -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebootChallengeState {
+    Absent,
+    PendingCurrentBoot,
+    ValidatedCurrentBoot,
+    CrossedBootBoundary,
+}
+
+fn prepare_reboot_cleanup_challenge(
+    apply: bool,
+    expected_binding: &ActivationBindingReport,
+) -> Result<(&'static str, u8, RebootChallengeReport)> {
+    let current_boot = read_boot_id()?;
+    let existing = read_reboot_challenge()?;
+    match classify_reboot_challenge(&current_boot, existing.as_ref(), expected_binding)? {
+        RebootChallengeState::Absent if !apply => Ok((
+            "ready",
+            0,
+            RebootChallengeReport {
+                state: "absent",
+                current_boot_matches: false,
+                validated: false,
+                marker_valid: false,
+            },
+        )),
+        RebootChallengeState::Absent => {
+            write_new_reboot_challenge(&current_boot, None, expected_binding)?;
+            let challenge = read_reboot_challenge()?
+                .ok_or_else(|| anyhow!("prepared reboot challenge is missing"))?;
+            ensure!(
+                classify_reboot_challenge(&current_boot, Some(&challenge), expected_binding)?
+                    == RebootChallengeState::PendingCurrentBoot,
+                "prepared reboot challenge is not pending for the current boot"
+            );
+            validate_reboot_marker(&reboot_marker_path(&challenge.marker_nonce)?)?;
+            Ok(("reboot_required", 2, pending_reboot_challenge_report()))
+        }
+        RebootChallengeState::PendingCurrentBoot => {
+            let challenge = existing.expect("classified challenge must exist");
+            validate_reboot_marker(&reboot_marker_path(&challenge.marker_nonce)?)?;
+            Ok(("reboot_required", 0, pending_reboot_challenge_report()))
+        }
+        RebootChallengeState::ValidatedCurrentBoot => {
+            bail!("runtime activation reboot challenge is already validated for this boot")
+        }
+        RebootChallengeState::CrossedBootBoundary => {
+            let challenge = existing.expect("classified challenge must exist");
+            ensure!(
+                path_is_absent(&reboot_marker_path(&challenge.marker_nonce)?)?,
+                "pre-reboot runtime marker survived the boot boundary"
+            );
+            bail!(
+                "runtime activation reboot challenge has crossed a real boot; continue activation instead"
+            )
+        }
+    }
+}
+
+fn classify_reboot_challenge(
+    current_boot: &str,
+    challenge: Option<&RebootChallenge>,
+    expected_binding: &ActivationBindingReport,
+) -> Result<RebootChallengeState> {
+    let Some(challenge) = challenge else {
+        return Ok(RebootChallengeState::Absent);
+    };
+    ensure!(
+        &challenge.activation_binding == expected_binding,
+        "reboot challenge does not match the active runtime binding"
+    );
+    if let Some(validated_boot) = challenge.validated_boot_id.as_deref()
+        && validated_boot != challenge.challenge_boot_id
+    {
+        bail!("reboot challenge validated boot ID is invalid");
+    }
+    if challenge.challenge_boot_id != current_boot {
+        return Ok(RebootChallengeState::CrossedBootBoundary);
+    }
+    if challenge.validated_boot_id.is_some() {
+        Ok(RebootChallengeState::ValidatedCurrentBoot)
+    } else {
+        Ok(RebootChallengeState::PendingCurrentBoot)
+    }
+}
+
+fn pending_reboot_challenge_report() -> RebootChallengeReport {
+    RebootChallengeReport {
+        state: "pending_current_boot",
+        current_boot_matches: true,
+        validated: false,
+        marker_valid: true,
+    }
+}
+
+fn verify_reboot_cleanup_challenge(binding: &VerifiedActivation) -> Result<()> {
     let current_boot = read_boot_id()?;
     let challenge = read_reboot_challenge()?;
+    let expected_binding = ActivationBindingReport::from(binding);
     match challenge {
         None => {
-            write_new_reboot_challenge(&current_boot, None)?;
+            write_new_reboot_challenge(&current_boot, None, &expected_binding)?;
             bail!("runtime activation requires one real reboot to validate cleanup");
         }
         Some(challenge) if challenge.challenge_boot_id == current_boot => {
+            ensure!(
+                challenge.activation_binding == expected_binding,
+                "reboot challenge does not match the active runtime binding"
+            );
             if challenge.validated_boot_id.as_deref() != Some(&current_boot) {
                 bail!("runtime activation reboot challenge has not crossed a real boot");
             }
             validate_reboot_marker(&reboot_marker_path(&challenge.marker_nonce)?)
         }
         Some(challenge) => {
+            ensure!(
+                challenge.activation_binding == expected_binding,
+                "reboot challenge does not match the active runtime binding"
+            );
             let marker = reboot_marker_path(&challenge.marker_nonce)?;
             ensure!(
                 path_is_absent(&marker)?,
                 "pre-reboot runtime marker survived the boot boundary"
             );
-            write_new_reboot_challenge(&current_boot, Some(current_boot.clone()))
+            write_new_reboot_challenge(&current_boot, Some(current_boot.clone()), &expected_binding)
         }
     }
 }
 
-fn write_new_reboot_challenge(boot_id: &str, validated_boot_id: Option<String>) -> Result<()> {
+fn write_new_reboot_challenge(
+    boot_id: &str,
+    validated_boot_id: Option<String>,
+    activation_binding: &ActivationBindingReport,
+) -> Result<()> {
     let marker_nonce = random_nonce()?;
     let marker = reboot_marker_path(&marker_nonce)?;
     create_private_fixture(&marker, REBOOT_MARKER_CONTENTS)?;
@@ -1030,6 +1205,7 @@ fn write_new_reboot_challenge(boot_id: &str, validated_boot_id: Option<String>) 
         challenge_boot_id: boot_id.to_owned(),
         marker_nonce,
         validated_boot_id,
+        activation_binding: activation_binding.clone(),
     };
     let mut payload = serde_json::to_vec(&challenge)?;
     payload.push(b'\n');
@@ -1082,7 +1258,7 @@ fn atomic_write_private(path: &Path, payload: &[u8]) -> Result<()> {
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name().unwrap().to_string_lossy(),
-        std::process::id()
+        random_nonce()?
     ));
     let mut file = OpenOptions::new()
         .write(true)
@@ -1420,6 +1596,65 @@ mod tests {
             Path::new(RUNTIME_CANARY_HOST_UNIX_FIXTURE_ROOT).join(format!("reboot-{nonce}.marker"))
         );
         assert!(reboot_marker_path("../outside").is_err());
+    }
+
+    #[test]
+    fn reboot_challenge_state_is_bound_to_boot_and_runtime() {
+        let current_boot = "11111111-2222-3333-4444-555555555555";
+        let previous_boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let binding = ActivationBindingReport::from(&verified_activation(current_boot));
+        assert_eq!(
+            classify_reboot_challenge(current_boot, None, &binding).unwrap(),
+            RebootChallengeState::Absent
+        );
+
+        let mut challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: current_boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: None,
+            activation_binding: binding.clone(),
+        };
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::PendingCurrentBoot
+        );
+        challenge.validated_boot_id = Some(current_boot.to_owned());
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::ValidatedCurrentBoot
+        );
+        challenge.challenge_boot_id = previous_boot.to_owned();
+        challenge.validated_boot_id = None;
+        assert_eq!(
+            classify_reboot_challenge(current_boot, Some(&challenge), &binding).unwrap(),
+            RebootChallengeState::CrossedBootBoundary
+        );
+
+        let mut other = binding.clone();
+        other.runtime_image_sha256 = "f".repeat(64);
+        assert!(classify_reboot_challenge(current_boot, Some(&challenge), &other).is_err());
+        challenge.validated_boot_id = Some(current_boot.to_owned());
+        assert!(classify_reboot_challenge(current_boot, Some(&challenge), &binding).is_err());
+    }
+
+    #[test]
+    fn reboot_challenge_schema_rejects_legacy_and_unknown_fields() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: None,
+            activation_binding: ActivationBindingReport::from(&verified_activation(boot)),
+        };
+        let mut value = serde_json::to_value(&challenge).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RebootChallenge>(value).is_err());
+
+        let mut legacy = serde_json::to_value(&challenge).unwrap();
+        legacy.as_object_mut().unwrap().remove("activation_binding");
+        assert!(serde_json::from_value::<RebootChallenge>(legacy).is_err());
     }
 
     #[test]

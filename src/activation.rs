@@ -477,6 +477,12 @@ pub(crate) fn begin_activation_renewal() -> Result<VerifiedActivation> {
     begin_activation_renewal_with(&ActivationPaths::production())
 }
 
+pub(crate) fn verify_preactivation_candidate() -> Result<VerifiedActivation> {
+    ensure_linux()?;
+    ensure_root(unsafe { libc::geteuid() })?;
+    verify_preactivation_candidate_with(&ActivationPaths::production())
+}
+
 pub(crate) fn abort_activation_renewal() -> Result<()> {
     ensure_linux()?;
     ensure_root(unsafe { libc::geteuid() })?;
@@ -485,6 +491,20 @@ pub(crate) fn abort_activation_renewal() -> Result<()> {
 
 fn begin_activation_renewal_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
     invalidate_activation_receipt_with(paths)?;
+    verify_activation_candidate_with(paths)
+}
+
+fn verify_preactivation_candidate_with(paths: &ActivationPaths) -> Result<VerifiedActivation> {
+    validate_trusted_ancestors(paths, &paths.receipt)?;
+    match fs::symlink_metadata(&paths.receipt) {
+        Ok(_) => {
+            return Err(anyhow!(
+                "activation receipt must be absent before first activation"
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     verify_activation_candidate_with(paths)
 }
 
@@ -1718,6 +1738,19 @@ mod tests {
         let verified =
             commit_activation_receipt_with(&fixture.paths, &candidate, passing_canaries()).unwrap();
         assert_eq!(verified.canaries.len(), REQUIRED_CANARIES.len());
+        assert!(fixture.paths.receipt.exists());
+    }
+
+    #[test]
+    fn preactivation_candidate_requires_an_absent_receipt_without_mutating_artifacts() {
+        let fixture = Fixture::new();
+
+        let candidate = verify_preactivation_candidate_with(&fixture.paths).unwrap();
+        assert!(candidate.canaries.is_empty());
+        assert!(!fixture.paths.receipt.exists());
+
+        fixture.install(&fixture.receipt());
+        assert!(verify_preactivation_candidate_with(&fixture.paths).is_err());
         assert!(fixture.paths.receipt.exists());
     }
 

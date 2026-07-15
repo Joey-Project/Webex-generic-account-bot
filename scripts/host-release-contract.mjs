@@ -41,6 +41,8 @@ const CODE_FILES = [
   'scripts/config-pull-worker.mjs',
   'scripts/deploy-config.mjs',
   'scripts/jenkins-readonly.mjs',
+  'scripts/prepare-activation-reboot-challenge',
+  'scripts/prepare-activation-reboot-challenge.mjs',
   'scripts/prepare-host-deployment',
   'scripts/prepare-host-deployment.mjs',
   'scripts/provision-host',
@@ -51,6 +53,7 @@ const EXECUTABLE_CODE_FILES = new Set([
   'scripts/config-policy/install-rendered-config.py',
   'scripts/config-policy/static-config-check.py',
   'scripts/config-policy/validate-config.sh',
+  'scripts/prepare-activation-reboot-challenge',
   'scripts/prepare-host-deployment',
   'scripts/provision-host',
 ]);
@@ -113,11 +116,11 @@ export function compareReleasePaths(left, right) {
 }
 
 export const TRUSTED_SOURCE_SHA256 = Object.freeze({
-  'bin/webex-codex-activation': '8b118499759e21d256dad41eec968fdf3f68f6d326cb75cfb6d8d0c648f6a465',
-  'bin/webex-codex-canary-probe': '7633e85f8c7e04bf8deff1ac68f56e6db108d926b8dc82f1ca6795bac37ce2da',
-  'bin/webex-codex-launcher': 'b983fcb93f06aab006efb01c6fa1aa1595bc9ca89e5566dc77931db51fef0487',
-  'bin/webex-codex-runtime': '2fde7a5f7886422708ed3533516caf382456b21469f930f7da4446026897ed3a',
-  'bin/webex-generic-account-bot': '0fd8e1c7ed93720a5202803e43488cbf6f166ec8697db5bb6c84bfd4df946679',
+  'bin/webex-codex-activation': '06a1c1487f1b2cc64b0aec98c1ccc8d06ac35ec1fcd98b51caaf37db9a28f8e7',
+  'bin/webex-codex-canary-probe': 'f363d4eb31f6947f09db86d7347a1d6d1339cfcc830e989d0e106061c0431dcf',
+  'bin/webex-codex-launcher': '40f1e93d59fd4a52180371bbe63095f29196e4cc171ba019c265cdb4a94650ac',
+  'bin/webex-codex-runtime': '5d6155d06782d456e699aa798a62743a09f1f3e42f50a096ffd676325dcfe5a2',
+  'bin/webex-generic-account-bot': 'e9dd930cd3350bf12d9eb42b90ca5c5148e46c7d7b8675662830013b09507c5e',
   'bin/webex-host-identity-lock': '484c99c075ca53a18b623efeedd1deffc5723db7d20bb71b2f57387f2ecdea73',
   'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',
   'runtime-sources/codex/bin/codex': 'cb1670c25b6e17fd82866a80e55df58bc10f5d18e44d25ec2c6f7c2ab98077cd',
