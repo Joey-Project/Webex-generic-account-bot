@@ -221,8 +221,11 @@ node scripts/deploy-config.mjs --dry-run
 node scripts/deploy-config.mjs --prepare
 node scripts/deploy-config.mjs --apply
 node scripts/deploy-config.mjs --apply --activate-runner
-node scripts/prepare-activation-reboot-challenge.mjs --dry-run
 ```
+
+The guarded first-activation reboot challenge workflow, including its required
+release identity arguments, is documented in the host preparation sequence
+below.
 
 The base host service assets are:
 
