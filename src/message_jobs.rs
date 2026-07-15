@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -62,7 +62,13 @@ impl MessageJobRecord {
 pub struct DurableMessageJobs {
     root: PathBuf,
     max_pending: usize,
-    operation_lock: StdMutex<()>,
+    operation_state: StdMutex<MessageJobIndex>,
+    runtime_unhealthy: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct MessageJobIndex {
+    entries: HashMap<String, u64>,
 }
 
 impl DurableMessageJobs {
@@ -74,17 +80,25 @@ impl DurableMessageJobs {
         let root = message_job_root(state_file)?;
         ensure_private_job_root(&root)?;
         recover_candidates(&root)?;
-        let jobs = Self {
+        let index = load_message_job_index(&root, max_pending)?;
+        Ok(Self {
             root,
             max_pending,
-            operation_lock: StdMutex::new(()),
-        };
-        jobs.validate_all_sync()?;
-        Ok(jobs)
+            operation_state: StdMutex::new(index),
+            runtime_unhealthy: AtomicBool::new(false),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        !self.runtime_unhealthy.load(Ordering::Acquire)
+    }
+
+    pub fn mark_unhealthy(&self) {
+        self.runtime_unhealthy.store(true, Ordering::Release);
     }
 
     pub async fn enqueue(
@@ -95,7 +109,8 @@ impl DurableMessageJobs {
         let jobs = std::sync::Arc::clone(self);
         task::spawn_blocking(move || jobs.enqueue_sync(&message_id, event))
             .await
-            .context("message job enqueue worker panicked")?
+            .context("message job enqueue worker panicked")
+            .and_then(|result| result)
     }
 
     pub async fn load(
@@ -103,16 +118,20 @@ impl DurableMessageJobs {
         message_id: String,
     ) -> Result<Option<MessageJobRecord>> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.load_sync(&message_id))
+        let result = task::spawn_blocking(move || jobs.load_sync(&message_id))
             .await
-            .context("message job load worker panicked")?
+            .context("message job load worker panicked")
+            .and_then(|result| result);
+        self.latch_error(result)
     }
 
     pub async fn remove(self: &std::sync::Arc<Self>, message_id: String) -> Result<bool> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.remove_sync(&message_id))
+        let result = task::spawn_blocking(move || jobs.remove_sync(&message_id))
             .await
-            .context("message job removal worker panicked")?
+            .context("message job removal worker panicked")
+            .and_then(|result| result);
+        self.latch_error(result)
     }
 
     pub async fn pending_message_ids(
@@ -121,16 +140,29 @@ impl DurableMessageJobs {
         limit: usize,
     ) -> Result<Vec<String>> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.pending_message_ids_sync(&excluded_message_ids, limit))
-            .await
-            .context("message job listing worker panicked")?
+        let result = task::spawn_blocking(move || {
+            jobs.pending_message_ids_sync(&excluded_message_ids, limit)
+        })
+        .await
+        .context("message job listing worker panicked")
+        .and_then(|result| result);
+        self.latch_error(result)
     }
 
     pub async fn pending_count(self: &std::sync::Arc<Self>) -> Result<usize> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.pending_count_sync())
+        let result = task::spawn_blocking(move || jobs.pending_count_sync())
             .await
-            .context("message job count worker panicked")?
+            .context("message job count worker panicked")
+            .and_then(|result| result);
+        self.latch_error(result)
+    }
+
+    fn latch_error<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.mark_unhealthy();
+        }
+        result
     }
 
     fn enqueue_sync(
@@ -138,13 +170,13 @@ impl DurableMessageJobs {
         message_id: &str,
         event: SidecarEvent,
     ) -> Result<MessageJobEnqueueStatus> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
         validate_message_event(message_id, &event)?;
-        self.prepare_root_sync()?;
+        self.prepare_root_sync(&mut index)?;
 
         let final_path = self.job_path(message_id);
         if final_path.try_exists()? {
@@ -155,9 +187,10 @@ impl DurableMessageJobs {
                     final_path.display()
                 ));
             }
+            register_index_record(&mut index, &existing)?;
             return Ok(MessageJobEnqueueStatus::Existing);
         }
-        if list_job_files(&self.root)?.len() >= self.max_pending {
+        if self.checked_job_files_sync(&index)?.len() >= self.max_pending {
             return Err(anyhow!(
                 "message job backlog reached the fixed limit of {}",
                 self.max_pending
@@ -193,6 +226,7 @@ impl DurableMessageJobs {
         match fs::hard_link(&candidate_path, &final_path) {
             Ok(()) => {
                 sync_directory(&self.root)?;
+                register_index_record(&mut index, &record)?;
                 fs::remove_file(&candidate_path)
                     .with_context(|| format!("failed to remove {}", candidate_path.display()))?;
                 sync_directory(&self.root)?;
@@ -214,6 +248,7 @@ impl DurableMessageJobs {
                         final_path.display()
                     ));
                 }
+                register_index_record(&mut index, &existing)?;
                 Ok(MessageJobEnqueueStatus::Existing)
             }
             Err(error) => {
@@ -230,12 +265,12 @@ impl DurableMessageJobs {
     }
 
     fn load_sync(&self, message_id: &str) -> Result<Option<MessageJobRecord>> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
-        self.prepare_root_sync()?;
+        self.prepare_root_sync(&mut index)?;
         let path = self.job_path(message_id);
         match read_job_file(&path) {
             Ok(record) => {
@@ -259,12 +294,12 @@ impl DurableMessageJobs {
     }
 
     fn remove_sync(&self, message_id: &str) -> Result<bool> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
-        self.prepare_root_sync()?;
+        self.prepare_root_sync(&mut index)?;
         let path = self.job_path(message_id);
         match read_job_file(&path) {
             Ok(record) => {
@@ -286,19 +321,20 @@ impl DurableMessageJobs {
         }
         fs::remove_file(&path)
             .with_context(|| format!("failed to remove message job {}", path.display()))?;
+        index.entries.remove(message_id);
         sync_directory(&self.root)?;
         Ok(true)
     }
 
     #[cfg(test)]
     fn list_sync(&self) -> Result<Vec<MessageJobRecord>> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
-        self.prepare_root_sync()?;
+        self.prepare_root_sync(&mut index)?;
         let mut jobs = Vec::new();
-        for path in self.checked_job_files_sync()? {
+        for path in self.checked_job_files_sync(&index)? {
             let record = read_job_file(&path)?;
             if self.job_path(&record.message_id) != path {
                 return Err(anyhow!(
@@ -316,83 +352,53 @@ impl DurableMessageJobs {
         Ok(jobs)
     }
 
-    fn validate_all_sync(&self) -> Result<()> {
-        let _guard = self
-            .operation_lock
-            .lock()
-            .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
-        self.prepare_root_sync()?;
-        let paths = self.checked_job_files_sync()?;
-        for path in paths {
-            let record = read_job_file(&path)?;
-            if self.job_path(&record.message_id) != path {
-                return Err(anyhow!(
-                    "message job filename does not match its message ID at {}",
-                    path.display()
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn pending_message_ids_sync(
         &self,
         excluded_message_ids: &HashSet<String>,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
-        self.prepare_root_sync()?;
+        self.prepare_root_sync(&mut index)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let excluded_digests = excluded_message_ids
+        self.checked_job_files_sync(&index)?;
+        let mut pending = index
+            .entries
             .iter()
-            .map(|message_id| message_id_digest(message_id))
-            .collect::<HashSet<_>>();
-        let mut message_ids = Vec::with_capacity(limit);
-        for path in self.checked_job_files_sync()? {
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                return Err(anyhow!("message job filename is not UTF-8"));
-            };
-            let digest = file_name
-                .strip_suffix(MESSAGE_JOB_FILE_SUFFIX)
-                .ok_or_else(|| anyhow!("invalid message job filename at {}", path.display()))?;
-            if excluded_digests.contains(digest) {
-                continue;
-            }
-            let record = read_job_file(&path)?;
-            if self.job_path(&record.message_id) != path {
-                return Err(anyhow!(
-                    "message job filename does not match its message ID at {}",
-                    path.display()
-                ));
-            }
-            message_ids.push(record.message_id);
-            if message_ids.len() == limit {
-                break;
-            }
-        }
+            .filter(|(message_id, _)| !excluded_message_ids.contains(*message_id))
+            .map(|(message_id, enqueued_at)| (*enqueued_at, message_id.clone()))
+            .collect::<Vec<_>>();
+        pending.sort();
+        let message_ids = pending
+            .into_iter()
+            .take(limit)
+            .map(|(_, message_id)| message_id)
+            .collect();
         Ok(message_ids)
     }
 
     fn pending_count_sync(&self) -> Result<usize> {
-        let _guard = self
-            .operation_lock
+        let mut index = self
+            .operation_state
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
-        self.prepare_root_sync()?;
-        Ok(self.checked_job_files_sync()?.len())
+        self.prepare_root_sync(&mut index)?;
+        Ok(self.checked_job_files_sync(&index)?.len())
     }
 
-    fn prepare_root_sync(&self) -> Result<()> {
+    fn prepare_root_sync(&self, index: &mut MessageJobIndex) -> Result<()> {
         ensure_private_job_root(&self.root)?;
-        recover_candidates(&self.root)
+        for record in recover_candidates(&self.root)? {
+            register_index_record(index, &record)?;
+        }
+        Ok(())
     }
 
-    fn checked_job_files_sync(&self) -> Result<Vec<PathBuf>> {
+    fn checked_job_files_sync(&self, index: &MessageJobIndex) -> Result<Vec<PathBuf>> {
         let paths = list_job_files(&self.root)?;
         if paths.len() > self.max_pending {
             return Err(anyhow!(
@@ -400,15 +406,21 @@ impl DurableMessageJobs {
                 self.max_pending
             ));
         }
+        let expected = index
+            .entries
+            .keys()
+            .map(|message_id| self.job_path(message_id))
+            .collect::<HashSet<_>>();
+        if paths.len() != expected.len() || paths.iter().any(|path| !expected.contains(path)) {
+            return Err(anyhow!(
+                "message job directory does not match the in-memory startup index"
+            ));
+        }
         Ok(paths)
     }
 
     fn job_path(&self, message_id: &str) -> PathBuf {
-        self.root.join(format!(
-            "{}{}",
-            message_id_digest(message_id),
-            MESSAGE_JOB_FILE_SUFFIX
-        ))
+        message_job_path(&self.root, message_id)
     }
 
     fn candidate_path(&self) -> PathBuf {
@@ -430,6 +442,48 @@ fn message_job_root(state_file: &Path) -> Result<PathBuf> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     Ok(parent.join(format!("{file_name}{MESSAGE_JOB_DIRECTORY_SUFFIX}")))
+}
+
+fn message_job_path(root: &Path, message_id: &str) -> PathBuf {
+    root.join(format!(
+        "{}{}",
+        message_id_digest(message_id),
+        MESSAGE_JOB_FILE_SUFFIX
+    ))
+}
+
+fn load_message_job_index(root: &Path, max_pending: usize) -> Result<MessageJobIndex> {
+    let paths = list_job_files(root)?;
+    if paths.len() > max_pending {
+        return Err(anyhow!(
+            "message job backlog exceeds the fixed limit of {max_pending}"
+        ));
+    }
+    let mut index = MessageJobIndex::default();
+    for path in paths {
+        let record = read_job_file(&path)?;
+        if message_job_path(root, &record.message_id) != path {
+            return Err(anyhow!(
+                "message job filename does not match its message ID at {}",
+                path.display()
+            ));
+        }
+        register_index_record(&mut index, &record)?;
+    }
+    Ok(index)
+}
+
+fn register_index_record(index: &mut MessageJobIndex, record: &MessageJobRecord) -> Result<()> {
+    match index.entries.entry(record.message_id.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert(record.enqueued_at_unix_nanos);
+            Ok(())
+        }
+        Entry::Occupied(entry) if *entry.get() == record.enqueued_at_unix_nanos => Ok(()),
+        Entry::Occupied(_) => Err(anyhow!(
+            "message job index contains conflicting records for message ID"
+        )),
+    }
 }
 
 pub fn validate_message_id(message_id: &str) -> Result<()> {
@@ -683,8 +737,9 @@ fn is_job_filename(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn recover_candidates(root: &Path) -> Result<()> {
+fn recover_candidates(root: &Path) -> Result<Vec<MessageJobRecord>> {
     let mut removed = false;
+    let mut published = Vec::new();
     for entry in fs::read_dir(root)
         .with_context(|| format!("failed to read message job root {}", root.display()))?
     {
@@ -729,6 +784,7 @@ fn recover_candidates(root: &Path) -> Result<()> {
                     candidate_path.display()
                 ));
             }
+            published.push(record);
         } else {
             return Err(anyhow!(
                 "message job candidate has an unexpected link count: {}",
@@ -746,7 +802,7 @@ fn recover_candidates(root: &Path) -> Result<()> {
     if removed {
         sync_directory(root)?;
     }
-    Ok(())
+    Ok(published)
 }
 
 fn read_candidate_file(path: &Path, links: u64) -> Result<MessageJobRecord> {

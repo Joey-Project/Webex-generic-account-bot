@@ -24,9 +24,13 @@ superseded_by:
   authoritative Webex hydration for all room, sender, body, thread, execution,
   and write decisions.
 - Added background execution bounded by `server.max_concurrent_requests`,
-  permit-before-load record handling, bounded non-active backlog selection,
-  automatic retry, startup rescheduling, duplicate in-process scheduling
+  permit-before-load event handling, a lightweight startup index, bounded
+  non-active and non-deferred backlog selection, automatic retry that releases
+  worker capacity, startup rescheduling, duplicate in-process scheduling
   suppression, and lightweight health counts for pending and active jobs.
+- Latched runtime spool failures into authenticated health while allowing
+  unrelated indexed jobs to continue; a corrupt event no longer blocks later
+  records or leaves `/healthz` falsely healthy.
 - Kept the existing `JsonlStateStore` attempt lease as the crash boundary: an
   unclean restart waits for a surviving lease to expire, then resumes the
   durable job. Existing hidden Webex markers reconcile ambiguous writes.
@@ -34,7 +38,8 @@ superseded_by:
   task limits, both interrupted publication states, corrupt or unsafe spool
   entries including non-blocking FIFO rejection, terminal invalid-ID handling,
   acknowledgement before Codex completion, duplicate sidecar delivery,
-  transient retry, and restart recovery after an old lease expires.
+  non-starving deferred retry, runtime-corruption health latching, transient
+  retry, and restart recovery after an old lease expires.
 
 ## Boundaries
 - This slice does not provide cross-process lease transfer, immediate takeover,

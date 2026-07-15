@@ -70,7 +70,10 @@ const JENKINS_FETCH_TIMEOUT_MAX_SECS: u64 = 60;
 const JENKINS_HELPER_COMPLETION_MARGIN_SECS: u64 = 30;
 const JENKINS_HELPER_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const JENKINS_HELPER_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
 const MESSAGE_JOB_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const MESSAGE_JOB_RESCAN_INTERVAL: Duration = Duration::from_millis(10);
 const MESSAGE_JOB_RETRY_FALLBACK: Duration = Duration::from_secs(30);
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
         app: app.clone(),
         message_jobs,
         active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
+        deferred_message_jobs: Arc::new(StdSyncMutex::new(HashMap::new())),
         ingest_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
         max_active_message_jobs: config.server.max_concurrent_requests.max(1),
     };
@@ -204,6 +208,7 @@ struct AppState {
     app: Arc<BotApp>,
     message_jobs: Arc<DurableMessageJobs>,
     active_message_jobs: Arc<StdSyncMutex<HashSet<String>>>,
+    deferred_message_jobs: Arc<StdSyncMutex<HashMap<String, Instant>>>,
     ingest_slots: Arc<Semaphore>,
     max_active_message_jobs: usize,
 }
@@ -2611,6 +2616,13 @@ struct ActiveMessageJobGuard {
     active_message_jobs: Arc<StdSyncMutex<HashSet<String>>>,
 }
 
+#[derive(Clone, Copy)]
+enum MessageJobRunOutcome {
+    Complete,
+    RetryAfter(Duration),
+    Stopped,
+}
+
 impl Drop for ActiveMessageJobGuard {
     fn drop(&mut self) {
         if let Ok(mut active) = self.active_message_jobs.lock() {
@@ -2660,9 +2672,20 @@ async fn schedule_pending_message_jobs(state: &AppState) -> Result<()> {
     if available == 0 {
         return Ok(());
     }
+    let now = Instant::now();
+    let deferred = {
+        let mut deferred = state
+            .deferred_message_jobs
+            .lock()
+            .map_err(|_| anyhow!("deferred message job map is poisoned"))?;
+        deferred.retain(|_, retry_at| *retry_at > now);
+        deferred.keys().cloned().collect::<HashSet<_>>()
+    };
+    let mut excluded = active;
+    excluded.extend(deferred);
     for message_id in state
         .message_jobs
-        .pending_message_ids(active, available)
+        .pending_message_ids(excluded, available)
         .await?
     {
         schedule_message_job(state, message_id)?;
@@ -2681,6 +2704,20 @@ async fn rescan_message_jobs(state: AppState) {
 
 fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
     {
+        let now = Instant::now();
+        let mut deferred = state
+            .deferred_message_jobs
+            .lock()
+            .map_err(|_| anyhow!("deferred message job map is poisoned"))?;
+        if deferred
+            .get(&message_id)
+            .is_some_and(|retry_at| *retry_at > now)
+        {
+            return Ok(());
+        }
+        deferred.remove(&message_id);
+    }
+    {
         let mut active = state
             .active_message_jobs
             .lock()
@@ -2696,9 +2733,31 @@ fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
     };
     let state = state.clone();
     tokio::spawn(async move {
+        let outcome = run_persisted_message_job(&state, &message_id).await;
         {
-            let _guard = guard;
-            run_persisted_message_job(&state, &message_id).await;
+            let mut deferred = match state.deferred_message_jobs.lock() {
+                Ok(deferred) => deferred,
+                Err(_) => {
+                    error!("deferred message job map is poisoned");
+                    drop(guard);
+                    return;
+                }
+            };
+            match outcome {
+                MessageJobRunOutcome::RetryAfter(delay) => {
+                    deferred.insert(
+                        message_id.clone(),
+                        Instant::now() + delay.max(Duration::from_millis(10)),
+                    );
+                }
+                MessageJobRunOutcome::Complete | MessageJobRunOutcome::Stopped => {
+                    deferred.remove(&message_id);
+                }
+            }
+        }
+        drop(guard);
+        if matches!(outcome, MessageJobRunOutcome::Stopped) {
+            return;
         }
         if let Err(error) = schedule_pending_message_jobs(&state).await {
             error!(error = %error, "failed to schedule the next durable message job");
@@ -2707,50 +2766,55 @@ fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn run_persisted_message_job(state: &AppState, message_id: &str) {
-    loop {
-        let permit = match state.app.request_slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
-        let record = match state.message_jobs.load(message_id.to_owned()).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(error) => {
-                drop(permit);
-                error!(message_id = %message_id, error = %error, "failed to load durable message job");
-                tokio::time::sleep(MESSAGE_JOB_RETRY_FALLBACK).await;
-                continue;
-            }
-        };
-        let event = record.into_event();
-        let result = state.app.process_event(event).await;
-        drop(permit);
-        match result {
-            Ok(action) => match state.message_jobs.remove(message_id.to_owned()).await {
-                Ok(_) => {
-                    info!(
-                        message_id = %message_id,
-                        action = action.action,
-                        "completed durable message job"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    error!(message_id = %message_id, error = %error, "failed to remove completed durable message job");
-                    tokio::time::sleep(MESSAGE_JOB_RETRY_FALLBACK).await;
-                }
-            },
-            Err(error) => {
-                let retry_after = error.retry_after.unwrap_or(MESSAGE_JOB_RETRY_FALLBACK);
-                warn!(
+async fn run_persisted_message_job(state: &AppState, message_id: &str) -> MessageJobRunOutcome {
+    let permit = match state.app.request_slots.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return MessageJobRunOutcome::Stopped,
+    };
+    let record = match state.message_jobs.load(message_id.to_owned()).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            state.message_jobs.mark_unhealthy();
+            error!(message_id = %message_id, "durable message job disappeared before execution");
+            return MessageJobRunOutcome::RetryAfter(MESSAGE_JOB_RETRY_FALLBACK);
+        }
+        Err(error) => {
+            error!(message_id = %message_id, error = %error, "failed to load durable message job");
+            return MessageJobRunOutcome::RetryAfter(MESSAGE_JOB_RETRY_FALLBACK);
+        }
+    };
+    let event = record.into_event();
+    let result = state.app.process_event(event).await;
+    drop(permit);
+    match result {
+        Ok(action) => match state.message_jobs.remove(message_id.to_owned()).await {
+            Ok(true) => {
+                info!(
                     message_id = %message_id,
-                    retry_after_secs = retry_after.as_secs_f64(),
-                    error = %error.message,
-                    "durable message job will be retried"
+                    action = action.action,
+                    "completed durable message job"
                 );
-                tokio::time::sleep(retry_after.max(Duration::from_millis(10))).await;
+                MessageJobRunOutcome::Complete
             }
+            Ok(false) => {
+                state.message_jobs.mark_unhealthy();
+                error!(message_id = %message_id, "completed durable message job disappeared before removal");
+                MessageJobRunOutcome::Complete
+            }
+            Err(error) => {
+                error!(message_id = %message_id, error = %error, "failed to remove completed durable message job");
+                MessageJobRunOutcome::RetryAfter(MESSAGE_JOB_RETRY_FALLBACK)
+            }
+        },
+        Err(error) => {
+            let retry_after = error.retry_after.unwrap_or(MESSAGE_JOB_RETRY_FALLBACK);
+            warn!(
+                message_id = %message_id,
+                retry_after_secs = retry_after.as_secs_f64(),
+                error = %error.message,
+                "durable message job will be retried"
+            );
+            MessageJobRunOutcome::RetryAfter(retry_after)
         }
     }
 }
@@ -2817,7 +2881,17 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
 }
 
 async fn message_job_counts(state: &AppState) -> Result<(usize, usize)> {
+    if !state.message_jobs.is_healthy() {
+        return Err(anyhow!(
+            "durable message job state has a latched runtime failure"
+        ));
+    }
     let pending = state.message_jobs.pending_count().await?;
+    if !state.message_jobs.is_healthy() {
+        return Err(anyhow!(
+            "durable message job state has a latched runtime failure"
+        ));
+    }
     let active = state
         .active_message_jobs
         .lock()
@@ -4280,6 +4354,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_retry_releases_capacity_for_unrelated_jobs() {
+        let harness = TestHarness::new();
+        let mut state = harness.app_state();
+        state.max_active_message_jobs = 1;
+        harness
+            .webex
+            .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(503, Some(Duration::from_secs(30))),
+            )))));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-unrelated")));
+        harness.runner.push_output("Unrelated reply");
+        let retrying = message_event(inbound_message("message-deferred", "retry later"));
+        let unrelated = message_event(inbound_message("message-unrelated", "run now"));
+
+        assert_eq!(
+            handle_event(State(state.clone()), event_request(&retrying))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .deferred_message_jobs
+                    .lock()
+                    .unwrap()
+                    .contains_key("message-deferred")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            handle_event(State(state.clone()), event_request(&unrelated))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        wait_for_job_removal(&state.message_jobs, "message-unrelated").await;
+
+        assert!(
+            state
+                .message_jobs
+                .load("message-deferred".to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(
+            state
+                .message_jobs
+                .remove("message-deferred".to_owned())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_runtime_job_latches_health_but_does_not_block_later_jobs() {
+        let harness = TestHarness::new();
+        let mut state = harness.app_state();
+        state.max_active_message_jobs = 1;
+        state
+            .message_jobs
+            .enqueue(
+                "message-corrupt".to_owned(),
+                message_event(inbound_message("message-corrupt", "corrupt me")),
+            )
+            .await
+            .unwrap();
+        let corrupt_path = fs::read_dir(state.message_jobs.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension() == Some(OsStr::new("json")))
+            .unwrap();
+        fs::write(&corrupt_path, b"not-json\n").unwrap();
+        state
+            .message_jobs
+            .enqueue(
+                "message-after-corrupt".to_owned(),
+                message_event(inbound_message("message-after-corrupt", "still run")),
+            )
+            .await
+            .unwrap();
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-after-corrupt")));
+        harness.runner.push_output("Later reply");
+
+        schedule_pending_message_jobs(&state).await.unwrap();
+        wait_for_job_removal(&state.message_jobs, "message-after-corrupt").await;
+
+        assert!(!state.message_jobs.is_healthy());
+        assert_eq!(
+            handle_health(State(state.clone()), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(harness.runner.calls().len(), 1);
+        fs::remove_dir_all(state.message_jobs.root()).unwrap();
+    }
+
+    #[tokio::test]
     async fn startup_recovery_waits_out_an_old_attempt_lease_without_losing_the_job() {
         let state_path = unique_state_path();
         let mut config = (*test_config(state_path)).clone();
@@ -4302,6 +4489,7 @@ mod tests {
         let state = harness.app_state();
 
         schedule_pending_message_jobs(&state).await.unwrap();
+        let rescan = tokio::spawn(rescan_message_jobs(state.clone()));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(harness.runner.calls().is_empty());
@@ -4314,6 +4502,8 @@ mod tests {
                 .is_some()
         );
         wait_for_job_removal(&state.message_jobs, "message-recovery").await;
+        rescan.abort();
+        let _ = rescan.await;
         assert_eq!(harness.runner.calls().len(), 1);
         assert!(harness.processed("message-recovery").await);
     }
@@ -4322,6 +4512,7 @@ mod tests {
     async fn background_job_retries_transient_webex_failure_without_sidecar_redelivery() {
         let harness = TestHarness::new();
         let state = harness.app_state();
+        let rescan = tokio::spawn(rescan_message_jobs(state.clone()));
         harness
             .webex
             .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
@@ -4338,6 +4529,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         wait_for_job_removal(&state.message_jobs, "message-retry").await;
+        rescan.abort();
+        let _ = rescan.await;
         assert_eq!(harness.runner.calls().len(), 1);
         assert_eq!(harness.webex.created_requests().len(), 1);
         assert!(harness.processed("message-retry").await);
@@ -7879,6 +8072,7 @@ mod tests {
                 app: self.app.clone(),
                 message_jobs: Arc::new(DurableMessageJobs::open(&self.state_path).unwrap()),
                 active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
+                deferred_message_jobs: Arc::new(StdSyncMutex::new(HashMap::new())),
                 ingest_slots: Arc::new(Semaphore::new(4)),
                 max_active_message_jobs: 4,
             }
