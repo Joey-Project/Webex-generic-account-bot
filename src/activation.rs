@@ -881,7 +881,7 @@ fn validate_active_manifest(manifest: &ActiveRuntimeManifest) -> Result<()> {
     Ok(())
 }
 
-fn parse_boot_id(bytes: &[u8]) -> Result<String> {
+pub(crate) fn parse_boot_id(bytes: &[u8]) -> Result<String> {
     let value = std::str::from_utf8(bytes).context("kernel boot identifier is not UTF-8")?;
     let value = value.strip_suffix('\n').unwrap_or(value);
     if value.len() != 36

@@ -1325,7 +1325,15 @@ fn read_reboot_challenge_with(paths: &RebootChallengePaths) -> Result<Option<Reb
         }
     };
     if challenge.version != REBOOT_CHALLENGE_VERSION
-        || challenge.challenge_boot_id.trim().is_empty()
+        || !activation::parse_boot_id(challenge.challenge_boot_id.as_bytes())
+            .is_ok_and(|boot_id| boot_id == challenge.challenge_boot_id)
+        || challenge
+            .validated_boot_id
+            .as_deref()
+            .is_some_and(|validated_boot_id| {
+                !activation::parse_boot_id(validated_boot_id.as_bytes())
+                    .is_ok_and(|boot_id| boot_id == validated_boot_id)
+            })
         || validate_runtime_canary_nonce(&challenge.marker_nonce).is_err()
     {
         bail!("reboot challenge is invalid");
@@ -1952,6 +1960,37 @@ mod tests {
                 .to_string()
                 .contains("legacy reboot challenge schema version 1")
         );
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_noncanonical_boot_ids() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        for (challenge_boot_id, validated_boot_id) in [
+            ("not-a-boot-id", None),
+            (boot, Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")),
+        ] {
+            let fixture = RebootChallengeFixture::new(boot);
+            let activation = verified_activation(boot);
+            let challenge = RebootChallenge {
+                version: REBOOT_CHALLENGE_VERSION,
+                challenge_boot_id: challenge_boot_id.to_owned(),
+                marker_nonce: "0".repeat(64),
+                validated_boot_id: validated_boot_id.map(str::to_owned),
+                activation_binding: ActivationBindingReport::from(&activation),
+            };
+            let payload = serde_json::to_vec(&challenge).unwrap();
+            create_private_fixture_with_owner(
+                &fixture.paths.challenge,
+                &payload,
+                fixture.paths.owner,
+            )
+            .unwrap();
+
+            let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+                .expect_err("reject a noncanonical persisted boot identifier");
+            assert!(error.to_string().contains("reboot challenge is invalid"));
+            assert_eq!(fs::read(&fixture.paths.challenge).unwrap(), payload);
+        }
     }
 
     #[test]

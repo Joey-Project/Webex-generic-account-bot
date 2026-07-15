@@ -40,6 +40,8 @@ superseded_by:
 - Challenge preparation and renewal both require the boot-scoped marker root
   to retain the exact trusted owner and mode before reading or writing marker
   evidence.
+- Persisted challenge and validated boot identifiers must use the exact
+  canonical kernel boot-ID format before either can enter state classification.
 - This step never fetches or installs config, starts or enables a unit, runs
   Codex canaries, reboots the host, activates the runner, or contacts Webex.
 
@@ -56,5 +58,5 @@ superseded_by:
 - State machine: `src/activation_canary.rs`
 - Tests: `test/prepare-activation-reboot-challenge.node-test.mjs`
 - Rust disk-state tests cover v2 arm/retry, boot crossing, marker survival,
-  marker-root rejection, binding drift, renewal validation, and legacy-v1
-  identification.
+  marker-root and noncanonical boot-ID rejection, binding drift, renewal
+  validation, and legacy-v1 identification.
