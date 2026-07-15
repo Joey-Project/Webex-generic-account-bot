@@ -23,6 +23,7 @@ import {
   validateConfigTreeManifest,
   validateConfigTreePaths,
   validateDeploymentLockProvisioning,
+  withSharedDeploymentLock,
 } from '../scripts/deploy-config.mjs';
 import {
   assertMaxRenderedBytes,
@@ -216,6 +217,28 @@ describe('deploy-config argument parsing', () => {
 
 describe('deploy-config lock policy', () => {
   const sharedLock = '/run/webex-config-deploy/deploy-config.lock';
+
+  it('holds and releases the reusable deployment lock around one operation', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-shared-lock-helper-'));
+    const lockFile = path.join(root, 'deploy-config.lock');
+    try {
+      let operationRan = false;
+      const result = await withSharedDeploymentLock(async () => {
+        operationRan = true;
+        await assert.rejects(
+          withSharedDeploymentLock(async () => {}, { lockFile }),
+          /deployment already in progress/,
+        );
+        return 'complete';
+      }, { lockFile });
+      assert.equal(result, 'complete');
+      assert.equal(operationRan, true);
+      assert.match(await fs.readFile(lockFile, 'utf8'), /"lock_kind":"linux-flock"/);
+      await withSharedDeploymentLock(async () => {}, { lockFile });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
   const rootUid = 0;
   const workerUid = 1001;
   const sharedGid = 2001;

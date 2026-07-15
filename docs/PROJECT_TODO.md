@@ -39,8 +39,13 @@
   preserving full activation and launcher preflight in `--check-config`.
 - [completed] Update both config-repository CI lanes to use
   `--check-config-structure` and pin the all-ephemeral `status`/`pull` profile.
-- [pending] Stage and apply the reviewed host release, complete activation, and
-  run deployment and Webex E2E before relying on production `/config pull`.
+- [completed] Add a fixed, default-dry-run host deployment preparation entrypoint
+  that verifies approved release evidence, provisions host policy, builds the
+  immutable runtime, and checks secret metadata without reading secret content
+  or changing service and activation state.
+- [pending] Stage and apply the reviewed host release, deliver secrets through
+  the separate operator channel, complete activation, and run deployment and
+  Webex E2E before relying on production `/config pull`.
 - [pending] Add recoverable activation and in-flight drain/handoff semantics
   before enabling `/config reload` and `/config sync`; never run deployment or
   service work inside the Webex request handler.

@@ -1804,6 +1804,38 @@ async function closeLock(lockState) {
   await lockState.handle.close();
 }
 
+export async function withSharedDeploymentLock(
+  operation,
+  { fsApi = fs, lockFile = SHARED_DEPLOYMENT_LOCK } = {},
+) {
+  if (typeof operation !== 'function') {
+    throw new Error('shared deployment lock operation must be a function');
+  }
+  const lockState = await acquireLock(lockFile, fsApi);
+  let primaryError = null;
+  try {
+    return await operation();
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    let cleanupError = null;
+    try {
+      await verifyLockForRelease(lockFile, lockState, fsApi);
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await closeLock(lockState);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (cleanupError) {
+      throw combineCleanupError(primaryError, cleanupError, 'shared lock cleanup failed');
+    }
+  }
+}
+
 async function writeLockMetadata(handle, owner) {
   const payload = Buffer.from(`${JSON.stringify(owner)}\n`, 'utf8');
   await handle.write(payload, 0, payload.length, 0);

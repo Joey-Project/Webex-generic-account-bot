@@ -4,7 +4,7 @@ title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
 updated: 2026-07-15
-branch: codex/durable-message-job-recovery
+branch: codex/host-deployment-preflight
 pr:
 supersedes: []
 superseded_by:
@@ -16,6 +16,11 @@ superseded_by:
 - Split deployment automation and Codex runner isolation into small PRs with independent worktrees and merge gates.
 
 ## Current Progress
+- Host deployment preparation now composes the already reviewed fixed release
+  verification, guarded host provisioner, and immutable runtime builder behind
+  one default-dry-run entrypoint. It reports metadata-only secret readiness but
+  never installs or reads secret content, changes service state, or attempts
+  runner activation.
 - Durable message-job recovery publishes each supported sidecar event to a
   private, bounded, fsync-backed spool before acknowledgement. Background
   workers preserve the existing authoritative hydration, attempt lease, Webex

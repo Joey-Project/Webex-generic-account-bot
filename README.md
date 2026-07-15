@@ -489,21 +489,91 @@ complete matching candidate or recovers a matching install after a
 publish/fsync interruption; incomplete or multiple candidates and mismatching
 installs require explicit administrator inspection.
 
-Only after this bootstrap succeeds should the guarded provisioner create host
-identities and policy paths. Then the root-owned runtime builder can write the
-source manifest and immutable SquashFS image:
+Only after this bootstrap succeeds should the reviewed host deployment
+preparation entrypoint verify the installed release, create host identities and
+policy paths, and build the immutable runtime image. Carry the same approved
+release evidence into both dry-run and apply:
 
 ```bash
-sudo -- /opt/webex-generic-account-bot/code/scripts/provision-host --apply
-sudo -- /usr/bin/node \
-  /opt/webex-generic-account-bot/code/scripts/build-codex-runtime-image.mjs \
-  --write-source-manifest
-sudo -- /usr/bin/node \
-  /opt/webex-generic-account-bot/code/scripts/build-codex-runtime-image.mjs
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --dry-run \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --apply --through provisioned \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
 
-Secrets, deploy credentials, service enablement, runner activation, and Webex
-E2E remain separate deployment gates.
+Dry-run always calls the root-owned release installer in verification mode,
+the guarded provisioner in dry-run mode, and, for the default
+`preactivation-ready` target, the runtime builder's read-only source inspection.
+Apply requires an explicit `--through provisioned` or `--through
+preactivation-ready`; there is no implicit apply target. The provisioned target
+stops after host policy convergence. The provisioner serialises that mutation
+with the same shared deployment lock used by config deployment. The
+preactivation target then reacquires the lock, revalidates dormant and unchanged
+host policy under it, requires a clean receipt/drop-in/reboot-challenge boundary
+and complete secret readiness, then runs the read-only runtime conflict check.
+A conflicting active runtime exits into the separate upgrade workflow before
+the source manifest is written. Only then does preparation invoke the fixed
+runtime write/build paths. It rechecks both the activation boundary and secret
+metadata after the runtime build before reporting success. `--require-secrets`
+enforces the same readiness contract for either target. If a later readiness
+gate fails, the converged host policy remains in the safe, rerunnable
+`provisioned` state.
+
+The entrypoint does not install or parse secret contents, enable or start a
+unit, install the runner permission drop-in, mint an activation receipt, or
+call Webex. It suppresses child stdout and stderr on failures instead of copying
+possibly credential-shaped diagnostics into deployment logs. Runtime dry-run
+performs no writes and reports an existing upgrade runtime as `conflict`.
+First-deployment apply accepts an absent runtime or an exact matching idempotent
+retry; it rejects a different active source or runtime build contract instead
+of acting as an upgrade mechanism. A missing, corrupt, or inconsistent active
+image also fails closed: preserve `active.json` and use a separately reviewed
+runtime recovery procedure rather than deleting deployment evidence in this
+entrypoint. Every report states that service state is unchanged and activation
+was not attempted. Shared-lock contention preserves exit status `75` so an
+operator or deployment scheduler can retry it separately from a permanent
+preflight failure.
+
+Install secrets through a separate administrator-controlled channel after
+provisioning. The readiness check uses `lstat` metadata only and never opens or
+reads these files:
+
+| Secret | Owner | Group | Accepted modes |
+| --- | --- | --- | --- |
+| `/var/lib/webex-headless-access/access-token` | `root` | `webex-generic-account-bot` | `0440`, `0640` |
+| `/etc/webex-generic-account-bot/bot.env` | `root` | `root` | `0400`, `0600` |
+| `/etc/webex-generic-account-bot/jenkins.env` | `root` | `webex-generic-account-bot` | `0440`, `0640` |
+| `/etc/webex-generic-account-bot/codex-auth.json` | `root` | `root` | `0400`, `0600` |
+| `/var/lib/webex-generic-account-bot/deploy/id_ed25519` | `root` | `webex-config-deploy` | `0440`, `0640` |
+
+Each file must be non-empty, at most 1 MiB, regular, non-symlinked, and
+single-linked. Its fixed parent must retain the provisioned root ownership,
+group, and mode `0750`, and neither parent nor file may carry an extended POSIX
+ACL. After the separate secret delivery completes, require
+the readiness gate explicitly:
+
+```bash
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --dry-run --require-secrets \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+```
+
+Then prepare the immutable runtime under the same reviewed release evidence:
+
+```bash
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --apply --through preactivation-ready \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
+```
+
+Secret delivery, service enablement, runner activation, and Webex E2E remain
+separate deployment gates.
 
 The production CLI has no source, target, or root override. It reads a fixed
 allowlist of four sysusers files, six tmpfiles files, and five systemd units
@@ -1363,13 +1433,20 @@ The fixed root-owned source layout is:
 Copy the files from the matching Codex vendor package without following
 symlinks. Every source and parent directory must be root-owned and not writable
 by group or other. The runtime wrapper, BusyBox, Codex, `rg`, and `bwrap` must
-be static x86-64 ELF executables. With `/usr/bin/mksquashfs` installed, generate
-and consume the fixed source manifest as root:
+be static x86-64 ELF executables. With `/usr/bin/mksquashfs` installed, use the
+guarded production entrypoint to inspect active-runtime compatibility before it
+generates and consumes the fixed source manifest:
 
 ```bash
-node scripts/build-codex-runtime-image.mjs --write-source-manifest
-node scripts/build-codex-runtime-image.mjs
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --apply --through preactivation-ready \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
+
+The runtime builder's no-argument mode is an internal primitive for a separately
+reviewed runtime upgrade workflow. Do not invoke it directly for production
+first deployment or preactivation preparation.
 
 The builder atomically selects
 `/opt/webex-generic-account-bot/runtime/active.json` only after fsyncing and
