@@ -1433,13 +1433,20 @@ The fixed root-owned source layout is:
 Copy the files from the matching Codex vendor package without following
 symlinks. Every source and parent directory must be root-owned and not writable
 by group or other. The runtime wrapper, BusyBox, Codex, `rg`, and `bwrap` must
-be static x86-64 ELF executables. With `/usr/bin/mksquashfs` installed, generate
-and consume the fixed source manifest as root:
+be static x86-64 ELF executables. With `/usr/bin/mksquashfs` installed, use the
+guarded production entrypoint to inspect active-runtime compatibility before it
+generates and consumes the fixed source manifest:
 
 ```bash
-node scripts/build-codex-runtime-image.mjs --write-source-manifest
-node scripts/build-codex-runtime-image.mjs
+sudo -- /opt/webex-generic-account-bot/code/scripts/prepare-host-deployment \
+  --apply --through preactivation-ready \
+  --expected-bot-revision "$REVIEWED_BOT_REVISION" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256"
 ```
+
+The runtime builder's no-argument mode is an internal primitive for a separately
+reviewed runtime upgrade workflow. Do not invoke it directly for production
+first deployment or preactivation preparation.
 
 The builder atomically selects
 `/opt/webex-generic-account-bot/runtime/active.json` only after fsyncing and
