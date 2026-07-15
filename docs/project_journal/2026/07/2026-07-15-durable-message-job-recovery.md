@@ -24,6 +24,9 @@ superseded_by:
   or room hints that a same-UID current-user runner could read. Authoritative
   Webex hydration supplies all room, sender, body, thread, execution, and write
   decisions.
+- Required raw job and recovery-candidate bytes to match the canonical record
+  serialization, rejecting duplicate JSON keys and other noncanonical disk
+  records before they enter the in-memory index.
 - Added background execution bounded by `server.max_concurrent_requests`,
   permit-before-load event handling, a lightweight startup index, bounded
   non-active and non-deferred backlog selection, automatic retry that releases
@@ -49,6 +52,7 @@ superseded_by:
   task limits, both interrupted publication states, corrupt or unsafe spool
   entries including non-blocking FIFO rejection, terminal invalid-ID handling,
   canonical ID-only persistence, same-UID payload non-disclosure,
+  duplicate-key rejection,
   acknowledgement before Codex completion, duplicate sidecar delivery,
   non-starving deferred retry, runtime-corruption health latching, transient
   retry, retry-delay bounding, scheduler-state health latching, health-scan

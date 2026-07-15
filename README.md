@@ -45,9 +45,11 @@ file and containing directory have been synced. The job spool is derived from
 mode-`0600` records, and admits at most 4096 pending messages. Atomic
 no-clobber publication preserves the first accepted message ID without storing
 the rest of the sidecar payload; authoritative Webex hydration controls every
-security and routing decision. File and recovery-candidate enumeration stops
-as soon as the fixed bound is exceeded. Startup validates the complete spool
-and reschedules every pending job through a worker set bounded by
+security and routing decision. Reads require the raw record bytes to match the
+single canonical serialization, so duplicate JSON keys and other noncanonical
+disk records fail closed. File and recovery-candidate enumeration stops as soon
+as the fixed bound is exceeded. Startup validates the complete spool and
+reschedules every pending job through a worker set bounded by
 `server.max_concurrent_requests`; queued ID envelopes are loaded only after a
 worker obtains an execution permit.
 Startup builds a lightweight ID/timestamp index, and periodic rescans select

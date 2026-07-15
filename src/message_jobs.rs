@@ -228,15 +228,7 @@ impl DurableMessageJobs {
             enqueued_at_unix_nanos: unix_nanos_now(),
             event,
         };
-        validate_record(&record)?;
-        let mut bytes = serde_json::to_vec(&record).context("failed to serialise message job")?;
-        bytes.push(b'\n');
-        if bytes.len() as u64 > MAX_MESSAGE_JOB_RECORD_BYTES {
-            return Err(anyhow!(
-                "message job record exceeds the {} byte limit",
-                MAX_MESSAGE_JOB_RECORD_BYTES
-            ));
-        }
+        let bytes = encode_message_job_record(&record)?;
 
         let candidate_path = self.candidate_path();
         let mut candidate = create_private_file(&candidate_path)?;
@@ -553,6 +545,29 @@ fn validate_record(record: &MessageJobRecord) -> Result<()> {
     Ok(())
 }
 
+fn encode_message_job_record(record: &MessageJobRecord) -> Result<Vec<u8>> {
+    validate_record(record)?;
+    let mut bytes = serde_json::to_vec(record).context("failed to serialise message job")?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_MESSAGE_JOB_RECORD_BYTES {
+        return Err(anyhow!(
+            "message job record exceeds the {} byte limit",
+            MAX_MESSAGE_JOB_RECORD_BYTES
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_message_job_record(bytes: &[u8]) -> Result<MessageJobRecord> {
+    let record: MessageJobRecord =
+        serde_json::from_slice(bytes).context("invalid message job JSON")?;
+    validate_record(&record)?;
+    if encode_message_job_record(&record)? != bytes {
+        return Err(anyhow!("message job record is not canonical JSON"));
+    }
+    Ok(record)
+}
+
 fn message_id_digest(message_id: &str) -> String {
     digest(&SHA256, message_id.as_bytes())
         .as_ref()
@@ -678,9 +693,7 @@ fn read_job_file(path: &Path) -> Result<MessageJobRecord> {
             path.display()
         ));
     }
-    let record: MessageJobRecord = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid message job JSON at {}", path.display()))?;
-    validate_record(&record)
+    let record = decode_message_job_record(&bytes)
         .with_context(|| format!("invalid message job at {}", path.display()))?;
     Ok(record)
 }
@@ -887,9 +900,8 @@ fn read_candidate_file(path: &Path, links: u64) -> Result<MessageJobRecord> {
             path.display()
         ));
     }
-    let record: MessageJobRecord = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid message job candidate JSON at {}", path.display()))?;
-    validate_record(&record)?;
+    let record = decode_message_job_record(&bytes)
+        .with_context(|| format!("invalid message job candidate at {}", path.display()))?;
     Ok(record)
 }
 
@@ -1124,7 +1136,7 @@ mod tests {
         )
         .unwrap();
         let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
-        assert!(error.to_string().contains("invalid message job JSON"));
+        assert!(format!("{error:#}").contains("invalid message job JSON"));
     }
 
     #[test]
@@ -1150,6 +1162,31 @@ mod tests {
 
         assert!(format!("{error:#}").contains("only its message ID envelope"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_rejects_duplicate_json_keys_that_hide_sidecar_content() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        let path = jobs.job_path("message-duplicate-key");
+        let record = MessageJobRecord {
+            version: MESSAGE_JOB_RECORD_VERSION,
+            message_id: "message-duplicate-key".to_owned(),
+            enqueued_at_unix_nanos: 1,
+            event: persisted_message_event("message-duplicate-key"),
+        };
+        let canonical = String::from_utf8(encode_message_job_record(&record).unwrap()).unwrap();
+        let forged = canonical.replace(
+            r#""data":{"id":"message-duplicate-key"}"#,
+            r#""data":{"id":"sensitive-hidden-value","id":"message-duplicate-key"}"#,
+        );
+        assert_ne!(forged, canonical);
+        write_private_file(&path, forged.as_bytes());
+        drop(jobs);
+
+        let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not canonical JSON"));
     }
 
     #[cfg(unix)]
