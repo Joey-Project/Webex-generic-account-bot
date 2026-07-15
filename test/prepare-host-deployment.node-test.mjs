@@ -244,6 +244,82 @@ describe('host deployment preparation', () => {
     assert.equal(runtimeCommandReached, false);
   });
 
+  it('rejects host policy drift after acquiring the runtime lock', async () => {
+    let runtimeCommandReached = false;
+    await assert.rejects(
+      prepareHostDeployment(options({
+        apply: true,
+        through: 'preactivation-ready',
+      }), {
+        euid: 0,
+        runJson: async (command, args) => {
+          if (command === DEFAULTS.releaseInstaller) return releaseReport();
+          if (command === DEFAULTS.provisioner) {
+            return args[0] === '--apply'
+              ? provisionReport('applied')
+              : provisionReport('dry-run', 1);
+          }
+          runtimeCommandReached = true;
+          return runtimeReport();
+        },
+        inspectSecrets: async () => secretReport('ready'),
+        inspectBoundary: async () => activationBoundary(true),
+        withLock: async (operation) => operation(),
+      }),
+      /host policy changed before runtime preparation/,
+    );
+    assert.equal(runtimeCommandReached, false);
+  });
+
+  it('rejects activation boundary drift after the runtime build', async () => {
+    let boundaryInspections = 0;
+    let runtimeCommands = 0;
+    await assert.rejects(
+      prepareHostDeployment(options({
+        apply: true,
+        through: 'preactivation-ready',
+      }), {
+        euid: 0,
+        runJson: async (command, args) => {
+          if (command === DEFAULTS.releaseInstaller) return releaseReport();
+          if (command === DEFAULTS.provisioner) {
+            return args[0] === '--apply'
+              ? provisionReport('applied')
+              : provisionReport('dry-run', 0);
+          }
+          runtimeCommands += 1;
+          return args.at(-1) === '--write-source-manifest'
+            ? sourceManifestReport()
+            : runtimeReport();
+        },
+        inspectSecrets: async () => secretReport('ready'),
+        inspectBoundary: async () => {
+          boundaryInspections += 1;
+          return activationBoundary(boundaryInspections === 1);
+        },
+        withLock: async (operation) => operation(),
+      }),
+      /activation boundary changed while preparing the runtime/,
+    );
+    assert.equal(runtimeCommands, 2);
+    assert.equal(boundaryInspections, 2);
+  });
+
+  it('reports an existing upgrade runtime as a read-only conflict', async () => {
+    const report = await prepareHostDeployment(options(), {
+      euid: 0,
+      runJson: async (command) => {
+        if (command === DEFAULTS.releaseInstaller) return releaseReport();
+        if (command === DEFAULTS.provisioner) return provisionReport('dry-run');
+        return runtimeInspectionReport('conflict');
+      },
+      inspectSecrets: async () => secretReport('ready'),
+      inspectBoundary: async () => activationBoundary(true),
+    });
+    assert.equal(report.runtime.active_runtime, 'conflict');
+    assert.equal(report.runtime.writes_performed, 0);
+  });
+
   it('reports only absence or presence for activation boundary artifacts', async () => {
     const report = await inspectActivationBoundary({
       fsApi: {
@@ -392,7 +468,7 @@ function options(overrides = {}) {
   };
 }
 
-function runtimeInspectionReport() {
+function runtimeInspectionReport(activeRuntime = 'absent') {
   return {
     version: 1,
     status: 'inspected',
@@ -400,7 +476,7 @@ function runtimeInspectionReport() {
     codex_target: 'x86_64-unknown-linux-musl',
     source_file_count: 7,
     source_manifest_sha256: DIGEST,
-    active_runtime: 'absent',
+    active_runtime: activeRuntime,
     writes_performed: 0,
   };
 }

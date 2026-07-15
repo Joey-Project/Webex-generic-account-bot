@@ -277,15 +277,24 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
     sourceDefinitions,
   );
   const sourceManifestSha256 = sha256(sourceBytes);
+  const inspectedMksquashfs = await inspectTrustedBuildTool(
+    settings.mksquashfs,
+    expectedUid,
+  );
+  const firstDeploymentContract = createFirstDeploymentContract(
+    manifest,
+    sourceManifestSha256,
+    inspectedMksquashfs.sha256,
+  );
   const existingActive = options.firstDeployment
     ? await inspectFirstDeploymentRuntimeState(
       settings.outputRoot,
-      sourceManifestSha256,
+      firstDeploymentContract,
       { expectedUid, expectedGid },
     )
     : null;
   if (existingActive?.status === 'conflict') {
-    throw new Error('existing active runtime does not match first-deployment sources');
+    throw new Error('existing active runtime does not match the first-deployment contract');
   }
   const stagingRoot = await fs.mkdtemp(path.join(settings.outputRoot, '.runtime-build-'));
   const imageTemporary = path.join(
@@ -305,16 +314,8 @@ export async function buildRuntimeImage(options = {}, injected = {}) {
       settings.mksquashfs,
       64 * 1024 * 1024,
     );
-    if (
-      existingActive?.status === 'matching'
-      && (
-        existingActive.active.mksquashfs_sha256 !== mksquashfsSha256
-        || existingActive.active.mksquashfs_argv_sha256 !== sha256(
-          Buffer.from(JSON.stringify(mksquashfsArgs('/staging', '/image')), 'utf8'),
-        )
-      )
-    ) {
-      throw new Error('existing active runtime uses different first-deployment build inputs');
+    if (mksquashfsSha256 !== inspectedMksquashfs.sha256) {
+      throw new Error('mksquashfs changed after first-deployment inspection');
     }
     await fs.chmod(stagingRoot, 0o700);
     await stageManifest(stagingRoot, manifest, expectedUid, trustFile);
@@ -381,6 +382,7 @@ export async function inspectRuntimeSources(injected = {}) {
     throw new Error('runtime source inspection must run as root');
   }
   await trustFile(mksquashfs, expectedUid, { executable: true });
+  const inspectedMksquashfs = await inspectTrustedBuildTool(mksquashfs, expectedUid);
   await trustFile(packageMetadata, expectedUid, { executable: false });
   const packageBytes = await readBoundedFile(packageMetadata, 64 * 1024);
   const packageValue = JSON.parse(packageBytes.toString('utf8'));
@@ -443,17 +445,24 @@ export async function inspectRuntimeSources(injected = {}) {
     definitions,
   );
   const payload = `${JSON.stringify(manifest, null, 2)}\n`;
+  const sourceManifestSha256 = sha256(Buffer.from(payload, 'utf8'));
   return Object.freeze({
     manifest,
-    source_manifest_sha256: sha256(Buffer.from(payload, 'utf8')),
+    source_manifest_sha256: sourceManifestSha256,
+    first_deployment_contract: createFirstDeploymentContract(
+      manifest,
+      sourceManifestSha256,
+      inspectedMksquashfs.sha256,
+    ),
   });
 }
 
 export async function inspectFirstDeploymentRuntimeState(
   outputRoot,
-  sourceManifestSha256,
+  expectedContract,
   { expectedUid = 0, expectedGid = 0, fsApi = fs } = {},
 ) {
+  validateFirstDeploymentContract(expectedContract);
   const activePath = path.join(outputRoot, 'active.json');
   let handle;
   try {
@@ -497,10 +506,10 @@ export async function inspectFirstDeploymentRuntimeState(
     if (image.sha256 !== active.image_sha256 || image.size !== active.image_size) {
       throw new Error('existing runtime image does not match the active manifest');
     }
-    return Object.freeze({
-      status: active.source_manifest_sha256 === sourceManifestSha256 ? 'matching' : 'conflict',
-      active,
-    });
+    const matching = Object.entries(expectedContract).every(
+      ([key, expected]) => active[key] === expected,
+    );
+    return Object.freeze({ status: matching ? 'matching' : 'conflict', active });
   } finally {
     await handle.close();
   }
@@ -527,10 +536,14 @@ export function parseActiveManifest(value) {
   );
   if (
     value.version !== ACTIVE_MANIFEST_VERSION
-    || value.builder_version !== BUILDER_VERSION
-    || value.codex_version !== SUPPORTED_CODEX_VERSION
-    || value.codex_target !== SUPPORTED_CODEX_TARGET
-    || value.codex_layout_version !== SUPPORTED_CODEX_LAYOUT_VERSION
+    || !Number.isSafeInteger(value.builder_version)
+    || value.builder_version <= 0
+    || typeof value.codex_version !== 'string'
+    || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(value.codex_version)
+    || typeof value.codex_target !== 'string'
+    || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(value.codex_target)
+    || !Number.isSafeInteger(value.codex_layout_version)
+    || value.codex_layout_version <= 0
     || !SHA256_PATTERN.test(value.image_sha256 ?? '')
     || value.image !== `images/${value.image_sha256}.squashfs`
     || !Number.isSafeInteger(value.image_size)
@@ -941,6 +954,65 @@ async function inspectTrustedSource(file, expectedUid, executable) {
   }
 }
 
+async function inspectTrustedBuildTool(file, expectedUid) {
+  const handle = await fs.open(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_CLOEXEC | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    assertTrustedSourceMetadata(before, file, expectedUid, true);
+    const digest = await hashOpenFile(handle, file, 64 * 1024 * 1024);
+    const after = await handle.stat();
+    assertUnchangedMetadata(before, after, file);
+    return Object.freeze({ sha256: digest });
+  } finally {
+    await handle.close();
+  }
+}
+
+function createFirstDeploymentContract(manifest, sourceManifestSha256, mksquashfsSha256) {
+  return Object.freeze({
+    builder_version: BUILDER_VERSION,
+    codex_version: manifest.codex_version,
+    codex_target: manifest.codex_target,
+    codex_layout_version: manifest.codex_layout_version,
+    source_manifest_sha256: sourceManifestSha256,
+    mksquashfs_sha256: mksquashfsSha256,
+    mksquashfs_argv_sha256: sha256(
+      Buffer.from(JSON.stringify(mksquashfsArgs('/staging', '/image')), 'utf8'),
+    ),
+  });
+}
+
+function validateFirstDeploymentContract(value) {
+  assertPlainObject(value, 'first-deployment contract');
+  expectExactKeys(
+    value,
+    [
+      'builder_version',
+      'codex_layout_version',
+      'codex_target',
+      'codex_version',
+      'mksquashfs_argv_sha256',
+      'mksquashfs_sha256',
+      'source_manifest_sha256',
+    ],
+    'first-deployment contract',
+  );
+  if (
+    value.builder_version !== BUILDER_VERSION
+    || value.codex_version !== SUPPORTED_CODEX_VERSION
+    || value.codex_target !== SUPPORTED_CODEX_TARGET
+    || value.codex_layout_version !== SUPPORTED_CODEX_LAYOUT_VERSION
+    || !SHA256_PATTERN.test(value.source_manifest_sha256 ?? '')
+    || !SHA256_PATTERN.test(value.mksquashfs_sha256 ?? '')
+    || !SHA256_PATTERN.test(value.mksquashfs_argv_sha256 ?? '')
+  ) {
+    throw new Error('first-deployment contract is invalid');
+  }
+}
+
 async function assertStaticX8664Elf(handle, file, fileSize) {
   const header = Buffer.alloc(64);
   const headerRead = await handle.read(header, 0, header.length, 0);
@@ -1175,10 +1247,10 @@ export async function runCli({
   const options = parseArgs(argv);
   if (options.mode === 'dry-run') {
     const inspected = await inspectSources();
-    const runtimeState = await inspectState(DEFAULTS.outputRoot, inspected.source_manifest_sha256);
-    if (runtimeState.status === 'conflict') {
-      throw new Error('existing active runtime does not match first-deployment sources');
-    }
+    const runtimeState = await inspectState(
+      DEFAULTS.outputRoot,
+      inspected.first_deployment_contract,
+    );
     const report = {
       version: 1,
       status: 'inspected',

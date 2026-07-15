@@ -60,6 +60,9 @@ describe('Codex runtime image contract', () => {
           files: Array(7).fill({}),
         },
         source_manifest_sha256: 'a'.repeat(64),
+        first_deployment_contract: {
+          source_manifest_sha256: 'a'.repeat(64),
+        },
       }),
       inspectState: async () => ({ status: 'absent' }),
       writeManifest: async () => { mutationReached = true; },
@@ -76,6 +79,29 @@ describe('Codex runtime image contract', () => {
       active_runtime: 'absent',
       writes_performed: 0,
     });
+
+    output = '';
+    await runRuntimeCli({
+      argv: ['--dry-run', '--json'],
+      stdout: { write: (value) => { output += value; } },
+      inspectSources: async () => ({
+        manifest: {
+          codex_version: '0.142.3',
+          codex_target: 'x86_64-unknown-linux-musl',
+          files: Array(7).fill({}),
+        },
+        source_manifest_sha256: 'a'.repeat(64),
+        first_deployment_contract: {
+          source_manifest_sha256: 'a'.repeat(64),
+          mksquashfs_sha256: 'b'.repeat(64),
+        },
+      }),
+      inspectState: async (_root, contract) => {
+        assert.equal(contract.mksquashfs_sha256, 'b'.repeat(64));
+        return { status: 'conflict' };
+      },
+    });
+    assert.equal(JSON.parse(output).active_runtime, 'conflict');
   });
 
   it('accepts only the exact mandatory runtime source schema', () => {
@@ -230,33 +256,32 @@ describe('Codex runtime image contract', () => {
 
       let observedArgs;
       let observedEntries;
-      const active = await buildRuntimeImage(
-        { manifest: manifestFile, outputRoot, mksquashfs: fakeMksquashfs },
-        {
-          requireRoot: false,
-          expectedUid: process.geteuid(),
-          expectedGid: process.getegid(),
-          assertTrustedFile: async () => {},
-          assertTrustedDirectory: async () => {},
-          sourceDefinitions: files.map(({ source, destination, mode }) => ({
-            source,
-            destination,
-            mode,
-          })),
-          runMksquashfs: async (_executable, args) => {
-            observedArgs = args;
-            const stagedEntries = await listRelativeFiles(args[0]);
-            observedEntries = stagedEntries;
-            await fs.writeFile(
-              args[1],
-              Buffer.concat([
-                Buffer.from('hsqs', 'ascii'),
-                Buffer.from(JSON.stringify(stagedEntries), 'utf8'),
-              ]),
-            );
-          },
+      const settings = { manifest: manifestFile, outputRoot, mksquashfs: fakeMksquashfs };
+      const injected = {
+        requireRoot: false,
+        expectedUid: process.geteuid(),
+        expectedGid: process.getegid(),
+        assertTrustedFile: async () => {},
+        assertTrustedDirectory: async () => {},
+        sourceDefinitions: files.map(({ source, destination, mode }) => ({
+          source,
+          destination,
+          mode,
+        })),
+        runMksquashfs: async (_executable, args) => {
+          observedArgs = args;
+          const stagedEntries = await listRelativeFiles(args[0]);
+          observedEntries = stagedEntries;
+          await fs.writeFile(
+            args[1],
+            Buffer.concat([
+              Buffer.from('hsqs', 'ascii'),
+              Buffer.from(JSON.stringify(stagedEntries), 'utf8'),
+            ]),
+          );
         },
-      );
+      };
+      const active = await buildRuntimeImage(settings, injected);
 
       assert.deepEqual(observedArgs, mksquashfsArgs(observedArgs[0], observedArgs[1]));
       for (const entry of [
@@ -284,17 +309,43 @@ describe('Codex runtime image contract', () => {
       assert.equal((await fs.readFile(image)).subarray(0, 4).toString('ascii'), 'hsqs');
       const matching = await inspectFirstDeploymentRuntimeState(
         outputRoot,
-        active.source_manifest_sha256,
+        firstDeploymentContract(active),
         { expectedUid: process.geteuid(), expectedGid: process.getegid() },
       );
       assert.equal(matching.status, 'matching');
       assert.deepEqual(matching.active, active);
       const conflict = await inspectFirstDeploymentRuntimeState(
         outputRoot,
-        'f'.repeat(64),
+        firstDeploymentContract(active, { source_manifest_sha256: 'f'.repeat(64) }),
         { expectedUid: process.geteuid(), expectedGid: process.getegid() },
       );
       assert.equal(conflict.status, 'conflict');
+      const toolConflict = await inspectFirstDeploymentRuntimeState(
+        outputRoot,
+        firstDeploymentContract(active, { mksquashfs_sha256: 'e'.repeat(64) }),
+        { expectedUid: process.geteuid(), expectedGid: process.getegid() },
+      );
+      assert.equal(toolConflict.status, 'conflict');
+
+      const repeated = await buildRuntimeImage(
+        { ...settings, firstDeployment: true },
+        injected,
+      );
+      assert.deepEqual(repeated, active);
+
+      const activePath = path.join(outputRoot, 'active.json');
+      await fs.chmod(activePath, 0o644);
+      await fs.writeFile(
+        activePath,
+        `${JSON.stringify({ ...active, codex_version: '0.141.0' }, null, 2)}\n`,
+      );
+      await fs.chmod(activePath, 0o444);
+      const upgrade = await inspectFirstDeploymentRuntimeState(
+        outputRoot,
+        firstDeploymentContract(active),
+        { expectedUid: process.geteuid(), expectedGid: process.getegid() },
+      );
+      assert.equal(upgrade.status, 'conflict');
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -334,10 +385,19 @@ describe('Codex runtime image contract', () => {
         assertTrustedFile: async () => {},
         sourceDefinitions: definitions,
         packageMetadata: metadataFile,
+        mksquashfs: definitions[0].source,
       });
       await assert.rejects(fs.lstat(output), { code: 'ENOENT' });
       assert.equal(inspection.manifest.files.length, REQUIRED_FILE_DESTINATIONS.length);
       assert.match(inspection.source_manifest_sha256, /^[a-f0-9]{64}$/);
+      assert.equal(
+        inspection.first_deployment_contract.source_manifest_sha256,
+        inspection.source_manifest_sha256,
+      );
+      assert.match(
+        inspection.first_deployment_contract.mksquashfs_sha256,
+        /^[a-f0-9]{64}$/,
+      );
 
       const manifest = await writeSourceManifest({
         requireRoot: false,
@@ -347,6 +407,7 @@ describe('Codex runtime image contract', () => {
         assertTrustedDirectory: async () => {},
         sourceDefinitions: definitions,
         packageMetadata: metadataFile,
+        mksquashfs: definitions[0].source,
         output,
       });
 
@@ -377,6 +438,7 @@ describe('Codex runtime image contract', () => {
           assertTrustedDirectory: async () => {},
           sourceDefinitions: definitions,
           packageMetadata: metadataFile,
+          mksquashfs: definitions[1].source,
           output: path.join(root, 'dynamic-sources.json'),
         }),
         /dynamically linked/,
@@ -424,6 +486,19 @@ async function listRelativeFiles(root, current = root, result = []) {
 
 function digest(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function firstDeploymentContract(active, overrides = {}) {
+  return {
+    builder_version: active.builder_version,
+    codex_version: active.codex_version,
+    codex_target: active.codex_target,
+    codex_layout_version: active.codex_layout_version,
+    source_manifest_sha256: active.source_manifest_sha256,
+    mksquashfs_sha256: active.mksquashfs_sha256,
+    mksquashfs_argv_sha256: active.mksquashfs_argv_sha256,
+    ...overrides,
+  };
 }
 
 function staticElfPayload(contents) {

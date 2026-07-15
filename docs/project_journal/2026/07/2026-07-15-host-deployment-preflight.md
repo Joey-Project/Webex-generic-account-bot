@@ -24,9 +24,15 @@ superseded_by:
   explicit `preactivation-ready` target then acquires the shared deployment
   lock, revalidates policy under that lock, and invokes the fixed runtime
   source-manifest and image builders.
-- Runtime dry-run inspects fixed sources without writing. First-deployment
-  apply rejects an existing active runtime unless its source and build contract
-  exactly match an idempotent retry.
+- Runtime dry-run inspects fixed sources without writing. It compares the
+  source, builder, `mksquashfs`, and fixed argv contract and reports a different
+  upgrade runtime as a conflict. Apply rejects an existing active runtime unless
+  that contract exactly matches an idempotent retry; corrupt runtime state
+  remains intact for a separate recovery workflow.
+- The provisioner uses the shared deployment lock for policy convergence. The
+  preactivation phase reacquires it for policy revalidation and runtime
+  preparation. A later readiness failure leaves the host safely provisioned
+  and rerunnable.
 - Secret readiness checks fixed parent and file metadata with `lstat`; secret
   files are never opened or read. Missing secrets are reported as incomplete
   readiness unless the operator selects `--require-secrets`.

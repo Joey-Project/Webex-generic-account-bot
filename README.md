@@ -510,19 +510,26 @@ the guarded provisioner in dry-run mode, and, for the default
 `preactivation-ready` target, the runtime builder's read-only source inspection.
 Apply requires an explicit `--through provisioned` or `--through
 preactivation-ready`; there is no implicit apply target. The provisioned target
-stops after host policy convergence. The preactivation target reacquires the
-shared deployment lock, revalidates dormant and unchanged host policy under the
-lock, requires a clean receipt/drop-in/reboot-challenge boundary and complete
-secret readiness, then invokes only the fixed runtime builder paths.
+stops after host policy convergence. The provisioner serialises that mutation
+with the same shared deployment lock used by config deployment. The
+preactivation target then reacquires the lock, revalidates dormant and unchanged
+host policy under it, requires a clean receipt/drop-in/reboot-challenge boundary
+and complete secret readiness, then invokes only the fixed runtime builder
+paths. If a later readiness gate fails, the converged host policy remains in the
+safe, rerunnable `provisioned` state.
 
 The entrypoint does not install or parse secret contents, enable or start a
 unit, install the runner permission drop-in, mint an activation receipt, or
 call Webex. It suppresses child stdout and stderr on failures instead of copying
 possibly credential-shaped diagnostics into deployment logs. Runtime dry-run
-performs no writes. First-deployment apply accepts an absent runtime or an exact
-matching idempotent retry; it rejects a different active source or runtime build
-contract instead of acting as an upgrade mechanism. Every report states that
-service state is unchanged and activation was not attempted.
+performs no writes and reports an existing upgrade runtime as `conflict`.
+First-deployment apply accepts an absent runtime or an exact matching idempotent
+retry; it rejects a different active source or runtime build contract instead
+of acting as an upgrade mechanism. A missing, corrupt, or inconsistent active
+image also fails closed: preserve `active.json` and use a separately reviewed
+runtime recovery procedure rather than deleting deployment evidence in this
+entrypoint. Every report states that service state is unchanged and activation
+was not attempted.
 
 Install secrets through a separate administrator-controlled channel after
 provisioning. The readiness check uses `lstat` metadata only and never opens or

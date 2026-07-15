@@ -552,7 +552,7 @@ function validateRuntimeInspectionReport(value) {
     || value.writes_performed !== 0
     || typeof value.codex_version !== 'string'
     || value.codex_target !== 'x86_64-unknown-linux-musl'
-    || !['absent', 'matching'].includes(value.active_runtime)
+    || !['absent', 'conflict', 'matching'].includes(value.active_runtime)
     || !Number.isSafeInteger(value.source_file_count)
     || value.source_file_count <= 0
     || !SHA256_PATTERN.test(value.source_manifest_sha256 ?? '')
