@@ -204,8 +204,9 @@
 - Initial host release bootstrap is content-manifested and first-install only.
   An unprivileged builder exports the exact clean reviewed commit, rebuilds the
   Rust binaries with a content-pinned SquashFS toolchain, fixed target, and
-  isolated Cargo home, revalidates the complete source snapshot after each
-  Cargo build, and packages source payloads from freshly rehashed committed
+  isolated Cargo home, revalidates the complete source snapshot and its
+  post-materialisation inode/ctime baseline after each Cargo build, and
+  packages source payloads from freshly rehashed committed
   blobs alongside a digest-pinned runtime allowlist. A
   separately delivered root-owned environment-clearing trust anchor requires
   an out-of-band approved commit and manifest digest before publishing the

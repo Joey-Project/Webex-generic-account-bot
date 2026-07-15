@@ -288,8 +288,9 @@ remote helper, and repository-local behaviour or `refs/replace` cannot change
 the objects exported under the approved commit SHA. Source materialisation is
 preflighted per blob and capped at 1 GiB in aggregate before any committed file
 is written. The builder revalidates the snapshot's complete file and directory
-topology, ownership, modes, sizes, stable metadata, and blob object IDs after
-each Cargo build and again before assembling the bundle. Bundle `code/*`
+topology, ownership, modes, sizes, blob object IDs, and every file and
+directory's inode plus nanosecond ctime against the post-materialisation
+baseline after each Cargo build and again before assembling the bundle. Bundle `code/*`
 payloads are read afresh from their committed blobs and rehashed rather than
 copied from the writable compilation snapshot. The Rust toolchain must be an
 independently reviewed SquashFS

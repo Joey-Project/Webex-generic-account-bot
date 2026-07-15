@@ -284,24 +284,53 @@ async function materializeRevision(repoRoot, scratch, revision, run) {
     await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
     await writeBytesFile(destination, bytes, entry.mode);
   }
-  return Object.freeze({
-    entries: Object.freeze(entries.map((entry) => Object.freeze({ ...entry }))),
+  const expectedDirectories = sourceDirectories(entries);
+  await assertSourceTopology(
+    sourceRoot,
+    expectedDirectories,
+    entries.map((entry) => entry.path).toSorted(),
+  );
+  const directories = [];
+  for (const sourcePath of expectedDirectories) {
+    directories.push(Object.freeze({
+      identity: await readSourceDirectoryIdentity(sourceRoot, sourcePath),
+      path: sourcePath,
+    }));
+  }
+  const baselinedEntries = [];
+  for (const entry of entries) {
+    baselinedEntries.push(Object.freeze({
+      ...entry,
+      identity: await verifyMaterializedSourceFile(sourceRoot, entry),
+    }));
+  }
+  const snapshot = Object.freeze({
+    directories: Object.freeze(directories),
+    entries: Object.freeze(baselinedEntries),
     environment: Object.freeze({ ...environment }),
     repoRoot,
     revision,
     root: sourceRoot,
     run,
   });
+  await verifyMaterializedRevision(snapshot);
+  return snapshot;
 }
 
 async function verifyMaterializedRevision(snapshot) {
   const expectedFiles = snapshot.entries.map((entry) => entry.path).toSorted();
-  const expectedDirectories = sourceDirectories(snapshot.entries);
+  const expectedDirectories = snapshot.directories.map((entry) => entry.path);
   await assertSourceTopology(snapshot.root, expectedDirectories, expectedFiles);
+  for (const directory of snapshot.directories) {
+    await readSourceDirectoryIdentity(snapshot.root, directory.path, directory.identity);
+  }
   for (const entry of snapshot.entries) {
     await verifyMaterializedSourceFile(snapshot.root, entry);
   }
   await assertSourceTopology(snapshot.root, expectedDirectories, expectedFiles);
+  for (const directory of snapshot.directories) {
+    await readSourceDirectoryIdentity(snapshot.root, directory.path, directory.identity);
+  }
 }
 
 function sourceDirectories(entries) {
@@ -331,13 +360,13 @@ async function scanMaterializedSourceTree(root) {
   const files = [];
   let entries = 0;
   async function visit(directory, relative) {
-    const metadata = await fs.lstat(directory);
+    const metadata = await fs.lstat(directory, { bigint: true });
     if (
       !metadata.isDirectory()
       || metadata.isSymbolicLink()
-      || metadata.uid !== process.getuid()
-      || metadata.gid !== process.getgid()
-      || (metadata.mode & 0o022) !== 0
+      || metadata.uid !== BigInt(process.getuid())
+      || metadata.gid !== BigInt(process.getgid())
+      || (metadata.mode & 0o022n) !== 0n
     ) {
       throw new Error(`committed source snapshot changed: ${relative || '.'}`);
     }
@@ -355,7 +384,7 @@ async function scanMaterializedSourceTree(root) {
       }
       const childRelative = relative === '' ? name : `${relative}/${name}`;
       const child = path.join(directory, name);
-      const childMetadata = await fs.lstat(child);
+      const childMetadata = await fs.lstat(child, { bigint: true });
       if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
         await visit(child, childRelative);
       } else if (childMetadata.isFile() && !childMetadata.isSymbolicLink()) {
@@ -370,6 +399,27 @@ async function scanMaterializedSourceTree(root) {
     directories: directories.toSorted(),
     files: files.toSorted(),
   };
+}
+
+async function readSourceDirectoryIdentity(root, sourcePath, expectedIdentity) {
+  const directory = sourcePath === ''
+    ? root
+    : path.join(root, ...sourcePath.split('/'));
+  const metadata = await fs.lstat(directory, { bigint: true });
+  if (
+    !metadata.isDirectory()
+    || metadata.isSymbolicLink()
+    || metadata.uid !== BigInt(process.getuid())
+    || metadata.gid !== BigInt(process.getgid())
+    || (metadata.mode & 0o022n) !== 0n
+  ) {
+    throw new Error(`committed source snapshot changed: ${sourcePath || '.'}`);
+  }
+  const identity = sourceMetadataIdentity(metadata);
+  if (expectedIdentity !== undefined) {
+    assertSourceIdentity(expectedIdentity, identity, sourcePath || '.');
+  }
+  return identity;
 }
 
 async function verifyMaterializedSourceFile(root, entry) {
@@ -392,20 +442,47 @@ async function verifyMaterializedSourceFile(root, entry) {
     ) {
       throw new Error(`committed source snapshot changed: ${entry.path}`);
     }
+    const identity = sourceMetadataIdentity(before);
+    if (entry.identity !== undefined) {
+      assertSourceIdentity(entry.identity, identity, entry.path);
+    }
     const digest = gitObjectDigest('blob', entry.size, entry.object);
     await consumeExactFile(input, entry.size, source, (chunk) => digest.update(chunk));
     if (digest.digest('hex') !== entry.object) {
       throw new Error(`committed source snapshot changed: ${entry.path}`);
     }
-    assertStableSnapshotMetadata(before, await input.stat({ bigint: true }), entry.path);
+    assertSourceIdentity(
+      identity,
+      sourceMetadataIdentity(await input.stat({ bigint: true })),
+      entry.path,
+    );
+    return identity;
   } finally {
     await input.close();
   }
 }
 
-function assertStableSnapshotMetadata(before, after, sourcePath) {
-  for (const key of ['dev', 'ino', 'size', 'mode', 'uid', 'gid', 'mtimeNs', 'ctimeNs']) {
-    if (before[key] !== after[key]) {
+function sourceMetadataIdentity(metadata) {
+  const identity = {};
+  for (const key of [
+    'dev',
+    'ino',
+    'size',
+    'mode',
+    'uid',
+    'gid',
+    'nlink',
+    'mtimeNs',
+    'ctimeNs',
+  ]) {
+    identity[key] = metadata[key].toString();
+  }
+  return Object.freeze(identity);
+}
+
+function assertSourceIdentity(expected, actual, sourcePath) {
+  for (const key of Object.keys(expected)) {
+    if (expected[key] !== actual[key]) {
       throw new Error(`committed source snapshot changed: ${sourcePath}`);
     }
   }

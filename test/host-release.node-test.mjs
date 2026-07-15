@@ -784,7 +784,7 @@ describe('host release bootstrap', () => {
     }
   });
 
-  it('rejects source snapshot tampering performed during the build', async () => {
+  it('rejects source snapshot tampering restored before build completion', async () => {
     const fixture = await createFixture();
     const sourcePath = 'scripts/provision-host.mjs';
     const git = (args) => execFileAsync('/usr/bin/git', args, {
@@ -812,7 +812,66 @@ describe('host release bootstrap', () => {
         buildFixtureResult(fixture, undefined, {
           revision: undefined,
           buildArtifacts: async ({ repoRoot }) => {
-            await fs.writeFile(path.join(repoRoot, sourcePath), 'build-side tampering\n');
+            const source = path.join(repoRoot, sourcePath);
+            const original = await fs.readFile(source);
+            const before = await fs.lstat(source, { bigint: true });
+            await new Promise((resolve) => setTimeout(resolve, 2));
+            await fs.writeFile(source, 'build-side tampering\n');
+            await fs.writeFile(source, original);
+            const after = await fs.lstat(source, { bigint: true });
+            assert.notEqual(after.ctimeNs, before.ctimeNs);
+            return {
+              hostBinDir: fixture.hostBinDir,
+              staticBinDir: fixture.staticBinDir,
+              cargoVersion: CARGO_VERSION,
+              rustcVersion: RUSTC_VERSION,
+              toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
+            };
+          },
+        }),
+        /committed source snapshot changed/,
+      );
+      await assertMissing(fixture.bundle);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects source topology tampering restored before build completion', async () => {
+    const fixture = await createFixture();
+    const git = (args) => execFileAsync('/usr/bin/git', args, {
+      cwd: fixture.repoRoot,
+      env: {
+        LANG: 'C',
+        LC_ALL: 'C',
+        PATH: '/usr/bin:/bin',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+      },
+      maxBuffer: 1024 * 1024,
+    });
+    try {
+      await git(['init', '--initial-branch=main']);
+      await git(['add', '.']);
+      await git([
+        '-c', 'user.name=Host Release Test',
+        '-c', 'user.email=host-release@example.invalid',
+        'commit',
+        '-m', 'fixture',
+      ]);
+
+      await assert.rejects(
+        buildFixtureResult(fixture, undefined, {
+          revision: undefined,
+          buildArtifacts: async ({ repoRoot }) => {
+            const directory = path.join(repoRoot, 'scripts');
+            const transient = path.join(directory, 'build-side-transient');
+            const before = await fs.lstat(directory, { bigint: true });
+            await new Promise((resolve) => setTimeout(resolve, 2));
+            await fs.writeFile(transient, 'transient\n');
+            await fs.rm(transient);
+            const after = await fs.lstat(directory, { bigint: true });
+            assert.notEqual(after.ctimeNs, before.ctimeNs);
             return {
               hostBinDir: fixture.hostBinDir,
               staticBinDir: fixture.staticBinDir,
