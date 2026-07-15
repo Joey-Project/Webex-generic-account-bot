@@ -73,7 +73,7 @@ export async function buildHostRelease(options, injected = {}) {
   assertSupportedNodeVersion();
   assertUnprivilegedBuilder();
   const repoRoot = requireAbsolutePath(injected.repoRoot ?? options.repoRoot, '--repo');
-  const output = requireAbsolutePath(options.output, '--output');
+  const output = requireBuildEnvironmentPath(options.output, '--output');
   const inputRoot = requireAbsolutePath(options.inputRoot, '--input-root');
   const codexPackageRoot = requireAbsolutePath(
     options.codexPackageRoot,
@@ -501,6 +501,8 @@ export function cargoBuildInvocation(repoRoot, args) {
 }
 
 export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalRustFlags = []) {
+  requireBuildEnvironmentPath(scratch, 'build scratch path');
+  requireBuildEnvironmentPath(toolchainRoot, 'Rust toolchain path');
   return {
     HOME: path.join(scratch, 'home'),
     CARGO_HOME: path.join(scratch, 'cargo-home'),
@@ -1042,6 +1044,14 @@ function requireAbsolutePath(value, flag) {
     throw new Error(`${flag} must be a normalized absolute path`);
   }
   return value;
+}
+
+function requireBuildEnvironmentPath(value, flag) {
+  const absolute = requireAbsolutePath(value, flag);
+  if (/[:=\u0000-\u001f\u007f]/.test(absolute)) {
+    throw new Error(`${flag} must not contain build-environment delimiters`);
+  }
+  return absolute;
 }
 
 function requireValue(argv, index, flag) {

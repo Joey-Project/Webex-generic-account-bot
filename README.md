@@ -273,6 +273,8 @@ snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
 Cargo home and home directory. Tracked worktree edits, untracked files, ignored
 local caches, and files never enter that object-only snapshot; the printed full
 commit SHA is the source identity presented for approval. The builder
+rejects output paths containing `:`, `=`, DEL, or control characters before
+they can be serialised into `PATH` or `CARGO_ENCODED_RUSTFLAGS`. It
 independently recomputes the commit object ID, reconstructs the complete root
 tree object ID from the listed paths, and recomputes every blob object ID before
 writing it, so a forged or concurrently replaced object-store entry fails

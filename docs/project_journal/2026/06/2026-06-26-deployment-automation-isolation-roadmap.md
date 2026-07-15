@@ -47,6 +47,8 @@ superseded_by:
   The builder uses that same verified BusyBox as its bundle payload source, and
   both production entrypoints preflight GNU `mv --no-copy` before expensive
   build or install work.
+  Caller-selected output paths cannot contain delimiters that would split
+  `PATH`, remap rules, or `CARGO_ENCODED_RUSTFLAGS`.
   Git promisor lazy fetching is disabled so a missing committed object fails
   without running a repository-configured remote helper.
   The builder is now a root-owned read-only trust-anchor member that accepts an

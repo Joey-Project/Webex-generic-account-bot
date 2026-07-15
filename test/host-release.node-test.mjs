@@ -177,6 +177,32 @@ describe('host release bootstrap', () => {
     );
   });
 
+  it('rejects output paths that can inject build environment fields', async () => {
+    const options = {
+      output: '/tmp/release',
+      inputRoot: '/tmp/release-inputs',
+      codexPackageRoot: '/tmp/codex',
+      rustToolchainImage: '/tmp/rust-toolchain.squashfs',
+    };
+    for (const delimiter of [':', '=', '\u001f', '\n']) {
+      await assert.rejects(
+        buildHostRelease(
+          { ...options, output: `/tmp/release${delimiter}injected` },
+          { repoRoot: '/tmp/repo' },
+        ),
+        /--output must not contain build-environment delimiters/,
+      );
+    }
+    assert.throws(
+      () => buildEnvironment('/tmp/release:injected', '/tmp/rust-toolchain'),
+      /build scratch path must not contain build-environment delimiters/,
+    );
+    assert.throws(
+      () => buildEnvironment('/tmp/release', '/tmp/rust=toolchain'),
+      /Rust toolchain path must not contain build-environment delimiters/,
+    );
+  });
+
   it('remaps private build paths and fixes reproducibility inputs', () => {
     const environment = buildEnvironment(
       '/tmp/release scratch',
