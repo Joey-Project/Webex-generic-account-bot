@@ -121,7 +121,7 @@ export const TRUSTED_SOURCE_SHA256 = Object.freeze({
   'bin/webex-codex-launcher': '40f1e93d59fd4a52180371bbe63095f29196e4cc171ba019c265cdb4a94650ac',
   'bin/webex-codex-runtime': '5d6155d06782d456e699aa798a62743a09f1f3e42f50a096ffd676325dcfe5a2',
   'bin/webex-generic-account-bot': 'e9dd930cd3350bf12d9eb42b90ca5c5148e46c7d7b8675662830013b09507c5e',
-  'bin/webex-host-identity-lock': '7f2cf31086545a9ab4de53e2d24e85bbf6e789e43c299b84f1f6c54993952a2c',
+  'bin/webex-host-identity-lock': '464864c99683feac88ea047dc55e354cb564338b230cce64dabccd49bccc754e',
   'runtime-sources/busybox': 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14',
   'runtime-sources/codex/bin/codex': 'cb1670c25b6e17fd82866a80e55df58bc10f5d18e44d25ec2c6f7c2ab98077cd',
   'runtime-sources/codex/codex-package.json': 'b27002210921372fa043e8e49f6c543cf4cddc0d35bd01a32ecfbc699efd5e2a',
