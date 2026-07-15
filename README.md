@@ -297,6 +297,8 @@ sysroot remain an explicit build-host trust base; the builder selects their
 absolute paths and never substitutes caller-controlled native tools. Cargo runs
 from root-owned `/` with an absolute `--manifest-path`, so `.cargo/config.toml`
 files beside or above the caller-selected output directory are not loaded. The
+reviewed `Cargo.toml` declares itself as a resolver-3 workspace root, so Cargo
+cannot adopt a caller-provided ancestor workspace manifest, lockfile, or patch. The
 builder requires `/` and any existing `/.cargo` to be root-owned and
 non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
 and binds both directory identities across the Cargo work. This closes the

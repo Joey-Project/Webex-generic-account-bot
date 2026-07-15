@@ -50,6 +50,8 @@ superseded_by:
   size-preflighted and capped at 1 GiB in aggregate before materialisation.
   Commit, reconstructed root-tree, and blob object IDs are independently
   rehashed so forged or concurrently replaced Git object storage fails closed.
+  The reviewed Cargo manifest is an explicit workspace root, preventing a
+  caller-owned output ancestor from injecting workspace patches or a lockfile.
 - Host-owned config layout migration merged in config PRs #13, #14, and #15.
 - Configuration Space delivery is split into PR 2a (authoritative hydration,
   admin schema, read-only status), PR 2b1 (immutable staged preparation), PR
