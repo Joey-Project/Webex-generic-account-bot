@@ -38,7 +38,8 @@ superseded_by:
   Committed source materialisation now uses bounded `ls-tree`/`cat-file` reads
   with local Git behaviour disabled instead of attribute-sensitive archives.
   Cargo rejects fixed-root configuration, manifest ordering is locale
-  independent, and recovered bundles are fully re-synced before acceptance.
+  independent, nanosecond Cargo-directory identity detects transient config,
+  and recovered bundles are fully re-synced before acceptance.
   Both production entrypoints start through a pinned root-owned static BusyBox
   before clearing the environment and execing `/usr/bin/node`, so native loader
   variables cannot run before the trust checks. Object-only source

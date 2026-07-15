@@ -71,7 +71,7 @@ export function usage() {
 
 export async function buildHostRelease(options, injected = {}) {
   assertSupportedNodeVersion();
-  assertUnprivilegedBuilder();
+  assertUnprivilegedBuilder(injected.builderRealUid, injected.builderEffectiveUid);
   const repoRoot = requireAbsolutePath(injected.repoRoot ?? options.repoRoot, '--repo');
   const output = requireBuildEnvironmentPath(options.output, '--output');
   const inputRoot = requireAbsolutePath(options.inputRoot, '--input-root');
@@ -613,12 +613,12 @@ export async function assertCargoConfigurationIsolated(
   expectedUid = 0,
 ) {
   const resolvedRoot = path.resolve(root);
-  const rootMetadata = await fs.lstat(resolvedRoot);
+  const rootMetadata = await fs.lstat(resolvedRoot, { bigint: true });
   assertTrustedCargoDirectory(rootMetadata, resolvedRoot, expectedUid);
   const cargoDirectory = path.join(resolvedRoot, '.cargo');
   let metadata;
   try {
-    metadata = await fs.lstat(cargoDirectory);
+    metadata = await fs.lstat(cargoDirectory, { bigint: true });
   } catch (error) {
     if (error?.code === 'ENOENT') {
       const identity = Object.freeze({
@@ -633,7 +633,7 @@ export async function assertCargoConfigurationIsolated(
   assertTrustedCargoDirectory(metadata, cargoDirectory, expectedUid);
   for (const name of ['config', 'config.toml']) {
     try {
-      await fs.lstat(path.join(cargoDirectory, name));
+      await fs.lstat(path.join(cargoDirectory, name), { bigint: true });
       throw new Error(`Cargo configuration is not permitted: ${path.join(cargoDirectory, name)}`);
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
@@ -651,8 +651,8 @@ function assertTrustedCargoDirectory(metadata, directory, expectedUid) {
   if (
     !metadata.isDirectory()
     || metadata.isSymbolicLink()
-    || metadata.uid !== expectedUid
-    || (metadata.mode & 0o022) !== 0
+    || metadata.uid !== BigInt(expectedUid)
+    || (metadata.mode & 0o022n) !== 0n
   ) {
     throw new Error(`Cargo configuration root is untrusted: ${directory}`);
   }
@@ -660,12 +660,12 @@ function assertTrustedCargoDirectory(metadata, directory, expectedUid) {
 
 function directoryIdentity(metadata) {
   return Object.freeze({
-    ctimeMs: metadata.ctimeMs,
-    dev: metadata.dev,
-    gid: metadata.gid,
-    ino: metadata.ino,
-    mode: metadata.mode,
-    uid: metadata.uid,
+    ctimeNs: metadata.ctimeNs.toString(),
+    dev: metadata.dev.toString(),
+    gid: metadata.gid.toString(),
+    ino: metadata.ino.toString(),
+    mode: metadata.mode.toString(),
+    uid: metadata.uid.toString(),
   });
 }
 

@@ -306,9 +306,9 @@ reviewed `Cargo.toml` declares itself as a resolver-3 workspace root, so Cargo
 cannot adopt a caller-provided ancestor workspace manifest, lockfile, or patch. The
 builder requires `/` and any existing `/.cargo` to be root-owned and
 non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
-and binds both directory identities across the Cargo work. This closes the
-remaining fixed-working-directory configuration path and its create/remove
-race.
+and binds both inode and nanosecond ctime identities across the Cargo work. This
+closes the remaining fixed-working-directory configuration path and its
+create/remove race.
 The output parent must already be a current-UID/GID mode `0700` directory; the
 documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned
