@@ -39,6 +39,13 @@ superseded_by:
   serialized blocking health scans behind a dedicated single-slot gate;
   concurrent health scans return `503` without consuming another blocking
   worker.
+- Moved ingress and health-scan permits into their blocking workers so async
+  cancellation cannot release bounded capacity early. Blocking worker errors
+  and panics latch health before returning or propagating, even after caller
+  cancellation.
+- Distinguished a stale process-local scheduler snapshot after successful
+  internal removal from an externally missing indexed job. The former is a
+  harmless completed race; the latter still latches health.
 - Latched runtime spool failures into authenticated health while allowing
   unrelated indexed jobs to continue; a corrupt event no longer blocks later
   records or leaves `/healthz` falsely healthy.
@@ -56,8 +63,9 @@ superseded_by:
   acknowledgement before Codex completion, duplicate sidecar delivery,
   non-starving deferred retry, runtime-corruption health latching, transient
   retry, retry-delay bounding, scheduler-state health latching, health-scan
-  admission, bounded filesystem enumeration, and restart recovery after an old
-  lease expires.
+  admission and cancellation, ingress cancellation, blocking panic latching,
+  stale-snapshot classification, bounded filesystem enumeration, and restart
+  recovery after an old lease expires.
 
 ## Boundaries
 - This slice does not provide cross-process lease transfer, immediate takeover,

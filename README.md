@@ -60,6 +60,14 @@ honour the existing retry delay up to a 24-hour scheduler bound, and release
 worker capacity for unrelated messages. Scheduler-state failures latch health
 unhealthy until restart.
 
+Ingress permits move into the blocking persistence worker before the HTTP
+future awaits it. A disconnected or cancelled request therefore cannot release
+capacity while its worker still retains the event, and non-capacity worker
+errors or panics latch health even when no async caller remains. A stale
+process-local scheduler snapshot whose indexed job was already removed by a
+successful completion is skipped without poisoning health; a file missing
+while its index entry still exists remains an integrity failure.
+
 An unclean restart can leave a non-expired `JsonlStateStore` attempt lease.
 Recovery waits for that lease to expire before rerunning the durable job, which
 favours duplicate prevention over immediate takeover. Hidden reply/source
@@ -73,11 +81,12 @@ Authenticated `/healthz` output includes `messageJobDirectory`,
 binding the listener when a queued record is invalid. At runtime, health
 validates the private spool topology and file metadata and returns `503` when
 that state is unreadable or unsafe. One dedicated single-slot gate bounds these
-blocking scans; a concurrent scan receives `503` instead of occupying another
-blocking worker. A worker likewise retains and reports a record that becomes
-unreadable instead of silently skipping accepted work. Runtime spool failures
-are latched unhealthy until restart, while deferred selection lets later valid
-records continue to run.
+blocking scans; the permit moves into the scan worker, so request cancellation
+cannot release it early. A concurrent scan receives `503` instead of occupying
+another blocking worker. A worker likewise retains and reports a record that
+becomes unreadable instead of silently skipping accepted work. Runtime spool
+failures are latched unhealthy until restart, while deferred selection lets
+later valid records continue to run.
 
 ## Configuration
 

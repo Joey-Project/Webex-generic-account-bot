@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
-use tokio::task;
+use tokio::{sync::OwnedSemaphorePermit, task};
 use webex_headless_messenger::SidecarEvent;
 
 #[cfg(unix)]
@@ -81,6 +81,8 @@ pub struct DurableMessageJobs {
     max_pending: usize,
     operation_state: StdMutex<MessageJobIndex>,
     runtime_unhealthy: AtomicBool,
+    #[cfg(test)]
+    blocking_worker_started: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +105,8 @@ impl DurableMessageJobs {
             max_pending,
             operation_state: StdMutex::new(index),
             runtime_unhealthy: AtomicBool::new(false),
+            #[cfg(test)]
+            blocking_worker_started: StdMutex::new(None),
         })
     }
 
@@ -123,11 +127,32 @@ impl DurableMessageJobs {
         message_id: String,
         event: SidecarEvent,
     ) -> Result<MessageJobEnqueueStatus> {
+        self.enqueue_guarded(message_id, event, None).await
+    }
+
+    pub async fn enqueue_with_permit(
+        self: &std::sync::Arc<Self>,
+        message_id: String,
+        event: SidecarEvent,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<MessageJobEnqueueStatus> {
+        self.enqueue_guarded(message_id, event, Some(permit)).await
+    }
+
+    async fn enqueue_guarded(
+        self: &std::sync::Arc<Self>,
+        message_id: String,
+        event: SidecarEvent,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<MessageJobEnqueueStatus> {
         let jobs = std::sync::Arc::clone(self);
-        let result = task::spawn_blocking(move || jobs.enqueue_sync(&message_id, event))
-            .await
-            .context("message job enqueue worker panicked")
-            .and_then(|result| result);
+        let result = task::spawn_blocking(move || {
+            let _permit = permit;
+            jobs.run_blocking_operation(true, || jobs.enqueue_sync(&message_id, event))
+        })
+        .await
+        .context("message job enqueue worker panicked")
+        .and_then(|result| result);
         if result
             .as_ref()
             .is_err_and(|error| error.downcast_ref::<MessageJobBacklogFull>().is_none())
@@ -142,19 +167,23 @@ impl DurableMessageJobs {
         message_id: String,
     ) -> Result<Option<MessageJobRecord>> {
         let jobs = std::sync::Arc::clone(self);
-        let result = task::spawn_blocking(move || jobs.load_sync(&message_id))
-            .await
-            .context("message job load worker panicked")
-            .and_then(|result| result);
+        let result = task::spawn_blocking(move || {
+            jobs.run_blocking_operation(false, || jobs.load_sync(&message_id))
+        })
+        .await
+        .context("message job load worker panicked")
+        .and_then(|result| result);
         self.latch_error(result)
     }
 
     pub async fn remove(self: &std::sync::Arc<Self>, message_id: String) -> Result<bool> {
         let jobs = std::sync::Arc::clone(self);
-        let result = task::spawn_blocking(move || jobs.remove_sync(&message_id))
-            .await
-            .context("message job removal worker panicked")
-            .and_then(|result| result);
+        let result = task::spawn_blocking(move || {
+            jobs.run_blocking_operation(false, || jobs.remove_sync(&message_id))
+        })
+        .await
+        .context("message job removal worker panicked")
+        .and_then(|result| result);
         self.latch_error(result)
     }
 
@@ -165,7 +194,9 @@ impl DurableMessageJobs {
     ) -> Result<Vec<String>> {
         let jobs = std::sync::Arc::clone(self);
         let result = task::spawn_blocking(move || {
-            jobs.pending_message_ids_sync(&excluded_message_ids, limit)
+            jobs.run_blocking_operation(false, || {
+                jobs.pending_message_ids_sync(&excluded_message_ids, limit)
+            })
         })
         .await
         .context("message job listing worker panicked")
@@ -174,12 +205,62 @@ impl DurableMessageJobs {
     }
 
     pub async fn pending_count(self: &std::sync::Arc<Self>) -> Result<usize> {
+        self.pending_count_guarded(None).await
+    }
+
+    pub async fn pending_count_with_permit(
+        self: &std::sync::Arc<Self>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<usize> {
+        self.pending_count_guarded(Some(permit)).await
+    }
+
+    async fn pending_count_guarded(
+        self: &std::sync::Arc<Self>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<usize> {
         let jobs = std::sync::Arc::clone(self);
-        let result = task::spawn_blocking(move || jobs.pending_count_sync())
-            .await
-            .context("message job count worker panicked")
-            .and_then(|result| result);
+        let result = task::spawn_blocking(move || {
+            let _permit = permit;
+            jobs.run_blocking_operation(false, || jobs.pending_count_sync())
+        })
+        .await
+        .context("message job count worker panicked")
+        .and_then(|result| result);
         self.latch_error(result)
+    }
+
+    fn run_blocking_operation<T>(
+        &self,
+        capacity_error_is_healthy: bool,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(test)]
+        if let Some(started) = self.blocking_worker_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+            Ok(result) => {
+                if result.as_ref().is_err_and(|error| {
+                    !capacity_error_is_healthy
+                        || error.downcast_ref::<MessageJobBacklogFull>().is_none()
+                }) {
+                    self.mark_unhealthy();
+                }
+                result
+            }
+            Err(payload) => {
+                self.mark_unhealthy();
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn notify_when_blocking_worker_starts(&self) -> std::sync::mpsc::Receiver<()> {
+        let (started, receiver) = std::sync::mpsc::channel();
+        *self.blocking_worker_started.lock().unwrap() = Some(started);
+        receiver
     }
 
     fn latch_error<T>(&self, result: Result<T>) -> Result<T> {
@@ -304,7 +385,13 @@ impl DurableMessageJobs {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
-                Ok(None)
+                if index.entries.contains_key(message_id) {
+                    Err(anyhow!(
+                        "indexed message job disappeared before it could be loaded"
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
             Err(error) => Err(error),
         }
@@ -1053,6 +1140,101 @@ mod tests {
         assert!(jobs.is_healthy());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_health_count_keeps_its_permit_until_blocking_work_finishes() {
+        let fixture = Fixture::new();
+        let jobs = std::sync::Arc::new(DurableMessageJobs::open(&fixture.state_file).unwrap());
+        let (release, holder) = hold_operation_lock(jobs.clone());
+        let started = jobs.notify_when_blocking_worker_starts();
+        let scans = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = scans.clone().acquire_owned().await.unwrap();
+        let task = tokio::spawn({
+            let jobs = jobs.clone();
+            async move { jobs.pending_count_with_permit(permit).await }
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(scans.clone().try_acquire_owned().is_err());
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if scans.clone().try_acquire_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(jobs.is_healthy());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_enqueue_keeps_its_permit_and_latches_worker_errors() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = Fixture::new();
+        let jobs = std::sync::Arc::new(DurableMessageJobs::open(&fixture.state_file).unwrap());
+        let (release, holder) = hold_operation_lock(jobs.clone());
+        let started = jobs.notify_when_blocking_worker_starts();
+        let ingests = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = ingests.clone().acquire_owned().await.unwrap();
+        let task = tokio::spawn({
+            let jobs = jobs.clone();
+            async move {
+                jobs.enqueue_with_permit(
+                    "message-cancelled".to_owned(),
+                    message_event("message-cancelled", "must stay bounded"),
+                    permit,
+                )
+                .await
+            }
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        fs::set_permissions(jobs.root(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(ingests.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !jobs.is_healthy() && ingests.clone().try_acquire_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::set_permissions(jobs.root(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn blocking_worker_panics_latch_health_before_propagating() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            jobs.run_blocking_operation(false, || -> Result<()> {
+                panic!("blocking worker panic");
+            })
+        }));
+
+        assert!(panic.is_err());
+        assert!(!jobs.is_healthy());
+    }
+
     #[test]
     fn pending_ids_are_bounded_and_exclude_active_jobs() {
         let fixture = Fixture::new();
@@ -1253,6 +1435,22 @@ mod tests {
         fs::write(path, bytes).unwrap();
         #[cfg(unix)]
         fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    }
+
+    fn hold_operation_lock(
+        jobs: std::sync::Arc<DurableMessageJobs>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked, locked_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = jobs.operation_state.lock().unwrap();
+            locked.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        locked_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        (release, holder)
     }
 
     struct Fixture {

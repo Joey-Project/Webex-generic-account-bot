@@ -2806,9 +2806,8 @@ async fn run_persisted_message_job(state: &AppState, message_id: &str) -> Messag
     let record = match state.message_jobs.load(message_id.to_owned()).await {
         Ok(Some(record)) => record,
         Ok(None) => {
-            state.message_jobs.mark_unhealthy();
-            error!(message_id = %message_id, "durable message job disappeared before execution");
-            return MessageJobRunOutcome::RetryAfter(MESSAGE_JOB_RETRY_FALLBACK);
+            info!(message_id = %message_id, "skipped a stale durable message job reservation");
+            return MessageJobRunOutcome::Complete;
         }
         Err(error) => {
             error!(message_id = %message_id, error = %error, "failed to load durable message job");
@@ -2855,7 +2854,7 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
     if let Err(error) = authorize(&state.app, request.headers()) {
         return error.into_response();
     }
-    let _permit = match state.ingest_slots.clone().try_acquire_owned() {
+    let permit = match state.ingest_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             return HttpError::retry_after(
@@ -2891,7 +2890,11 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
         Ok(MessageJobAdmission::Queue(message_id)) => message_id,
         Err(error) => return error.into_response(),
     };
-    let enqueue_status = match state.message_jobs.enqueue(message_id.clone(), event).await {
+    let enqueue_status = match state
+        .message_jobs
+        .enqueue_with_permit(message_id.clone(), event, permit)
+        .await
+    {
         Ok(status) => status,
         Err(error) => {
             error!(message_id = %message_id, error = %error, "failed to persist durable message job");
@@ -2914,7 +2917,7 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
 }
 
 async fn message_job_counts(state: &AppState) -> Result<(usize, usize)> {
-    let _scan_permit = state
+    let scan_permit = state
         .message_job_health_scans
         .clone()
         .try_acquire_owned()
@@ -2924,7 +2927,10 @@ async fn message_job_counts(state: &AppState) -> Result<(usize, usize)> {
             "durable message job state has a latched runtime failure"
         ));
     }
-    let pending = state.message_jobs.pending_count().await?;
+    let pending = state
+        .message_jobs
+        .pending_count_with_permit(scan_permit)
+        .await?;
     if !state.message_jobs.is_healthy() {
         return Err(anyhow!(
             "durable message job state has a latched runtime failure"
@@ -4538,6 +4544,95 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_internal_completion_does_not_latch_health() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        state
+            .message_jobs
+            .enqueue(
+                "message-stale".to_owned(),
+                message_event(inbound_message("message-stale", "stale snapshot")),
+            )
+            .await
+            .unwrap();
+        let stale = state
+            .message_jobs
+            .pending_message_ids(HashSet::new(), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            state
+                .message_jobs
+                .remove("message-stale".to_owned())
+                .await
+                .unwrap()
+        );
+
+        schedule_message_job(&state, stale).unwrap();
+        assert_eq!(state.active_message_jobs.lock().unwrap().len(), 1);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.active_message_jobs.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(state.message_jobs.is_healthy());
+        assert_eq!(
+            handle_health(State(state), HeaderMap::new()).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn externally_missing_indexed_job_latches_health() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        state
+            .message_jobs
+            .enqueue(
+                "message-missing".to_owned(),
+                message_event(inbound_message("message-missing", "missing externally")),
+            )
+            .await
+            .unwrap();
+        let path = fs::read_dir(state.message_jobs.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension() == Some(OsStr::new("json")))
+            .unwrap();
+        fs::remove_file(path).unwrap();
+
+        schedule_message_job(&state, "message-missing".to_owned()).unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !state.message_jobs.is_healthy()
+                    && state.active_message_jobs.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            handle_health(State(state.clone()), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        fs::remove_dir_all(state.message_jobs.root()).unwrap();
     }
 
     #[tokio::test]
