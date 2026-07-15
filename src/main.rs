@@ -41,7 +41,7 @@ use webex_generic_account_bot::{
     FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FileConfigStatusProvider, FollowupTrigger, MessageContext,
     ReplyFormat, UnixConfigActionClient, WEBEX_LIST_PAGE_SIZE,
     followup_reply_marker_search_max_pages, is_config_command_namespace,
-    message_jobs::{DurableMessageJobs, MessageJobEnqueueStatus},
+    message_jobs::{DurableMessageJobs, MessageJobEnqueueStatus, validate_message_id},
     message_matches_prefix, parse_config_command, render_prompt, should_trigger, trim_to_chars,
     webex::build_webex_client,
 };
@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         message_jobs,
         active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
         ingest_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
+        max_active_message_jobs: config.server.max_concurrent_requests.max(1),
     };
     schedule_pending_message_jobs(&app_state).await?;
     tokio::spawn(rescan_message_jobs(app_state.clone()));
@@ -204,6 +205,7 @@ struct AppState {
     message_jobs: Arc<DurableMessageJobs>,
     active_message_jobs: Arc<StdSyncMutex<HashSet<String>>>,
     ingest_slots: Arc<Semaphore>,
+    max_active_message_jobs: usize,
 }
 
 struct BotApp {
@@ -2641,12 +2643,29 @@ fn admit_message_job(event: &SidecarEvent) -> Result<MessageJobAdmission, HttpEr
             None,
         )));
     };
+    validate_message_id(&message_id)
+        .map_err(|error| HttpError::bad_request(format!("invalid message ID: {error}")))?;
     Ok(MessageJobAdmission::Queue(message_id))
 }
 
 async fn schedule_pending_message_jobs(state: &AppState) -> Result<()> {
-    for job in state.message_jobs.list().await? {
-        schedule_message_job(state, job.message_id().to_owned())?;
+    let (active, available) = {
+        let active = state
+            .active_message_jobs
+            .lock()
+            .map_err(|_| anyhow!("active message job set is poisoned"))?;
+        let available = state.max_active_message_jobs.saturating_sub(active.len());
+        (active.clone(), available)
+    };
+    if available == 0 {
+        return Ok(());
+    }
+    for message_id in state
+        .message_jobs
+        .pending_message_ids(active, available)
+        .await?
+    {
+        schedule_message_job(state, message_id)?;
     }
     Ok(())
 }
@@ -2666,9 +2685,10 @@ fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
             .active_message_jobs
             .lock()
             .map_err(|_| anyhow!("active message job set is poisoned"))?;
-        if !active.insert(message_id.clone()) {
+        if active.contains(&message_id) || active.len() >= state.max_active_message_jobs {
             return Ok(());
         }
+        active.insert(message_id.clone());
     }
     let guard = ActiveMessageJobGuard {
         message_id: message_id.clone(),
@@ -2676,28 +2696,35 @@ fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
     };
     let state = state.clone();
     tokio::spawn(async move {
-        let _guard = guard;
-        run_persisted_message_job(&state, &message_id).await;
+        {
+            let _guard = guard;
+            run_persisted_message_job(&state, &message_id).await;
+        }
+        if let Err(error) = schedule_pending_message_jobs(&state).await {
+            error!(error = %error, "failed to schedule the next durable message job");
+        }
     });
     Ok(())
 }
 
 async fn run_persisted_message_job(state: &AppState, message_id: &str) {
     loop {
+        let permit = match state.app.request_slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let record = match state.message_jobs.load(message_id.to_owned()).await {
             Ok(Some(record)) => record,
             Ok(None) => return,
             Err(error) => {
+                drop(permit);
                 error!(message_id = %message_id, error = %error, "failed to load durable message job");
                 tokio::time::sleep(MESSAGE_JOB_RETRY_FALLBACK).await;
                 continue;
             }
         };
-        let permit = match state.app.request_slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
-        let result = state.app.process_event(record.event().clone()).await;
+        let event = record.into_event();
+        let result = state.app.process_event(event).await;
         drop(permit);
         match result {
             Ok(action) => match state.message_jobs.remove(message_id.to_owned()).await {
@@ -2790,7 +2817,7 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
 }
 
 async fn message_job_counts(state: &AppState) -> Result<(usize, usize)> {
-    let pending = state.message_jobs.list().await?.len();
+    let pending = state.message_jobs.pending_count().await?;
     let active = state
         .active_message_jobs
         .lock()
@@ -4184,6 +4211,72 @@ mod tests {
         wait_for_job_removal(&state.message_jobs, "message-duplicate").await;
         assert_eq!(harness.runner.calls().len(), 1);
         assert_eq!(harness.webex.created_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_message_ids_are_terminal_bad_requests() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+
+        for message_id in [
+            String::new(),
+            "message\ncontrol".to_owned(),
+            "x".repeat(1025),
+        ] {
+            let event = message_event(inbound_message(&message_id, "invalid ID"));
+            let response = handle_event(State(state.clone()), event_request(&event)).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        }
+        assert_eq!(state.message_jobs.pending_count().await.unwrap(), 0);
+        assert!(harness.runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_scheduler_bounds_active_tasks_and_drains_the_backlog() {
+        let harness = TestHarness::new();
+        let mut state = harness.app_state();
+        state.max_active_message_jobs = 1;
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-bounded-1")));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-bounded-2")));
+        harness.runner.push_output("First bounded reply");
+        harness.runner.push_output("Second bounded reply");
+        let (started, release) = harness.runner.block_next_run();
+        let first = message_event(inbound_message("message-bounded-1", "first"));
+        let second = message_event(inbound_message("message-bounded-2", "second"));
+
+        assert_eq!(
+            handle_event(State(state.clone()), event_request(&first))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_event(State(state.clone()), event_request(&second))
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let health =
+            response_json(handle_health(State(state.clone()), HeaderMap::new()).await).await;
+        assert_eq!(health["pendingMessageJobs"], 2);
+        assert_eq!(health["activeMessageJobs"], 1);
+
+        release.notify_one();
+        wait_for_job_removal(&state.message_jobs, "message-bounded-1").await;
+        wait_for_job_removal(&state.message_jobs, "message-bounded-2").await;
+        assert_eq!(harness.runner.calls().len(), 2);
+        assert_eq!(harness.webex.created_requests().len(), 2);
     }
 
     #[tokio::test]
@@ -7787,6 +7880,7 @@ mod tests {
                 message_jobs: Arc::new(DurableMessageJobs::open(&self.state_path).unwrap()),
                 active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
                 ingest_slots: Arc::new(Semaphore::new(4)),
+                max_active_message_jobs: 4,
             }
         }
     }

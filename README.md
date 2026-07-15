@@ -44,7 +44,11 @@ mode-`0600` records, and admits at most 4096 pending messages. Atomic
 no-clobber publication preserves the first accepted sidecar hint for a message
 ID; authoritative Webex hydration still controls every security and routing
 decision. Startup validates the complete spool and reschedules every pending
-job. Retryable failures remain queued and honour the existing retry delay.
+job through a worker set bounded by `server.max_concurrent_requests`; queued
+records are loaded only after a worker obtains an execution permit. Periodic
+rescans select only enough non-active IDs to fill available worker slots, so a
+full valid backlog does not create thousands of tasks or retain every event in
+memory. Retryable failures remain queued and honour the existing retry delay.
 
 An unclean restart can leave a non-expired `JsonlStateStore` attempt lease.
 Recovery waits for that lease to expire before rerunning the durable job, which
@@ -55,8 +59,11 @@ transfer; this job-spool slice does not enable `/config reload` or `/config
 sync`.
 
 Authenticated `/healthz` output includes `messageJobDirectory`,
-`pendingMessageJobs`, and `activeMessageJobs`. An unreadable or invalid spool
-makes health return `503` rather than silently skipping accepted work.
+`pendingMessageJobs`, and `activeMessageJobs`. Startup exits fail-closed before
+binding the listener when a queued record is invalid. At runtime, health
+validates the private spool topology and file metadata and returns `503` when
+that state is unreadable or unsafe; a worker likewise retains and reports a
+record that becomes unreadable instead of silently skipping accepted work.
 
 ## Configuration
 

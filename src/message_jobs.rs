@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -51,6 +52,10 @@ impl MessageJobRecord {
     pub fn event(&self) -> &SidecarEvent {
         &self.event
     }
+
+    pub fn into_event(self) -> SidecarEvent {
+        self.event
+    }
 }
 
 #[derive(Debug)]
@@ -74,7 +79,7 @@ impl DurableMessageJobs {
             max_pending,
             operation_lock: StdMutex::new(()),
         };
-        jobs.list_sync()?;
+        jobs.validate_all_sync()?;
         Ok(jobs)
     }
 
@@ -110,11 +115,22 @@ impl DurableMessageJobs {
             .context("message job removal worker panicked")?
     }
 
-    pub async fn list(self: &std::sync::Arc<Self>) -> Result<Vec<MessageJobRecord>> {
+    pub async fn pending_message_ids(
+        self: &std::sync::Arc<Self>,
+        excluded_message_ids: HashSet<String>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         let jobs = std::sync::Arc::clone(self);
-        task::spawn_blocking(move || jobs.list_sync())
+        task::spawn_blocking(move || jobs.pending_message_ids_sync(&excluded_message_ids, limit))
             .await
             .context("message job listing worker panicked")?
+    }
+
+    pub async fn pending_count(self: &std::sync::Arc<Self>) -> Result<usize> {
+        let jobs = std::sync::Arc::clone(self);
+        task::spawn_blocking(move || jobs.pending_count_sync())
+            .await
+            .context("message job count worker panicked")?
     }
 
     fn enqueue_sync(
@@ -128,7 +144,7 @@ impl DurableMessageJobs {
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
         validate_message_event(message_id, &event)?;
-        ensure_private_job_root(&self.root)?;
+        self.prepare_root_sync()?;
 
         let final_path = self.job_path(message_id);
         if final_path.try_exists()? {
@@ -219,6 +235,7 @@ impl DurableMessageJobs {
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
+        self.prepare_root_sync()?;
         let path = self.job_path(message_id);
         match read_job_file(&path) {
             Ok(record) => {
@@ -247,6 +264,7 @@ impl DurableMessageJobs {
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
         validate_message_id(message_id)?;
+        self.prepare_root_sync()?;
         let path = self.job_path(message_id);
         match read_job_file(&path) {
             Ok(record) => {
@@ -272,14 +290,15 @@ impl DurableMessageJobs {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn list_sync(&self) -> Result<Vec<MessageJobRecord>> {
         let _guard = self
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
-        ensure_private_job_root(&self.root)?;
+        self.prepare_root_sync()?;
         let mut jobs = Vec::new();
-        for path in list_job_files(&self.root)? {
+        for path in self.checked_job_files_sync()? {
             let record = read_job_file(&path)?;
             if self.job_path(&record.message_id) != path {
                 return Err(anyhow!(
@@ -289,18 +308,99 @@ impl DurableMessageJobs {
             }
             jobs.push(record);
         }
-        if jobs.len() > self.max_pending {
-            return Err(anyhow!(
-                "message job backlog exceeds the fixed limit of {}",
-                self.max_pending
-            ));
-        }
         jobs.sort_by(|left, right| {
             left.enqueued_at_unix_nanos
                 .cmp(&right.enqueued_at_unix_nanos)
                 .then_with(|| left.message_id.cmp(&right.message_id))
         });
         Ok(jobs)
+    }
+
+    fn validate_all_sync(&self) -> Result<()> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
+        self.prepare_root_sync()?;
+        let paths = self.checked_job_files_sync()?;
+        for path in paths {
+            let record = read_job_file(&path)?;
+            if self.job_path(&record.message_id) != path {
+                return Err(anyhow!(
+                    "message job filename does not match its message ID at {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn pending_message_ids_sync(
+        &self,
+        excluded_message_ids: &HashSet<String>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
+        self.prepare_root_sync()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let excluded_digests = excluded_message_ids
+            .iter()
+            .map(|message_id| message_id_digest(message_id))
+            .collect::<HashSet<_>>();
+        let mut message_ids = Vec::with_capacity(limit);
+        for path in self.checked_job_files_sync()? {
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Err(anyhow!("message job filename is not UTF-8"));
+            };
+            let digest = file_name
+                .strip_suffix(MESSAGE_JOB_FILE_SUFFIX)
+                .ok_or_else(|| anyhow!("invalid message job filename at {}", path.display()))?;
+            if excluded_digests.contains(digest) {
+                continue;
+            }
+            let record = read_job_file(&path)?;
+            if self.job_path(&record.message_id) != path {
+                return Err(anyhow!(
+                    "message job filename does not match its message ID at {}",
+                    path.display()
+                ));
+            }
+            message_ids.push(record.message_id);
+            if message_ids.len() == limit {
+                break;
+            }
+        }
+        Ok(message_ids)
+    }
+
+    fn pending_count_sync(&self) -> Result<usize> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("message job operation lock is poisoned"))?;
+        self.prepare_root_sync()?;
+        Ok(self.checked_job_files_sync()?.len())
+    }
+
+    fn prepare_root_sync(&self) -> Result<()> {
+        ensure_private_job_root(&self.root)?;
+        recover_candidates(&self.root)
+    }
+
+    fn checked_job_files_sync(&self) -> Result<Vec<PathBuf>> {
+        let paths = list_job_files(&self.root)?;
+        if paths.len() > self.max_pending {
+            return Err(anyhow!(
+                "message job backlog exceeds the fixed limit of {}",
+                self.max_pending
+            ));
+        }
+        Ok(paths)
     }
 
     fn job_path(&self, message_id: &str) -> PathBuf {
@@ -332,7 +432,7 @@ fn message_job_root(state_file: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!("{file_name}{MESSAGE_JOB_DIRECTORY_SUFFIX}")))
 }
 
-fn validate_message_id(message_id: &str) -> Result<()> {
+pub fn validate_message_id(message_id: &str) -> Result<()> {
     if message_id.is_empty() || message_id.len() > MAX_MESSAGE_ID_BYTES {
         return Err(anyhow!(
             "message ID must contain 1..={MAX_MESSAGE_ID_BYTES} bytes"
@@ -454,7 +554,7 @@ fn open_job_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     options
         .open(path)
         .with_context(|| format!("failed to open message job {}", path.display()))
@@ -551,6 +651,10 @@ fn list_job_files(root: &Path) -> Result<Vec<PathBuf>> {
             .to_str()
             .ok_or_else(|| anyhow!("message job filename is not UTF-8"))?;
         if is_job_filename(name) {
+            let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
+                format!("failed to stat message job {}", entry.path().display())
+            })?;
+            validate_job_file_metadata(&entry.path(), &metadata, 1)?;
             files.push(entry.path());
             continue;
         }
@@ -647,16 +751,31 @@ fn recover_candidates(root: &Path) -> Result<()> {
 
 fn read_candidate_file(path: &Path, links: u64) -> Result<MessageJobRecord> {
     let mut file = open_job_file(path)?;
-    let metadata = file.metadata()?;
-    validate_job_file_metadata(path, &metadata, links)?;
-    if metadata.len() > MAX_MESSAGE_JOB_RECORD_BYTES {
+    let before = file.metadata()?;
+    validate_job_file_metadata(path, &before, links)?;
+    if before.len() > MAX_MESSAGE_JOB_RECORD_BYTES {
         return Err(anyhow!(
             "message job candidate is too large: {}",
             path.display()
         ));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_MESSAGE_JOB_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MESSAGE_JOB_RECORD_BYTES {
+        return Err(anyhow!(
+            "message job candidate is too large: {}",
+            path.display()
+        ));
+    }
+    let after = file.metadata()?;
+    if !same_file_snapshot(&before, &after) || after.len() != bytes.len() as u64 {
+        return Err(anyhow!(
+            "message job candidate changed while it was read: {}",
+            path.display()
+        ));
+    }
     let record: MessageJobRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid message job candidate JSON at {}", path.display()))?;
     validate_record(&record)?;
@@ -764,6 +883,62 @@ mod tests {
     }
 
     #[test]
+    fn pending_ids_are_bounded_and_exclude_active_jobs() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        for message_id in ["message-1", "message-2", "message-3"] {
+            jobs.enqueue_sync(message_id, message_event(message_id, "body"))
+                .unwrap();
+        }
+
+        let excluded = HashSet::from(["message-1".to_owned()]);
+        let pending = jobs.pending_message_ids_sync(&excluded, 1).unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0], "message-1");
+        assert_eq!(jobs.pending_count_sync().unwrap(), 3);
+        assert!(
+            jobs.pending_message_ids_sync(&HashSet::new(), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_recovers_published_job_after_candidate_removal_crash() {
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        let root = jobs.root().to_path_buf();
+        let record = MessageJobRecord {
+            version: MESSAGE_JOB_RECORD_VERSION,
+            message_id: "message-published".to_owned(),
+            enqueued_at_unix_nanos: 1,
+            event: message_event("message-published", "body"),
+        };
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        let candidate = root.join(".pending-crash-after-publish");
+        fs::write(&candidate, bytes).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            &candidate,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let final_path = jobs.job_path("message-published");
+        fs::hard_link(&candidate, &final_path).unwrap();
+        drop(jobs);
+
+        let reopened = DurableMessageJobs::open(&fixture.state_file).unwrap();
+
+        assert!(!candidate.exists());
+        assert_eq!(
+            reopened.load_sync("message-published").unwrap().unwrap(),
+            record
+        );
+    }
+
+    #[test]
     fn startup_removes_unpublished_candidate_but_rejects_corrupt_published_job() {
         let fixture = Fixture::new();
         let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
@@ -815,6 +990,34 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
         assert!(error.to_string().contains("mode 0700"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rejects_fifo_without_blocking_and_opens_jobs_nonblocking() {
+        use std::{
+            ffi::CString,
+            os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+        };
+
+        let fixture = Fixture::new();
+        let jobs = DurableMessageJobs::open(&fixture.state_file).unwrap();
+        let root = jobs.root().to_path_buf();
+        drop(jobs);
+        let fifo = root.join(format!("{}{}", "c".repeat(64), MESSAGE_JOB_FILE_SUFFIX));
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let error = DurableMessageJobs::open(&fixture.state_file).unwrap_err();
+        assert!(error.to_string().contains("real regular file"));
+        fs::remove_file(&fifo).unwrap();
+
+        let regular = root.join("nonblocking-check");
+        fs::write(&regular, b"check").unwrap();
+        let file = open_job_file(&regular).unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
     }
 
     fn message_event(message_id: &str, text: &str) -> SidecarEvent {

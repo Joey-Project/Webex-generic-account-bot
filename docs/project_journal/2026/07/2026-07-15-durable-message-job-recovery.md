@@ -23,16 +23,18 @@ superseded_by:
 - Preserved the first sidecar hint for duplicate message IDs while retaining
   authoritative Webex hydration for all room, sender, body, thread, execution,
   and write decisions.
-- Added bounded background execution, automatic retry, startup rescheduling,
-  duplicate in-process scheduling suppression, and health counts for pending
-  and active jobs.
+- Added background execution bounded by `server.max_concurrent_requests`,
+  permit-before-load record handling, bounded non-active backlog selection,
+  automatic retry, startup rescheduling, duplicate in-process scheduling
+  suppression, and lightweight health counts for pending and active jobs.
 - Kept the existing `JsonlStateStore` attempt lease as the crash boundary: an
   unclean restart waits for a surviving lease to expire, then resumes the
   durable job. Existing hidden Webex markers reconcile ambiguous writes.
-- Added tests for durable reopen/removal, duplicate enqueue, backlog limits,
-  interrupted candidates, corrupt or unsafe spool entries, acknowledgement
-  before Codex completion, duplicate sidecar delivery, transient retry, and
-  restart recovery after an old lease expires.
+- Added tests for durable reopen/removal, duplicate enqueue, backlog and active
+  task limits, both interrupted publication states, corrupt or unsafe spool
+  entries including non-blocking FIFO rejection, terminal invalid-ID handling,
+  acknowledgement before Codex completion, duplicate sidecar delivery,
+  transient retry, and restart recovery after an old lease expires.
 
 ## Boundaries
 - This slice does not provide cross-process lease transfer, immediate takeover,
