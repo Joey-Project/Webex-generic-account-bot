@@ -451,11 +451,22 @@ mod tests {
         );
         assert!(retained._file.metadata().is_ok());
         drop(retained);
-        // SAFETY: contender remains valid and the retained OFD is now closed.
-        assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-        );
+        let mut acquired = false;
+        for _ in 0..100 {
+            // SAFETY: contender remains valid and the retained OFD is now closed.
+            if unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                acquired = true;
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EWOULDBLOCK)
+            );
+            // A concurrently forked test child can retain a CLOEXEC descriptor
+            // only until its immediate exec boundary.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(acquired, "retained deployment lock was not released");
         drop(contender);
         fs::remove_file(path).expect("remove test lock");
     }

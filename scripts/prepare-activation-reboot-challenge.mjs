@@ -14,13 +14,16 @@ import {
 import {
   inspectActivationBoundary,
   prepareHostDeployment,
-  runJsonCommand,
 } from './prepare-host-deployment.mjs';
 
 const execFileAsync = promisify(execFile);
 const SHA1_PATTERN = /^[a-f0-9]{40}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const LAUNCHER_INSTANCE_PATTERN = /^webex-codex-launcher@[^@/\s]+\.service$/;
 const COMMAND_TIMEOUT_MS = 30_000;
+const COMMAND_OUTPUT_MAX_BYTES = 64 * 1024;
+const HELPER_DIAGNOSTIC_MAX_BYTES = 1024;
+const MAX_LAUNCHER_INSTANCES = 128;
 
 export const DEFAULTS = Object.freeze({
   activationHelper: '/opt/webex-generic-account-bot/bin/webex-codex-activation',
@@ -188,21 +191,51 @@ function buildReport({
 
 export async function inspectManagedUnits(settings = DEFAULTS, injected = {}) {
   const run = injected.run ?? execFileAsync;
+  const listCommands = [
+    [
+      'list-units',
+      '--all',
+      '--full',
+      '--plain',
+      '--no-legend',
+      '--no-pager',
+      '--type=service',
+      'webex-codex-launcher@*.service',
+    ],
+    [
+      'list-unit-files',
+      '--full',
+      '--no-legend',
+      '--no-pager',
+      'webex-codex-launcher@*.service',
+    ],
+  ];
+  let listings;
+  try {
+    listings = await Promise.all(listCommands.map((args) => run(
+      settings.systemctl,
+      args,
+      fixedCommandOptions(COMMAND_OUTPUT_MAX_BYTES),
+    )));
+  } catch {
+    throw new Error('launcher instance discovery failed');
+  }
+  if (listings.some(({ stderr }) => stderr !== '')) {
+    throw new Error('launcher instance discovery emitted unexpected diagnostics');
+  }
+  const instances = new Set(listings.flatMap(({ stdout }) => parseLauncherInstances(stdout)));
+  if (instances.size > MAX_LAUNCHER_INSTANCES) {
+    throw new Error('too many launcher instances');
+  }
+
   const units = [];
-  for (const unit of MANAGED_UNITS) {
+  for (const unit of [...MANAGED_UNITS, ...[...instances].sort()]) {
     let result;
     try {
       result = await run(
         settings.systemctl,
         ['show', '--property=ActiveState', '--value', '--', unit],
-        {
-          cwd: '/',
-          env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
-          encoding: 'utf8',
-          maxBuffer: 64 * 1024,
-          timeout: COMMAND_TIMEOUT_MS,
-          windowsHide: true,
-        },
+        fixedCommandOptions(COMMAND_OUTPUT_MAX_BYTES),
       );
     } catch {
       throw new Error(`managed unit state inspection failed: ${unit}`);
@@ -213,6 +246,19 @@ export async function inspectManagedUnits(settings = DEFAULTS, injected = {}) {
     units.push(Object.freeze({ unit, active_state: 'inactive' }));
   }
   return Object.freeze(units);
+}
+
+function parseLauncherInstances(output) {
+  const instances = [];
+  for (const line of String(output).split('\n').map((value) => value.trim()).filter(Boolean)) {
+    const [unit] = line.split(/\s+/);
+    if (unit === 'webex-codex-launcher@.service') continue;
+    if (!LAUNCHER_INSTANCE_PATTERN.test(unit)) {
+      throw new Error(`unexpected launcher instance listing: ${unit}`);
+    }
+    instances.push(unit);
+  }
+  return instances;
 }
 
 export async function assertDeploymentTransactionAbsent(settings = DEFAULTS, injected = {}) {
@@ -226,12 +272,54 @@ export async function assertDeploymentTransactionAbsent(settings = DEFAULTS, inj
   throw new Error('deployment recovery must be completed before preparing the reboot challenge');
 }
 
-async function runActivationHelper(settings, apply) {
-  return runJsonCommand(
-    settings.activationHelper,
-    ['prepare-reboot-challenge', ...(apply ? ['--apply'] : [])],
-    apply ? 'activation reboot challenge creation' : 'activation reboot challenge inspection',
-  );
+export async function runActivationHelper(settings = DEFAULTS, apply = false, injected = {}) {
+  const run = injected.run ?? execFileAsync;
+  const label = apply
+    ? 'activation reboot challenge creation'
+    : 'activation reboot challenge inspection';
+  let result;
+  try {
+    result = await run(
+      settings.activationHelper,
+      ['prepare-reboot-challenge', ...(apply ? ['--apply'] : [])],
+      fixedCommandOptions(COMMAND_OUTPUT_MAX_BYTES),
+    );
+  } catch (error) {
+    const status = Number.isSafeInteger(error?.code) ? `exit ${error.code}` : 'execution error';
+    const diagnostic = parseTrustedHelperDiagnostic(error?.stderr);
+    const failure = new Error(
+      diagnostic === null ? `${label} failed (${status})` : `${label} failed: ${diagnostic}`,
+    );
+    throw failure;
+  }
+  if (result.stderr !== '') throw new Error(`${label} emitted unexpected diagnostics`);
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`${label} returned invalid JSON`);
+  }
+}
+
+function parseTrustedHelperDiagnostic(stderr) {
+  if (
+    typeof stderr !== 'string'
+    || Buffer.byteLength(stderr, 'utf8') > HELPER_DIAGNOSTIC_MAX_BYTES
+  ) {
+    return null;
+  }
+  const match = /^Error: ([\x20-\x7e]{1,768})\n?$/.exec(stderr);
+  return match?.[1] ?? null;
+}
+
+function fixedCommandOptions(maxBuffer) {
+  return {
+    cwd: '/',
+    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+    encoding: 'utf8',
+    maxBuffer,
+    timeout: COMMAND_TIMEOUT_MS,
+    windowsHide: true,
+  };
 }
 
 function validateOptions(options) {
@@ -386,11 +474,18 @@ function validateBoundaryMatchesChallenge(boundary, challenge) {
 }
 
 function validateManagedUnitStates(units) {
+  const fixed = units?.slice(0, MANAGED_UNITS.length);
+  const instances = units?.slice(MANAGED_UNITS.length);
   if (
     !Array.isArray(units)
-    || units.length !== MANAGED_UNITS.length
-    || units.some((entry, index) => (
+    || units.length < MANAGED_UNITS.length
+    || fixed.some((entry, index) => (
       entry?.unit !== MANAGED_UNITS[index] || entry.active_state !== 'inactive'
+    ))
+    || instances.some((entry, index) => (
+      entry?.active_state !== 'inactive'
+      || !LAUNCHER_INSTANCE_PATTERN.test(entry.unit ?? '')
+      || (index > 0 && instances[index - 1].unit >= entry.unit)
     ))
   ) {
     throw new Error('managed systemd unit state report is invalid');

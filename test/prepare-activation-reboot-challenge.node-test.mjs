@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  DEFAULTS,
   MANAGED_UNITS,
   assertDeploymentTransactionAbsent,
   exitStatusForError,
   inspectManagedUnits,
   parseArgs,
   prepareActivationRebootChallenge,
+  runActivationHelper,
   runCli,
   usage,
 } from '../scripts/prepare-activation-reboot-challenge.mjs';
@@ -205,6 +207,9 @@ describe('first activation reboot challenge preparation', () => {
     const units = await inspectManagedUnits(undefined, {
       run: async (command, args, optionsValue) => {
         calls.push({ command, args, options: optionsValue });
+        if (args[0] === 'list-units' || args[0] === 'list-unit-files') {
+          return { stdout: '', stderr: '' };
+        }
         return { stdout: 'inactive\n', stderr: '' };
       },
     });
@@ -212,9 +217,19 @@ describe('first activation reboot challenge preparation', () => {
     assert(calls.every(({ command }) => command === '/usr/bin/systemctl'));
     assert.deepEqual(
       calls.map(({ args }) => args),
-      MANAGED_UNITS.map((unit) => [
-        'show', '--property=ActiveState', '--value', '--', unit,
-      ]),
+      [
+        [
+          'list-units', '--all', '--full', '--plain', '--no-legend', '--no-pager',
+          '--type=service', 'webex-codex-launcher@*.service',
+        ],
+        [
+          'list-unit-files', '--full', '--no-legend', '--no-pager',
+          'webex-codex-launcher@*.service',
+        ],
+        ...MANAGED_UNITS.map((unit) => [
+          'show', '--property=ActiveState', '--value', '--', unit,
+        ]),
+      ],
     );
 
     let lstatCalls = 0;
@@ -229,6 +244,80 @@ describe('first activation reboot challenge preparation', () => {
       },
     });
     assert.equal(lstatCalls, 1);
+  });
+
+  it('discovers launcher instances and rejects an active instance', async () => {
+    const instance = 'webex-codex-launcher@test.service';
+    const run = async (_command, args) => {
+      if (args[0] === 'list-units') {
+        return { stdout: `${instance} loaded inactive dead test\n`, stderr: '' };
+      }
+      if (args[0] === 'list-unit-files') {
+        return {
+          stdout: `webex-codex-launcher@.service static -\n${instance} static -\n`,
+          stderr: '',
+        };
+      }
+      return { stdout: 'inactive\n', stderr: '' };
+    };
+    assert.deepEqual(
+      await inspectManagedUnits(undefined, { run }),
+      [...inactiveUnits(), { unit: instance, active_state: 'inactive' }],
+    );
+
+    await assert.rejects(
+      inspectManagedUnits(undefined, {
+        run: async (command, args, optionsValue) => {
+          const result = await run(command, args, optionsValue);
+          if (args.at(-1) === instance && args[0] === 'show') {
+            return { stdout: 'active\n', stderr: '' };
+          }
+          return result;
+        },
+      }),
+      /managed unit must be inactive.*webex-codex-launcher@test\.service/,
+    );
+  });
+
+  it('surfaces only bounded single-line activation helper diagnostics', async () => {
+    const legacy = 'legacy reboot challenge schema version 1 requires operator recovery';
+    const calls = [];
+    await assert.rejects(
+      runActivationHelper(DEFAULTS, false, {
+        run: async (command, args, optionsValue) => {
+          calls.push({ command, args, options: optionsValue });
+          throw Object.assign(new Error('helper failed'), {
+            code: 1,
+            stderr: `Error: ${legacy}\n`,
+          });
+        },
+      }),
+      new RegExp(legacy),
+    );
+    assert.equal(calls[0].command, DEFAULTS.activationHelper);
+    assert.deepEqual(calls[0].args, ['prepare-reboot-challenge']);
+    assert.deepEqual(calls[0].options.env, {
+      LANG: 'C',
+      LC_ALL: 'C',
+      PATH: '/usr/bin:/bin',
+    });
+
+    const secret = 'do-not-surface';
+    await assert.rejects(
+      runActivationHelper(DEFAULTS, true, {
+        run: async () => {
+          throw Object.assign(new Error('helper failed'), {
+            code: 1,
+            stderr: `Error: ${secret}\nCaused by: second line\n`,
+          });
+        },
+      }),
+      (error) => {
+        assert.match(error.message, /creation failed \(exit 1\)/);
+        assert.doesNotMatch(error.message, new RegExp(secret));
+        return true;
+      },
+    );
   });
 
   it('preserves lock contention status through the CLI', async () => {

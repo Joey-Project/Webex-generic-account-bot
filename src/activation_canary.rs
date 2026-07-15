@@ -1149,6 +1149,7 @@ fn prepare_reboot_cleanup_challenge_with(
     apply: bool,
     expected_binding: &ActivationBindingReport,
 ) -> Result<(&'static str, u8, RebootChallengeReport)> {
+    validate_reboot_marker_root(paths)?;
     let current_boot = read_boot_id_with(&paths.boot_id)?;
     let existing = read_reboot_challenge_with(paths)?;
     match classify_reboot_challenge(&current_boot, existing.as_ref(), expected_binding)? {
@@ -1239,6 +1240,7 @@ fn verify_reboot_cleanup_challenge_with(
     paths: &RebootChallengePaths,
     binding: &VerifiedActivation,
 ) -> Result<()> {
+    validate_reboot_marker_root(paths)?;
     let current_boot = read_boot_id_with(&paths.boot_id)?;
     let challenge = read_reboot_challenge_with(paths)?;
     let expected_binding = ActivationBindingReport::from(binding);
@@ -1356,6 +1358,10 @@ fn validate_reboot_marker_with(paths: &RebootChallengePaths, nonce: &str) -> Res
         "current-boot reboot marker contents are invalid"
     );
     Ok(())
+}
+
+fn validate_reboot_marker_root(paths: &RebootChallengePaths) -> Result<()> {
+    validate_directory_owner(&paths.marker_root, 0o700, "reboot marker root", paths.owner)
 }
 
 fn atomic_write_private(path: &Path, payload: &[u8], owner: PrivateFileOwner) -> Result<()> {
@@ -1851,6 +1857,29 @@ mod tests {
             prepare_reboot_cleanup_challenge_with(&fixture.paths, true, &binding).unwrap();
         assert_eq!(writes, 0);
         assert_eq!(fixture.challenge().marker_nonce, original_nonce);
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_an_untrusted_marker_root() {
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let fixture = RebootChallengeFixture::new(boot);
+        let activation = verified_activation(boot);
+        let binding = ActivationBindingReport::from(&activation);
+        fs::set_permissions(
+            &fixture.paths.marker_root,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let error = prepare_reboot_cleanup_challenge_with(&fixture.paths, false, &binding)
+            .expect_err("reject an unsafe marker root before challenge preparation");
+        assert!(error.to_string().contains("reboot marker root metadata"));
+        assert!(!fixture.paths.challenge.exists());
+
+        let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+            .expect_err("reject an unsafe marker root before activation renewal");
+        assert!(error.to_string().contains("reboot marker root metadata"));
+        assert!(!fixture.paths.challenge.exists());
     }
 
     #[test]

@@ -29,12 +29,17 @@ superseded_by:
 - Exact legacy-v1 state is identified separately and remains fail closed. The
   runbook requires the complete preflight before archiving the fixed persistent
   challenge, re-arming v2, and crossing a new real reboot; old `/run` evidence
-  is never reused.
+  is never reused. The fixed host wrapper surfaces only a bounded single-line
+  diagnostic from the trusted activation helper so this recovery state remains
+  distinguishable without forwarding arbitrary child stderr.
 - The host entrypoint reuses reviewed release, policy, runtime, and secret
   readiness checks. Apply serialises with config deployment, requires the
   receipt, runner permission, and deployment transaction to remain absent,
-  and proves the bot, activation renewal, launcher socket, and config worker
-  units are inactive before and after.
+  and proves the bot, activation renewal, launcher socket, config worker, and
+  every bounded discovered launcher instance are inactive before and after.
+- Challenge preparation and renewal both require the boot-scoped marker root
+  to retain the exact trusted owner and mode before reading or writing marker
+  evidence.
 - This step never fetches or installs config, starts or enables a unit, runs
   Codex canaries, reboots the host, activates the runner, or contacts Webex.
 
@@ -51,4 +56,5 @@ superseded_by:
 - State machine: `src/activation_canary.rs`
 - Tests: `test/prepare-activation-reboot-challenge.node-test.mjs`
 - Rust disk-state tests cover v2 arm/retry, boot crossing, marker survival,
-  binding drift, renewal validation, and legacy-v1 identification.
+  marker-root rejection, binding drift, renewal validation, and legacy-v1
+  identification.
