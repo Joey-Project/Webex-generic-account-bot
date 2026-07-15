@@ -1333,6 +1333,7 @@ fn read_reboot_challenge_with(paths: &RebootChallengePaths) -> Result<Option<Reb
             .is_some_and(|validated_boot_id| {
                 !activation::parse_boot_id(validated_boot_id.as_bytes())
                     .is_ok_and(|boot_id| boot_id == validated_boot_id)
+                    || validated_boot_id != challenge.challenge_boot_id
             })
         || validate_runtime_canary_nonce(&challenge.marker_nonce).is_err()
     {
@@ -1991,6 +1992,31 @@ mod tests {
             assert!(error.to_string().contains("reboot challenge is invalid"));
             assert_eq!(fs::read(&fixture.paths.challenge).unwrap(), payload);
         }
+    }
+
+    #[test]
+    fn reboot_challenge_disk_state_rejects_inconsistent_validated_boot_id() {
+        let current_boot = "11111111-2222-3333-4444-555555555555";
+        let challenge_boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let validated_boot = "99999999-8888-7777-6666-555555555555";
+        let fixture = RebootChallengeFixture::new(current_boot);
+        let activation = verified_activation(current_boot);
+        let challenge = RebootChallenge {
+            version: REBOOT_CHALLENGE_VERSION,
+            challenge_boot_id: challenge_boot.to_owned(),
+            marker_nonce: "0".repeat(64),
+            validated_boot_id: Some(validated_boot.to_owned()),
+            activation_binding: ActivationBindingReport::from(&activation),
+        };
+        let payload = serde_json::to_vec(&challenge).unwrap();
+        create_private_fixture_with_owner(&fixture.paths.challenge, &payload, fixture.paths.owner)
+            .unwrap();
+
+        let error = verify_reboot_cleanup_challenge_with(&fixture.paths, &activation)
+            .expect_err("reject an inconsistent persisted validated boot identifier");
+        assert!(error.to_string().contains("reboot challenge is invalid"));
+        assert_eq!(fs::read(&fixture.paths.challenge).unwrap(), payload);
+        assert!(!fixture.marker(&challenge.marker_nonce).exists());
     }
 
     #[test]
