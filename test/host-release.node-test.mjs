@@ -702,6 +702,7 @@ describe('host release bootstrap', () => {
     const probeInstaller = path.join(root, 'install-host-release.mjs');
     const probeContract = path.join(root, 'host-release-contract.mjs');
     const probeBusybox = path.join(root, 'busybox');
+    const probeNode = path.join(root, 'node');
     try {
       await fs.writeFile(
         nativeSource,
@@ -748,11 +749,12 @@ describe('host release bootstrap', () => {
       await fs.writeFile(probeContract, 'export {};\n', { mode: 0o444 });
       await fs.copyFile('/usr/bin/busybox', probeBusybox);
       await fs.chmod(probeBusybox, 0o555);
+      await fs.copyFile(process.execPath, probeNode);
+      await fs.chmod(probeNode, 0o555);
       await fs.writeFile(probeInstallerWrapper, '#!/bin/false\n', { mode: 0o555 });
 
       const uid = process.getuid();
       const gid = process.getgid();
-      const nodeMode = ((await fs.lstat(process.execPath)).mode & 0o7777).toString(8);
       const productionDigests = new Map([
         [await sha256File(builderPath), await sha256File(probe)],
         [await sha256File(installerPath), await sha256File(probeInstaller)],
@@ -760,13 +762,12 @@ describe('host release bootstrap', () => {
       ]);
       let fixtureWrapper = wrapper
         .replaceAll('/usr/local/libexec/webex-host-release', root)
-        .replaceAll('/usr/bin/node', process.execPath)
+        .replaceAll('/usr/bin/node', probeNode)
         .replace(
           'for directory in / /usr /usr/bin /usr/local /usr/local/libexec "$trust_root"; do',
           'for directory in "$trust_root"; do',
         )
-        .replaceAll('0:0:', `${uid}:${gid}:`)
-        .replace(`check_file ${process.execPath} 555`, `check_file ${process.execPath} ${nodeMode}`);
+        .replaceAll('0:0:', `${uid}:${gid}:`);
       for (const [productionDigest, fixtureDigest] of productionDigests) {
         fixtureWrapper = fixtureWrapper.replaceAll(productionDigest, fixtureDigest);
       }
