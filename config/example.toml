@@ -13,11 +13,13 @@ event_path = "/webex/events"
 health_path = "/healthz"
 sidecar_token_env = "WEBEX_SIDECAR_TOKEN"
 allow_unauthenticated = false
+# Separate pools use this limit for simultaneous event persistence and for
+# long-running background jobs.
 max_concurrent_requests = 4
 
-# Keep this longer than the expected Codex runtime and shorter than the sidecar
-# retry horizon. The JS sidecar's WEBEX_SIDECAR_FORWARD_TIMEOUT_MS should be
-# greater than codex.timeout_secs.
+# Keep this longer than the expected Codex runtime. After an unclean restart,
+# a recovered durable job waits out any unexpired prior attempt lease before
+# retrying, which prevents concurrent duplicate work.
 attempt_lease_secs = 1200
 
 [webex]

@@ -1,6 +1,7 @@
 # Project TODO
 
-- [pending] Add durable background job recovery so long Codex runs can survive bot restarts after sidecar acceptance.
+- [completed] Add durable background job recovery so long Codex runs can
+  survive bot restarts after sidecar acceptance.
 - [completed] Add immutable staged config preparation that does not replace
   live config or touch the bot service.
 - [completed] Add the separate-identity Unix-socket config-action worker and

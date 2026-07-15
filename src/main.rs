@@ -40,8 +40,10 @@ use webex_generic_account_bot::{
     ConfigStatusProvider, DIRECT_REPLY_MARKER_SEARCH_MAX_PAGES, ExecCodexRunner,
     FOLLOWUP_MARKER_SEARCH_MAX_MESSAGES, FileConfigStatusProvider, FollowupTrigger, MessageContext,
     ReplyFormat, UnixConfigActionClient, WEBEX_LIST_PAGE_SIZE,
-    followup_reply_marker_search_max_pages, is_config_command_namespace, message_matches_prefix,
-    parse_config_command, render_prompt, should_trigger, trim_to_chars, webex::build_webex_client,
+    followup_reply_marker_search_max_pages, is_config_command_namespace,
+    message_jobs::{DurableMessageJobs, MessageJobEnqueueStatus},
+    message_matches_prefix, parse_config_command, render_prompt, should_trigger, trim_to_chars,
+    webex::build_webex_client,
 };
 use webex_headless_messenger::{
     ApiError, AttemptLease, AttemptStart, Error as WebexError, JsonlStateStore, Page, SidecarEvent,
@@ -68,6 +70,8 @@ const JENKINS_FETCH_TIMEOUT_MAX_SECS: u64 = 60;
 const JENKINS_HELPER_COMPLETION_MARGIN_SECS: u64 = 30;
 const JENKINS_HELPER_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const JENKINS_HELPER_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(250);
+const MESSAGE_JOB_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+const MESSAGE_JOB_RETRY_FALLBACK: Duration = Duration::from_secs(30);
 static JENKINS_ARTIFACT_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_JENKINS_ARTIFACT_DIRS: OnceLock<StdSyncMutex<HashSet<PathBuf>>> = OnceLock::new();
 static JENKINS_ARTIFACT_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -148,6 +152,7 @@ async fn main() -> Result<()> {
     let webex: Arc<dyn WebexApi> = Arc::new(build_webex_client(&config.webex)?);
     let self_person_id = resolve_self_person_id(&config, webex.as_ref()).await?;
     let state_store = JsonlStateStore::load(config.state_file.clone())?;
+    let message_jobs = Arc::new(DurableMessageJobs::open(&config.state_file)?);
     let app = Arc::new(BotApp {
         config: config.clone(),
         sidecar_token,
@@ -159,13 +164,21 @@ async fn main() -> Result<()> {
         config_actions: Arc::new(UnixConfigActionClient::default()),
         request_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
     });
+    let app_state = AppState {
+        app: app.clone(),
+        message_jobs,
+        active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
+        ingest_slots: Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1))),
+    };
+    schedule_pending_message_jobs(&app_state).await?;
+    tokio::spawn(rescan_message_jobs(app_state.clone()));
 
     let event_path = config.server.event_path.clone();
     let health_path = config.server.health_path.clone();
     let router = Router::new()
         .route(&event_path, post(handle_event))
         .route(&health_path, get(handle_health))
-        .with_state(AppState { app: app.clone() });
+        .with_state(app_state);
     let bind: SocketAddr = config
         .server
         .bind
@@ -188,6 +201,9 @@ async fn main() -> Result<()> {
 #[derive(Clone)]
 struct AppState {
     app: Arc<BotApp>,
+    message_jobs: Arc<DurableMessageJobs>,
+    active_message_jobs: Arc<StdSyncMutex<HashSet<String>>>,
+    ingest_slots: Arc<Semaphore>,
 }
 
 struct BotApp {
@@ -2583,11 +2599,140 @@ impl BotApp {
     }
 }
 
+enum MessageJobAdmission {
+    Ignore(BotAction),
+    Queue(String),
+}
+
+struct ActiveMessageJobGuard {
+    message_id: String,
+    active_message_jobs: Arc<StdSyncMutex<HashSet<String>>>,
+}
+
+impl Drop for ActiveMessageJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_message_jobs.lock() {
+            active.remove(&self.message_id);
+        }
+    }
+}
+
+fn admit_message_job(event: &SidecarEvent) -> Result<MessageJobAdmission, HttpError> {
+    if event.version != 1 {
+        return Ok(MessageJobAdmission::Ignore(BotAction::ignored(
+            "unsupported_event_version",
+            None,
+            None,
+        )));
+    }
+    if event.resource != "messages" || event.event != "created" {
+        return Ok(MessageJobAdmission::Ignore(BotAction::ignored(
+            "unsupported_event",
+            Some(event.resource.clone()),
+            None,
+        )));
+    }
+    let message: Message = serde_json::from_value(event.data.clone())
+        .map_err(|error| HttpError::bad_request(format!("invalid message payload: {error}")))?;
+    let Some(message_id) = message.id else {
+        return Ok(MessageJobAdmission::Ignore(BotAction::ignored(
+            "missing_message_id",
+            None,
+            None,
+        )));
+    };
+    Ok(MessageJobAdmission::Queue(message_id))
+}
+
+async fn schedule_pending_message_jobs(state: &AppState) -> Result<()> {
+    for job in state.message_jobs.list().await? {
+        schedule_message_job(state, job.message_id().to_owned())?;
+    }
+    Ok(())
+}
+
+async fn rescan_message_jobs(state: AppState) {
+    loop {
+        tokio::time::sleep(MESSAGE_JOB_RESCAN_INTERVAL).await;
+        if let Err(error) = schedule_pending_message_jobs(&state).await {
+            error!(error = %error, "failed to rescan durable message jobs");
+        }
+    }
+}
+
+fn schedule_message_job(state: &AppState, message_id: String) -> Result<()> {
+    {
+        let mut active = state
+            .active_message_jobs
+            .lock()
+            .map_err(|_| anyhow!("active message job set is poisoned"))?;
+        if !active.insert(message_id.clone()) {
+            return Ok(());
+        }
+    }
+    let guard = ActiveMessageJobGuard {
+        message_id: message_id.clone(),
+        active_message_jobs: state.active_message_jobs.clone(),
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        run_persisted_message_job(&state, &message_id).await;
+    });
+    Ok(())
+}
+
+async fn run_persisted_message_job(state: &AppState, message_id: &str) {
+    loop {
+        let record = match state.message_jobs.load(message_id.to_owned()).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                error!(message_id = %message_id, error = %error, "failed to load durable message job");
+                tokio::time::sleep(MESSAGE_JOB_RETRY_FALLBACK).await;
+                continue;
+            }
+        };
+        let permit = match state.app.request_slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let result = state.app.process_event(record.event().clone()).await;
+        drop(permit);
+        match result {
+            Ok(action) => match state.message_jobs.remove(message_id.to_owned()).await {
+                Ok(_) => {
+                    info!(
+                        message_id = %message_id,
+                        action = action.action,
+                        "completed durable message job"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    error!(message_id = %message_id, error = %error, "failed to remove completed durable message job");
+                    tokio::time::sleep(MESSAGE_JOB_RETRY_FALLBACK).await;
+                }
+            },
+            Err(error) => {
+                let retry_after = error.retry_after.unwrap_or(MESSAGE_JOB_RETRY_FALLBACK);
+                warn!(
+                    message_id = %message_id,
+                    retry_after_secs = retry_after.as_secs_f64(),
+                    error = %error.message,
+                    "durable message job will be retried"
+                );
+                tokio::time::sleep(retry_after.max(Duration::from_millis(10))).await;
+            }
+        }
+    }
+}
+
 async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> Response {
     if let Err(error) = authorize(&state.app, request.headers()) {
         return error.into_response();
     }
-    let _permit = match state.app.request_slots.clone().try_acquire_owned() {
+    let _permit = match state.ingest_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             return HttpError::retry_after(
@@ -2612,23 +2757,68 @@ async fn handle_event(State(state): State<AppState>, request: Request<Body>) -> 
                 .into_response();
         }
     };
-    match state.app.process_event(event).await {
-        Ok(action) => {
-            let status = if action.action == "replied" {
-                StatusCode::OK
-            } else {
-                StatusCode::ACCEPTED
-            };
-            (status, Json(json!({ "ok": true, "action": action }))).into_response()
+    let message_id = match admit_message_job(&event) {
+        Ok(MessageJobAdmission::Ignore(action)) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({ "ok": true, "action": action })),
+            )
+                .into_response();
         }
-        Err(error) => error.into_response(),
+        Ok(MessageJobAdmission::Queue(message_id)) => message_id,
+        Err(error) => return error.into_response(),
+    };
+    let enqueue_status = match state.message_jobs.enqueue(message_id.clone(), event).await {
+        Ok(status) => status,
+        Err(error) => {
+            error!(message_id = %message_id, error = %error, "failed to persist durable message job");
+            return HttpError::message_job_error().into_response();
+        }
+    };
+    if let Err(error) = schedule_message_job(&state, message_id.clone()) {
+        error!(message_id = %message_id, error = %error, "failed to schedule durable message job");
     }
+    let action = BotAction::queued(
+        message_id,
+        matches!(enqueue_status, MessageJobEnqueueStatus::Existing),
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "ok": true, "action": action })),
+    )
+        .into_response()
+}
+
+async fn message_job_counts(state: &AppState) -> Result<(usize, usize)> {
+    let pending = state.message_jobs.list().await?.len();
+    let active = state
+        .active_message_jobs
+        .lock()
+        .map_err(|_| anyhow!("active message job set is poisoned"))?
+        .len();
+    Ok((pending, active))
+}
+
+fn message_job_health_error(error: anyhow::Error) -> Response {
+    error!(error = %error, "message job health check failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "ok": false,
+            "error": "message job state unavailable",
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(error) = authorize(&state.app, &headers) {
         return error.into_response();
     }
+    let (pending_message_jobs, active_message_jobs) = match message_job_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => return message_job_health_error(error),
+    };
     let state_path = {
         let store = state.app.state.lock().await;
         store.path().display().to_string()
@@ -2640,6 +2830,9 @@ async fn handle_health(State(state): State<AppState>, headers: HeaderMap) -> Res
             "rooms": state.app.config.rooms.len(),
             "selfPersonIdKnown": state.app.self_person_id.is_some(),
             "stateFile": state_path,
+            "messageJobDirectory": state.message_jobs.root().display().to_string(),
+            "pendingMessageJobs": pending_message_jobs,
+            "activeMessageJobs": active_message_jobs,
         })),
     )
         .into_response()
@@ -2657,6 +2850,17 @@ struct BotAction {
 }
 
 impl BotAction {
+    fn queued(message_id: String, existing: bool) -> Self {
+        Self {
+            action: "queued",
+            reason: existing.then(|| "already_queued".to_owned()),
+            message_id: Some(message_id),
+            room_id: None,
+            reply_id: None,
+            reply_chars: None,
+        }
+    }
+
     fn ignored(
         reason: impl Into<String>,
         message_id: Option<String>,
@@ -2782,6 +2986,14 @@ impl HttpError {
             StatusCode::SERVICE_UNAVAILABLE,
             format!("state store error: {error}"),
             Duration::from_secs(30),
+        )
+    }
+
+    fn message_job_error() -> Self {
+        Self::retry_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "message job persistence unavailable",
+            MESSAGE_JOB_RETRY_FALLBACK,
         )
     }
 }
@@ -3900,6 +4112,168 @@ mod tests {
         Option<usize>,
     );
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn handler_acknowledges_only_after_durable_enqueue_then_completes_in_background() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-background")));
+        harness.runner.push_output("Background reply");
+        let (started, release) = harness.runner.block_next_run();
+        let event = message_event(inbound_message("message-background", "please inspect"));
+
+        let response = handle_event(State(state.clone()), event_request(&event)).await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(body["action"]["action"], "queued");
+        assert_eq!(body["action"]["messageId"], "message-background");
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            state
+                .message_jobs
+                .load("message-background".to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(harness.webex.created_requests().is_empty());
+
+        let health = handle_health(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let health = response_json(health).await;
+        assert_eq!(health["pendingMessageJobs"], 1);
+        assert_eq!(health["activeMessageJobs"], 1);
+
+        release.notify_one();
+        wait_for_job_removal(&state.message_jobs, "message-background").await;
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert_eq!(harness.webex.created_requests().len(), 1);
+        assert!(harness.processed("message-background").await);
+    }
+
+    #[tokio::test]
+    async fn duplicate_sidecar_delivery_reuses_one_durable_background_job() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-duplicate")));
+        harness.runner.push_output("One reply");
+        let (started, release) = harness.runner.block_next_run();
+        let event = message_event(inbound_message("message-duplicate", "please inspect"));
+
+        let first = handle_event(State(state.clone()), event_request(&event)).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let duplicate = handle_event(State(state.clone()), event_request(&event)).await;
+
+        assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+        let duplicate = response_json(duplicate).await;
+        assert_eq!(duplicate["action"]["action"], "queued");
+        assert_eq!(duplicate["action"]["reason"], "already_queued");
+        release.notify_one();
+        wait_for_job_removal(&state.message_jobs, "message-duplicate").await;
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert_eq!(harness.webex.created_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_waits_out_an_old_attempt_lease_without_losing_the_job() {
+        let state_path = unique_state_path();
+        let mut config = (*test_config(state_path)).clone();
+        config.server.attempt_lease_secs = 1;
+        let harness = TestHarness::with_config(Arc::new(config));
+        let event = message_event(inbound_message("message-recovery", "recover me"));
+        let old_attempt = harness.app.begin_attempt("message-recovery").await.unwrap();
+        assert!(matches!(old_attempt, AttemptStart::Started(_)));
+        let persisted = Arc::new(DurableMessageJobs::open(&harness.state_path).unwrap());
+        persisted
+            .enqueue("message-recovery".to_owned(), event)
+            .await
+            .unwrap();
+        drop(persisted);
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-recovered")));
+        harness.runner.push_output("Recovered reply");
+        let state = harness.app_state();
+
+        schedule_pending_message_jobs(&state).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(harness.runner.calls().is_empty());
+        assert!(
+            state
+                .message_jobs
+                .load("message-recovery".to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        wait_for_job_removal(&state.message_jobs, "message-recovery").await;
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert!(harness.processed("message-recovery").await);
+    }
+
+    #[tokio::test]
+    async fn background_job_retries_transient_webex_failure_without_sidecar_redelivery() {
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        harness
+            .webex
+            .push_reply_search(Err(WebexCallError::Client(WebexError::Api(Box::new(
+                api_error(503, Some(Duration::from_millis(1))),
+            )))));
+        harness.webex.push_reply_search(Ok(Vec::new()));
+        harness
+            .webex
+            .push_create_result(Ok(reply_message("reply-after-retry")));
+        harness.runner.push_output("Retry reply");
+        let event = message_event(inbound_message("message-retry", "retry me"));
+
+        let response = handle_event(State(state.clone()), event_request(&event)).await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_job_removal(&state.message_jobs, "message-retry").await;
+        assert_eq!(harness.runner.calls().len(), 1);
+        assert_eq!(harness.webex.created_requests().len(), 1);
+        assert!(harness.processed("message-retry").await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistence_failure_is_retryable_without_exposing_internal_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let harness = TestHarness::new();
+        let state = harness.app_state();
+        fs::set_permissions(state.message_jobs.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        let event = message_event(inbound_message("message-failed", "do not accept"));
+
+        let response = handle_event(State(state.clone()), event_request(&event)).await;
+
+        fs::set_permissions(state.message_jobs.root(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "30");
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "message job persistence unavailable");
+        assert!(
+            !body
+                .to_string()
+                .contains(&state.message_jobs.root().display().to_string())
+        );
+        assert!(harness.runner.calls().is_empty());
+    }
 
     #[tokio::test]
     async fn process_event_runs_codex_and_sends_markdown_reply() {
@@ -7353,7 +7727,7 @@ mod tests {
     }
 
     struct TestHarness {
-        app: BotApp,
+        app: Arc<BotApp>,
         webex: Arc<FakeWebex>,
         runner: Arc<FakeRunner>,
         config_status: Arc<FakeConfigStatus>,
@@ -7377,7 +7751,7 @@ mod tests {
             let runner = Arc::new(FakeRunner::default());
             let config_status = Arc::new(FakeConfigStatus::default());
             let config_actions = Arc::new(FakeConfigActions::default());
-            let app = BotApp {
+            let app = Arc::new(BotApp {
                 config,
                 sidecar_token: None,
                 self_person_id: Some(SELF_PERSON_ID.to_owned()),
@@ -7387,7 +7761,7 @@ mod tests {
                 config_status: config_status.clone(),
                 config_actions: config_actions.clone(),
                 request_slots: Arc::new(Semaphore::new(4)),
-            };
+            });
             Self {
                 app,
                 webex,
@@ -7406,11 +7780,23 @@ mod tests {
                 .await
                 .contains_processed_message(message_id)
         }
+
+        fn app_state(&self) -> AppState {
+            AppState {
+                app: self.app.clone(),
+                message_jobs: Arc::new(DurableMessageJobs::open(&self.state_path).unwrap()),
+                active_message_jobs: Arc::new(StdSyncMutex::new(HashSet::new())),
+                ingest_slots: Arc::new(Semaphore::new(4)),
+            }
+        }
     }
 
     impl Drop for TestHarness {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.state_path);
+            if let Ok(message_jobs) = DurableMessageJobs::open(&self.state_path) {
+                let _ = fs::remove_dir_all(message_jobs.root());
+            }
             let _ = fs::remove_dir_all(&self.codex_cwd);
         }
     }
@@ -7569,6 +7955,12 @@ mod tests {
         calls: StdMutex<Vec<(String, String)>>,
         workspace_sources: StdMutex<Vec<Option<PathBuf>>>,
         evidence_mutation: StdMutex<Option<String>>,
+        next_block: StdMutex<Option<RunnerBlock>>,
+    }
+
+    struct RunnerBlock {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     }
 
     impl FakeRunner {
@@ -7595,6 +7987,16 @@ mod tests {
         fn mutate_evidence_on_run(&self, contents: impl Into<String>) {
             *self.evidence_mutation.lock().unwrap() = Some(contents.into());
         }
+
+        fn block_next_run(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *self.next_block.lock().unwrap() = Some(RunnerBlock {
+                started: started.clone(),
+                release: release.clone(),
+            });
+            (started, release)
+        }
     }
 
     #[async_trait]
@@ -7609,6 +8011,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((message_id.to_owned(), prompt.to_owned()));
+            let next_block = self.next_block.lock().unwrap().take();
+            if let Some(block) = next_block {
+                block.started.notify_one();
+                block.release.notified().await;
+            }
             if let Some(contents) = self.evidence_mutation.lock().unwrap().take() {
                 let artifact_dir = first_artifact_dir_from_prompt(prompt);
                 fs::write(artifact_dir.join("logs/foo.log"), contents).unwrap();
@@ -7825,6 +8232,39 @@ mod tests {
             "Original {original_message_id}: {original_body}\nThread:\n{thread_context}\nFollow-up {message_id}: {body}".to_owned();
         config.validate().unwrap();
         Arc::new(config)
+    }
+
+    fn event_request(event: &SidecarEvent) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/webex/events")
+            .body(Body::from(serde_json::to_vec(event).unwrap()))
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), MAX_EVENT_BODY_BYTES)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn wait_for_job_removal(message_jobs: &Arc<DurableMessageJobs>, message_id: &str) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if message_jobs
+                    .load(message_id.to_owned())
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn unique_state_path() -> PathBuf {

@@ -11,6 +11,9 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 
 - Receives `SidecarEvent` JSON from the Webex JS SDK sidecar over loopback HTTP.
 - Authenticates local forwarding with `WEBEX_SIDECAR_TOKEN`.
+- Persists each supported message-created event to a private, bounded job spool
+  before returning `202 Accepted`, then performs Webex hydration, Codex work,
+  and reply delivery in background workers.
 - Uses `JsonlStateStore` leases to avoid concurrent duplicate Codex runs for the
   same Webex message.
 - Matches behavior by Webex `roomId`.
@@ -23,7 +26,8 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
 - Reconciles ambiguous Webex reply creation failures with a stable reply marker
   before retrying, using the same bounded marker-page budget as the initial
   reconciliation.
-- Bounds concurrent request processing with `server.max_concurrent_requests`.
+- Bounds both concurrent ingress persistence and background message processing
+  with separate `server.max_concurrent_requests` semaphore pools.
 - Scrubs Webex token variables from the Codex subprocess environment.
 - Hydrates every sidecar message ID through Webex before making room, sender,
   body, thread, Codex, or reply-routing decisions. Sidecar message fields are
@@ -33,10 +37,26 @@ for Webex OAuth/REST, sidecar event envelopes, and durable message attempt state
   durable `/config pull` only when every effective Codex runner is isolated as
   `ephemeral-linux-user`; `reload` and `sync` remain invalid.
 
-The first implementation is synchronous per sidecar request: the HTTP request
-returns after Codex finishes and the Webex reply is accepted. For this slice,
-set the JS sidecar forwarding timeout higher than the configured Codex timeout.
-Durable background job recovery is the next reliability layer.
+The HTTP event endpoint acknowledges a supported message only after its job
+file and containing directory have been synced. The job spool is derived from
+`state_file` by appending `.jobs` to its filename, is mode `0700`, stores
+mode-`0600` records, and admits at most 4096 pending messages. Atomic
+no-clobber publication preserves the first accepted sidecar hint for a message
+ID; authoritative Webex hydration still controls every security and routing
+decision. Startup validates the complete spool and reschedules every pending
+job. Retryable failures remain queued and honour the existing retry delay.
+
+An unclean restart can leave a non-expired `JsonlStateStore` attempt lease.
+Recovery waits for that lease to expire before rerunning the durable job, which
+favours duplicate prevention over immediate takeover. Hidden reply/source
+markers reconcile any Webex write accepted immediately before a crash. A later
+supervised handoff slice will own cross-process drain and immediate lease
+transfer; this job-spool slice does not enable `/config reload` or `/config
+sync`.
+
+Authenticated `/healthz` output includes `messageJobDirectory`,
+`pendingMessageJobs`, and `activeMessageJobs`. An unreadable or invalid spool
+makes health return `503` rather than silently skipping accepted work.
 
 ## Configuration
 

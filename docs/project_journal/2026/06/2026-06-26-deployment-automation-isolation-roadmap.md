@@ -3,8 +3,8 @@ id: 20260626-deployment-automation-isolation-roadmap
 title: Deployment Automation and Isolation Roadmap
 status: active
 created: 2026-06-26
-updated: 2026-07-14
-branch: codex/host-release-bootstrap
+updated: 2026-07-15
+branch: codex/durable-message-job-recovery
 pr:
 supersedes: []
 superseded_by:
@@ -16,6 +16,13 @@ superseded_by:
 - Split deployment automation and Codex runner isolation into small PRs with independent worktrees and merge gates.
 
 ## Current Progress
+- Durable message-job recovery publishes each supported sidecar event to a
+  private, bounded, fsync-backed spool before acknowledgement. Background
+  workers preserve the existing authoritative hydration, attempt lease, Webex
+  marker, and Codex execution paths. Startup validates and reschedules all
+  pending jobs; retryable failures remain queued, while a prior process's
+  unexpired attempt lease delays takeover to prevent duplicate runs. This slice
+  adds no config activation, service handoff, or `/config reload`/`sync` path.
 - Trusted deployment entrypoint merged in bot PR #8.
 - First-install host release bootstrap packages the fixed runtime allowlist with
   content metadata, fixed third-party digests, and Rust binaries rebuilt from an

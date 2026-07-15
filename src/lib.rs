@@ -16,6 +16,7 @@ pub mod input_sealer;
 pub mod isolated_execution;
 pub mod launcher_client;
 pub mod launcher_protocol;
+pub mod message_jobs;
 pub mod policy;
 pub mod runner;
 #[cfg(target_os = "linux")]

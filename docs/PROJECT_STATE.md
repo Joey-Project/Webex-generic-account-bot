@@ -2,7 +2,11 @@
 
 ## Current State
 - Repo is being converted from the Codex review-gate template into a Rust Webex generic-account bot.
-- First slice targets a synchronous sidecar receiver that maps Webex rooms to Codex prompt policies.
+- The sidecar receiver now durably publishes supported message events before
+  acknowledgement and processes them through bounded background workers.
+  Pending work is recovered after restart; an uncleanly terminated run waits
+  out its existing attempt lease before retrying, and Webex markers preserve
+  reply idempotence.
 - PR1b deployment automation adds `scripts/deploy-config.mjs`, a host-owned
   fixed-argv entrypoint for fresh config fetch, trusted bot-repo
   validation/install policy, restart rollback, and dry-run/status support.
