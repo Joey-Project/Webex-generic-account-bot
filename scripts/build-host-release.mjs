@@ -21,6 +21,7 @@ import {
 } from './host-release-contract.mjs';
 import * as releaseContract from './host-release-contract.mjs';
 import {
+  assertNoCopyMoveSupported,
   assertSupportedNodeVersion,
   consumeExactFile,
   validateBundle,
@@ -82,7 +83,7 @@ export async function buildHostRelease(options, injected = {}) {
     options.rustToolchainImage,
     '--rust-toolchain-image',
   );
-  const busybox = path.resolve(injected.busybox ?? '/usr/bin/busybox');
+  const busybox = resolveBusyboxPath(injected.busybox);
   const run = injected.execFileAsync ?? execFileAsync;
   const sync = injected.syncDirectory ?? syncDirectory;
   const resync = injected.resyncBundle ?? resyncBundle;
@@ -201,6 +202,10 @@ export async function buildHostRelease(options, injected = {}) {
   } finally {
     await fs.rm(scratch, { recursive: true, force: true });
   }
+}
+
+export function resolveBusyboxPath(candidate) {
+  return path.resolve(candidate ?? PRODUCTION_BUSYBOX_PATH);
 }
 
 async function materializeRevision(repoRoot, scratch, revision, run) {
@@ -1055,6 +1060,7 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
+  await assertNoCopyMoveSupported();
   const result = await buildHostRelease(options);
   process.stdout.write(`status=${result.status}\n`);
   process.stdout.write(`bot_revision=${result.manifest.bot_revision}\n`);

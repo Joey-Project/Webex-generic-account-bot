@@ -44,6 +44,9 @@ superseded_by:
   variables cannot run before the trust checks. Object-only source
   materialisation no longer executes a worktree cleanliness command, and Cargo
   binds trusted root-directory identities across compilation.
+  The builder uses that same verified BusyBox as its bundle payload source, and
+  both production entrypoints preflight GNU `mv --no-copy` before expensive
+  build or install work.
   Git promisor lazy fetching is disabled so a missing committed object fails
   without running a repository-configured remote helper.
   The builder is now a root-owned read-only trust-anchor member that accepts an

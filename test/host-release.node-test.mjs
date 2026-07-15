@@ -19,6 +19,7 @@ import {
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
   readBoundedRegularFile,
+  resolveBusyboxPath,
   resyncBundle,
 } from '../scripts/build-host-release.mjs';
 import * as releaseContract from '../scripts/host-release-contract.mjs';
@@ -35,6 +36,7 @@ import {
   compareReleasePaths,
 } from '../scripts/host-release-contract.mjs';
 import {
+  assertNoCopyMoveSupported,
   assertSupportedNodeVersion,
   consumeExactFile,
   installHostRelease,
@@ -130,6 +132,34 @@ describe('host release bootstrap', () => {
     assert.doesNotThrow(() => assertSupportedNodeVersion('26.3.0'));
     assert.throws(() => assertSupportedNodeVersion('23.11.1'), /Node\.js 24 or newer/);
     assert.throws(() => assertSupportedNodeVersion('invalid'), /Node\.js 24 or newer/);
+  });
+
+  it('binds production BusyBox and no-copy publication to fixed host contracts', async () => {
+    assert.equal(
+      resolveBusyboxPath(),
+      '/usr/local/libexec/webex-host-release/busybox',
+    );
+    assert.equal(resolveBusyboxPath('/tmp/../usr/bin/busybox'), '/usr/bin/busybox');
+
+    const calls = [];
+    await assertNoCopyMoveSupported(async (command, args, options) => {
+      calls.push({ command, args, options });
+    });
+    assert.deepEqual(calls, [{
+      command: '/usr/bin/mv',
+      args: ['--no-copy', '--version'],
+      options: {
+        cwd: '/',
+        env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+        maxBuffer: 1024 * 1024,
+      },
+    }]);
+    await assert.rejects(
+      assertNoCopyMoveSupported(async () => {
+        throw new Error('unsupported option');
+      }),
+      /requires GNU Coreutils mv with --no-copy support/,
+    );
   });
 
   it('requires an unprivileged builder and bounds the complete source snapshot', () => {

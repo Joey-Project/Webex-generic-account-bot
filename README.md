@@ -1303,9 +1303,10 @@ unit input, the bot cannot reuse the run path, and `systemd-tmpfiles` removes
 abandoned quarantined inputs after one day. PR 4b creates the input group but
 does not add the bot to it or provide the privileged sealing broker.
 
-The minimum host contract is Node.js 24 or newer at `/usr/bin/node`, systemd
-255, Linux 5.9 or newer, cgroup v2, SquashFS/loop support, mount and PID
-namespaces, `close_range(2)`, and a host
+The minimum host contract is Node.js 24 or newer at `/usr/bin/node`, GNU
+Coreutils `mv` with `--no-copy` support at `/usr/bin/mv`, systemd 255, Linux
+5.9 or newer, cgroup v2, SquashFS/loop support, mount and PID namespaces,
+`close_range(2)`, and a host
 policy that permits the bundled `bwrap` to create its inner sandbox. These are
 not inferred from version strings alone. PR 4c2 must run the real image and
 permission canaries on the deployment host and mint the boot-scoped activation

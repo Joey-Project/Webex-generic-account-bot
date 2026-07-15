@@ -61,6 +61,21 @@ export function usage() {
   ].join('\n');
 }
 
+export async function assertNoCopyMoveSupported(run = execFileAsync) {
+  try {
+    await run('/usr/bin/mv', ['--no-copy', '--version'], {
+      cwd: '/',
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    throw new Error(
+      'host release requires GNU Coreutils mv with --no-copy support',
+      { cause: error },
+    );
+  }
+}
+
 export async function installHostRelease(options, injected = {}) {
   assertSupportedNodeVersion();
   const contract = assertReleaseContract(injected.contract);
@@ -888,6 +903,7 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
+  await assertNoCopyMoveSupported();
   const result = await installHostRelease(options, { contract });
   if (options.json) process.stdout.write(`${JSON.stringify(result)}\n`);
   else {
