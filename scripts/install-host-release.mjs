@@ -254,6 +254,8 @@ export async function validateBundle(
 
 export function parseManifest(value, contract) {
   const {
+    CARGO_VENDOR_IMAGE_SHA256,
+    CARGO_VENDOR_TREE_SHA256,
     CARGO_VERSION,
     CODEX_VERSION,
     compareReleasePaths,
@@ -287,17 +289,21 @@ export function parseManifest(value, contract) {
     || Array.isArray(value.build)
     || JSON.stringify(Object.keys(value.build).toSorted())
       !== JSON.stringify([
+        'cargo_vendor_sha256',
+        'cargo_vendor_tree_sha256',
         'cargo_version',
         'rustc_version',
         'toolchain_sha256',
         'toolchain_tree_sha256',
       ])
+    || value.build.cargo_vendor_sha256 !== CARGO_VENDOR_IMAGE_SHA256
+    || value.build.cargo_vendor_tree_sha256 !== CARGO_VENDOR_TREE_SHA256
     || value.build.cargo_version !== CARGO_VERSION
     || value.build.rustc_version !== RUSTC_VERSION
     || value.build.toolchain_sha256 !== RUST_TOOLCHAIN_IMAGE_SHA256
     || value.build.toolchain_tree_sha256 !== RUST_TOOLCHAIN_TREE_SHA256
   ) {
-    throw new Error('host release Rust toolchain provenance is invalid');
+    throw new Error('host release build provenance is invalid');
   }
   if (!Array.isArray(value.files) || value.files.length !== RELEASE_FILES.length) {
     throw new Error('host release file list is invalid');
@@ -730,6 +736,8 @@ function assertReleaseContract(contract) {
     || typeof contract.compareReleasePaths !== 'function'
     || typeof contract.CODEX_VERSION !== 'string'
     || typeof contract.CARGO_VERSION !== 'string'
+    || typeof contract.CARGO_VENDOR_IMAGE_SHA256 !== 'string'
+    || typeof contract.CARGO_VENDOR_TREE_SHA256 !== 'string'
     || typeof contract.RUSTC_VERSION !== 'string'
     || typeof contract.RUST_TOOLCHAIN_IMAGE_SHA256 !== 'string'
     || typeof contract.RUST_TOOLCHAIN_TREE_SHA256 !== 'string'

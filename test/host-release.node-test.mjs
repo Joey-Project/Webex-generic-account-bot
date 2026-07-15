@@ -15,6 +15,7 @@ import {
   buildEnvironment,
   buildHostRelease,
   cargoBuildInvocation,
+  cargoVendorConfiguration,
   copyMeasuredFile,
   parseArgs as parseBuildArgs,
   publishDirectoryNoReplace,
@@ -22,10 +23,14 @@ import {
   resolveBusyboxPath,
   resyncBundle,
   snapshotToolchainTree,
+  snapshotCargoVendorTree,
+  verifyCargoVendorTree,
   verifyToolchainTree,
 } from '../scripts/build-host-release.mjs';
 import * as releaseContract from '../scripts/host-release-contract.mjs';
 import {
+  CARGO_VENDOR_IMAGE_SHA256,
+  CARGO_VENDOR_TREE_SHA256,
   CARGO_VERSION,
   CODEX_VERSION,
   MINIMUM_NODE_MAJOR,
@@ -99,6 +104,7 @@ describe('host release bootstrap', () => {
         '--input-root', '/tmp/release-inputs',
         '--codex-package-root', '/tmp/codex',
         '--rust-toolchain-image', '/tmp/rust-toolchain.squashfs',
+        '--cargo-vendor-image', '/tmp/cargo-vendor.squashfs',
       ]),
       {
         repoRoot: '/tmp/repo',
@@ -106,6 +112,7 @@ describe('host release bootstrap', () => {
         inputRoot: '/tmp/release-inputs',
         codexPackageRoot: '/tmp/codex',
         rustToolchainImage: '/tmp/rust-toolchain.squashfs',
+        cargoVendorImage: '/tmp/cargo-vendor.squashfs',
       },
     );
     assert.deepEqual(parseInstallArgs([]), { apply: false, json: false });
@@ -247,12 +254,53 @@ describe('host release bootstrap', () => {
     }
   });
 
+  it('normalises and binds the complete Cargo vendor tree', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-vendor-tree-test-'));
+    const packageRoot = path.join(root, 'fixture-1.0.0');
+    const buildScript = path.join(packageRoot, 'build.rs');
+    try {
+      await fs.mkdir(packageRoot);
+      await fs.writeFile(buildScript, 'fn main() {}\n', { mode: 0o755 });
+      const snapshot = await snapshotCargoVendorTree(root);
+      assert.equal((await fs.lstat(root)).mode & 0o7777, 0o500);
+      assert.equal((await fs.lstat(packageRoot)).mode & 0o7777, 0o500);
+      assert.equal((await fs.lstat(buildScript)).mode & 0o7777, 0o400);
+      await assert.doesNotReject(verifyCargoVendorTree(snapshot));
+      await fs.chmod(buildScript, 0o600);
+      await fs.writeFile(buildScript, 'fn main() { panic!() }\n');
+      await fs.chmod(buildScript, 0o400);
+      await assert.rejects(
+        verifyCargoVendorTree(snapshot),
+        /trusted Cargo vendor tree changed/,
+      );
+    } finally {
+      await fs.chmod(root, 0o700).catch(() => {});
+      await fs.chmod(packageRoot, 0o700).catch(() => {});
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects special files in an extracted Cargo vendor tree', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-cargo-vendor-link-test-'));
+    try {
+      await fs.symlink('/etc/passwd', path.join(root, 'crate-source'));
+      await assert.rejects(
+        snapshotCargoVendorTree(root),
+        /contains an untrusted file/,
+      );
+    } finally {
+      await fs.chmod(root, 0o700).catch(() => {});
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects output paths that can inject build environment fields', async () => {
     const options = {
       output: '/tmp/release',
       inputRoot: '/tmp/release-inputs',
       codexPackageRoot: '/tmp/codex',
       rustToolchainImage: '/tmp/rust-toolchain.squashfs',
+      cargoVendorImage: '/tmp/cargo-vendor.squashfs',
     };
     for (const delimiter of [':', '=', '\u001f', '\n']) {
       await assert.rejects(
@@ -286,6 +334,7 @@ describe('host release bootstrap', () => {
     );
     assert.equal(environment.HOME, '/tmp/release scratch/home');
     assert.equal(environment.CARGO_HOME, '/tmp/release scratch/cargo-home');
+    assert.equal(environment.CARGO_NET_OFFLINE, 'true');
     assert.equal(environment.SOURCE_DATE_EPOCH, '0');
     assert.equal(environment.CC, '/usr/bin/cc');
     assert.equal(environment.AR, '/usr/bin/ar');
@@ -304,7 +353,6 @@ describe('host release bootstrap', () => {
 
   it('keeps caller Cargo configuration outside the build search path', () => {
     const invocation = cargoBuildInvocation('/tmp/caller-controlled/release/source', [
-      '--locked',
       '--release',
     ]);
     assert.deepEqual(invocation, {
@@ -313,10 +361,39 @@ describe('host release bootstrap', () => {
         '--manifest-path',
         '/tmp/caller-controlled/release/source/Cargo.toml',
         '--locked',
+        '--offline',
         '--release',
       ],
       cwd: '/',
     });
+  });
+
+  it('pins Cargo to one offline vendored source tree', () => {
+    assert.equal(
+      cargoVendorConfiguration('/tmp/release scratch/cargo-vendor'),
+      [
+        '[source.crates-io]',
+        'replace-with = "vendored-sources"',
+        '',
+        '[source.vendored-sources]',
+        'directory = "/tmp/release scratch/cargo-vendor"',
+        '',
+        '[net]',
+        'offline = true',
+        '',
+      ].join('\n'),
+    );
+    assert.deepEqual(
+      cargoBuildInvocation('/tmp/source', ['--release']).args,
+      [
+        'build',
+        '--manifest-path',
+        '/tmp/source/Cargo.toml',
+        '--locked',
+        '--offline',
+        '--release',
+      ],
+    );
   });
 
   it('does not load Cargo configuration or a workspace above the frozen source', async () => {
@@ -366,8 +443,6 @@ describe('host release bootstrap', () => {
       );
       await fs.writeFile(path.join(source, 'src', 'main.rs'), 'fn main() {}\n');
       const invocation = cargoBuildInvocation(source, [
-        '--locked',
-        '--offline',
         '--target-dir',
         path.join(root, 'target'),
       ]);
@@ -482,6 +557,8 @@ describe('host release bootstrap', () => {
       assert.equal(manifest.bot_revision, REVISION);
       assert.equal(manifest.codex_version, CODEX_VERSION);
       assert.deepEqual(manifest.build, {
+        cargo_vendor_sha256: CARGO_VENDOR_IMAGE_SHA256,
+        cargo_vendor_tree_sha256: CARGO_VENDOR_TREE_SHA256,
         cargo_version: CARGO_VERSION,
         rustc_version: RUSTC_VERSION,
         toolchain_sha256: RUST_TOOLCHAIN_IMAGE_SHA256,
@@ -525,51 +602,58 @@ describe('host release bootstrap', () => {
     }
   });
 
-  it('starts the trusted installer through an exact environment-clearing wrapper', async () => {
-    const wrapperPath = new URL('../scripts/install-host-release', import.meta.url);
-    const wrapper = await fs.readFile(wrapperPath, 'utf8');
-    const metadata = await fs.lstat(wrapperPath);
-    assert.equal(metadata.mode & 0o111, 0o111);
-    assert.equal(wrapper, [
-      '#!/usr/local/libexec/webex-host-release/busybox sh',
-      '# shellcheck shell=dash',
-      'set -eu',
-      '',
-      'exec /usr/local/libexec/webex-host-release/busybox env -i \\',
-      '  HOME=/root \\',
-      '  LANG=C \\',
-      '  LC_ALL=C \\',
-      '  PATH=/usr/bin:/bin \\',
-      '  /usr/bin/node \\',
-      '  /usr/local/libexec/webex-host-release/install-host-release.mjs \\',
-      '  "$@"',
-      '',
-    ].join('\n'));
+  it('authenticates bootstrap modules before starting Node.js', async () => {
+    const modules = [
+      ['build-host-release.mjs', new URL('../scripts/build-host-release.mjs', import.meta.url)],
+      ['install-host-release.mjs', new URL('../scripts/install-host-release.mjs', import.meta.url)],
+      ['host-release-contract.mjs', new URL('../scripts/host-release-contract.mjs', import.meta.url)],
+    ];
+    const digests = new Map(await Promise.all(modules.map(async ([name, modulePath]) => [
+      name,
+      await sha256File(modulePath),
+    ])));
+
+    for (const [name, home, expectedUidCheck] of [
+      ['build-host-release', 'HOME=/', 'effective UID must be non-root'],
+      ['install-host-release', 'HOME=/root', 'effective UID must be root'],
+    ]) {
+      const wrapperPath = new URL(`../scripts/${name}`, import.meta.url);
+      const wrapper = await fs.readFile(wrapperPath, 'utf8');
+      const metadata = await fs.lstat(wrapperPath);
+      assert.equal(metadata.mode & 0o7777, 0o755);
+      assert.ok(wrapper.startsWith([
+        '#!/usr/local/libexec/webex-host-release/busybox sh',
+        '# shellcheck shell=dash',
+        'set -eu',
+        '',
+        '# shellcheck disable=SC2016',
+        'exec /usr/local/libexec/webex-host-release/busybox env -i \\',
+        `  ${home} \\`,
+      ].join('\n')));
+      assert.match(wrapper, new RegExp(expectedUidCheck));
+      assert.doesNotMatch(wrapper, /__[A-Z_]+__/);
+
+      let lastDigestCheck = -1;
+      for (const [moduleName] of modules) {
+        const check = `check_sha256 "$trust_root/${moduleName}" ${digests.get(moduleName)}`;
+        const index = wrapper.indexOf(check);
+        assert.notEqual(index, -1, `${name} does not pin ${moduleName}`);
+        lastDigestCheck = Math.max(lastDigestCheck, index);
+      }
+      const nodeVersionCheck = wrapper.indexOf('node_version=$(/usr/bin/node --version)');
+      const nodeEntrypoint = wrapper.lastIndexOf('  /usr/bin/node \\\n');
+      assert.ok(lastDigestCheck < nodeVersionCheck);
+      assert.ok(nodeVersionCheck < nodeEntrypoint);
+      assert.ok(nodeEntrypoint < wrapper.lastIndexOf(`  "$trust_root/${name}.mjs" \\`));
+    }
   });
 
-  it('starts the release builder through a static environment-clearing wrapper', async (context) => {
+  it('clears inherited loader state and rejects module drift before import', async (context) => {
     const wrapperPath = new URL('../scripts/build-host-release', import.meta.url);
     const builderPath = new URL('../scripts/build-host-release.mjs', import.meta.url);
+    const installerPath = new URL('../scripts/install-host-release.mjs', import.meta.url);
+    const contractPath = new URL('../scripts/host-release-contract.mjs', import.meta.url);
     const wrapper = await fs.readFile(wrapperPath, 'utf8');
-    const wrapperMetadata = await fs.lstat(wrapperPath);
-    const builderMetadata = await fs.lstat(builderPath);
-    assert.equal(wrapperMetadata.mode & 0o111, 0o111);
-    assert.equal(builderMetadata.mode & 0o111, 0);
-    assert.equal(wrapper, [
-      '#!/usr/local/libexec/webex-host-release/busybox sh',
-      '# shellcheck shell=dash',
-      'set -eu',
-      '',
-      'exec /usr/local/libexec/webex-host-release/busybox env -i \\',
-      '  HOME=/ \\',
-      '  LANG=C \\',
-      '  LC_ALL=C \\',
-      '  PATH=/usr/bin:/bin \\',
-      '  /usr/bin/node \\',
-      '  /usr/local/libexec/webex-host-release/build-host-release.mjs \\',
-      '  "$@"',
-      '',
-    ].join('\n'));
 
     let hostBusybox;
     try {
@@ -590,11 +674,17 @@ describe('host release bootstrap', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-builder-env-test-'));
     const nativeMarker = path.join(root, 'native-preload-ran');
     const nodeMarker = path.join(root, 'node-preload-ran');
+    const importMarker = path.join(root, 'builder-import-ran');
+    const environmentMarker = path.join(root, 'builder-environment.json');
     const nativeSource = path.join(root, 'preload.c');
     const nativePreload = path.join(root, 'preload.so');
     const nodePreload = path.join(root, 'preload.cjs');
-    const probe = path.join(root, 'probe.mjs');
+    const probe = path.join(root, 'build-host-release.mjs');
     const probeWrapper = path.join(root, 'build-host-release');
+    const probeInstallerWrapper = path.join(root, 'install-host-release');
+    const probeInstaller = path.join(root, 'install-host-release.mjs');
+    const probeContract = path.join(root, 'host-release-contract.mjs');
+    const probeBusybox = path.join(root, 'busybox');
     try {
       await fs.writeFile(
         nativeSource,
@@ -629,20 +719,47 @@ describe('host release bootstrap', () => {
       );
       await fs.writeFile(
         probe,
-        'process.stdout.write(JSON.stringify(process.env));\n',
+        [
+          "const fs = await import('node:fs/promises');",
+          `await fs.writeFile(${JSON.stringify(importMarker)}, 'ran');`,
+          `await fs.writeFile(${JSON.stringify(environmentMarker)}, JSON.stringify(process.env));`,
+          '',
+        ].join('\n'),
+        { mode: 0o444 },
       );
+      await fs.writeFile(probeInstaller, 'export {};\n', { mode: 0o444 });
+      await fs.writeFile(probeContract, 'export {};\n', { mode: 0o444 });
+      await fs.copyFile('/usr/bin/busybox', probeBusybox);
+      await fs.chmod(probeBusybox, 0o555);
+      await fs.writeFile(probeInstallerWrapper, '#!/bin/false\n', { mode: 0o555 });
+
+      const uid = process.getuid();
+      const gid = process.getgid();
+      const nodeMode = ((await fs.lstat(process.execPath)).mode & 0o7777).toString(8);
+      const productionDigests = new Map([
+        [await sha256File(builderPath), await sha256File(probe)],
+        [await sha256File(installerPath), await sha256File(probeInstaller)],
+        [await sha256File(contractPath), await sha256File(probeContract)],
+      ]);
+      let fixtureWrapper = wrapper
+        .replaceAll('/usr/local/libexec/webex-host-release', root)
+        .replaceAll('/usr/bin/node', process.execPath)
+        .replace(
+          'for directory in / /usr /usr/bin /usr/local /usr/local/libexec "$trust_root"; do',
+          'for directory in "$trust_root"; do',
+        )
+        .replaceAll('0:0:', `${uid}:${gid}:`)
+        .replace(`check_file ${process.execPath} 555`, `check_file ${process.execPath} ${nodeMode}`);
+      for (const [productionDigest, fixtureDigest] of productionDigests) {
+        fixtureWrapper = fixtureWrapper.replaceAll(productionDigest, fixtureDigest);
+      }
       await fs.writeFile(
         probeWrapper,
-        wrapper
-          .replaceAll('/usr/local/libexec/webex-host-release/busybox', '/usr/bin/busybox')
-          .replace('/usr/bin/node', process.execPath)
-          .replace(
-            '/usr/local/libexec/webex-host-release/build-host-release.mjs',
-            probe,
-          ),
-        { mode: 0o755 },
+        fixtureWrapper,
+        { mode: 0o555 },
       );
-      const { stdout } = await execFileAsync(probeWrapper, [], {
+      await fs.chmod(root, 0o755);
+      await execFileAsync(probeWrapper, [], {
         env: {
           ...process.env,
           LD_PRELOAD: nativePreload,
@@ -650,7 +767,8 @@ describe('host release bootstrap', () => {
         },
         maxBuffer: 1024 * 1024,
       });
-      assert.deepEqual(JSON.parse(stdout), {
+      assert.equal(await fs.readFile(importMarker, 'utf8'), 'ran');
+      assert.deepEqual(JSON.parse(await fs.readFile(environmentMarker, 'utf8')), {
         HOME: '/',
         LANG: 'C',
         LC_ALL: 'C',
@@ -658,6 +776,17 @@ describe('host release bootstrap', () => {
       });
       await assertMissing(nativeMarker);
       await assertMissing(nodeMarker);
+
+      await fs.rm(importMarker);
+      await fs.rm(environmentMarker);
+      await fs.chmod(probe, 0o600);
+      await fs.appendFile(probe, '// tampered\n');
+      await fs.chmod(probe, 0o444);
+      await assert.rejects(
+        execFileAsync(probeWrapper, [], { maxBuffer: 1024 * 1024 }),
+        /build-host-release\.mjs digest is invalid/,
+      );
+      await assertMissing(importMarker);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -780,32 +909,38 @@ describe('host release bootstrap', () => {
     }
   });
 
-  it('rejects untrusted Rust toolchain provenance in the bundle manifest', async () => {
-    const fixture = await createFixture();
-    try {
-      await buildFixtureBundle(fixture);
-      const manifestPath = path.join(fixture.bundle, 'manifest.json');
-      const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-      manifest.build.toolchain_tree_sha256 = '0'.repeat(64);
-      const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-      await fs.chmod(manifestPath, 0o600);
-      await fs.writeFile(manifestPath, bytes);
-      await fs.chmod(manifestPath, 0o444);
-      const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  it('rejects untrusted build provenance in the bundle manifest', async () => {
+    for (const field of [
+      'cargo_vendor_sha256',
+      'cargo_vendor_tree_sha256',
+      'toolchain_tree_sha256',
+    ]) {
+      const fixture = await createFixture();
+      try {
+        await buildFixtureBundle(fixture);
+        const manifestPath = path.join(fixture.bundle, 'manifest.json');
+        const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+        manifest.build[field] = '0'.repeat(64);
+        const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+        await fs.chmod(manifestPath, 0o600);
+        await fs.writeFile(manifestPath, bytes);
+        await fs.chmod(manifestPath, 0o444);
+        const digest = crypto.createHash('sha256').update(bytes).digest('hex');
 
-      await assert.rejects(
-        validateBundle(
-          fixture.bundle,
-          process.getuid(),
-          process.getgid(),
-          digest,
-          REVISION,
-          releaseContract,
-        ),
-        /Rust toolchain provenance is invalid/,
-      );
-    } finally {
-      await fs.rm(fixture.root, { recursive: true, force: true });
+        await assert.rejects(
+          validateBundle(
+            fixture.bundle,
+            process.getuid(),
+            process.getgid(),
+            digest,
+            REVISION,
+            releaseContract,
+          ),
+          /build provenance is invalid/,
+        );
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -932,6 +1067,8 @@ describe('host release bootstrap', () => {
             return {
               hostBinDir: fixture.hostBinDir,
               staticBinDir: fixture.staticBinDir,
+              cargoVendorSha256: CARGO_VENDOR_IMAGE_SHA256,
+              cargoVendorTreeSha256: CARGO_VENDOR_TREE_SHA256,
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
@@ -985,6 +1122,8 @@ describe('host release bootstrap', () => {
             return {
               hostBinDir: fixture.hostBinDir,
               staticBinDir: fixture.staticBinDir,
+              cargoVendorSha256: CARGO_VENDOR_IMAGE_SHA256,
+              cargoVendorTreeSha256: CARGO_VENDOR_TREE_SHA256,
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
@@ -1273,7 +1412,14 @@ describe('host release bootstrap', () => {
   });
 
   it('rejects shared, writable, symlinked, missing, and escaped input roots', async () => {
-    for (const mutation of ['shared', 'writable', 'symlink', 'missing', 'escaped']) {
+    for (const mutation of [
+      'shared',
+      'writable',
+      'symlink',
+      'missing',
+      'escaped-toolchain',
+      'escaped-vendor',
+    ]) {
       const fixture = await createFixture();
       try {
         if (mutation === 'shared') {
@@ -1286,10 +1432,14 @@ describe('host release bootstrap', () => {
           await fs.symlink(realInputRoot, fixture.inputRoot);
         } else if (mutation === 'missing') {
           fixture.inputRoot = path.join(fixture.root, 'missing-inputs');
-        } else {
+        } else if (mutation === 'escaped-toolchain') {
           const escaped = path.join(fixture.root, 'escaped-toolchain.squashfs');
           await fs.rename(fixture.rustToolchainImage, escaped);
           fixture.rustToolchainImage = escaped;
+        } else {
+          const escaped = path.join(fixture.root, 'escaped-cargo-vendor.squashfs');
+          await fs.rename(fixture.cargoVendorImage, escaped);
+          fixture.cargoVendorImage = escaped;
         }
         await assert.rejects(
           buildFixtureResult(fixture),
@@ -1335,6 +1485,8 @@ describe('host release bootstrap', () => {
             return {
               hostBinDir: fixture.hostBinDir,
               staticBinDir: fixture.staticBinDir,
+              cargoVendorSha256: CARGO_VENDOR_IMAGE_SHA256,
+              cargoVendorTreeSha256: CARGO_VENDOR_TREE_SHA256,
               cargoVersion: CARGO_VERSION,
               rustcVersion: RUSTC_VERSION,
               toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,
@@ -1502,6 +1654,10 @@ describe('host release bootstrap', () => {
   });
 });
 
+async function sha256File(file) {
+  return crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex');
+}
+
 async function createFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-host-release-test-'));
   const inputRoot = path.join(root, 'inputs');
@@ -1511,6 +1667,7 @@ async function createFixture() {
   const codexRoot = path.join(inputRoot, 'codex');
   const busybox = path.join(root, 'busybox');
   const rustToolchainImage = path.join(inputRoot, 'rust-toolchain.squashfs');
+  const cargoVendorImage = path.join(inputRoot, 'cargo-vendor.squashfs');
   const bundle = path.join(root, 'bundle');
   const installParent = path.join(root, 'install-parent');
   const installRoot = path.join(installParent, 'webex-generic-account-bot');
@@ -1523,6 +1680,11 @@ async function createFixture() {
   await fs.writeFile(
     rustToolchainImage,
     'unused fixture Rust toolchain image',
+    { mode: 0o600 },
+  );
+  await fs.writeFile(
+    cargoVendorImage,
+    'unused fixture Cargo vendor image',
     { mode: 0o600 },
   );
 
@@ -1557,6 +1719,7 @@ async function createFixture() {
     codexRoot,
     busybox,
     rustToolchainImage,
+    cargoVendorImage,
     bundle,
     installRoot,
   };
@@ -1575,6 +1738,7 @@ async function buildFixtureResult(fixture, trustedSourceSha256, injected = {}) {
       inputRoot: fixture.inputRoot,
       codexPackageRoot: fixture.codexRoot,
       rustToolchainImage: fixture.rustToolchainImage,
+      cargoVendorImage: fixture.cargoVendorImage,
     },
     {
       repoRoot: fixture.repoRoot,
@@ -1586,6 +1750,8 @@ async function buildFixtureResult(fixture, trustedSourceSha256, injected = {}) {
       buildArtifacts: async () => ({
         hostBinDir: fixture.hostBinDir,
         staticBinDir: fixture.staticBinDir,
+        cargoVendorSha256: CARGO_VENDOR_IMAGE_SHA256,
+        cargoVendorTreeSha256: CARGO_VENDOR_TREE_SHA256,
         cargoVersion: CARGO_VERSION,
         rustcVersion: RUSTC_VERSION,
         toolchainSha256: RUST_TOOLCHAIN_IMAGE_SHA256,

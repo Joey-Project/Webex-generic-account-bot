@@ -203,15 +203,17 @@
 
 - Initial host release bootstrap is content-manifested and first-install only.
   An unprivileged builder exports the exact clean reviewed commit, rebuilds the
-  Rust binaries with a content-pinned SquashFS toolchain, fixed target, and
-  isolated Cargo home. It pins the normalised extracted `bin`/`lib` tree,
-  Cargo configuration sentinels, scratch-root identity, and all six final
+  Rust binaries with content-pinned SquashFS toolchain and Cargo vendor inputs,
+  a fixed target, and an offline isolated Cargo home. It pins both normalised
+  extracted trees, Cargo source-replacement configuration, scratch-root
+  identity, and all six final
   executable digests; revalidates those boundaries plus the complete source
   snapshot and its post-materialisation inode/ctime baseline around each Cargo
   command; and
   packages source payloads from freshly rehashed committed
   blobs alongside a digest-pinned runtime allowlist. A
-  separately delivered root-owned environment-clearing trust anchor requires
+  separately delivered root-owned environment-clearing trust anchor verifies
+  the JavaScript modules before import and requires
   an out-of-band approved commit and manifest digest before publishing the
   complete `/opt/webex-generic-account-bot` tree without clobbering an existing
   target.

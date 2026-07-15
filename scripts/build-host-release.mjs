@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
+  CARGO_VENDOR_IMAGE_SHA256,
+  CARGO_VENDOR_IMAGE_SIZE,
+  CARGO_VENDOR_TREE_SHA256,
   CARGO_VERSION,
   CODEX_VERSION,
   RELEASE_FILES,
@@ -54,6 +57,8 @@ export function parseArgs(argv) {
       options.codexPackageRoot = requireValue(argv, ++index, arg);
     } else if (arg === '--rust-toolchain-image') {
       options.rustToolchainImage = requireValue(argv, ++index, arg);
+    } else if (arg === '--cargo-vendor-image') {
+      options.cargoVendorImage = requireValue(argv, ++index, arg);
     } else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -65,6 +70,7 @@ export function usage() {
     `Usage: ${PRODUCTION_BUILDER_WRAPPER_PATH} --repo <directory> --output <directory>`,
     '       --input-root <directory>',
     '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
+    '       --cargo-vendor-image <squashfs>',
     '',
     'Builds an unprivileged, content-manifested first-install host release bundle.',
   ].join('\n');
@@ -84,6 +90,10 @@ export async function buildHostRelease(options, injected = {}) {
     options.rustToolchainImage,
     '--rust-toolchain-image',
   );
+  const cargoVendorImage = requireAbsolutePath(
+    options.cargoVendorImage,
+    '--cargo-vendor-image',
+  );
   const busybox = resolveBusyboxPath(injected.busybox);
   const run = injected.execFileAsync ?? execFileAsync;
   const sync = injected.syncDirectory ?? syncDirectory;
@@ -94,7 +104,10 @@ export async function buildHostRelease(options, injected = {}) {
   const codexInputFiles = RELEASE_FILES
     .filter(({ kind }) => kind === 'codex-runtime')
     .map((entry) => releaseSource(entry, { codexPackageRoot }));
-  await assertTrustedBuildInputs(inputRoot, [rustToolchainImage, ...codexInputFiles]);
+  await assertTrustedBuildInputs(
+    inputRoot,
+    [rustToolchainImage, cargoVendorImage, ...codexInputFiles],
+  );
   await validateCodexPackage(codexPackageRoot);
   const parent = path.dirname(output);
   await assertTrustedBuildParent(parent);
@@ -128,6 +141,7 @@ export async function buildHostRelease(options, injected = {}) {
         sourceRoot,
         scratch,
         rustToolchainImage,
+        cargoVendorImage,
         run,
         injected.assertCargoConfiguration ?? assertCargoConfigurationIsolated,
         verifySourceSnapshot,
@@ -179,6 +193,8 @@ export async function buildHostRelease(options, injected = {}) {
       bot_revision: revision,
       codex_version: CODEX_VERSION,
       build: {
+        cargo_vendor_sha256: artifacts.cargoVendorSha256,
+        cargo_vendor_tree_sha256: artifacts.cargoVendorTreeSha256,
         cargo_version: artifacts.cargoVersion,
         rustc_version: artifacts.rustcVersion,
         toolchain_sha256: artifacts.toolchainSha256,
@@ -652,22 +668,63 @@ export function assertUnprivilegedBuilder(
   }
 }
 
-export async function snapshotToolchainTree(root, expectedSha256) {
-  await normaliseToolchainTree(root);
+const TOOLCHAIN_TREE_POLICY = Object.freeze({
+  digestLabel: 'extracted Rust toolchain',
+  label: 'trusted Rust toolchain',
+  maxBytes: 1024 * 1024 * 1024,
+  maxDirectories: 100,
+  maxFileBytes: MAX_FILE_BYTES,
+  maxFiles: 1_000,
+  preserveExecutables: true,
+});
+
+const CARGO_VENDOR_TREE_POLICY = Object.freeze({
+  digestLabel: 'extracted Cargo vendor tree',
+  label: 'trusted Cargo vendor tree',
+  maxBytes: 512 * 1024 * 1024,
+  maxDirectories: 5_000,
+  maxFileBytes: 64 * 1024 * 1024,
+  maxFiles: 20_000,
+  preserveExecutables: false,
+});
+
+const CARGO_HOME_TREE_POLICY = Object.freeze({
+  digestLabel: 'private Cargo home',
+  label: 'private Cargo home',
+  maxBytes: 1024 * 1024,
+  maxDirectories: 2,
+  maxFileBytes: 1024 * 1024,
+  maxFiles: 2,
+  preserveExecutables: false,
+});
+
+export function snapshotToolchainTree(root, expectedSha256) {
+  return snapshotReadOnlyTree(root, expectedSha256, TOOLCHAIN_TREE_POLICY);
+}
+
+export function snapshotCargoVendorTree(root, expectedSha256) {
+  return snapshotReadOnlyTree(root, expectedSha256, CARGO_VENDOR_TREE_POLICY);
+}
+
+async function snapshotReadOnlyTree(root, expectedSha256, policy) {
+  await normaliseReadOnlyTree(root, policy);
   const directories = [];
   const files = [];
   let totalBytes = 0;
   async function visit(directory, relative) {
     const metadata = await fs.lstat(directory, { bigint: true });
-    assertToolchainMetadata(metadata, relative || '.', true);
+    assertReadOnlyTreeMetadata(metadata, relative || '.', true, policy);
     directories.push(Object.freeze({
       identity: sourceMetadataIdentity(metadata),
       path: relative,
     }));
+    if (directories.length > policy.maxDirectories) {
+      throw new Error(`${policy.label} has too many directories`);
+    }
     const names = await fs.readdir(directory, { encoding: 'buffer' });
     names.sort(Buffer.compare);
     for (const nameBytes of names) {
-      const name = trustedTreeName(nameBytes);
+      const name = trustedTreeName(nameBytes, policy);
       const childRelative = relative === '' ? name : `${relative}/${name}`;
       const child = path.join(directory, name);
       const childMetadata = await fs.lstat(child, { bigint: true });
@@ -675,12 +732,12 @@ export async function snapshotToolchainTree(root, expectedSha256) {
         await visit(child, childRelative);
         continue;
       }
-      assertToolchainMetadata(childMetadata, childRelative, false);
+      assertReadOnlyTreeMetadata(childMetadata, childRelative, false, policy);
       const size = Number(childMetadata.size);
-      if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) {
-        throw new Error(`trusted Rust toolchain file is outside the size limit: ${childRelative}`);
+      if (!Number.isSafeInteger(size) || size < 0 || size > policy.maxFileBytes) {
+        throw new Error(`${policy.label} file is outside the size limit: ${childRelative}`);
       }
-      totalBytes = accountToolchainBytes(totalBytes, size);
+      totalBytes = accountReadOnlyTreeBytes(totalBytes, size, policy);
       const measured = await measureRegularFile(child, size, childRelative);
       files.push(Object.freeze({
         identity: measured.identity,
@@ -689,7 +746,9 @@ export async function snapshotToolchainTree(root, expectedSha256) {
         sha256: measured.sha256,
         size,
       }));
-      if (files.length > 1_000) throw new Error('trusted Rust toolchain has too many files');
+      if (files.length > policy.maxFiles) {
+        throw new Error(`${policy.label} has too many files`);
+      }
     }
   }
   await visit(root, '');
@@ -708,55 +767,64 @@ export async function snapshotToolchainTree(root, expectedSha256) {
     .update(`${JSON.stringify(records)}\n`, 'utf8')
     .digest('hex');
   if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
-    throw new Error('extracted Rust toolchain does not match the trusted tree digest');
+    throw new Error(`${policy.digestLabel} does not match the trusted tree digest`);
   }
   const snapshot = Object.freeze({
     directories: Object.freeze(directories),
     files: Object.freeze(files),
+    policy,
     root,
     sha256,
   });
-  await verifyToolchainTree(snapshot);
+  await verifyReadOnlyTree(snapshot);
   return snapshot;
 }
 
-export async function verifyToolchainTree(snapshot) {
-  const topology = await readToolchainTopology(snapshot.root);
+export function verifyToolchainTree(snapshot) {
+  return verifyReadOnlyTree(snapshot);
+}
+
+export function verifyCargoVendorTree(snapshot) {
+  return verifyReadOnlyTree(snapshot);
+}
+
+async function verifyReadOnlyTree(snapshot) {
+  const topology = await readReadOnlyTreeTopology(snapshot.root, snapshot.policy);
   const expectedDirectories = snapshot.directories.map((entry) => entry.path);
   const expectedFiles = snapshot.files.map((entry) => entry.path);
   if (
     JSON.stringify(topology.directories) !== JSON.stringify(expectedDirectories)
     || JSON.stringify(topology.files) !== JSON.stringify(expectedFiles)
   ) {
-    throw new Error('trusted Rust toolchain changed: unexpected topology');
+    throw new Error(`${snapshot.policy.label} changed: unexpected topology`);
   }
   for (const directory of snapshot.directories) {
     const target = directory.path === ''
       ? snapshot.root
       : path.join(snapshot.root, ...directory.path.split('/'));
     const metadata = await fs.lstat(target, { bigint: true });
-    assertToolchainMetadata(metadata, directory.path || '.', true);
+    assertReadOnlyTreeMetadata(metadata, directory.path || '.', true, snapshot.policy);
     assertSourceIdentity(
       directory.identity,
       sourceMetadataIdentity(metadata),
       directory.path || '.',
-      'trusted Rust toolchain changed',
+      `${snapshot.policy.label} changed`,
     );
   }
   for (const file of snapshot.files) {
     const target = path.join(snapshot.root, ...file.path.split('/'));
     const metadata = await fs.lstat(target, { bigint: true });
-    assertToolchainMetadata(metadata, file.path, false);
+    assertReadOnlyTreeMetadata(metadata, file.path, false, snapshot.policy);
     assertSourceIdentity(
       file.identity,
       sourceMetadataIdentity(metadata),
       file.path,
-      'trusted Rust toolchain changed',
+      `${snapshot.policy.label} changed`,
     );
   }
 }
 
-async function normaliseToolchainTree(root) {
+async function normaliseReadOnlyTree(root, policy) {
   async function visit(directory) {
     const metadata = await fs.lstat(directory, { bigint: true });
     if (
@@ -765,13 +833,13 @@ async function normaliseToolchainTree(root) {
       || metadata.uid !== BigInt(process.getuid())
       || metadata.gid !== BigInt(process.getgid())
     ) {
-      throw new Error(`extracted Rust toolchain contains an untrusted directory: ${directory}`);
+      throw new Error(`${policy.digestLabel} contains an untrusted directory: ${directory}`);
     }
     await fs.chmod(directory, 0o500);
     const names = await fs.readdir(directory, { encoding: 'buffer' });
     names.sort(Buffer.compare);
     for (const nameBytes of names) {
-      const name = trustedTreeName(nameBytes);
+      const name = trustedTreeName(nameBytes, policy);
       const child = path.join(directory, name);
       const childMetadata = await fs.lstat(child, { bigint: true });
       if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
@@ -784,9 +852,11 @@ async function normaliseToolchainTree(root) {
           || childMetadata.gid !== BigInt(process.getgid())
           || childMetadata.nlink !== 1n
         ) {
-          throw new Error(`extracted Rust toolchain contains an untrusted file: ${child}`);
+          throw new Error(`${policy.digestLabel} contains an untrusted file: ${child}`);
         }
-        const mode = (childMetadata.mode & 0o111n) === 0n ? 0o400 : 0o500;
+        const mode = policy.preserveExecutables && (childMetadata.mode & 0o111n) !== 0n
+          ? 0o500
+          : 0o400;
         await fs.chmod(child, mode);
       }
     }
@@ -794,25 +864,37 @@ async function normaliseToolchainTree(root) {
   await visit(root);
 }
 
-async function readToolchainTopology(root) {
+async function readReadOnlyTreeTopology(root, policy) {
   const directories = [];
   const files = [];
+  let totalBytes = 0;
   async function visit(directory, relative) {
     const metadata = await fs.lstat(directory, { bigint: true });
-    assertToolchainMetadata(metadata, relative || '.', true);
+    assertReadOnlyTreeMetadata(metadata, relative || '.', true, policy);
     directories.push(relative);
+    if (directories.length > policy.maxDirectories) {
+      throw new Error(`${policy.label} has too many directories`);
+    }
     const names = await fs.readdir(directory, { encoding: 'buffer' });
     names.sort(Buffer.compare);
     for (const nameBytes of names) {
-      const name = trustedTreeName(nameBytes);
+      const name = trustedTreeName(nameBytes, policy);
       const childRelative = relative === '' ? name : `${relative}/${name}`;
       const child = path.join(directory, name);
       const childMetadata = await fs.lstat(child, { bigint: true });
       if (childMetadata.isDirectory() && !childMetadata.isSymbolicLink()) {
         await visit(child, childRelative);
       } else {
-        assertToolchainMetadata(childMetadata, childRelative, false);
+        assertReadOnlyTreeMetadata(childMetadata, childRelative, false, policy);
+        const size = Number(childMetadata.size);
+        if (!Number.isSafeInteger(size) || size < 0 || size > policy.maxFileBytes) {
+          throw new Error(`${policy.label} file is outside the size limit: ${childRelative}`);
+        }
+        totalBytes = accountReadOnlyTreeBytes(totalBytes, size, policy);
         files.push(childRelative);
+        if (files.length > policy.maxFiles) {
+          throw new Error(`${policy.label} has too many files`);
+        }
       }
     }
   }
@@ -820,8 +902,12 @@ async function readToolchainTopology(root) {
   return { directories, files };
 }
 
-function assertToolchainMetadata(metadata, relative, directory) {
-  const permittedModes = directory ? [0o500n] : [0o400n, 0o500n];
+function assertReadOnlyTreeMetadata(metadata, relative, directory, policy) {
+  const permittedModes = directory
+    ? [0o500n]
+    : policy.preserveExecutables
+      ? [0o400n, 0o500n]
+      : [0o400n];
   if (
     (directory ? !metadata.isDirectory() : !metadata.isFile())
     || metadata.isSymbolicLink()
@@ -830,11 +916,11 @@ function assertToolchainMetadata(metadata, relative, directory) {
     || (!directory && metadata.nlink !== 1n)
     || !permittedModes.includes(metadata.mode & 0o7777n)
   ) {
-    throw new Error(`trusted Rust toolchain metadata changed: ${relative}`);
+    throw new Error(`${policy.label} metadata changed: ${relative}`);
   }
 }
 
-function trustedTreeName(bytes) {
+function trustedTreeName(bytes, policy) {
   const name = bytes.toString('utf8');
   if (
     bytes.length === 0
@@ -843,15 +929,15 @@ function trustedTreeName(bytes) {
     || name === '..'
     || name.includes('/')
   ) {
-    throw new Error('trusted Rust toolchain contains an unsafe path');
+    throw new Error(`${policy.label} contains an unsafe path`);
   }
   return name;
 }
 
-function accountToolchainBytes(total, size) {
+function accountReadOnlyTreeBytes(total, size, policy) {
   const next = total + size;
-  if (!Number.isSafeInteger(next) || next > 1024 * 1024 * 1024) {
-    throw new Error('trusted Rust toolchain exceeds the aggregate byte limit');
+  if (!Number.isSafeInteger(next) || next > policy.maxBytes) {
+    throw new Error(`${policy.label} exceeds the aggregate byte limit`);
   }
   return next;
 }
@@ -933,6 +1019,7 @@ async function buildRustArtifacts(
   repoRoot,
   scratch,
   rustToolchainImage,
+  cargoVendorImage,
   run,
   assertCargoConfiguration,
   verifySourceSnapshot,
@@ -969,6 +1056,40 @@ async function buildRustArtifacts(
     toolchainRoot,
     RUST_TOOLCHAIN_TREE_SHA256,
   );
+  const copiedCargoVendorImage = path.join(scratch, 'cargo-vendor.squashfs');
+  const measuredCargoVendor = await copyMeasuredFile(
+    cargoVendorImage,
+    copiedCargoVendorImage,
+    0o400,
+  );
+  if (
+    measuredCargoVendor.size !== CARGO_VENDOR_IMAGE_SIZE
+    || measuredCargoVendor.sha256 !== CARGO_VENDOR_IMAGE_SHA256
+  ) {
+    throw new Error('Cargo vendor image does not match the trusted release digest');
+  }
+  const cargoVendorImageSnapshot = await snapshotPinnedFile(
+    copiedCargoVendorImage,
+    measuredCargoVendor.size,
+    measuredCargoVendor.sha256,
+    'Cargo vendor SquashFS',
+  );
+  const cargoVendorRoot = path.join(scratch, 'cargo-vendor');
+  await run('/usr/bin/unsquashfs', [
+    '-no-progress',
+    '-dest',
+    cargoVendorRoot,
+    copiedCargoVendorImage,
+  ], {
+    cwd: '/',
+    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  await verifyPinnedFile(cargoVendorImageSnapshot);
+  const cargoVendorSnapshot = await snapshotCargoVendorTree(
+    cargoVendorRoot,
+    CARGO_VENDOR_TREE_SHA256,
+  );
   const cargoHome = path.join(scratch, 'cargo-home');
   const home = path.join(scratch, 'home');
   const hostTarget = path.join(scratch, 'host-target');
@@ -977,13 +1098,13 @@ async function buildRustArtifacts(
   await fs.mkdir(home, { mode: 0o700 });
   await fs.mkdir(hostTarget, { mode: 0o700 });
   await fs.mkdir(staticTarget, { mode: 0o700 });
-  const emptyDigest = crypto.createHash('sha256').update('').digest('hex');
-  const cargoConfigSnapshots = [];
-  for (const name of ['config', 'config.toml']) {
-    const config = path.join(cargoHome, name);
-    await writeBytesFile(config, Buffer.alloc(0), 0o400);
-    cargoConfigSnapshots.push(await snapshotPinnedFile(config, 0, emptyDigest, `Cargo ${name}`));
-  }
+  const cargoConfig = Buffer.from(cargoVendorConfiguration(cargoVendorRoot), 'utf8');
+  await writeBytesFile(path.join(cargoHome, 'config.toml'), cargoConfig, 0o400);
+  const cargoHomeSnapshot = await snapshotReadOnlyTree(
+    cargoHome,
+    undefined,
+    CARGO_HOME_TREE_POLICY,
+  );
   const scratchIdentity = await snapshotPrivateDirectory(scratch, 'release build scratch');
   const cargoBin = path.join(toolchainRoot, 'bin/cargo');
   const rustcBin = path.join(toolchainRoot, 'bin/rustc');
@@ -993,7 +1114,9 @@ async function buildRustArtifacts(
     await verifySourceSnapshot();
     await verifyPinnedFile(toolchainImageSnapshot);
     await verifyToolchainTree(toolchainSnapshot);
-    for (const config of cargoConfigSnapshots) await verifyPinnedFile(config);
+    await verifyPinnedFile(cargoVendorImageSnapshot);
+    await verifyCargoVendorTree(cargoVendorSnapshot);
+    await verifyReadOnlyTree(cargoHomeSnapshot);
     await snapshotPrivateDirectory(scratch, 'release build scratch', scratchIdentity);
   };
   try {
@@ -1015,7 +1138,6 @@ async function buildRustArtifacts(
     }
 
     const hostBuild = cargoBuildInvocation(repoRoot, [
-      '--locked',
       '--release',
       '--all-features',
       '--target',
@@ -1030,7 +1152,6 @@ async function buildRustArtifacts(
     });
     await verifyBuildBoundary();
     const staticBuild = cargoBuildInvocation(repoRoot, [
-      '--locked',
       '--release',
       '--all-features',
       '--target',
@@ -1054,6 +1175,8 @@ async function buildRustArtifacts(
     return {
       hostBinDir: path.join(hostTarget, 'x86_64-unknown-linux-gnu', 'release'),
       staticBinDir: path.join(staticTarget, 'x86_64-unknown-linux-gnu', 'release'),
+      cargoVendorSha256: measuredCargoVendor.sha256,
+      cargoVendorTreeSha256: cargoVendorSnapshot.sha256,
       cargoVersion,
       rustcVersion,
       toolchainSha256: measuredToolchain.sha256,
@@ -1064,12 +1187,29 @@ async function buildRustArtifacts(
   }
 }
 
+export function cargoVendorConfiguration(cargoVendorRoot) {
+  const root = requireBuildEnvironmentPath(cargoVendorRoot, 'Cargo vendor path');
+  return [
+    '[source.crates-io]',
+    'replace-with = "vendored-sources"',
+    '',
+    '[source.vendored-sources]',
+    `directory = ${JSON.stringify(root)}`,
+    '',
+    '[net]',
+    'offline = true',
+    '',
+  ].join('\n');
+}
+
 export function cargoBuildInvocation(repoRoot, args) {
   return Object.freeze({
     args: Object.freeze([
       'build',
       '--manifest-path',
       path.join(path.resolve(repoRoot), 'Cargo.toml'),
+      '--locked',
+      '--offline',
       ...args,
     ]),
     cwd: '/',
@@ -1092,6 +1232,7 @@ export function buildEnvironment(scratch, toolchainRoot, extra = {}, additionalR
     CC_x86_64_unknown_linux_gnu: '/usr/bin/cc',
     AR_x86_64_unknown_linux_gnu: '/usr/bin/ar',
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: '/usr/bin/cc',
+    CARGO_NET_OFFLINE: 'true',
     CARGO_INCREMENTAL: '0',
     CARGO_ENCODED_RUSTFLAGS: [
       `--remap-path-prefix=${scratch}=/build`,

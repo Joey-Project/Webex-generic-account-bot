@@ -230,7 +230,8 @@ root-loaded code.
 
 The initial root-owned host release is a separate first-install boundary. A
 reviewed release-delivery step first installs Node.js 24 or newer at
-`/usr/bin/node` and a verified copy of the pinned, statically linked BusyBox at
+`/usr/bin/node` as a root-owned, single-link mode `0555` regular file and a
+verified copy of the pinned, statically linked BusyBox at
 `/usr/local/libexec/webex-host-release/busybox`. It then installs
 `build-host-release` and `install-host-release` as root-owned mode `0555`, plus
 their JavaScript implementations and `host-release-contract.mjs` as root-owned
@@ -246,10 +247,21 @@ repo_root=/path/to/reviewed/webex-generic-account-bot
 input_root="$(/usr/bin/mktemp -d /tmp/webex-host-release-inputs.XXXXXXXXXX)"
 codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
 # Materialise the separately reviewed Codex package at "$codex_package_root".
+cargo_bin=/home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo
+"$cargo_bin" vendor \
+  --locked \
+  --versioned-dirs \
+  --manifest-path "$repo_root/Cargo.toml" \
+  "$input_root/cargo-vendor"
 
 /usr/bin/mksquashfs \
   /home/codex/.rustup/toolchains/stable-x86_64-unknown-linux-gnu \
   "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs" \
+  -noappend -no-xattrs -no-progress -all-root \
+  -mkfs-time 0 -all-time 0 -comp xz
+/usr/bin/mksquashfs \
+  "$input_root/cargo-vendor" \
+  "$input_root/cargo-vendor.squashfs" \
   -noappend -no-xattrs -no-progress -all-root \
   -mkfs-time 0 -all-time 0 -comp xz
 /usr/bin/chmod -R go-w "$input_root"
@@ -261,13 +273,18 @@ release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
   --input-root "$input_root" \
   --codex-package-root "$codex_package_root" \
   --rust-toolchain-image \
-    "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
+    "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs" \
+  --cargo-vendor-image "$input_root/cargo-vendor.squashfs"
 ```
 
 The root-owned wrapper starts through the pinned static BusyBox and uses its
 static `env -i` applet before starting `/usr/bin/node`. This prevents native
 loader variables such as `LD_PRELOAD`, as well as caller `PATH`, `NODE_OPTIONS`,
-loaders, and preloads, from running before the builder's checks.
+loaders, and preloads, from running before the builder's checks. Before Node
+loads either JavaScript entrypoint or its statically imported contract, the
+wrapper verifies the complete root-owned ancestor chain, fixed file metadata,
+the pinned BusyBox size and digest, and fixed SHA-256 digests for both
+JavaScript implementations and the contract.
 The builder materialises the exact `HEAD` commit into an isolated source
 snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
 Cargo home and home directory. Tracked worktree edits, untracked files, ignored
@@ -306,6 +323,20 @@ requires the canonical tree digest
 The image, extracted topology, and every extracted inode/ctime identity are
 bound before and after every compiler invocation; the builder never executes
 the caller's mutable Rustup shims or toolchain.
+Cargo dependencies come from a separate reviewed SquashFS image of exactly
+`30576640` bytes with SHA-256
+`2c48918c40f3b9ff015c53f8be81a7894636d8ba94e99656a02a34de173a5ec9`.
+The builder normalises every extracted directory to mode `0500` and every file
+to mode `0400`, rejects links and special files, and requires canonical tree
+SHA-256
+`5b0214751dcea9f0546f3948750ab799ffe403f34d97c36f717c19783f7e8cba`.
+Its private Cargo home contains only a bound read-only `config.toml` that
+replaces crates.io with that extracted tree and sets offline mode. Every Cargo
+build also receives `--locked --offline` and `CARGO_NET_OFFLINE=true`; dependency
+resolution therefore fails closed instead of contacting a registry. These
+Cargo controls do not sandbox arbitrary network clients in dependency build
+scripts. A release environment that requires process-wide network denial must
+also provide a network namespace or equivalent host policy.
 Rust compiler paths are remapped to `/build`, and reproducibility inputs are
 fixed so a same-host retry can compare a newly built manifest with a completed
 output. The root-owned host `/usr/bin/cc`, `/usr/bin/ar`, linker, and native
@@ -319,9 +350,10 @@ builder requires `/` and any existing `/.cargo` to be root-owned and
 non-group/world-writable, rejects `/.cargo/config` and `/.cargo/config.toml`,
 and binds both inode and nanosecond ctime identities across the Cargo work. This
 closes the remaining fixed-working-directory configuration path and its
-create/remove race. The private `CARGO_HOME` contains read-only empty `config`
-and `config.toml` sentinels whose identities are checked around every Cargo
-command. All top-level scratch directories are created before a scratch-root
+create/remove race. The private `CARGO_HOME` contains only a read-only
+`config.toml` source-replacement file whose tree identity is checked around
+every Cargo command. All top-level scratch directories are created before a
+scratch-root
 identity baseline is taken, so replacing a toolchain, Cargo home, or target
 directory is also detected.
 The output parent must already be a current-UID/GID mode `0700` directory; the
@@ -329,15 +361,16 @@ documented `mktemp` command makes its name unpredictable inside `/tmp`. Its
 ancestors must be non-writable root/current-user directories or root-owned
 sticky directories. The builder revalidates that chain and its private `0700`
 staging tree immediately before no-clobber publication.
-The Codex package and toolchain image must likewise be materialised directly
-below a separate unpredictable current-UID/GID mode `0700` input root. Every
+The Codex package, toolchain image, and Cargo vendor image must likewise be
+materialised directly below a separate unpredictable current-UID/GID mode
+`0700` input root. Every
 selected input must be a regular file reached only through current-user-owned,
 non-group/world-writable directories below that root. Retained input file
 descriptors use non-blocking, no-follow opens before type, size, digest, and
 metadata-stability checks, so a FIFO or special file cannot stall the builder.
-It records the full Git SHA, fixed target and Rust/Codex versions, toolchain
-image and extracted-tree digests, exact allowlisted paths, modes, sizes, and
-SHA-256 digests. Manifest
+It records the full Git SHA, fixed target and Rust/Codex versions, toolchain and
+Cargo vendor image and extracted-tree digests, exact allowlisted paths, modes,
+sizes, and SHA-256 digests. Manifest
 paths use locale-independent code-point ordering, so caller locale and ICU
 defaults cannot change the trust-anchor digest. Fixed
 trusted digests cover the Codex executable, metadata, `rg`, `bwrap`, and the
@@ -357,13 +390,20 @@ service state.
 
 The pinned static BusyBox, two wrappers, JavaScript implementations, and contract
 are a separate trust anchor and are never loaded from the bundle. A reviewed
-release-delivery step must first install a root-owned Node.js 24 or newer runtime
-at `/usr/bin/node` and verify the BusyBox copy against SHA-256
+release-delivery step must independently verify these files before their first
+invocation and install them atomically into the root-owned, non-writable trust
+path. The wrapper's BusyBox self-check can detect later drift but cannot
+authenticate the interpreter that is already executing; malicious initial
+delivery or an already-compromised root account remains outside this in-band
+check. The delivery step must install a root-owned Node.js 24 or newer runtime
+at `/usr/bin/node` as a single-link mode `0555` regular file and verify the
+BusyBox copy against SHA-256
 `dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14`;
 the builder and installer reject older runtimes explicitly before using modern
 JavaScript APIs or loading the dynamic release contract. It then
-must install both wrappers and BusyBox as root-owned mode `0555` and both
-JavaScript implementations plus the contract as root-owned mode `0444` under
+must install both wrappers and BusyBox as root-owned, single-link mode `0555`
+regular files and both JavaScript implementations plus the contract as
+root-owned mode `0444` under
 `/usr/local/libexec/webex-host-release`, then
 stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
 mode `0700` tree. Carry the approved commit and manifest digest over an
