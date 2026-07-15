@@ -30,6 +30,7 @@ import {
   RELEASE_PATHS,
   RUSTC_VERSION,
   RUST_TOOLCHAIN_IMAGE_SHA256,
+  TRUSTED_SOURCE_SHA256,
   bundlePayloadPath,
   compareReleasePaths,
 } from '../scripts/host-release-contract.mjs';
@@ -399,10 +400,11 @@ describe('host release bootstrap', () => {
     const metadata = await fs.lstat(wrapperPath);
     assert.equal(metadata.mode & 0o111, 0o111);
     assert.equal(wrapper, [
-      '#!/bin/sh',
+      '#!/usr/local/libexec/webex-host-release/busybox sh',
+      '# shellcheck shell=dash',
       'set -eu',
       '',
-      'exec /usr/bin/env -i \\',
+      'exec /usr/local/libexec/webex-host-release/busybox env -i \\',
       '  HOME=/root \\',
       '  LANG=C \\',
       '  LC_ALL=C \\',
@@ -414,31 +416,96 @@ describe('host release bootstrap', () => {
     ].join('\n'));
   });
 
-  it('starts the release builder with a fixed Node runtime and cleared environment', async () => {
+  it('starts the release builder through a static environment-clearing wrapper', async () => {
+    const wrapperPath = new URL('../scripts/build-host-release', import.meta.url);
     const builderPath = new URL('../scripts/build-host-release.mjs', import.meta.url);
-    const builder = await fs.readFile(builderPath, 'utf8');
-    const metadata = await fs.lstat(builderPath);
-    assert.equal(metadata.mode & 0o111, 0o111);
-    assert.equal(
-      builder.split('\n', 1)[0],
-      '#!/usr/bin/env -S -i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/node',
-    );
+    const wrapper = await fs.readFile(wrapperPath, 'utf8');
+    const wrapperMetadata = await fs.lstat(wrapperPath);
+    const builderMetadata = await fs.lstat(builderPath);
+    assert.equal(wrapperMetadata.mode & 0o111, 0o111);
+    assert.equal(builderMetadata.mode & 0o111, 0);
+    assert.equal(wrapper, [
+      '#!/usr/local/libexec/webex-host-release/busybox sh',
+      '# shellcheck shell=dash',
+      'set -eu',
+      '',
+      'exec /usr/local/libexec/webex-host-release/busybox env -i \\',
+      '  HOME=/ \\',
+      '  LANG=C \\',
+      '  LC_ALL=C \\',
+      '  PATH=/usr/bin:/bin \\',
+      '  /usr/bin/node \\',
+      '  /usr/local/libexec/webex-host-release/build-host-release.mjs \\',
+      '  "$@"',
+      '',
+    ].join('\n'));
 
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'webex-builder-env-test-'));
-    const marker = path.join(root, 'preload-ran');
-    const preload = path.join(root, 'preload.cjs');
+    const nativeMarker = path.join(root, 'native-preload-ran');
+    const nodeMarker = path.join(root, 'node-preload-ran');
+    const nativeSource = path.join(root, 'preload.c');
+    const nativePreload = path.join(root, 'preload.so');
+    const nodePreload = path.join(root, 'preload.cjs');
+    const probe = path.join(root, 'probe.mjs');
+    const probeWrapper = path.join(root, 'build-host-release');
     try {
       await fs.writeFile(
-        preload,
-        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran');\n`,
+        nativeSource,
+        [
+          '#include <fcntl.h>',
+          '#include <unistd.h>',
+          '__attribute__((constructor)) static void loaded(void) {',
+          `  int fd = open(${JSON.stringify(nativeMarker)}, O_WRONLY | O_CREAT | O_TRUNC, 0600);`,
+          '  if (fd >= 0) {',
+          '    (void)write(fd, "ran", 3);',
+          '    (void)close(fd);',
+          '  }',
+          '}',
+          '',
+        ].join('\n'),
       );
-      const { stdout } = await execFileAsync('/usr/bin/env', [
-        '-S',
-        `-i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin ${process.execPath}`,
-        '-e',
-        'process.stdout.write(JSON.stringify(process.env))',
-      ], {
-        env: { ...process.env, NODE_OPTIONS: `--require=${preload}` },
+      await execFileAsync('/usr/bin/cc', [
+        '-shared',
+        '-fPIC',
+        '-o',
+        nativePreload,
+        nativeSource,
+      ]);
+      await execFileAsync('/usr/bin/env', ['-i', '/usr/bin/true'], {
+        env: { LD_PRELOAD: nativePreload },
+      });
+      assert.equal(await fs.readFile(nativeMarker, 'utf8'), 'ran');
+      await fs.rm(nativeMarker);
+      assert.equal(
+        crypto.createHash('sha256').update(await fs.readFile('/usr/bin/busybox')).digest('hex'),
+        TRUSTED_SOURCE_SHA256['runtime-sources/busybox'],
+      );
+
+      await fs.writeFile(
+        nodePreload,
+        `require('node:fs').writeFileSync(${JSON.stringify(nodeMarker)}, 'ran');\n`,
+      );
+      await fs.writeFile(
+        probe,
+        'process.stdout.write(JSON.stringify(process.env));\n',
+      );
+      await fs.writeFile(
+        probeWrapper,
+        wrapper
+          .replaceAll('/usr/local/libexec/webex-host-release/busybox', '/usr/bin/busybox')
+          .replace('/usr/bin/node', process.execPath)
+          .replace(
+            '/usr/local/libexec/webex-host-release/build-host-release.mjs',
+            probe,
+          ),
+        { mode: 0o755 },
+      );
+      const { stdout } = await execFileAsync(probeWrapper, [], {
+        env: {
+          ...process.env,
+          LD_PRELOAD: nativePreload,
+          NODE_OPTIONS: `--require=${nodePreload}`,
+        },
         maxBuffer: 1024 * 1024,
       });
       assert.deepEqual(JSON.parse(stdout), {
@@ -447,7 +514,8 @@ describe('host release bootstrap', () => {
         LC_ALL: 'C',
         PATH: '/usr/bin:/bin',
       });
-      await assertMissing(marker);
+      await assertMissing(nativeMarker);
+      await assertMissing(nodeMarker);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

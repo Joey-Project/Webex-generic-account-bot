@@ -3,10 +3,10 @@
 set -eu
 
 exec /usr/local/libexec/webex-host-release/busybox env -i \
-  HOME=/root \
+  HOME=/ \
   LANG=C \
   LC_ALL=C \
   PATH=/usr/bin:/bin \
   /usr/bin/node \
-  /usr/local/libexec/webex-host-release/install-host-release.mjs \
+  /usr/local/libexec/webex-host-release/build-host-release.mjs \
   "$@"

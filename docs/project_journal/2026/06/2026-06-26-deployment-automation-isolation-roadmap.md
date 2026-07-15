@@ -39,10 +39,11 @@ superseded_by:
   with local Git behaviour disabled instead of attribute-sensitive archives.
   Cargo rejects fixed-root configuration, manifest ordering is locale
   independent, and recovered bundles are fully re-synced before acceptance.
-  The production builder entrypoint clears its startup environment and pins
-  `/usr/bin/node`; object-only source materialisation no longer executes a
-  worktree cleanliness command, and Cargo binds trusted root-directory
-  identities across compilation.
+  Both production entrypoints start through a pinned root-owned static BusyBox
+  before clearing the environment and execing `/usr/bin/node`, so native loader
+  variables cannot run before the trust checks. Object-only source
+  materialisation no longer executes a worktree cleanliness command, and Cargo
+  binds trusted root-directory identities across compilation.
   Git promisor lazy fetching is disabled so a missing committed object fails
   without running a repository-configured remote helper.
   The builder is now a root-owned read-only trust-anchor member that accepts an
@@ -335,8 +336,9 @@ superseded_by:
 - Build a non-secret bundle without root from an exact reviewed commit export,
   rebuilding all six Rust binaries with a fixed target/toolchain and isolated
   Cargo home, then check fixed BusyBox and Codex `0.142.3` artifact digests.
-- Keep the environment-clearing wrapper, installer, and contract outside the
-  data-only bundle in a separate root-owned trust anchor. Require approved
+- Keep the pinned static BusyBox, environment-clearing wrappers, JavaScript
+  implementations, and contract outside the data-only bundle in a separate
+  root-owned trust anchor. Require approved
   commit and manifest digests, exact topology and metadata, and atomic
   no-clobber publication under `/opt`.
 - Recover a fully matching install after a publish/fsync interruption; refuse

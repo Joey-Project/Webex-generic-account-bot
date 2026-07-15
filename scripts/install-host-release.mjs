@@ -13,10 +13,13 @@ const execFileAsync = promisify(execFile);
 const PRODUCTION_BUNDLE_ROOT = '/var/lib/webex-host-release/bundle';
 const PRODUCTION_INSTALL_ROOT = '/opt/webex-generic-account-bot';
 const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+const PRODUCTION_BUSYBOX_PATH = `${PRODUCTION_TRUST_ROOT}/busybox`;
+const PRODUCTION_BUILDER_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release`;
 const PRODUCTION_BUILDER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release.mjs`;
-const PRODUCTION_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
+const PRODUCTION_INSTALLER_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
 const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
 const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
+const PRODUCTION_BUSYBOX_SHA256 = 'dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14';
 const MANIFEST_NAME = 'manifest.json';
 const MANIFEST_MAX_BYTES = 1024 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024;
@@ -49,9 +52,9 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    `Usage: ${PRODUCTION_WRAPPER_PATH} [--dry-run] [--json]`,
+    `Usage: ${PRODUCTION_INSTALLER_WRAPPER_PATH} [--dry-run] [--json]`,
     '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
-    `       ${PRODUCTION_WRAPPER_PATH} --apply [--json]`,
+    `       ${PRODUCTION_INSTALLER_WRAPPER_PATH} --apply [--json]`,
     '       --expected-bot-revision <sha> --expected-manifest-sha256 <sha256>',
     '',
     'Dry-run is the default. Trust, bundle, and install paths are fixed.',
@@ -828,9 +831,27 @@ async function assertProductionTrustAnchor() {
     0,
     0o755,
   );
+  const busyboxMetadata = await fs.lstat(PRODUCTION_BUSYBOX_PATH);
   assertFileMetadata(
-    await fs.lstat(PRODUCTION_WRAPPER_PATH),
-    PRODUCTION_WRAPPER_PATH,
+    busyboxMetadata,
+    PRODUCTION_BUSYBOX_PATH,
+    0,
+    0,
+    0o555,
+  );
+  if (await hashStableFile(PRODUCTION_BUSYBOX_PATH, busyboxMetadata) !== PRODUCTION_BUSYBOX_SHA256) {
+    throw new Error('production trust-anchor BusyBox digest is invalid');
+  }
+  assertFileMetadata(
+    await fs.lstat(PRODUCTION_BUILDER_WRAPPER_PATH),
+    PRODUCTION_BUILDER_WRAPPER_PATH,
+    0,
+    0,
+    0o555,
+  );
+  assertFileMetadata(
+    await fs.lstat(PRODUCTION_INSTALLER_WRAPPER_PATH),
+    PRODUCTION_INSTALLER_WRAPPER_PATH,
     0,
     0,
     0o555,
@@ -840,7 +861,7 @@ async function assertProductionTrustAnchor() {
     PRODUCTION_BUILDER_PATH,
     0,
     0,
-    0o555,
+    0o444,
   );
   assertFileMetadata(
     await fs.lstat(PRODUCTION_INSTALLER_PATH),

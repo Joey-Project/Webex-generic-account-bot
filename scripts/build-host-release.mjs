@@ -1,5 +1,3 @@
-#!/usr/bin/env -S -i HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/node
-
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
@@ -30,7 +28,10 @@ import {
 
 const execFileAsync = promisify(execFile);
 const PRODUCTION_TRUST_ROOT = '/usr/local/libexec/webex-host-release';
+const PRODUCTION_BUSYBOX_PATH = `${PRODUCTION_TRUST_ROOT}/busybox`;
+const PRODUCTION_BUILDER_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release`;
 const PRODUCTION_BUILDER_PATH = `${PRODUCTION_TRUST_ROOT}/build-host-release.mjs`;
+const PRODUCTION_INSTALLER_WRAPPER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release`;
 const PRODUCTION_INSTALLER_PATH = `${PRODUCTION_TRUST_ROOT}/install-host-release.mjs`;
 const PRODUCTION_CONTRACT_PATH = `${PRODUCTION_TRUST_ROOT}/host-release-contract.mjs`;
 const MANIFEST_NAME = 'manifest.json';
@@ -59,7 +60,7 @@ export function parseArgs(argv) {
 
 export function usage() {
   return [
-    `Usage: ${PRODUCTION_BUILDER_PATH} --repo <directory> --output <directory>`,
+    `Usage: ${PRODUCTION_BUILDER_WRAPPER_PATH} --repo <directory> --output <directory>`,
     '       --input-root <directory>',
     '       --codex-package-root <vendor-root> --rust-toolchain-image <squashfs>',
     '',
@@ -1075,9 +1076,34 @@ async function assertProductionBuilderTrustAnchor() {
     'directory',
   );
   assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_BUSYBOX_PATH),
+    PRODUCTION_BUSYBOX_PATH,
+    0o555,
+    'file',
+  );
+  const busyboxBytes = await readBoundedRegularFile(PRODUCTION_BUSYBOX_PATH, 16 * 1024 * 1024);
+  if (
+    crypto.createHash('sha256').update(busyboxBytes).digest('hex')
+    !== TRUSTED_SOURCE_SHA256['runtime-sources/busybox']
+  ) {
+    throw new Error('builder trust-anchor BusyBox digest is invalid');
+  }
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_BUILDER_WRAPPER_PATH),
+    PRODUCTION_BUILDER_WRAPPER_PATH,
+    0o555,
+    'file',
+  );
+  assertRootOwnedMetadata(
+    await fs.lstat(PRODUCTION_INSTALLER_WRAPPER_PATH),
+    PRODUCTION_INSTALLER_WRAPPER_PATH,
+    0o555,
+    'file',
+  );
+  assertRootOwnedMetadata(
     await fs.lstat(PRODUCTION_BUILDER_PATH),
     PRODUCTION_BUILDER_PATH,
-    0o555,
+    0o444,
     'file',
   );
   assertRootOwnedMetadata(

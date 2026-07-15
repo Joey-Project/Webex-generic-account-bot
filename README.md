@@ -230,9 +230,11 @@ root-loaded code.
 
 The initial root-owned host release is a separate first-install boundary. A
 reviewed release-delivery step first installs Node.js 24 or newer at
-`/usr/bin/node`, then installs `build-host-release.mjs` as root-owned mode
-`0555` and `install-host-release.mjs` plus `host-release-contract.mjs` as
-root-owned mode `0444` under `/usr/local/libexec/webex-host-release`. The
+`/usr/bin/node` and a verified copy of the pinned, statically linked BusyBox at
+`/usr/local/libexec/webex-host-release/busybox`. It then installs
+`build-host-release` and `install-host-release` as root-owned mode `0555`, plus
+their JavaScript implementations and `host-release-contract.mjs` as root-owned
+mode `0444` under `/usr/local/libexec/webex-host-release`. The
 builder refuses real or effective UID 0; an ordinary release user invokes this
 root-owned trust anchor to build from a separate repository checkout. It uses the fixed Rust
 `1.96.0` toolchain to rebuild the host
@@ -253,7 +255,7 @@ codex_package_root="$input_root/codex-0.142.3/vendor/x86_64-unknown-linux-musl"
 /usr/bin/chmod -R go-w "$input_root"
 
 release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
-/usr/local/libexec/webex-host-release/build-host-release.mjs \
+/usr/local/libexec/webex-host-release/build-host-release \
   --repo "$repo_root" \
   --output "$release_parent/bundle" \
   --input-root "$input_root" \
@@ -262,9 +264,10 @@ release_parent="$(/usr/bin/mktemp -d /tmp/webex-host-release.XXXXXXXXXX)"
     "$input_root/rust-toolchain-1.96.0-x86_64-unknown-linux-gnu.squashfs"
 ```
 
-The root-owned executable builder clears the complete caller environment in its shebang
-and starts the root-owned `/usr/bin/node` directly, so caller `PATH`,
-`NODE_OPTIONS`, loaders, and preloads cannot run before the builder's checks.
+The root-owned wrapper starts through the pinned static BusyBox and uses its
+static `env -i` applet before starting `/usr/bin/node`. This prevents native
+loader variables such as `LD_PRELOAD`, as well as caller `PATH`, `NODE_OPTIONS`,
+loaders, and preloads, from running before the builder's checks.
 The builder materialises the exact `HEAD` commit into an isolated source
 snapshot from bounded `ls-tree` and `cat-file` results and uses a build-local
 Cargo home and home directory. Tracked worktree edits, untracked files, ignored
@@ -331,13 +334,15 @@ from silently accumulating full build trees. It includes no tokens, environment
 files, deploy keys, rendered config, runtime image, systemd installation, or
 service state.
 
-The builder, installer, contract, and environment-clearing wrapper are a separate trust
-anchor and are never loaded from the bundle. A reviewed release-delivery step
-must first install a root-owned Node.js 24 or newer runtime at `/usr/bin/node`;
+The pinned static BusyBox, two wrappers, JavaScript implementations, and contract
+are a separate trust anchor and are never loaded from the bundle. A reviewed
+release-delivery step must first install a root-owned Node.js 24 or newer runtime
+at `/usr/bin/node` and verify the BusyBox copy against SHA-256
+`dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14`;
 the builder and installer reject older runtimes explicitly before using modern
 JavaScript APIs or loading the dynamic release contract. It then
-must install the wrapper and builder as root-owned mode `0555` and the installer
-plus contract as root-owned mode `0444` under
+must install both wrappers and BusyBox as root-owned mode `0555` and both
+JavaScript implementations plus the contract as root-owned mode `0444` under
 `/usr/local/libexec/webex-host-release`, then
 stage the data-only bundle at `/var/lib/webex-host-release/bundle` as a root-owned
 mode `0700` tree. Carry the approved commit and manifest digest over an
