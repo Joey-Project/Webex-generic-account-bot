@@ -615,22 +615,24 @@ describe('guarded host provisioner policy', () => {
       '  });',
       '',
     ].join('\n'));
-    const cleanLaunch = spawnSync(
-      '/usr/bin/env',
-      [
-        '-S',
-        `-i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ${process.execPath}`,
-        launcherPath,
-        '--help',
-      ],
-      {
+    const launcherDirectory = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'webex-provision-launcher-test-'),
+    );
+    try {
+      const cleanLauncherPath = path.join(launcherDirectory, 'provision-host');
+      const cleanLauncher = launcher.replace('/usr/bin/node', process.execPath);
+      await fs.writeFile(cleanLauncherPath, cleanLauncher, { mode: 0o755 });
+      await fs.symlink(provisionScript, path.join(launcherDirectory, 'provision-host.mjs'));
+      const cleanLaunch = spawnSync(cleanLauncherPath, ['--help'], {
         env: { NODE_OPTIONS: '--definitely-invalid' },
         encoding: 'utf8',
-      },
-    );
-    assert.equal(cleanLaunch.status, 0, cleanLaunch.stderr);
-    assert.match(cleanLaunch.stdout, /Dry-run is the default/);
-    assert.equal(cleanLaunch.stderr, '');
+      });
+      assert.equal(cleanLaunch.status, 0, cleanLaunch.stderr);
+      assert.match(cleanLaunch.stdout, /Dry-run is the default/);
+      assert.equal(cleanLaunch.stderr, '');
+    } finally {
+      await fs.rm(launcherDirectory, { recursive: true, force: true });
+    }
     const readme = await fs.readFile(
       fileURLToPath(new URL('../README.md', import.meta.url)),
       'utf8',

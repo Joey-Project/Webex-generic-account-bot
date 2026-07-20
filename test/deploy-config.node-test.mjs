@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 
 import {
   buildDeployPlan,
@@ -45,6 +45,9 @@ import {
   redactedConsoleLinesFromText,
 } from '../scripts/jenkins-readonly.mjs';
 
+// Synthetic fixture catalog ID: api-key-a.
+const SYNTHETIC_API_KEY = 'codex_synth_v1_api_key_a';
+
 const CONTAINED_PROCESS_TREE_INSPECTOR = Object.freeze({
   async captureBaseline() {
     return 'contained-test-baseline';
@@ -56,6 +59,16 @@ const CONTAINED_PROCESS_TREE_INSPECTOR = Object.freeze({
 
 const CONFIG_COMMANDS_ROOM_ID =
   'Y2lzY29zcGFyazovL3VzL1JPT00vZWI2YTA1MjAtNzY5My0xMWYxLThlYTUtM2YzYjFjMjYzYzA3';
+const TRUSTED_BOT_BIN_DIRECTORY = await fs.mkdtemp(
+  path.join(os.tmpdir(), 'deploy-config-bot-bin-test-'),
+);
+const TRUSTED_BOT_BIN = path.join(TRUSTED_BOT_BIN_DIRECTORY, 'webex-generic-account-bot');
+
+after(async () => {
+  await fs.rm(TRUSTED_BOT_BIN_DIRECTORY, { recursive: true, force: true });
+});
+
+await fs.writeFile(TRUSTED_BOT_BIN, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
 
 function runContainedCommand(commandSpec, env, signal = null) {
   return runCommand(commandSpec, env, signal, CONTAINED_PROCESS_TREE_INSPECTOR);
@@ -1351,12 +1364,19 @@ describe('trusted config policy', () => {
   });
 
   it('redacts private keys and common API key assignments', () => {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const privateKeyPem = privateKey.export({
+      type: 'pkcs8',
+      format: 'pem',
+    });
     const lines = redactedConsoleLinesFromText(
-      'API_KEY=abc123\nPRIVATE_KEY: hidden\n-----BEGIN PRIVATE KEY-----\nraw-key-material\n-----END PRIVATE KEY-----',
+      `API_KEY=${SYNTHETIC_API_KEY}\nPRIVATE_KEY: hidden\n${privateKeyPem}`,
     );
     const redacted = lines.join('\n');
 
-    assert.doesNotMatch(redacted, /abc123|hidden|raw-key-material/);
+    assert.doesNotMatch(redacted, /hidden/);
+    assert.equal(redacted.includes(SYNTHETIC_API_KEY), false);
+    assert.equal(redacted.includes(privateKeyPem.trim()), false);
     assert.match(redacted, /API_KEY=\[REDACTED\]/);
     assert.match(redacted, /\[REDACTED PRIVATE KEY\]/);
   });
@@ -2422,7 +2442,7 @@ describe('deploy-config CLI and execution', () => {
       '--bot-code-dir',
       path.join(temp, 'bot-code'),
       '--bot-bin',
-      '/usr/bin/true',
+      TRUSTED_BOT_BIN,
     ];
     const plan = buildDeployPlan(parseArgsAllow(argv));
     let commandFailed = false;
@@ -2494,7 +2514,7 @@ describe('deploy-config CLI and execution', () => {
       '--activation-receipt',
       path.join(temp, 'run', 'webex-codex-activation', 'receipt.json'),
       '--bot-bin',
-      '/usr/bin/true',
+      TRUSTED_BOT_BIN,
     ];
     const plan = buildDeployPlan(parseArgsAllow(argv));
     await fs.mkdir(path.dirname(plan.renderedConfig), { recursive: true, mode: 0o755 });
@@ -2656,7 +2676,7 @@ describe('deploy-config CLI and execution', () => {
         '--bot-code-dir',
         path.join(temp, 'bot-code'),
         '--bot-bin',
-        '/usr/bin/true',
+        TRUSTED_BOT_BIN,
       ],
       parentEnv: { WEBEX_BOT_DEPLOY_ALLOW_HOST_OVERRIDES: '1' },
       stdout: writer((chunk) => {
@@ -6086,7 +6106,7 @@ describe('deploy-config CLI and execution', () => {
   it('rejects a symlinked host-installed bot binary before running commands', async () => {
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'deploy-config-test-'));
     const botBin = path.join(temp, 'webex-generic-account-bot');
-    await fs.symlink('/usr/bin/true', botBin);
+    await fs.symlink(TRUSTED_BOT_BIN, botBin);
     const plan = buildDeployPlan(
       parseArgsAllow([
         '--apply',
@@ -8400,7 +8420,7 @@ function prepareTestArgs(temp, lockFile = path.join(temp, 'run', 'deploy.lock'))
     '--bot-code-dir',
     path.join(temp, 'bot-code'),
     '--bot-bin',
-    '/usr/bin/true',
+    TRUSTED_BOT_BIN,
   ];
 }
 
@@ -8754,7 +8774,7 @@ function parseArgsAllow(args) {
   }
   const withBotBin = testArgs.includes('--bot-bin')
     ? testArgs
-    : [...testArgs, '--bot-bin', '/usr/bin/true'];
+    : [...testArgs, '--bot-bin', TRUSTED_BOT_BIN];
   return parseArgs(withBotBin, { allowHostOverrides: true });
 }
 
