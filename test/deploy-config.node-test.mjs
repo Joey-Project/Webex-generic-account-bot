@@ -1369,6 +1369,9 @@ describe('trusted config policy', () => {
       type: 'pkcs8',
       format: 'pem',
     });
+    const privateKeyBodyLines = privateKeyPem
+      .split('\n')
+      .filter((line) => line !== '' && !line.startsWith('-----'));
     const lines = redactedConsoleLinesFromText(
       `API_KEY=${SYNTHETIC_API_KEY}\nPRIVATE_KEY: hidden\n${privateKeyPem}`,
     );
@@ -1377,6 +1380,10 @@ describe('trusted config policy', () => {
     assert.doesNotMatch(redacted, /hidden/);
     assert.equal(redacted.includes(SYNTHETIC_API_KEY), false);
     assert.equal(redacted.includes(privateKeyPem.trim()), false);
+    assert.notEqual(privateKeyBodyLines.length, 0);
+    for (const bodyLine of privateKeyBodyLines) {
+      assert.equal(redacted.includes(bodyLine), false);
+    }
     assert.match(redacted, /API_KEY=\[REDACTED\]/);
     assert.match(redacted, /\[REDACTED PRIVATE KEY\]/);
   });

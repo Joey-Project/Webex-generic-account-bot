@@ -616,7 +616,10 @@ describe('guarded host provisioner policy', () => {
       '',
     ].join('\n'));
     const launcherDirectory = await fs.mkdtemp(
-      path.join(os.tmpdir(), 'webex-provision-launcher-test-'),
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '.webex-provision-launcher-test-',
+      ),
     );
     try {
       const cleanLauncherPath = path.join(launcherDirectory, 'provision-host');

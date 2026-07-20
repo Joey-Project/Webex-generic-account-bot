@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-20
 updated: 2026-07-20
 branch: codex/test-fixture-portability-cleanup
-pr:
+pr: https://github.com/Joey-Project/Webex-generic-account-bot/pull/30
 supersedes: []
 superseded_by:
 ---
