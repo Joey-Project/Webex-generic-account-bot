@@ -1834,6 +1834,17 @@ also requires the boot-scoped renewal unit, which remains active after success
 so isolated transient units can bind their lifetime to it. `reload` and `sync`
 remain disabled.
 
+## Codex Review Gate
+
+The v2 Codex review gate is scoped to ordinary pull requests whose head branch
+is in this repository and whose base is the repository's default branch.
+Fork-head pull requests are outside this installation's supported scope:
+GitHub may leave `workflow_run.pull_requests` empty for a fork run, so the
+controller cannot safely associate that run with one PR. With
+`CODEX_REVIEW_GATE_AUTO_REQUEST=true`, such a run still does not trigger an
+automatic Codex request. This is an accepted scope boundary, not a missing fork
+implementation; do not infer fork support from the same-repository gate.
+
 ## Development
 
 Generated CI runs:
