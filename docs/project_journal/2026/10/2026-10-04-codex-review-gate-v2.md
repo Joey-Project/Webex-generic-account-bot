@@ -18,6 +18,7 @@ superseded_by:
 ## Current State
 - `.github/workflows/codex-review-gate.yml` uses the floating `@v2` action, read-only verifier permissions including `actions: read`, `request_author_permission: any`, and `request_review: false`.
 - `.github/workflows/codex-review-gate-controller.yml` is installed; `.github/CODEOWNERS` assigns workflow and CODEOWNERS ownership to `@JoeyTeng`.
+- The README defines the supported review-gate scope as ordinary same-repository pull requests to the default branch. Fork-head `workflow_run` association and automatic request are explicitly unsupported and are not implied by this installation.
 - The production ruleset is unchanged by this consumer installation. This note does not claim that a v2 production requirement or the wider repository migration is complete.
 
 ## Next Steps
